@@ -2,3 +2,4 @@
 /.direnv
 /var
 result*
+/.nix-results
