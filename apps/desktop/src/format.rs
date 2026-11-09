@@ -47,9 +47,76 @@ pub fn preview(text: &str, max: usize) -> String {
     }
 }
 
-/// A compact id for dense rows: first 8 hex characters.
-pub fn short_id(id: &str) -> String {
-    id.chars().take(8).collect()
+
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+
+/// Absolute UTC timestamp for detail rows.
+pub fn fmt_dt(value: DateTime<Utc>) -> String {
+    value.format("%Y-%m-%d %H:%M UTC").to_string()
+}
+
+/// Day heading for grouped intents.
+pub fn fmt_day(day: NaiveDate) -> String {
+    day.format("%a %d %b %Y").to_string()
+}
+
+/// Parse a `datetime-local` value as UTC (the hub stores UTC instants).
+pub fn parse_local(value: &str) -> Option<DateTime<Utc>> {
+    for format in ["%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(value, format) {
+            return Some(naive.and_utc());
+        }
+    }
+    None
+}
+
+/// Format a UTC instant for a `datetime-local` input (minute precision).
+pub fn default_local(value: DateTime<Utc>) -> String {
+    value.format("%Y-%m-%dT%H:%M").to_string()
+}
+
+/// Subsequence match used by the command palette. Returns a higher score for
+/// consecutive matches; `None` means the query is not a subsequence.
+pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+    let needle: Vec<char> = needle.to_lowercase().chars().collect();
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let haystack = haystack.to_lowercase();
+    let mut index = 0usize;
+    let mut score = 0i32;
+    let mut previous: Option<usize> = None;
+    for character in haystack.chars() {
+        if index < needle.len() && character == needle[index] {
+            score += match previous {
+                Some(p) if p + 1 == index => 3,
+                Some(_) => 1,
+                None => 2,
+            };
+            previous = Some(index);
+            index += 1;
+            if index == needle.len() {
+                return Some(score);
+            }
+        }
+    }
+    None
+}
+
+/// Indices of `haystacks` matching `needle`, best first.
+pub fn fuzzy_filter(needle: &str, haystacks: &[&str]) -> Vec<usize> {
+    let mut matches: Vec<(i32, usize)> = haystacks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, text)| fuzzy_score(needle, text).map(|score| (score, index)))
+        .collect();
+    matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    matches.into_iter().map(|(_, index)| index).collect()
+}
+
+/// First 12 characters of a hash/id for dense rows.
+pub fn short_hash(value: &str) -> String {
+    value.chars().take(12).collect()
 }
 
 #[cfg(test)]
@@ -78,8 +145,29 @@ mod tests {
     }
 
     #[test]
-    fn short_id_truncates() {
-        assert_eq!(short_id("0123456789"), "01234567");
-        assert_eq!(short_id("abc"), "abc");
+    fn datetime_helpers() {
+        let dt = DateTime::parse_from_rfc3339("2026-11-09T18:30:00Z").unwrap().with_timezone(&Utc);
+        assert_eq!(fmt_dt(dt), "2026-11-09 18:30 UTC");
+        assert_eq!(default_local(dt), "2026-11-09T18:30");
+        assert_eq!(parse_local("2026-11-09T18:30").unwrap(), dt);
+        assert_eq!(parse_local("2026-11-09T18:30:00").unwrap(), dt);
+        assert!(parse_local("not a date").is_none());
+        assert_eq!(fmt_day(NaiveDate::from_ymd_opt(2026, 11, 9).unwrap()), "Mon 09 Nov 2026");
+    }
+
+    #[test]
+    fn fuzzy_filter_orders_and_rejects() {
+        let items = ["Today", "News", "Studio", "Relationships"];
+        assert_eq!(fuzzy_filter("tod", &items), vec![0]);
+        assert_eq!(fuzzy_filter("ne", &items), vec![1]);
+        assert!(fuzzy_filter("zzz", &items).is_empty());
+        assert_eq!(fuzzy_filter("", &items), vec![0, 1, 2, 3]);
+        assert!(fuzzy_score("rel", "Relationships").unwrap() > 0);
+    }
+
+    #[test]
+    fn short_hash_caps() {
+        assert_eq!(short_hash("0123456789abcdef"), "0123456789ab");
+        assert_eq!(short_hash("abc"), "abc");
     }
 }

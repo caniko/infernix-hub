@@ -10,7 +10,7 @@ use crate::{Workspace, icons};
 pub fn Sidebar(workspace: Signal<Workspace>, nav_open: Signal<bool>) -> Element {
     rsx! {
         nav {
-            class: if nav_open() { "sidebar open" } else { "sidebar" },
+            class: if nav_open.cloned() { "sidebar open" } else { "sidebar" },
             aria_label: "Workspaces",
             div { class: "brand-lockup",
                 span { class: "brand-mark", aria_hidden: "true" }
@@ -37,7 +37,7 @@ fn NavItem(
     target: Workspace,
     index: usize,
 ) -> Element {
-    let active = workspace() == target;
+    let active = workspace.cloned() == target;
     let mut workspace = workspace;
     let mut nav_open = nav_open;
     rsx! {
@@ -62,6 +62,7 @@ pub fn Topbar(
     nav_open: Signal<bool>,
     live: bool,
     status_label: String,
+    on_palette: EventHandler<()>,
 ) -> Element {
     let mut inspector_open = inspector_open;
     let mut nav_open = nav_open;
@@ -83,8 +84,13 @@ pub fn Topbar(
                 "{status_label}"
             }
             button {
+                class: "btn btn-glass",
+                onclick: move |_| on_palette.call(()),
+                "Ctrl+K Commands"
+            }
+            button {
                 class: "icon-btn",
-                aria_pressed: if inspector_open() { "true" } else { "false" },
+                aria_pressed: if inspector_open.cloned() { "true" } else { "false" },
                 aria_label: "Toggle inspector",
                 onclick: move |_| inspector_open.toggle(),
                 "Inspector"
@@ -137,6 +143,17 @@ pub fn ContextItem(
             if !meta.is_empty() {
                 span { class: "ctx-meta", "{meta}" }
             }
+        }
+    }
+}
+
+/// Persistent warning when any adapter runs on fixtures.
+#[component]
+pub fn FixtureBanner() -> Element {
+    rsx! {
+        div { class: "fixture-banner", role: "alert",
+            strong { "FIXTURE MODE" }
+            span { "— integrations are simulated" }
         }
     }
 }

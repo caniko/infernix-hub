@@ -84,7 +84,7 @@ pub fn ProposalCard(
                         button {
                             class: "btn btn-primary",
                             onclick: move |_| {
-                                on_accept.call(Some(draft()));
+                                on_accept.call(Some(draft.cloned()));
                                 mode.set(ProposalMode::View);
                             },
                             "Accept edit"
@@ -107,7 +107,7 @@ pub fn ProposalCard(
                         button {
                             class: "btn btn-primary",
                             onclick: move |_| {
-                                let reason = draft().trim().to_string();
+                                let reason = draft.cloned().trim().to_string();
                                 on_reject.call(if reason.is_empty() { None } else { Some(reason) });
                                 mode.set(ProposalMode::View);
                             },
@@ -177,7 +177,7 @@ pub fn ListEditor(
     let mut items = items;
     let mut draft = use_signal(String::new);
     let add = move |_: MouseEvent| {
-        let v = draft().trim().to_string();
+        let v = draft.cloned().trim().to_string();
         if !v.is_empty() {
             items.write().push(v);
             draft.set(String::new());
@@ -188,14 +188,14 @@ pub fn ListEditor(
         div { class: "glass-card settings-section",
             div { class: "panel-head",
                 h3 { "{title}" }
-                span { class: "chip", "{items().len()}" }
+                span { class: "chip", "{items.cloned().len()}" }
             }
             p { class: "label-tech", "{hint}" }
-            if items().is_empty() {
+            if items.cloned().is_empty() {
                 p { class: "label-tech sub", "None declared." }
             } else {
                 div { class: "list-editor",
-                    for (i, entry) in items().into_iter().enumerate() {
+                    for (i, entry) in items.cloned().into_iter().enumerate() {
                         div { class: "chip-removable", key: "{i}",
                             span { "{entry}" }
                             button {
@@ -220,7 +220,7 @@ pub fn ListEditor(
                     oninput: move |e| draft.set(e.value()),
                     onkeydown: move |e| {
                         if e.key() == Key::Named(NamedKey::Enter) {
-                            let v = draft().trim().to_string();
+                            let v = draft.cloned().trim().to_string();
                             if !v.is_empty() {
                                 items.write().push(v);
                                 draft.set(String::new());

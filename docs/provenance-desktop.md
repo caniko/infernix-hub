@@ -74,9 +74,69 @@ All donor `assets/logos/*` files were omitted.
 - **Voice/mission/document/memory graph markup and styles**: not part of the
   hub domain.
 
+## Runtime configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HUB_URL` | `http://127.0.0.1:8470` | Hub base URL; the client appends `/v1`. |
+| `HUB_TOKEN` | empty | Operator bearer token. Set it when the hub enforces auth. |
+
+The console polls `/v1/status` plus the base lists and the selected detail on the
+donor's 1.5s cadence. A failed refresh keeps the last good data and shows the
+`ApiError` code/message; every list has loading, error and empty states.
+
+## Workspace → endpoint coverage
+
+| Workspace | Reads | Writes |
+|---|---|---|
+| Today | `GET /v1/today` | — |
+| News | `GET /v1/news`, `GET /v1/personas` | `POST /v1/content` (brief) |
+| Studio | `GET /v1/content`, `GET /v1/content/{id}`, `GET /v1/workflows`, `GET /v1/accounts`, `GET /v1/assets/{id}/content` | `POST /v1/content/{id}/generations`, `POST /v1/generations/{id}/cancel`, `POST /v1/assets/{id}/select`, `POST /v1/content/{id}/releases`, `POST /v1/releases/{id}/request-review`, `POST /v1/releases/{id}/schedule`, `POST /v1/intents/{id}/cancel` |
+| Calendar | `GET /v1/intents`, `GET /v1/accounts` (+ bounded `GET /v1/content/{id}` release index) | `POST /v1/intents/{id}/cancel` |
+| Relationships | `GET /v1/relationships`, `GET /v1/relationships/{id}` | `POST /v1/relationships/{id}/drafts`, `POST /v1/drafts/{id}/decision`, `POST /v1/relationships/{id}/takeover`, `POST /v1/relationships/{id}/release`, `POST /v1/relationships/{id}/handoff`, `POST /v1/relationships/{id}/follow-up` |
+| Library | `GET /v1/personas`, `GET /v1/personas/{id}/canon`, `GET /v1/assets` | `POST /v1/personas/{id}/canon`, `POST /v1/canon/{revision}/decision` |
+| Chat (content/persona) | `GET /v1/chat/{subject}/{id}` | `POST /v1/chat/{subject}/{id}` |
+| Palette | `GET /v1/search?q=` | — |
+| Status | `GET /v1/status` | — |
+
 ## Contract requests
 
-_None yet._ (Milestone C records any gaps found against `crates/contracts`.)
+1. **Intent approval state.** `PublicationIntent` exposes delivery state,
+   attempts and `release_revision_id`, but not the release's approval state or
+   `content_item_id`. Calendar therefore builds a bounded release index from
+   `GET /v1/content/{id}` (20 content details per poll, plus a "Refresh index"
+   button). Please add `release_state` (and preferably `content_item_id`) to
+   the intent payload, or a release-by-id read.
+2. **Release / generation by id.** `TodayItem` and palette hits can carry a
+   `release` or `generation` subject id, but there is no `GET /v1/releases/{id}`
+   or `GET /v1/generations/{id}`. The UI opens Studio with a pointer notice
+   instead of the exact item. A by-id read (or `content_item_id` on the subject)
+   would remove the workaround.
+3. **Follow-up helper.** `hub_contracts::client::HubClient` has no
+   `follow_up` method. The UI uses the public generic `post` to
+   `/relationships/{id}/follow-up` with `FollowUpIn`. Please add a typed helper
+   (and confirm the route spelling) so the CLI and desktop share one call.
+4. **Release list.** Calendar's index would be unnecessary with a release list
+   or a `GET /v1/releases?content_item_id=…` read.
+5. **Incremental reads.** The console fetches every base list on the donor's
+   1.5s cadence. Local-first hubs are small, but `ETag`/`updated_since` support
+   would keep polling cheap as content grows.
+
+## Known gaps
+
+- The desktop binary was smoke-run headlessly (Weston headless, mock hub) and
+  builds/tests pass, but no screenshot was captured: the headless compositor
+  did not expose a screen-capture protocol. A manual visual pass on a real
+  desktop session is still recommended.
+- `Cargo.lock` is workspace-owned and is not included in the desktop milestone
+  commits. The new dependencies (`contracts/client`, `chrono`, `serde`,
+  `serde_json`, `tokio`, `uuid`) require a lock update by the workspace owner
+  before `cargo build --locked` or the Nix desktop package can succeed.
+- Times entered in `datetime-local` fields are interpreted as UTC and labelled
+  `(UTC)`; the hub stores UTC instants.
+- `HUB_TOKEN` is read from the environment; there is no login UI.
+- `window.open` for handoff/posts may be blocked by the webview; the returned
+  URL is always shown and can be opened again from the button.
 
 ## Toolchain
 
@@ -91,5 +151,20 @@ The 0.6 → 0.8-alpha migration touched one API: keyboard matching now uses
 
 ## Verification
 
-- `nix develop -c cargo build -p infernix-hub-desktop` — builds on Dioxus 0.6 (milestone A) and on 0.8.0-alpha.3 (milestone B).
-- `nix develop -c cargo test -p infernix-hub-desktop`
+Final verification ran from the repository root with the checked-in devshell:
+
+- `nix develop -c cargo build -p infernix-hub-desktop` — passes (Dioxus 0.6 for
+  milestone A, 0.8.0-alpha.3 for milestones B/C).
+- `nix develop -c cargo test -p infernix-hub-desktop` — 12 pure-helper tests pass.
+- `nix develop -c cargo clippy -p infernix-hub-desktop --all-targets -- -D warnings`
+  — clean.
+- Headless smoke run: Weston headless + a throwaway mock hub (`/v1/status`,
+  today, news, content detail, relationships, canon, chat, assets). The app
+  stayed up for the full timeout with no panic; only expected GTK/devtools
+  warnings. No screenshot was captured because the headless compositor did not
+  expose the screen-capture protocol.
+
+During development the shared checkout briefly had an untracked
+`nix/treefmt.nix` from another workstream, which made `nix develop` fail flake
+evaluation; the equivalent devshell was evaluated from a scratch snapshot of the
+same flake until that file was tracked.

@@ -36,7 +36,7 @@ pub fn ChatPanel(
 ) -> Element {
     let mut input = use_signal(String::new);
     let mut submit = move || {
-        let text = input().trim().to_string();
+        let text = input.cloned().trim().to_string();
         if !text.is_empty() && !disabled {
             on_send.call(text);
             input.set(String::new());
@@ -78,7 +78,7 @@ pub fn ChatPanel(
                 }
                 button {
                     class: "btn btn-primary",
-                    disabled: disabled || input().trim().is_empty(),
+                    disabled: disabled || input.cloned().trim().is_empty(),
                     onclick: move |_| submit(),
                     "Send"
                 }

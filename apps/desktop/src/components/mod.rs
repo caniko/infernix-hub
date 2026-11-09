@@ -93,3 +93,21 @@ pub fn Notice(ok: bool, message: String) -> Element {
         p { class: if ok { "notice ok" } else { "notice err" }, role: "status", "{message}" }
     }
 }
+
+/// Stable error code + message from an `ApiError`/transport failure.
+#[component]
+pub fn ErrorCard(code: String, message: String) -> Element {
+    rsx! {
+        div { class: "error-card", role: "alert",
+            span { class: "code", "{code}" }
+            span { class: "msg", "{message}" }
+        }
+    }
+}
+
+#[component]
+pub fn Loading(text: String) -> Element {
+    rsx! {
+        p { class: "loading", aria_live: "polite", "{text}" }
+    }
+}

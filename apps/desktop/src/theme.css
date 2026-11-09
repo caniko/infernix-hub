@@ -135,7 +135,7 @@ a:hover { color: var(--focus); text-decoration: underline; }
 .topbar .hint { color: var(--text-2); font-size: 12px; }
 .spacer { flex: 1; }
 .status-dot { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-2); }
-.status-dot .beacon { width: 7px; height: 7px; border-radius: 50%; background: var(--bad); }
+.status-dot .beacon { width: 7px; height: 7px; border-radius: 50%; background: var(--text-2); }
 .status-dot.live .beacon { background: var(--ok); }
 
 /* ── Stage: context list | work surface | inspector ────────────────────── */
@@ -520,3 +520,26 @@ input[type="checkbox"] { accent-color: var(--honey); }
   .nav-toggle { display: inline-flex; }
   .stat-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* ── Milestone C additions ─────────────────────────────────────────────── */
+.notice-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 16px; flex: 0 0 auto;
+  font-size: 12.5px;
+}
+.notice-bar.ok { background: rgba(156, 181, 111, 0.12); color: var(--ok); border-bottom: 1px solid rgba(156, 181, 111, 0.25); }
+.notice-bar.err { background: rgba(224, 122, 95, 0.12); color: var(--bad); border-bottom: 1px solid rgba(224, 122, 95, 0.3); }
+.notice-bar span { flex: 1; min-width: 0; }
+
+.today-row { display: flex; flex-direction: column; gap: 6px; padding: 11px 13px; }
+.today-title { font-size: 13.5px; color: var(--text); }
+
+.facet { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
+.facet-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; }
+.facet-list li { font-size: 12.5px; color: var(--text); }
+
+.calendar-day h2 { font-size: 15px; }
+.intent-row .mono { color: var(--text-2); font-size: 0.66rem; }
+.asset-grid.four .asset-tile { min-width: 0; }
+.inspector .panel { margin-bottom: 14px; }
+.inspector h4 { font-family: var(--font-mono); font-size: 0.7rem; color: var(--honey); text-transform: uppercase; letter-spacing: 0.06em; }
