@@ -1,0 +1,79 @@
+{
+  "11111111-1111-4111-8111-111111111111": {
+    "prompt": [
+      12,
+      "11111111-1111-4111-8111-111111111111",
+      {
+        "3": {
+          "class_type": "KSampler",
+          "inputs": {
+            "seed": 42,
+            "steps": 20
+          }
+        },
+        "9": {
+          "class_type": "SaveImage",
+          "inputs": {
+            "filename_prefix": "Infernix"
+          }
+        },
+        "12": {
+          "class_type": "VHS_VideoCombine",
+          "inputs": {
+            "filename_prefix": "clip"
+          }
+        }
+      },
+      {
+        "client_id": "hub-client-1",
+        "create_time": 1762690000000
+      },
+      [
+        "9",
+        "12"
+      ],
+      {}
+    ],
+    "outputs": {
+      "9": {
+        "images": [
+          {
+            "filename": "Infernix_00001_.png",
+            "subfolder": "",
+            "type": "output"
+          }
+        ]
+      },
+      "12": {
+        "gifs": [
+          {
+            "filename": "clip_00001_.mp4",
+            "subfolder": "video",
+            "type": "output"
+          }
+        ]
+      }
+    },
+    "status": {
+      "status_str": "success",
+      "completed": true,
+      "messages": [
+        [
+          "execution_start",
+          {
+            "prompt_id": "11111111-1111-4111-8111-111111111111",
+            "timestamp": 1762690000000
+          }
+        ],
+        [
+          "execution_success",
+          {
+            "prompt_id": "11111111-1111-4111-8111-111111111111",
+            "timestamp": 1762690009000
+          }
+        ]
+      ]
+    },
+    "meta": {}
+  }
+}

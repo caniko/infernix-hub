@@ -1,0 +1,23 @@
+{
+  "id": "9f1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d",
+  "companyId": "11111111-2222-4333-8444-555555555555",
+  "type": "request_board_approval",
+  "status": "approved",
+  "payload": {
+    "title": "Approve release revision relrev_01",
+    "summary": "Board approval for the exact revision and payload hash.",
+    "release_revision_id": "relrev_01",
+    "payload_hash": "sha256:abc",
+    "actions": [
+      {
+        "kind": "publish",
+        "intent_id": "intent_01"
+      }
+    ]
+  },
+  "decisionNote": "Approved after review.",
+  "decidedByUserId": "user_board_human",
+  "decidedAt": "2026-11-09T12:34:56.000Z",
+  "createdAt": "2026-11-09T12:00:00.000Z",
+  "updatedAt": "2026-11-09T12:34:56.000Z"
+}

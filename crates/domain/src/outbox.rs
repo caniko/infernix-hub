@@ -86,3 +86,19 @@ pub async fn mark_failed(tx: &mut sqlx::PgConnection, id: Uuid, error: &str, ret
     .await?;
     Ok(())
 }
+
+/// Postpone a delivery without spending a retry (e.g. waiting for GPU
+/// admission). Returns true when the reason changed.
+pub async fn defer(tx: &mut sqlx::PgConnection, id: Uuid, secs: i64, reason: &str) -> DResult<bool> {
+    let changed: bool = sqlx::query_scalar(
+        "update outbox o set next_attempt_at = now() + make_interval(secs => $2), last_error = $3
+         from (select last_error from outbox where id = $1) prev where o.id = $1
+         returning prev.last_error is distinct from $3",
+    )
+    .bind(id)
+    .bind(secs as f64)
+    .bind(reason)
+    .fetch_one(tx)
+    .await?;
+    Ok(changed)
+}

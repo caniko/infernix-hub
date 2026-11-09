@@ -1,0 +1,53 @@
+{
+  "22222222-2222-4222-8222-222222222222": {
+    "prompt": [
+      13,
+      "22222222-2222-4222-8222-222222222222",
+      {
+        "3": {
+          "class_type": "KSampler",
+          "inputs": {}
+        }
+      },
+      {
+        "client_id": "hub-client-1"
+      },
+      [
+        "9"
+      ],
+      {}
+    ],
+    "outputs": {},
+    "status": {
+      "status_str": "error",
+      "completed": false,
+      "messages": [
+        [
+          "execution_start",
+          {
+            "prompt_id": "22222222-2222-4222-8222-222222222222",
+            "timestamp": 1762690010000
+          }
+        ],
+        [
+          "execution_error",
+          {
+            "prompt_id": "22222222-2222-4222-8222-222222222222",
+            "node_id": "3",
+            "node_type": "KSampler",
+            "executed": [],
+            "exception_message": "CUDA out of memory",
+            "exception_type": "torch.OutOfMemoryError",
+            "traceback": [
+              "Traceback (most recent call last): ..."
+            ],
+            "current_inputs": {},
+            "current_outputs": [],
+            "timestamp": 1762690011000
+          }
+        ]
+      ]
+    },
+    "meta": {}
+  }
+}

@@ -215,8 +215,17 @@ pub enum ProgressEvent {
     },
 }
 
+/// Prompt ids the engine reports in `/queue`, ours or not.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EngineLoad {
+    pub running: Vec<String>,
+    pub pending: Vec<String>,
+}
+
 #[async_trait]
 pub trait Comfy: Send + Sync {
+    /// Current queue, for GPU admission.
+    async fn load(&self, base_url: &str) -> PortResult<EngineLoad>;
     /// Streams progress for prompts submitted with `client_id` until the socket
     /// closes; the caller reconnects and reconciles through `outcome`.
     async fn subscribe(&self, base_url: &str, client_id: &str, tx: tokio::sync::mpsc::Sender<ProgressEvent>) -> PortResult<()>;
@@ -312,4 +321,13 @@ pub struct AssistantReply {
 pub trait Assistant: Send + Sync {
     /// `context` carries the brief, accepted canon and linked Paperclip work.
     async fn reply(&self, context: &Value, turns: &[AssistantTurn]) -> PortResult<AssistantReply>;
+}
+
+// ── Shared-GPU peers ────────────────────────────────────────────────────────
+
+/// Another GPU tenant (llama-swap) whose loaded models occupy the device.
+#[async_trait]
+pub trait GpuPeer: Send + Sync {
+    /// True when any model is loaded or loading at `running_url` (llama-swap `GET /running`).
+    async fn busy(&self, running_url: &str) -> PortResult<bool>;
 }

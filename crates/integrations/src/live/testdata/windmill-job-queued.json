@@ -1,0 +1,22 @@
+{
+  "type": "QueuedJob",
+  "workspace_id": "studio",
+  "id": "0199a0b1-2c3d-4e5f-8a9b-0c1d2e3f4a5c",
+  "parent_job": null,
+  "created_by": "can",
+  "created_at": "2026-11-09T11:05:00.000Z",
+  "started_at": null,
+  "scheduled_for": "2026-11-09T11:05:00.000Z",
+  "running": false,
+  "script_path": "f/infernix_hub/publication_timer",
+  "script_hash": "f6e5d4c3b2",
+  "args": {
+    "intent_id": "intent_01",
+    "schedule_revision": 3
+  },
+  "logs": "",
+  "canceled": false,
+  "job_kind": "script",
+  "language": "bun",
+  "tag": "hub"
+}

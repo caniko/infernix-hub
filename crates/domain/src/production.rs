@@ -675,6 +675,84 @@ pub async fn cancel(hub: &Hub, actor: &Actor, generation_id: Uuid) -> DResult<Ca
     Ok(CancelOut { state: get_generation(hub, generation_id).await?.state, actions })
 }
 
+// ── GPU admission ───────────────────────────────────────────────────────────
+
+/// Per-engine admission policy, from `engine_instances.capabilities.admission`.
+/// Absent policy admits immediately.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AdmissionPolicy {
+    #[serde(default = "one")]
+    pub max_in_flight: i64,
+    #[serde(default = "yes")]
+    pub defer_on_unknown_work: bool,
+    #[serde(default)]
+    pub defer_while_llm_loaded: bool,
+    #[serde(default)]
+    pub llm_running_url: Option<String>,
+}
+
+fn one() -> i64 {
+    1
+}
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Admission {
+    Admit,
+    Defer(String),
+}
+
+/// Decide whether a generation may start on its engine now. Any read that
+/// fails defers (fail closed): an unknown job is not a free device.
+pub async fn admission(hub: &Hub, generation_id: Uuid) -> DResult<Admission> {
+    let row: Option<(String, String, Value)> = sqlx::query_as(
+        "select e.id, e.base_url, e.capabilities from generation_requests g join workflows w on w.id = g.workflow_id
+         join engine_instances e on e.id = w.engine_instance_id where g.id = $1",
+    )
+    .bind(generation_id)
+    .fetch_optional(&hub.db)
+    .await?;
+    let (engine_id, base_url, caps) = row.ok_or(DomainError::NotFound("generation request"))?;
+    let Some(policy) = caps.get("admission") else { return Ok(Admission::Admit) };
+    let policy: AdmissionPolicy = serde_json::from_value(policy.clone()).map_err(|e| invalid("invalid_admission", e.to_string()))?;
+
+    let ours_in_flight: i64 = sqlx::query_scalar(
+        "select count(*) from generation_requests g join workflows w on w.id = g.workflow_id
+         where w.engine_instance_id = $1 and g.id <> $2 and g.state in ('dispatched', 'running', 'cancelling')",
+    )
+    .bind(&engine_id)
+    .bind(generation_id)
+    .fetch_one(&hub.db)
+    .await?;
+    if ours_in_flight >= policy.max_in_flight {
+        return Ok(Admission::Defer(format!("{engine_id}: {ours_in_flight} hub generation(s) in flight (limit {})", policy.max_in_flight)));
+    }
+    if policy.defer_on_unknown_work {
+        let load = match hub.comfy.load(&base_url).await {
+            Ok(l) => l,
+            Err(e) => return Ok(Admission::Defer(format!("{engine_id}: cannot read engine queue ({e})"))),
+        };
+        let ours: Vec<String> =
+            sqlx::query_scalar("select external_id from execution_attempts where kind = 'comfy_prompt'").fetch_all(&hub.db).await?;
+        let unknown = load.running.iter().chain(&load.pending).filter(|p| !ours.contains(p)).count();
+        if unknown > 0 {
+            return Ok(Admission::Defer(format!("{engine_id}: {unknown} job(s) the hub did not submit are queued or running")));
+        }
+    }
+    if policy.defer_while_llm_loaded
+        && let Some(url) = &policy.llm_running_url
+    {
+        match hub.gpu_peer.busy(url).await {
+            Ok(false) => {}
+            Ok(true) => return Ok(Admission::Defer(format!("{engine_id}: shared GPU has an LLM loaded ({url})"))),
+            Err(e) => return Ok(Admission::Defer(format!("{engine_id}: cannot read GPU peer {url} ({e})"))),
+        }
+    }
+    Ok(Admission::Admit)
+}
+
 // ── Assets ──────────────────────────────────────────────────────────────────
 
 const ASSET_COLS: &str =

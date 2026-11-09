@@ -88,6 +88,7 @@ pub struct Hub {
     pub publisher: Arc<dyn ports::Publisher>,
     pub assets: Arc<dyn ports::AssetStore>,
     pub assistant: Arc<dyn ports::Assistant>,
+    pub gpu_peer: Arc<dyn ports::GpuPeer>,
 }
 
 /// The authenticated caller plus the request's correlation id.
@@ -167,3 +168,11 @@ pub async fn history(db: &PgPool, subject_type: &str, subject_id: &str) -> DResu
 }
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// Embedded migrations not yet applied successfully (all of them on an empty database).
+pub async fn pending_migrations(db: &PgPool) -> DResult<Vec<i64>> {
+    let exists: bool = sqlx::query_scalar("select to_regclass('_sqlx_migrations') is not null").fetch_one(db).await?;
+    let applied: Vec<i64> =
+        if exists { sqlx::query_scalar("select version from _sqlx_migrations where success").fetch_all(db).await? } else { vec![] };
+    Ok(MIGRATOR.iter().map(|m| m.version).filter(|v| !applied.contains(v)).collect())
+}
