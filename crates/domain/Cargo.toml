@@ -1,0 +1,21 @@
+[package]
+name = "hub-domain"
+description = "Hub domain: canonical release hashing, guards, and the transactional command layer shared by API, worker, CLI and agent tools."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+contracts.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
