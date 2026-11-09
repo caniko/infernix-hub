@@ -162,6 +162,8 @@ create table generation_requests (
     request_version int not null,
     inputs jsonb not null,
     variants int not null check (variants between 1 and 8),
+    -- Hub-chosen ComfyUI prompt ids, known before submission.
+    prompt_ids jsonb not null,
     state text not null,
     created_by text not null,
     created_at timestamptz not null default now(),

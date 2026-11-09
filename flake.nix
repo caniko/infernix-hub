@@ -33,7 +33,7 @@
         pkgConfigDeps = packages.desktopBuildInputs;
         packages =
           packages.desktopBuildInputs
-          ++ (with pkgs; [pkg-config postgresql_16 sqlx-cli cargo-nextest]);
+          ++ (with pkgs; [pkg-config postgresql_16 cargo-nextest treefmt alejandra]);
         extraEnv = {
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath packages.desktopBuildInputs;
           # WebKitGTK DMA-BUF renderer fails on some GPU stacks; fall back safely.

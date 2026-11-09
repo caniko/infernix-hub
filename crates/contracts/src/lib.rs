@@ -62,7 +62,7 @@ wire_enum!(ReleaseState { Draft = "draft", InReview = "in_review", Approved = "a
 wire_enum!(IntentState { Scheduled = "scheduled", Claimed = "claimed", Submitting = "submitting", Accepted = "accepted", Published = "published", Failed = "failed", OutcomeUnknown = "outcome_unknown", Cancelled = "cancelled" });
 wire_enum!(Owner { Agent = "agent", Human = "human" });
 wire_enum!(Direction { Inbound = "inbound", Outbound = "outbound" });
-wire_enum!(DraftState { Draft = "draft", InReview = "in_review", Approved = "approved", Queued = "queued", Sent = "sent", Invalidated = "invalidated", OutcomeUnknown = "outcome_unknown", HandedOff = "handed_off", Rejected = "rejected" });
+wire_enum!(DraftState { Draft = "draft", InReview = "in_review", Approved = "approved", Queued = "queued", Sending = "sending", Sent = "sent", Invalidated = "invalidated", OutcomeUnknown = "outcome_unknown", HandedOff = "handed_off", Rejected = "rejected" });
 wire_enum!(OutboxState { Pending = "pending", Delivered = "delivered", Dead = "dead" });
 wire_enum!(
     /// How far an integration has actually been proven.
@@ -166,8 +166,12 @@ pub struct CanonProposalIn {
 pub enum CanonDecisionIn {
     Accept,
     /// Accept with the operator's edits applied (donor "edit & approve").
-    AcceptEdited { body: CanonBody },
-    Reject { reason: Option<String> },
+    AcceptEdited {
+        body: CanonBody,
+    },
+    Reject {
+        reason: Option<String>,
+    },
 }
 
 // ── News ────────────────────────────────────────────────────────────────────
@@ -456,6 +460,20 @@ pub struct DispatchIn {
     pub schedule_revision: i32,
     /// Windmill job id of the timer firing, for the receipt trail.
     pub trigger_id: String,
+}
+
+/// Operator resolution of an `outcome_unknown` delivery after checking the
+/// platform by hand (for transports without a reconciliation read).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolveIntentIn {
+    pub published: bool,
+    pub provider_post_id: Option<String>,
+    pub provider_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkApprovalIn {
+    pub approval_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

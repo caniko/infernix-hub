@@ -30,7 +30,6 @@ contracts = { path = "crates/contracts", package = "hub-contracts" }
 domain = { path = "crates/domain", package = "hub-domain" }
 integrations = { path = "crates/integrations", package = "hub-integrations" }
 worker = { path = "crates/worker", package = "hub-worker" }
-api = { path = "crates/api", package = "infernix-hubd" }
 
 anyhow = "1"
 async-trait = "0.1"

@@ -80,13 +80,8 @@ impl HubClient {
 
     /// Raw bytes (asset content) — returns `(mime, bytes)`.
     pub async fn get_bytes(&self, path: &str) -> Result<(String, Vec<u8>), ClientError> {
-        let resp = self
-            .http
-            .get(self.url(path))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let resp =
+            self.http.get(self.url(path)).bearer_auth(&self.token).send().await.map_err(|e| ClientError::Transport(e.to_string()))?;
         let status = resp.status();
         let mime = resp
             .headers()
@@ -105,13 +100,27 @@ impl HubClient {
     }
 
     // Typed helpers for the main journey.
-    pub async fn status(&self) -> Result<SystemStatus, ClientError> { self.get("/status").await }
-    pub async fn today(&self) -> Result<Today, ClientError> { self.get("/today").await }
-    pub async fn news(&self) -> Result<Vec<NewsItem>, ClientError> { self.get("/news").await }
-    pub async fn personas(&self) -> Result<Vec<Persona>, ClientError> { self.get("/personas").await }
-    pub async fn workflows(&self) -> Result<Vec<Workflow>, ClientError> { self.get("/workflows").await }
-    pub async fn accounts(&self) -> Result<Vec<Account>, ClientError> { self.get("/accounts").await }
-    pub async fn content(&self) -> Result<Vec<ContentItem>, ClientError> { self.get("/content").await }
+    pub async fn status(&self) -> Result<SystemStatus, ClientError> {
+        self.get("/status").await
+    }
+    pub async fn today(&self) -> Result<Today, ClientError> {
+        self.get("/today").await
+    }
+    pub async fn news(&self) -> Result<Vec<NewsItem>, ClientError> {
+        self.get("/news").await
+    }
+    pub async fn personas(&self) -> Result<Vec<Persona>, ClientError> {
+        self.get("/personas").await
+    }
+    pub async fn workflows(&self) -> Result<Vec<Workflow>, ClientError> {
+        self.get("/workflows").await
+    }
+    pub async fn accounts(&self) -> Result<Vec<Account>, ClientError> {
+        self.get("/accounts").await
+    }
+    pub async fn content(&self) -> Result<Vec<ContentItem>, ClientError> {
+        self.get("/content").await
+    }
     pub async fn content_detail(&self, id: Uuid) -> Result<ContentDetail, ClientError> {
         self.get(&format!("/content/{id}")).await
     }
@@ -139,8 +148,12 @@ impl HubClient {
     pub async fn cancel_intent(&self, intent: Uuid) -> Result<PublicationIntent, ClientError> {
         self.post(&format!("/intents/{intent}/cancel"), &()).await
     }
-    pub async fn intents(&self) -> Result<Vec<PublicationIntent>, ClientError> { self.get("/intents").await }
-    pub async fn relationships(&self) -> Result<Vec<Relationship>, ClientError> { self.get("/relationships").await }
+    pub async fn intents(&self) -> Result<Vec<PublicationIntent>, ClientError> {
+        self.get("/intents").await
+    }
+    pub async fn relationships(&self) -> Result<Vec<Relationship>, ClientError> {
+        self.get("/relationships").await
+    }
     pub async fn relationship(&self, id: Uuid) -> Result<RelationshipDetail, ClientError> {
         self.get(&format!("/relationships/{id}")).await
     }
@@ -177,7 +190,9 @@ impl HubClient {
     pub async fn search(&self, q: &str) -> Result<Vec<SearchHit>, ClientError> {
         self.send(self.http.get(self.url("/search")).query(&[("q", q)])).await
     }
-    pub async fn assets(&self) -> Result<Vec<Asset>, ClientError> { self.get("/assets").await }
+    pub async fn assets(&self) -> Result<Vec<Asset>, ClientError> {
+        self.get("/assets").await
+    }
     pub async fn set_pause(&self, body: &PauseIn) -> Result<SystemStatus, ClientError> {
         self.post("/system/pause", body).await
     }
