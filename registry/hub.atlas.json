@@ -1,0 +1,7 @@
+{
+  "engines": [
+    { "id": "comfy-atlas", "base_url": "http://127.0.0.1:8188", "capabilities": { "version": "0.37.0", "targeted_interrupt": true, "jobs_api": true } }
+  ],
+  "personas": [],
+  "accounts": []
+}

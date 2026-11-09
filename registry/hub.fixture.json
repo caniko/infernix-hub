@@ -1,0 +1,11 @@
+{
+  "company_id": "fixture-company",
+  "engines": [{ "id": "comfy-atlas", "base_url": "fixture://comfyui", "capabilities": { "targeted_interrupt": true, "client_prompt_id": true } }],
+  "personas": [{ "name": "Juniper Vale", "voice": "Warm, precise, a little wry. Explains why a thing matters before how it works.", "rules": ["Credit sources by name", "One idea per post"], "avoid": ["Hype words", "Unverified claims"], "world": ["Juniper runs a small studio on a hillside"] }],
+  "accounts": [
+    { "id": "fixture-mastodon", "platform": "mastodon", "handle": "@juniper@fixture.social", "transport": "fixture", "persona": "Juniper Vale",
+      "capabilities": { "publish": true, "comments": true, "mentions": true, "replies": true, "dms": false, "analytics": false } },
+    { "id": "fixture-bluesky", "platform": "bluesky", "handle": "@juniper.fixture", "transport": "fixture", "persona": "Juniper Vale",
+      "capabilities": { "publish": true, "comments": false, "mentions": true, "replies": false, "dms": false, "analytics": false } }
+  ]
+}

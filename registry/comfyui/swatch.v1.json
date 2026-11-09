@@ -1,0 +1,45 @@
+{
+  "name": "swatch",
+  "version": 1,
+  "engine_instance_id": "comfy-atlas",
+  "windmill_path": "f/infernix_hub/comfy_generate",
+  "notes": "Model-free contract smoke workflow (core EmptyImage \u2192 SaveImage). Exercises /prompt, /history, /view and asset import without loading a model or claiming VRAM.",
+  "bindings": {
+    "color": {
+      "node": "1",
+      "input": "color",
+      "default": 15050539
+    },
+    "width": {
+      "node": "1",
+      "input": "width",
+      "default": 512
+    },
+    "height": {
+      "node": "1",
+      "input": "height",
+      "default": 512
+    }
+  },
+  "graph": {
+    "1": {
+      "class_type": "EmptyImage",
+      "inputs": {
+        "width": 512,
+        "height": 512,
+        "batch_size": 1,
+        "color": 15050539
+      }
+    },
+    "2": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "filename_prefix": "infernix-hub-swatch",
+        "images": [
+          "1",
+          0
+        ]
+      }
+    }
+  }
+}

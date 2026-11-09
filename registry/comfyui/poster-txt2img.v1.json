@@ -1,0 +1,128 @@
+{
+  "name": "poster-txt2img",
+  "version": 1,
+  "engine_instance_id": "comfy-atlas",
+  "windmill_path": "f/infernix_hub/comfy_generate",
+  "notes": "Standard SD-style txt2img graph (API format). The `checkpoint` default names a fixture model; atlas has no checkpoints installed (2026-11-09), so live use must pass an installed model name or ComfyUI rejects the prompt.",
+  "bindings": {
+    "prompt": {
+      "node": "6",
+      "input": "text"
+    },
+    "negative": {
+      "node": "7",
+      "input": "text",
+      "default": "blurry, watermark, text artifacts"
+    },
+    "checkpoint": {
+      "node": "4",
+      "input": "ckpt_name",
+      "default": "fixture-checkpoint.safetensors"
+    },
+    "seed": {
+      "node": "3",
+      "input": "seed"
+    },
+    "steps": {
+      "node": "3",
+      "input": "steps",
+      "default": 24
+    },
+    "width": {
+      "node": "5",
+      "input": "width",
+      "default": 1024
+    },
+    "height": {
+      "node": "5",
+      "input": "height",
+      "default": 1024
+    }
+  },
+  "graph": {
+    "3": {
+      "class_type": "KSampler",
+      "inputs": {
+        "seed": 0,
+        "steps": 24,
+        "cfg": 6.5,
+        "sampler_name": "euler",
+        "scheduler": "normal",
+        "denoise": 1,
+        "model": [
+          "4",
+          0
+        ],
+        "positive": [
+          "6",
+          0
+        ],
+        "negative": [
+          "7",
+          0
+        ],
+        "latent_image": [
+          "5",
+          0
+        ]
+      }
+    },
+    "4": {
+      "class_type": "CheckpointLoaderSimple",
+      "inputs": {
+        "ckpt_name": ""
+      }
+    },
+    "5": {
+      "class_type": "EmptyLatentImage",
+      "inputs": {
+        "width": 1024,
+        "height": 1024,
+        "batch_size": 1
+      }
+    },
+    "6": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "",
+        "clip": [
+          "4",
+          1
+        ]
+      }
+    },
+    "7": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "",
+        "clip": [
+          "4",
+          1
+        ]
+      }
+    },
+    "8": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "3",
+          0
+        ],
+        "vae": [
+          "4",
+          2
+        ]
+      }
+    },
+    "9": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "filename_prefix": "infernix-hub",
+        "images": [
+          "8",
+          0
+        ]
+      }
+    }
+  }
+}

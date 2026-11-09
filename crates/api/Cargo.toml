@@ -8,12 +8,14 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
-contracts.workspace = true
+contracts = { workspace = true, features = ["client"] }
 domain.workspace = true
 integrations.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -24,5 +26,3 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 worker.workspace = true
 
-[dev-dependencies]
-contracts = { workspace = true, features = ["client"] }
