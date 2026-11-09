@@ -71,7 +71,7 @@ pub fn ChatPanel(
                     value: "{input}",
                     oninput: move |e| input.set(e.value()),
                     onkeydown: move |e| {
-                        if e.key() == Key::Enter {
+                        if e.key() == Key::Named(NamedKey::Enter) {
                             submit();
                         }
                     },

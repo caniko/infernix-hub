@@ -7,4 +7,6 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-dioxus = { version = "0.6", features = ["desktop"] }
+# Newest published 0.8 alpha (crates.io, 2026-11-09). The desktop feature is
+# additive to the default feature set, so no `dx` CLI is required for cargo.
+dioxus = { version = "=0.8.0-alpha.3", features = ["desktop"] }

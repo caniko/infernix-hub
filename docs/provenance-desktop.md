@@ -78,7 +78,18 @@ All donor `assets/logos/*` files were omitted.
 
 _None yet._ (Milestone C records any gaps found against `crates/contracts`.)
 
+## Toolchain
+
+The app is pinned to **Dioxus `=0.8.0-alpha.3`** (the newest published 0.8
+alpha on crates.io at 2026-11-09), with the `desktop` feature. No `dx` CLI is
+required: `cargo build -p infernix-hub-desktop` builds the binary directly.
+
+The 0.6 → 0.8-alpha migration touched one API: keyboard matching now uses
+`Key::Named(NamedKey::Enter)` (the 0.6 `Key::Enter` variant is gone).
+`EventHandler` (now an alias of `Callback`), `use_signal`, `use_coroutine`,
+`document::Title` and `dangerous_inner_html` remain source-compatible.
+
 ## Verification
 
-- `nix develop -c cargo build -p infernix-hub-desktop`
+- `nix develop -c cargo build -p infernix-hub-desktop` — builds on Dioxus 0.6 (milestone A) and on 0.8.0-alpha.3 (milestone B).
 - `nix develop -c cargo test -p infernix-hub-desktop`
