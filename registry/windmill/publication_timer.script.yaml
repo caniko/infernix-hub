@@ -12,17 +12,23 @@ schema:
   $schema: "https://json-schema.org/draft/2020-12/schema"
   type: object
   properties:
-    intent_id:
-      type: string
-    schedule_revision:
-      type: integer
-    due_at:
-      type: string
-      format: date-time
-    dispatch_url:
-      type: string
+    timer:
+      description: Hub PublicationTimer (Windmill passes it as main's `timer` argument)
+      type: object
+      properties:
+        intent_id:
+          type: string
+        schedule_revision:
+          type: integer
+        due_at:
+          type: string
+          format: date-time
+        dispatch_url:
+          type: string
+      required:
+        - intent_id
+        - schedule_revision
+        - due_at
+        - dispatch_url
   required:
-    - intent_id
-    - schedule_revision
-    - due_at
-    - dispatch_url
+    - timer

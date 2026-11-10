@@ -189,7 +189,9 @@
   ];
   allFixture = lib.all (mode: mode != "live") allIntegrations;
 
-  mode = types.enum ["fixture" "live" "disabled"];
+  # Only the publisher has a real disabled mode (the hub refuses the others).
+  mode = types.enum ["fixture" "live"];
+  publisherMode = types.enum ["fixture" "live" "disabled"];
 in {
   imports = [harbor-db.nixosModules.default];
 
@@ -309,7 +311,7 @@ in {
         description = "ComfyUI adapter; defaults to live when services.infernix.comfyui is enabled.";
       };
       publisher = mkOption {
-        type = mode;
+        type = publisherMode;
         default = "fixture";
       };
       assistant = mkOption {
@@ -549,6 +551,10 @@ in {
           message = "infernix-hub: live Windmill needs credentials.windmillToken.";
         }
         {
+          assertion = cfg.integrations.publisher != "live" || cfg.integrations.paperclip == "live";
+          message = "infernix-hub: a live publisher needs live Paperclip; fixture approvals cannot authorize real posts.";
+        }
+        {
           assertion = cfg.integrations.publisher != "live" || cfg.credentials.postizToken != null;
           message = "infernix-hub: a live publisher needs credentials.postizToken.";
         }
@@ -646,25 +652,26 @@ in {
       services.postgresql = {
         enable = true;
         ensureDatabases = [cfg.database.name];
+        # ensureDBOwnership needs the role and database names to match, which a
+        # separate migration role or a custom database name breaks; the owner
+        # is set explicitly below instead.
         ensureUsers =
-          [
-            {
-              name = databaseOwner;
-              ensureDBOwnership = true;
-            }
-          ]
+          [{name = databaseOwner;}]
           ++ optional (databaseOwner != runtimeUser) {name = runtimeUser;};
       };
 
-      systemd.services.postgresql-setup = mkIf usesSeparateMigrationUser {
-        script = lib.mkAfter ''
-          psql -d ${lib.escapeShellArg cfg.database.name} -tAc "GRANT USAGE ON SCHEMA public TO ${sqlIdentifier runtimeUser};"
-          psql -d ${lib.escapeShellArg cfg.database.name} -tAc "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${sqlIdentifier runtimeUser};"
-          psql -d ${lib.escapeShellArg cfg.database.name} -tAc "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ${sqlIdentifier runtimeUser};"
-          psql -d ${lib.escapeShellArg cfg.database.name} -tAc "ALTER DEFAULT PRIVILEGES FOR ROLE ${sqlIdentifier migrationUser} IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO ${sqlIdentifier runtimeUser};"
-          psql -d ${lib.escapeShellArg cfg.database.name} -tAc "ALTER DEFAULT PRIVILEGES FOR ROLE ${sqlIdentifier migrationUser} IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO ${sqlIdentifier runtimeUser};"
-        '';
-      };
+      systemd.services.postgresql-setup.script = lib.mkAfter (lib.concatMapStrings
+        (sql: "psql -d ${lib.escapeShellArg cfg.database.name} -tAc ${lib.escapeShellArg sql}\n")
+        ([
+            "ALTER DATABASE ${sqlIdentifier cfg.database.name} OWNER TO ${sqlIdentifier databaseOwner};"
+          ]
+          ++ lib.optionals usesSeparateMigrationUser [
+            "GRANT USAGE ON SCHEMA public TO ${sqlIdentifier runtimeUser};"
+            "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${sqlIdentifier runtimeUser};"
+            "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ${sqlIdentifier runtimeUser};"
+            "ALTER DEFAULT PRIVILEGES FOR ROLE ${sqlIdentifier migrationUser} IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO ${sqlIdentifier runtimeUser};"
+            "ALTER DEFAULT PRIVILEGES FOR ROLE ${sqlIdentifier migrationUser} IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO ${sqlIdentifier runtimeUser};"
+          ]));
     })
 
     # Schema ownership belongs to harbor-db; the runtime unit starts only

@@ -131,6 +131,19 @@ fn status(name: &str, mode: AdapterMode, live: Verification, detail: &str) -> In
 }
 
 pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
+    // Only the publisher has a real disabled mode; the others would silently
+    // fall back to a simulation that the status page reports as disabled.
+    for (name, mode) in
+        [("HUB_PAPERCLIP", s.paperclip), ("HUB_WINDMILL", s.windmill), ("HUB_COMFY", s.comfy), ("HUB_ASSISTANT", s.assistant)]
+    {
+        if mode == AdapterMode::Disabled {
+            bail!("{name}=disabled is not supported; use fixture or live");
+        }
+    }
+    // Simulated approvals must never authorize a real post.
+    if s.publisher == AdapterMode::Live && s.paperclip != AdapterMode::Live {
+        bail!("HUB_PUBLISHER=live requires HUB_PAPERCLIP=live (fixture approvals cannot authorize real publishing)");
+    }
     if s.windmill == AdapterMode::Fixture && s.comfy != AdapterMode::Fixture {
         bail!("HUB_WINDMILL=fixture runs the procedure in-process and needs HUB_COMFY=fixture");
     }

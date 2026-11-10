@@ -255,6 +255,11 @@ impl Store {
     }
     pub fn set_selected_persona(&self, value: Option<Uuid>) {
         let mut signal = self.selected_persona;
+        if signal.cloned() != value {
+            // Canon is loaded per persona; never let the next persona read the previous one's.
+            let mut canon = self.canon;
+            canon.set(Loaded::default());
+        }
         signal.set(value);
     }
     pub fn set_selected_relationship(&self, value: Option<Uuid>) {

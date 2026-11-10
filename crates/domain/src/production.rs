@@ -322,6 +322,26 @@ pub async fn record_dispatched(hub: &Hub, generation_id: Uuid, windmill_job_id: 
     Ok(())
 }
 
+/// Why a queued generation command must not start a procedure: it already
+/// started (a replay after a crash) or the request was cancelled while queued.
+/// `Some(true)` = already done, `Some(false)` = drop it, `None` = send.
+pub async fn dispatch_blocker(hub: &Hub, generation_id: Uuid) -> DResult<Option<(bool, String)>> {
+    let (state, started): (String, bool) = sqlx::query_as(
+        "select g.state, exists(select 1 from execution_attempts a where a.generation_request_id = g.id and a.kind = 'windmill_root')
+         from generation_requests g where g.id = $1",
+    )
+    .bind(generation_id)
+    .fetch_one(&hub.db)
+    .await?;
+    Ok(if started {
+        Some((true, "procedure already started".into()))
+    } else if state != GenerationState::Requested.as_str() {
+        Some((false, format!("generation is {state}; not submitted")))
+    } else {
+        None
+    })
+}
+
 fn terminal(s: AttemptState) -> bool {
     matches!(s, AttemptState::Succeeded | AttemptState::Failed | AttemptState::Cancelled | AttemptState::OutcomeUnknown)
 }
@@ -430,7 +450,13 @@ pub async fn reconcile_prompt(hub: &Hub, p: &OpenPrompt) -> DResult<()> {
         PromptOutcome::Failed { message } => set_attempt(hub, p.attempt_id, AttemptState::Failed, json!({ "error": message })).await?,
         PromptOutcome::Unknown => {
             let age = (chrono::Utc::now() - p.created_at).num_seconds();
-            if age > SUBMIT_GRACE_SECS {
+            // A command still in the outbox (e.g. waiting for GPU admission)
+            // has not started submitting; its prompts cannot be overdue yet.
+            let queued: bool = sqlx::query_scalar("select exists(select 1 from outbox where idempotency_key = $1 and state = 'pending')")
+                .bind(format!("generation:{}", p.generation_id))
+                .fetch_one(&hub.db)
+                .await?;
+            if age > SUBMIT_GRACE_SECS && !queued {
                 // Did the procedure finish? If it failed, the prompt was never
                 // submitted; if it succeeded, the engine lost track of it.
                 let root: Option<String> = sqlx::query_scalar(

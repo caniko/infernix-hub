@@ -268,9 +268,10 @@ pub fn StudioView() -> Element {
                     {
                         let item = &detail.item;
                         let (state_label, state_tone) = labels::content_state(item.state);
-                        let latest_release = detail.releases.last().cloned();
-                        let reviewable = detail.releases.iter().rev().find(|r| r.state == ReleaseState::Draft).cloned();
-                        let approved = detail.releases.iter().rev().find(|r| r.state == ReleaseState::Approved).cloned();
+                        // Releases arrive newest first.
+                        let latest_release = detail.releases.first().cloned();
+                        let reviewable = detail.releases.iter().find(|r| r.state == ReleaseState::Draft).cloned();
+                        let approved = detail.releases.iter().find(|r| r.state == ReleaseState::Approved).cloned();
                         rsx! {
                             div { class: "work-head",
                                 div {

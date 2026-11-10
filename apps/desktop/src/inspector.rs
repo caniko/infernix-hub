@@ -46,7 +46,7 @@ fn optional(label: &str, value: &Option<String>) -> Option<(String, String)> {
 
 pub fn from_content(detail: &ContentDetail) -> InspectorData {
     let item = &detail.item;
-    let latest_release = detail.releases.last();
+    let latest_release = detail.releases.first(); // newest first
     let mut foreign = Vec::new();
     if let Some((key, value)) = optional("paperclip issue", &item.paperclip_issue_id) {
         foreign.push((key, value));

@@ -12,34 +12,40 @@ schema:
   $schema: "https://json-schema.org/draft/2020-12/schema"
   type: object
   properties:
-    request_version:
-      type: integer
-      const: 1
-    generation_request_id:
-      type: string
-    windmill_path:
-      type: string
-    engine_instance_id:
-      type: string
-    engine_base_url:
-      type: string
-    prompts:
-      type: array
-      items: {}
-    prompt_ids:
-      type: array
-      items:
-        type: string
-    comfy_client_id:
-      type: string
-    receipt_url:
-      type: string
+    job:
+      description: Hub GenerationJob (Windmill passes it as main's `job` argument)
+      type: object
+      properties:
+        request_version:
+          type: integer
+          const: 1
+        generation_request_id:
+          type: string
+        windmill_path:
+          type: string
+        engine_instance_id:
+          type: string
+        engine_base_url:
+          type: string
+        prompts:
+          type: array
+          items: {}
+        prompt_ids:
+          type: array
+          items:
+            type: string
+        comfy_client_id:
+          type: string
+        receipt_url:
+          type: string
+      required:
+        - request_version
+        - generation_request_id
+        - engine_instance_id
+        - engine_base_url
+        - prompts
+        - prompt_ids
+        - comfy_client_id
+        - receipt_url
   required:
-    - request_version
-    - generation_request_id
-    - engine_instance_id
-    - engine_base_url
-    - prompts
-    - prompt_ids
-    - comfy_client_id
-    - receipt_url
+    - job

@@ -154,6 +154,11 @@ impl Publisher for PostizClient {
         if req.reply_to.is_some() {
             return Err(PortError::Unsupported("postiz has no reply endpoint; reply_to cannot be honoured".into()));
         }
+        // The documented upload/post payloads carry no alt text; publishing the
+        // approved media without it would change the approved revision.
+        if req.media.iter().any(|m| !m.alt_text.trim().is_empty()) {
+            return Err(PortError::Unsupported("postiz public API has no documented media alt text; refusing to drop it".into()));
+        }
         let mut images = Vec::with_capacity(req.media.len());
         for blob in &req.media {
             images.push(self.upload(blob).await?);

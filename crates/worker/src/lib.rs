@@ -63,6 +63,17 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
         }
         outbox::PAPERCLIP_CREATE_APPROVAL => {
             let Some(release_id) = uuid_field(p, "release_revision_id") else { return Delivery::Dead("bad payload".into()) };
+            // Replay after a crash that lost only the outbox commit: the
+            // approval was created and recorded; do not create a second one.
+            match domain::sqlx::query_scalar::<_, bool>("select paperclip_approval_id is not null from release_revisions where id = $1")
+                .bind(release_id)
+                .fetch_optional(&hub.db)
+                .await
+            {
+                Ok(Some(true)) => return Delivery::Done,
+                Ok(_) => {}
+                Err(e) => return Delivery::Retry(e.to_string()),
+            }
             let req = ApprovalRequest {
                 company_id: p["company_id"].as_str().unwrap_or_default().into(),
                 title: p["title"].as_str().unwrap_or_default().into(),
@@ -130,7 +141,9 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
 
 /// Deliver due outbox rows, one row per transaction.
 // ponytail: the row lock is held across the remote call; fine for one worker
-// and small batches, switch to a lease column if delivery gets slow.
+// and small batches, switch to a lease column if delivery gets slow. A crash
+// between a non-idempotent call and its record still replays it; approvals and
+// generations check their recorded effect first, which closes the common case.
 pub async fn drain_outbox(hub: &Hub) -> DResult<usize> {
     let mut n = 0;
     loop {
@@ -139,8 +152,23 @@ pub async fn drain_outbox(hub: &Hub) -> DResult<usize> {
         let Some(row) = rows.into_iter().next() else { return Ok(n) };
         let span = tracing::info_span!("outbox", topic = %row.topic, correlation_id = row.correlation_id.as_deref().unwrap_or(""));
         let _g = span.enter();
-        if row.topic == outbox::WINDMILL_RUN_GENERATION
-            && let Some(gen_id) = row.payload["generation_request_id"].as_str().and_then(|s| Uuid::parse_str(s).ok())
+        let gen_id = (row.topic == outbox::WINDMILL_RUN_GENERATION)
+            .then(|| row.payload["generation_request_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()))
+            .flatten();
+        if let Some(gen_id) = gen_id
+            && let Some((done, why)) = production::dispatch_blocker(hub, gen_id).await?
+        {
+            tracing::info!(%why, "generation command not sent");
+            if done {
+                outbox::mark_delivered(&mut tx, row.id).await?
+            } else {
+                outbox::mark_failed(&mut tx, row.id, &why, false, MAX_ATTEMPTS).await?
+            }
+            tx.commit().await?;
+            n += 1;
+            continue;
+        }
+        if let Some(gen_id) = gen_id
             && let production::Admission::Defer(reason) = production::admission(hub, gen_id).await?
         {
             if outbox::defer(&mut tx, row.id, 5, &reason).await? {

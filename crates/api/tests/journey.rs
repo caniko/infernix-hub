@@ -638,8 +638,16 @@ async fn gpu_admission_treats_unknown_jobs_and_loaded_llm_as_busy() {
     }
     peer.loaded.store(true, std::sync::atomic::Ordering::SeqCst);
     release_outbox().await;
+    // A long deferral is not a lost submission: prompts stay open.
+    domain::sqlx::query("update execution_attempts set created_at = now() - interval '1 hour' where generation_request_id = $1")
+        .bind(g.id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
     h.tick().await;
-    assert_eq!(h.generation(item.id, g.id).await.state, GenerationState::Requested);
+    let deferred = h.generation(item.id, g.id).await;
+    assert_eq!(deferred.state, GenerationState::Requested);
+    assert!(deferred.attempts.iter().all(|a| a.state == AttemptState::Submitted), "{:?}", deferred.attempts);
     // Device free: admitted and dispatched; a deferral never spent a retry.
     peer.loaded.store(false, std::sync::atomic::Ordering::SeqCst);
     release_outbox().await;
@@ -651,4 +659,49 @@ async fn gpu_admission_treats_unknown_jobs_and_loaded_llm_as_busy() {
         .await
         .unwrap();
     assert_eq!(attempts, 1);
+}
+
+#[tokio::test]
+async fn generation_cancelled_while_awaiting_admission_is_never_submitted() {
+    let Some(h) = harness().await else { return };
+    domain::production::register_engine(
+        &h.hub,
+        "comfy-atlas",
+        "fixture://comfyui",
+        json!({ "admission": { "defer_while_llm_loaded": true, "llm_running_url": "http://llama-swap/running" } }),
+    )
+    .await
+    .unwrap();
+    let comfy = h.fx.comfy.clone().unwrap();
+    let peer = h.fx.gpu_peer.clone().unwrap();
+    peer.loaded.store(true, std::sync::atomic::Ordering::SeqCst);
+    let item = h.brief(None).await;
+    let wf = h.workflow("poster-txt2img").await;
+    let g = h.op.generate(item.id, &GenerateIn { workflow_id: wf.id, inputs: json!({ "prompt": "z" }), variants: 1 }).await.unwrap();
+    h.tick().await;
+    h.op.cancel_generation(g.id).await.unwrap();
+    peer.loaded.store(false, std::sync::atomic::Ordering::SeqCst);
+    domain::sqlx::query("update outbox set next_attempt_at = now() where state = 'pending'").execute(&h.hub.db).await.unwrap();
+    h.tick().await;
+    assert!(comfy.queued().is_empty() && comfy.running().is_none(), "cancelled work reached the engine");
+    let state: String =
+        domain::sqlx::query_scalar("select state from outbox where topic = 'windmill.run_generation'").fetch_one(&h.hub.db).await.unwrap();
+    assert_eq!(state, "dead");
+}
+
+#[tokio::test]
+async fn unreachable_publisher_arms_a_retry_timer_for_the_same_revision() {
+    let Some(h) = harness().await else { return };
+    let publisher = h.fx.publisher.clone().unwrap();
+    publisher.set_mode("fixture-mastodon", PublishMode::Unreachable);
+    let (_, rel) = h.ready_release(&["fixture-mastodon"]).await;
+    h.op.schedule(rel.id, &ScheduleIn { due_at: Utc::now() }).await.unwrap();
+    let first = h.armed().await.remove(0);
+    assert_eq!(h.fire(&first).await.unwrap().intent.state, IntentState::Scheduled);
+    let timers = h.armed().await;
+    assert_eq!(timers.len(), 2, "a retry timer was armed");
+    let retry = timers.last().unwrap().clone();
+    assert_eq!((retry.intent_id.as_str(), retry.schedule_revision), (first.intent_id.as_str(), first.schedule_revision));
+    publisher.set_mode("fixture-mastodon", PublishMode::Publish);
+    assert_eq!(h.fire(&retry).await.unwrap().intent.state, IntentState::Published);
 }

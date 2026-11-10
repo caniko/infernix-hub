@@ -7,7 +7,8 @@
 //!   [`PortError::Unreachable`];
 //! * timeout or reset after the request (body) was sent, or a response body
 //!   read failure → [`PortError::Ambiguous`];
-//! * HTTP 4xx/5xx → [`PortError::Rejected`];
+//! * HTTP 4xx, and 5xx on a read → [`PortError::Rejected`]; 5xx on a write →
+//!   [`PortError::Ambiguous`];
 //! * 404 on a read → [`PortError::NotFound`].
 //!
 //! Secrets never appear in `Debug`: every config holding a token has a manual
@@ -54,6 +55,15 @@ pub(crate) fn transport_error(err: reqwest::Error, body_sent: bool) -> PortError
     if body_sent { PortError::Ambiguous(err.to_string()) } else { PortError::Unreachable(err.to_string()) }
 }
 
+/// A 5xx on a write does not prove the server did nothing (a gateway can fail
+/// after the upstream applied it), so it is ambiguous, never a rejection.
+fn status_error(status: u16, bytes: &[u8], write: bool) -> PortError {
+    if write && status >= 500 {
+        return PortError::Ambiguous(format!("HTTP {status} on a write: {}", snippet(bytes)));
+    }
+    PortError::Rejected { status, message: snippet(bytes) }
+}
+
 /// Read a response as JSON.
 ///
 /// * `not_found` maps 404 to [`PortError::NotFound`] (reads only).
@@ -66,7 +76,7 @@ pub(crate) async fn read_json(resp: reqwest::Response, not_found: bool, write: b
         return Err(PortError::NotFound);
     }
     if !(200..300).contains(&status) {
-        return Err(PortError::Rejected { status, message: snippet(&bytes) });
+        return Err(status_error(status, &bytes, write));
     }
     serde_json::from_slice(&bytes).map_err(|e| {
         let message = format!("invalid JSON response: {e}; body: {}", snippet(&bytes));
@@ -82,7 +92,7 @@ pub(crate) async fn read_text(resp: reqwest::Response, not_found: bool, write: b
         return Err(PortError::NotFound);
     }
     if !(200..300).contains(&status) {
-        return Err(PortError::Rejected { status, message: snippet(&bytes) });
+        return Err(status_error(status, &bytes, write));
     }
     let text = String::from_utf8_lossy(&bytes).trim().to_string();
     if text.is_empty() && write {
@@ -114,6 +124,13 @@ pub(crate) fn trim_base(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_errors_on_writes_are_ambiguous() {
+        assert!(matches!(status_error(502, b"bad gateway", true), PortError::Ambiguous(_)));
+        assert!(matches!(status_error(502, b"bad gateway", false), PortError::Rejected { status: 502, .. }));
+        assert!(matches!(status_error(409, b"conflict", true), PortError::Rejected { status: 409, .. }));
+    }
 
     #[test]
     fn trims_every_trailing_slash() {

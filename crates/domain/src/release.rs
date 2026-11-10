@@ -651,13 +651,35 @@ pub async fn dispatch(hub: &Hub, actor: &Actor, intent_id: Uuid, input: Dispatch
         Err(PortError::Ambiguous(e)) => {
             finish_attempt(hub, intent_id, attempt_id, IntentState::OutcomeUnknown, json!({ "error": e }), None).await
         }
-        // Never reached the provider: hand the intent back to the timer's own retries.
+        // Never reached the provider: back to scheduled, and arm a retry timer
+        // for the same revision (this timer is finishing). The dispatch window
+        // bounds the retries.
         Err(PortError::Unreachable(e)) => {
-            finish_attempt(hub, intent_id, attempt_id, IntentState::Scheduled, json!({ "error": e, "not_sent": true }), None).await
+            let out =
+                finish_attempt(hub, intent_id, attempt_id, IntentState::Scheduled, json!({ "error": e, "not_sent": true }), None).await?;
+            let timer = crate::ports::PublicationTimer {
+                intent_id: intent_id.to_string(),
+                schedule_revision: out.intent.schedule_revision,
+                due_at: Utc::now() + chrono::Duration::seconds(UNREACHABLE_RETRY_SECS),
+                dispatch_url: format!("{}/v1/intents/{intent_id}/dispatch", hub.config.public_url),
+            };
+            let mut tx = hub.db.begin().await?;
+            outbox::enqueue(
+                &mut tx,
+                &Actor::system(),
+                outbox::WINDMILL_SCHEDULE_PUBLICATION,
+                &format!("timer:{intent_id}:{}:retry{attempt}", out.intent.schedule_revision),
+                serde_json::to_value(&timer).unwrap_or_default(),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(out)
         }
         Err(e) => finish_attempt(hub, intent_id, attempt_id, IntentState::Failed, json!({ "error": e.to_string() }), None).await,
     }
 }
+
+const UNREACHABLE_RETRY_SECS: i64 = 60;
 
 async fn finish_attempt(
     hub: &Hub,
@@ -738,7 +760,13 @@ pub async fn reconcile_intent(hub: &Hub, intent_id: Uuid, account_id: &str, key:
     let mut tx = hub.db.begin().await?;
     let current: String =
         sqlx::query_scalar("select state from publication_intents where id = $1 for update").bind(intent_id).fetch_one(&mut *tx).await?;
-    if !matches!(current.as_str(), "accepted" | "outcome_unknown" | "submitting") {
+    let latest: Option<String> =
+        sqlx::query_scalar("select idempotency_key from delivery_attempts where intent_id = $1 order by attempt desc limit 1")
+            .bind(intent_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    // A newer attempt superseded this read; its own reconciliation decides.
+    if !matches!(current.as_str(), "accepted" | "outcome_unknown" | "submitting") || latest.as_deref() != Some(key) {
         return Ok(());
     }
     let next = match &found {
@@ -789,7 +817,8 @@ pub async fn resolve_intent(hub: &Hub, actor: &Actor, intent_id: Uuid, input: Re
         .fetch_optional(&mut *tx)
         .await?;
     let current = current.ok_or(DomainError::NotFound("publication intent"))?;
-    if current != "outcome_unknown" {
+    // `accepted` is resolvable too: a provider without lookup (Postiz) can never confirm it.
+    if !matches!(current.as_str(), "outcome_unknown" | "accepted") {
         return Err(conflict("intent_not_unknown", format!("intent is {current}")));
     }
     let next = if input.published { "published" } else { "failed" };

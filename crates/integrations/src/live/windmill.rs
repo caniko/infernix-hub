@@ -126,14 +126,13 @@ fn parse_job(id: &str, value: Value) -> PortResult<JobView> {
 #[async_trait]
 impl Windmill for WindmillClient {
     async fn run_generation(&self, job: &GenerationJob) -> PortResult<String> {
-        let body = serde_json::to_value(job).map_err(|e| PortError::Rejected { status: 0, message: format!("encode job: {e}") })?;
-        self.run(&job.windmill_path, None, &body).await
+        // Windmill maps body keys to `main`'s parameter names: `main(job: GenerationJob)`.
+        self.run(&job.windmill_path, None, &json!({ "job": job })).await
     }
 
     async fn schedule_publication(&self, timer: &PublicationTimer) -> PortResult<String> {
-        let body = serde_json::to_value(timer).map_err(|e| PortError::Rejected { status: 0, message: format!("encode timer: {e}") })?;
         let scheduled_for = timer.due_at.to_rfc3339_opts(SecondsFormat::Secs, true);
-        self.run("f/infernix_hub/publication_timer", Some(scheduled_for), &body).await
+        self.run("f/infernix_hub/publication_timer", Some(scheduled_for), &json!({ "timer": timer })).await
     }
 
     async fn job(&self, id: &str) -> PortResult<JobView> {
