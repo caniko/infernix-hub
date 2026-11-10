@@ -9,16 +9,18 @@
     # Update the revision deliberately: the build-cache namespace and the
     # wrapper contract are part of the deployment envelope.
     harbor-rs = {
-      url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=ed89d0b13fc61dd1b2217bf4bba97f32cec27ba7";
+      url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=6055d7d2b3a05d7d91d50938c7fb6f862a5eec85";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
     # Migration ordering, grants, and the `migrate --check` gate.
     harbor-db = {
-      url = "github:caniko/harbor-db/febc9f30022e42e2a9b8cb4e64d71ba28c79b7b1";
+      url = "github:caniko/harbor-db/b00867f501ae43a1ad4fe23fb72476ccfd10f049";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.harbor-rs.follows = "harbor-rs";
+      inputs.harbor-meta.follows = "harbor-rs/harbor-meta";
       inputs.crane.follows = "crane";
+      inputs.treefmt-nix.follows = "treefmt-nix";
     };
 
     # ComfyUI, llama-swap, and load-balancer options the NixOS module reads.
@@ -32,7 +34,11 @@
 
     rust-overlay.follows = "harbor-rs/rust-overlay";
     crane.follows = "harbor-rs/crane";
-    treefmt-nix.follows = "harbor-rs/treefmt-nix";
+    # harbor-rs keeps treefmt-nix in its dev partition, so it is direct here.
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
