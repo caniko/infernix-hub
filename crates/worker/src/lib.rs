@@ -208,7 +208,6 @@ pub async fn reconcile(hub: &Hub) -> DResult<()> {
             tracing::warn!(prompt_id = %p.prompt_id, error = %e, "prompt reconcile failed");
         }
     }
-    production::reconcile_procedures(hub).await?;
     for (release_id, approval_id) in release::releases_in_review(hub).await? {
         match hub.paperclip.get_approval(&approval_id).await {
             Ok(view) => release::apply_approval(hub, release_id, &view).await?,
@@ -219,7 +218,15 @@ pub async fn reconcile(hub: &Hub) -> DResult<()> {
         release::reconcile_intent(hub, intent, &account, &key).await?;
     }
     engagement::reconcile_replies(hub).await?;
-    Ok(())
+    // Display only: last, and bounded so a stalled Windmill read cannot hold
+    // up the next outbox drain.
+    match tokio::time::timeout(Duration::from_secs(10), production::reconcile_procedures(hub)).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!("procedure status pass timed out; continuing next tick");
+            Ok(())
+        }
+    }
 }
 
 /// Outbox + reconcile, for tests and the `dev` loop.

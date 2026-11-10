@@ -252,6 +252,11 @@ pub async fn link_approval(hub: &Hub, actor: &Actor, release_id: Uuid, input: Li
 /// Apply an authoritative approval read (worker reconcile, notification hint).
 pub async fn apply_approval(hub: &Hub, release_id: Uuid, view: &ApprovalView) -> DResult<()> {
     let mut tx = hub.db.begin().await?;
+    // Same lock order as `freeze`: content row first, then the release.
+    sqlx::query("select c.id from content_items c join release_revisions r on r.content_item_id = c.id where r.id = $1 for update of c")
+        .bind(release_id)
+        .execute(&mut *tx)
+        .await?;
     let rel = get_release(&mut tx, release_id, true).await?;
     if rel.state != ReleaseState::InReview || rel.paperclip_approval_id.as_deref() != Some(view.id.as_str()) {
         return Ok(());
