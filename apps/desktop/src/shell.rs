@@ -15,7 +15,7 @@ pub fn Sidebar(workspace: Signal<Workspace>, nav_open: Signal<bool>) -> Element 
             div { class: "brand-lockup",
                 span { class: "brand-mark", aria_hidden: "true" }
                 div { class: "wordmark",
-                    "infernix"
+                    "fleetix"
                     span { class: "wordmark-sub", "hub console" }
                 }
             }

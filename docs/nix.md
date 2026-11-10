@@ -1,6 +1,6 @@
 # Nix packaging and NixOS module
 
-`infernix-hub` is packaged with [harbor-rs](https://github.com/caniko/harbor-rs)
+`fleetix-hub` is packaged with [harbor-rs](https://github.com/caniko/harbor-rs)
 toolchain, build-cache, dev-shell, and formatter helpers, and its systemd unit
 is paired with [harbor-db](https://github.com/caniko/harbor-db) for database
 migrations. The NixOS module also reads the
@@ -27,9 +27,9 @@ Rust toolchain are shared.
 
 | Output | Binary | Notes |
 | --- | --- | --- |
-| `infernix-hubd` (also `default`) | `infernix-hubd` | Server + embedded worker. Ships `registry/` at `$out/share/infernix-hub/registry`; the module points `HUB_REGISTRY_DIR` there. |
+| `fleetix-hubd` (also `default`) | `fleetix-hubd` | Server + embedded worker. Ships `registry/` at `$out/share/fleetix-hub/registry`; the module points `HUB_REGISTRY_DIR` there. |
 | `hubctl` | `hubctl` | Operator CLI over the typed API client. |
-| `infernix-hub-desktop` | `infernix-hub-desktop` | Dioxus 0.8 desktop shell. Built separately from the server so WebKitGTK, GTK3, and libsoup-3 never enter the service closure. |
+| `fleetix-hub-desktop` | `fleetix-hub-desktop` | Dioxus 0.8 desktop shell. Built separately from the server so WebKitGTK, GTK3, and libsoup-3 never enter the service closure. |
 
 Builds go through `harbor-rs.lib.mkBuildCachePolicy` with
 `withRustCache`; the wrapper and namespace come from the shared fleet policy
@@ -65,7 +65,7 @@ Formatting is treefmt only (`rustfmt` with edition 2024 and the repo's
 | `checks.<system>.clippy` | Native workspace clippy with `-D warnings`, desktop excluded. |
 | `checks.<system>.nextest` | Native nextest run; database tests self-skip without `HUB_TEST_DATABASE_URL`. |
 | `checks.<system>.fmt` | treefmt check over the flake source. |
-| `checks.x86_64-linux.module-eval-fixture` | The module alone, every integration fixture: fixture company id, no seed file, `HUB_MIGRATE_ON_START=0`, local PostgreSQL, harbor-db migration + `migrate --check` units gating `infernix-hub.service`. |
+| `checks.x86_64-linux.module-eval-fixture` | The module alone, every integration fixture: fixture company id, no seed file, `HUB_MIGRATE_ON_START=0`, local PostgreSQL, harbor-db migration + `migrate --check` units gating `fleetix-hub.service`. |
 | `checks.x86_64-linux.module-eval-live` | The module plus `infernix.nixosModules.default` with ComfyUI and llama-swap enabled: seed engine `comfy-<host>` at `http://127.0.0.1:8188`, admission policy JSON, `LLM_URL` at llama-swap, unit `After`/`Wants` for both services, migration gate enabled. |
 
 ```console
@@ -77,8 +77,8 @@ nix build .#checks.x86_64-linux.module-eval-live
 
 ## Module overview
 
-`nixosModules.default` (alias `nixosModules.infernix-hub`) exposes
-`services.infernix-hub`.
+`nixosModules.default` (alias `nixosModules.fleetix-hub`) exposes
+`services.fleetix-hub`.
 
 - `package`, `bind`, `publicUrl`, `companyId`, `assetDir`, `seedFile`,
   `environment`.
@@ -95,12 +95,12 @@ nix build .#checks.x86_64-linux.module-eval-live
 ### Database and migrations
 
 The module imports `harbor-db.nixosModules.default` and registers
-`services.harbor-db.projects.infernix-hub`:
+`services.harbor-db.projects.fleetix-hub`:
 
-- apply command `infernix-hubd migrate`, check command
-  `infernix-hubd migrate --check`,
-- generated units `harbor-db-infernix-hub.service` (before and required by
-  `infernix-hub.service`) and `harbor-db-infernix-hub-check.service`,
+- apply command `fleetix-hubd migrate`, check command
+  `fleetix-hubd migrate --check`,
+- generated units `harbor-db-fleetix-hub.service` (before and required by
+  `fleetix-hub.service`) and `harbor-db-fleetix-hub-check.service`,
 - `HUB_MIGRATE_ON_START=0` on the runtime unit, so the server refuses to start
   when the schema is stale instead of racing migrations.
 
@@ -122,12 +122,12 @@ When `services.infernix.comfyui.enable` is set, the module:
 - registers engine `comfy-<hostName>` at
   `http://<host>:<port>` (a `0.0.0.0`/`::` listener is reached over
   `127.0.0.1`),
-- orders `infernix-hub.service` after and wants `comfyui.service`.
+- orders `fleetix-hub.service` after and wants `comfyui.service`.
 
 Additional engines can be declared explicitly, keyed by id:
 
 ```nix
-services.infernix-hub.engines.murph-comfy = {
+services.fleetix-hub.engines.murph-comfy = {
   baseUrl = "http://10.123.0.7:8190";
   capabilities = { };
 };
@@ -195,7 +195,7 @@ back to `fixture-company`, so a fixture-only host needs no Paperclip company.
 starts:
 
 ```nix
-ExecStartPre = infernix-hubd token --name <name> --role <role> --token-file %d/token-<name>
+ExecStartPre = fleetix-hubd token --name <name> --role <role> --token-file %d/token-<name>
 ```
 
 with `LoadCredential=token-<name>:<file>`. Registration is idempotent, so
@@ -224,9 +224,9 @@ how the options line up with the current atlas services and fleet secrets.
 
 ```nix
 { config, inputs, ... }: {
-  imports = [inputs.infernix-hub.nixosModules.default];
+  imports = [inputs.fleetix-hub.nixosModules.default];
 
-  services.infernix-hub = {
+  services.fleetix-hub = {
     enable = true;
     bind = "127.0.0.1:8470";
     # Paperclip company id from the board; the hub refuses to start without it
@@ -235,7 +235,7 @@ how the options line up with the current atlas services and fleet secrets.
 
     database = {
       createLocally = true;
-      # Migrations run as an operator peer role; the infernix-hub role receives
+      # Migrations run as an operator peer role; the fleetix-hub role receives
       # grants and stays unable to run DDL.
       migrationsUser = "can";
     };
@@ -262,9 +262,9 @@ how the options line up with the current atlas services and fleet secrets.
     };
 
     tokens = {
-      operator.file = config.age.secrets.infernix-hub-operator-token.path;
-      windmill-procedure.file = config.age.secrets.infernix-hub-windmill-token.path;
-      n8n-ingest.file = config.age.secrets.infernix-hub-n8n-token.path;
+      operator.file = config.age.secrets.fleetix-hub-operator-token.path;
+      windmill-procedure.file = config.age.secrets.fleetix-hub-windmill-token.path;
+      n8n-ingest.file = config.age.secrets.fleetix-hub-n8n-token.path;
     };
 
     personas = [

@@ -1,6 +1,6 @@
 [package]
-name = "infernix-hub-desktop"
-description = "Local-first operator console for the infernix-hub content operations hub."
+name = "fleetix-hub-desktop"
+description = "Local-first operator console for the fleetix-hub content operations hub."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,5 +1,5 @@
 {
-  description = "infernix-hub: local-first content operations hub";
+  description = "fleetix-hub: local-first content operations hub";
 
   inputs = {
     # One nixpkgs for the flake, harbor-rs, harbor-db, and infernix.
@@ -125,8 +125,8 @@
     });
   in {
     packages = forAllSystems (system: {
-      inherit (perSystem.${system}.packages) infernix-hubd hubctl infernix-hub-desktop;
-      default = perSystem.${system}.packages.infernix-hubd;
+      inherit (perSystem.${system}.packages) fleetix-hubd hubctl fleetix-hub-desktop;
+      default = perSystem.${system}.packages.fleetix-hubd;
     });
 
     checks = forAllSystems (system: perSystem.${system}.checks);
@@ -136,6 +136,6 @@
     formatter = forAllSystems (system: perSystem.${system}.treefmtWrapper);
 
     nixosModules.default = import ./nix/module.nix {inherit self harbor-rs harbor-db;};
-    nixosModules.infernix-hub = self.nixosModules.default;
+    nixosModules.fleetix-hub = self.nixosModules.default;
   };
 }

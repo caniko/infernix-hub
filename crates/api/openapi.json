@@ -195,7 +195,7 @@
   },
   "info": {
     "description": "Hand-maintained index of the hub API. Field-level schemas are the Rust types in crates/contracts (serde JSON, snake_case enums); x-roles names who may call. Headers: Authorization: Bearer <token>, x-correlation-id (echoed in errors), idempotency-key (ingest).",
-    "title": "infernix-hub API",
+    "title": "fleetix-hub API",
     "version": "v1"
   },
   "openapi": "3.1.0",

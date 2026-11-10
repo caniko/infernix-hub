@@ -1,6 +1,6 @@
-# Infernix Hub vision
+# Fleetix Hub vision
 
-Infernix Hub is a local-first content operations hub. It combines an Axum API,
+Fleetix Hub is a local-first content operations hub. It combines an Axum API,
 a transactional domain command layer, an integration worker, and a Dioxus
 desktop console over a shared typed contract, with PostgreSQL migrations and a
 registry of external services. Its purpose is to give one operator console for

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "hubctl", version, about = "infernix-hub CLI")]
+#[command(name = "hubctl", version, about = "fleetix-hub CLI")]
 struct Cli {
     #[arg(long, env = "HUB_URL", default_value = "http://127.0.0.1:8470")]
     url: String,

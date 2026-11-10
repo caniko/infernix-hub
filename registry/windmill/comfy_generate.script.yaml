@@ -1,6 +1,6 @@
 summary: Submit ComfyUI prompts and post comfy_prompt receipts (procedure version 1)
 description: >-
-  infernix-hub generation procedure, version 1. One ComfyUI /prompt per variant
+  fleetix-hub generation procedure, version 1. One ComfyUI /prompt per variant
   with the hub-chosen prompt_id and client_id, then an immediate comfy_prompt
   receipt to the hub. An ambiguous /prompt failure is reconciled through
   /history and /queue and never resubmitted. Receipt posts retry 3 times.

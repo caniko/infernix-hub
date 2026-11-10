@@ -184,5 +184,5 @@ nothing can be contract- or live-verified.
 
 `registry/windmill/comfy_generate.ts` and `publication_timer.ts` are written
 with version-1 metadata. **Not deployed**: `wmill sync push` was not run and no
-schedule was created. Required secret variable: `f/infernix_hub/hub_token`. See
+schedule was created. Required secret variable: `f/fleetix_hub/hub_token`. See
 `registry/windmill/README.md`.

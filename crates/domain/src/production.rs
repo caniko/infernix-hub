@@ -203,7 +203,7 @@ pub async fn generate(hub: &Hub, actor: &Actor, content_id: Uuid, input: Generat
 /// One stable `/ws` client id per hub process family, so progress for every
 /// prompt the hub requested reaches its listener.
 pub fn comfy_client_id() -> String {
-    std::env::var("HUB_COMFY_CLIENT_ID").unwrap_or_else(|_| "infernix-hub".into())
+    std::env::var("HUB_COMFY_CLIENT_ID").unwrap_or_else(|_| "fleetix-hub".into())
 }
 
 const GEN_SELECT: &str = "select to_jsonb(t) from (

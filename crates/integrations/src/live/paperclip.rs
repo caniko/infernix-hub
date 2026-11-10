@@ -116,7 +116,7 @@ impl Paperclip for PaperclipClient {
             "actions": req.actions,
         });
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert("requested_by".into(), json!("infernix-hub"));
+            obj.insert("requested_by".into(), json!("fleetix-hub"));
         }
         let mut body = json!({
             // The general board approval type supported by Paperclip 0.3.1.

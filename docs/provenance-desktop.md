@@ -1,4 +1,4 @@
-# Desktop provenance — infernix-hub console
+# Desktop provenance — fleetix-hub console
 
 The desktop app (`apps/desktop`) is an adaptation of the pinned donor snapshot
 of **aivyx-pa** (MIT), commit `8097870bdad7c1a726448eeeeb82331027f1e6cf`, at
@@ -7,7 +7,7 @@ Only the donor's `crates/aivyx-web` shell, component kit and stylesheet were
 used. The donor tree was read-only and is not part of the build graph.
 
 The donor's `TRADEMARK.md` was read. No Aivyx name, logo, wordmark, favicon or
-"Stitch" branding is copied or displayed: the app is branded "infernix hub".
+"Stitch" branding is copied or displayed: the app is branded "fleetix hub".
 Fonts (OFL) and the generic line icons are copied, as permitted.
 
 ## Donor files
@@ -51,7 +51,7 @@ All donor `assets/logos/*` files were omitted.
 
 - **Brand assets and copy** (`assets/logos/*`, "Aivyx", "AIVYX", "Stitch", the
   favicon and logomark): prohibited by the donor trademark policy. Replaced by
-  a CSS honey mark and the "infernix hub" wordmark.
+  a CSS honey mark and the "fleetix hub" wordmark.
 - **WebSocket transport** (`ws_task`, `FrontendMessage`, `DaemonEnvelope`,
   `gloo_net::websocket`, `gloo_timers`): the hub exposes a typed HTTP contract
   (`hub_contracts::client::HubClient`), so the desktop talks to it directly and
@@ -142,7 +142,7 @@ donor's 1.5s cadence. A failed refresh keeps the last good data and shows the
 
 The app is pinned to **Dioxus `=0.8.0-alpha.3`** (the newest published 0.8
 alpha on crates.io at 2026-11-09), with the `desktop` feature. No `dx` CLI is
-required: `cargo build -p infernix-hub-desktop` builds the binary directly.
+required: `cargo build -p fleetix-hub-desktop` builds the binary directly.
 
 The 0.6 → 0.8-alpha migration touched one API: keyboard matching now uses
 `Key::Named(NamedKey::Enter)` (the 0.6 `Key::Enter` variant is gone).
@@ -153,10 +153,10 @@ The 0.6 → 0.8-alpha migration touched one API: keyboard matching now uses
 
 Final verification ran from the repository root with the checked-in devshell:
 
-- `nix develop -c cargo build -p infernix-hub-desktop` — passes (Dioxus 0.6 for
+- `nix develop -c cargo build -p fleetix-hub-desktop` — passes (Dioxus 0.6 for
   milestone A, 0.8.0-alpha.3 for milestones B/C).
-- `nix develop -c cargo test -p infernix-hub-desktop` — 12 pure-helper tests pass.
-- `nix develop -c cargo clippy -p infernix-hub-desktop --all-targets -- -D warnings`
+- `nix develop -c cargo test -p fleetix-hub-desktop` — 12 pure-helper tests pass.
+- `nix develop -c cargo clippy -p fleetix-hub-desktop --all-targets -- -D warnings`
   — clean.
 - Headless smoke run: Weston headless + a throwaway mock hub (`/v1/status`,
   today, news, content detail, relationships, canon, chat, assets). The app

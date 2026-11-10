@@ -63,7 +63,7 @@ pub async fn create_brief(hub: &Hub, actor: &Actor, input: CreateBriefIn) -> DRe
         actor,
         outbox::PAPERCLIP_CREATE_ISSUE,
         &format!("issue:content:{id}"),
-        json!({ "content_item_id": id, "company_id": hub.config.company_id, "title": input.title, "description": description, "origin_key": format!("infernix-hub:content:{id}") }),
+        json!({ "content_item_id": id, "company_id": hub.config.company_id, "title": input.title, "description": description, "origin_key": format!("fleetix-hub:content:{id}") }),
     )
     .await?;
     audit(

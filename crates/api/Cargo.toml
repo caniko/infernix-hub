@@ -1,5 +1,5 @@
 [package]
-name = "infernix-hubd"
+name = "fleetix-hubd"
 description = "Hub API server (Axum) with the embedded integration worker."
 version.workspace = true
 edition.workspace = true

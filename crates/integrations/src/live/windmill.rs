@@ -132,7 +132,7 @@ impl Windmill for WindmillClient {
 
     async fn schedule_publication(&self, timer: &PublicationTimer) -> PortResult<String> {
         let scheduled_for = timer.due_at.to_rfc3339_opts(SecondsFormat::Secs, true);
-        self.run("f/infernix_hub/publication_timer", Some(scheduled_for), &json!({ "timer": timer })).await
+        self.run("f/fleetix_hub/publication_timer", Some(scheduled_for), &json!({ "timer": timer })).await
     }
 
     async fn job(&self, id: &str) -> PortResult<JobView> {
@@ -151,7 +151,7 @@ impl Windmill for WindmillClient {
         let url = self.url(&format!("/jobs_u/queue/cancel/{id}"));
         let resp = self
             .auth(self.http.post(url))
-            .json(&json!({ "reason": "cancelled by infernix-hub" }))
+            .json(&json!({ "reason": "cancelled by fleetix-hub" }))
             .send()
             .await
             .map_err(|e| transport_error(e, true))?;
@@ -179,10 +179,10 @@ mod tests {
     #[test]
     fn pinned_paths_split_on_the_last_at() {
         assert_eq!(
-            WindmillClient::split_pinned_path("f/infernix_hub/comfy_generate@abc123"),
-            ("f/infernix_hub/comfy_generate", Some("abc123"))
+            WindmillClient::split_pinned_path("f/fleetix_hub/comfy_generate@abc123"),
+            ("f/fleetix_hub/comfy_generate", Some("abc123"))
         );
-        assert_eq!(WindmillClient::split_pinned_path("f/infernix_hub/comfy_generate"), ("f/infernix_hub/comfy_generate", None));
+        assert_eq!(WindmillClient::split_pinned_path("f/fleetix_hub/comfy_generate"), ("f/fleetix_hub/comfy_generate", None));
         assert_eq!(WindmillClient::split_pinned_path("@abc"), ("@abc", None));
     }
 

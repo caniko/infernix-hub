@@ -7,7 +7,7 @@ use std::time::Duration;
 use chrono::Utc;
 use contracts::client::{ClientError, HubClient};
 use contracts::*;
-use infernix_hubd::bootstrap::{self, Fixtures, Settings};
+use fleetix_hubd::bootstrap::{self, Fixtures, Settings};
 use integrations::fixture::PublishMode;
 use serde_json::json;
 use uuid::Uuid;
@@ -56,7 +56,7 @@ async fn start(db_url: &str, assets: &std::path::Path) -> H {
     w.manual_timers.store(true, std::sync::atomic::Ordering::SeqCst);
     let hub = state.hub.clone();
     let server = tokio::spawn(async move {
-        axum::serve(listener, infernix_hubd::router(state)).await.unwrap();
+        axum::serve(listener, fleetix_hubd::router(state)).await.unwrap();
     });
     let url = s.public_url.clone();
     H {
@@ -600,7 +600,7 @@ async fn chat_suggestions_are_proposals_not_canon() {
 
 #[test]
 fn openapi_lists_every_route() {
-    let doc: serde_json::Value = serde_json::from_str(infernix_hubd::OPENAPI).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(fleetix_hubd::OPENAPI).unwrap();
     let src = include_str!("../src/lib.rs");
     for line in src.lines().filter(|l| l.trim_start().starts_with(".route(\"")) {
         let path = line.split('"').nth(1).unwrap();

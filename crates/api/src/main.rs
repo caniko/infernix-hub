@@ -1,14 +1,14 @@
-//! `infernix-hubd`: API server with the embedded integration worker.
+//! `fleetix-hubd`: API server with the embedded integration worker.
 
 use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use contracts::Role;
-use infernix_hubd::bootstrap::{self, Settings};
+use fleetix_hubd::bootstrap::{self, Settings};
 
 #[derive(Parser)]
-#[command(name = "infernix-hubd", version, about = "infernix-hub API server")]
+#[command(name = "fleetix-hubd", version, about = "fleetix-hub API server")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
             });
             println!("\nFIXTURE MODE — every integration is simulated in-process.");
             println!("API      {}/v1   (OpenAPI: {}/openapi.json)", s.public_url, s.public_url);
-            println!("Desktop  HUB_URL={} HUB_TOKEN=dev-operator-token cargo run -p infernix-hub-desktop", s.public_url);
+            println!("Desktop  HUB_URL={} HUB_TOKEN=dev-operator-token cargo run -p fleetix-hub-desktop", s.public_url);
             println!("CLI      HUB_URL={} HUB_TOKEN=dev-operator-token cargo run -p hubctl -- today\n", s.public_url);
             serve(&bind, state).await?;
         }
@@ -199,10 +199,10 @@ async fn demo_events(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn serve(bind: &str, state: infernix_hubd::AppState) -> anyhow::Result<()> {
+async fn serve(bind: &str, state: fleetix_hubd::AppState) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, "listening");
-    axum::serve(listener, infernix_hubd::router(state))
+    axum::serve(listener, fleetix_hubd::router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

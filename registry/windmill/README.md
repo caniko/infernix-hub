@@ -7,15 +7,15 @@ change the code a queued job executes.
 
 | Path | Input | Purpose |
 | --- | --- | --- |
-| `f/infernix_hub/comfy_generate` | `GenerationJob` | Submit ComfyUI prompts and post `comfy_prompt` receipts |
-| `f/infernix_hub/publication_timer` | `PublicationTimer` | Dispatch an armed publication timer to the hub |
+| `f/fleetix_hub/comfy_generate` | `GenerationJob` | Submit ComfyUI prompts and post `comfy_prompt` receipts |
+| `f/fleetix_hub/publication_timer` | `PublicationTimer` | Dispatch an armed publication timer to the hub |
 
 ## Required variable
 
 Create one **secret** Windmill variable before the first run:
 
 ```
-f/infernix_hub/hub_token
+f/fleetix_hub/hub_token
 ```
 
 Both procedures read it with `wmill.getVariable` and send it as

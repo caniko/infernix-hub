@@ -19,7 +19,7 @@
   options,
   ...
 }: let
-  cfg = config.services.infernix-hub;
+  cfg = config.services.fleetix-hub;
   inherit
     (lib)
     mkEnableOption
@@ -31,8 +31,8 @@
     types
     ;
 
-  runtimeUser = "infernix-hub";
-  runtimeGroup = "infernix-hub";
+  runtimeUser = "fleetix-hub";
+  runtimeGroup = "fleetix-hub";
 
   system = pkgs.stdenv.hostPlatform.system;
 
@@ -126,7 +126,7 @@
     if cfg.seedFile != null
     then cfg.seedFile
     else if engineRecords != [] || cfg.personas != [] || cfg.accounts != []
-    then (pkgs.formats.json {}).generate "infernix-hub-seed.json" seedContent
+    then (pkgs.formats.json {}).generate "fleetix-hub-seed.json" seedContent
     else null;
 
   # --- database -----------------------------------------------------------
@@ -152,11 +152,11 @@
   launcher =
     if cfg.database.urlFile != null
     then
-      pkgs.writeShellScript "infernix-hubd-db-url" ''
+      pkgs.writeShellScript "fleetix-hubd-db-url" ''
         export DATABASE_URL="$(cat ${toString cfg.database.urlFile})"
-        exec ${cfg.package}/bin/infernix-hubd "$@"
+        exec ${cfg.package}/bin/fleetix-hubd "$@"
       ''
-    else "${cfg.package}/bin/infernix-hubd";
+    else "${cfg.package}/bin/fleetix-hubd";
 
   # --- credentials --------------------------------------------------------
   credentials = lib.filterAttrs (_: value: value != null) {
@@ -195,14 +195,14 @@
 in {
   imports = [harbor-db.nixosModules.default];
 
-  options.services.infernix-hub = {
-    enable = mkEnableOption "infernix-hub content operations hub";
+  options.services.fleetix-hub = {
+    enable = mkEnableOption "fleetix-hub content operations hub";
 
     package = mkOption {
       type = types.package;
-      default = self.packages.${system}.infernix-hubd;
-      defaultText = lib.literalExpression "infernix-hub.packages.\${system}.infernix-hubd";
-      description = "Server package; must ship registry/ under share/infernix-hub.";
+      default = self.packages.${system}.fleetix-hubd;
+      defaultText = lib.literalExpression "fleetix-hub.packages.\${system}.fleetix-hubd";
+      description = "Server package; must ship registry/ under share/fleetix-hub.";
     };
 
     bind = mkOption {
@@ -225,7 +225,7 @@ in {
 
     assetDir = mkOption {
       type = types.path;
-      default = "/var/lib/infernix-hub/assets";
+      default = "/var/lib/fleetix-hub/assets";
       description = "Durable content-addressed asset volume.";
     };
 
@@ -246,12 +246,12 @@ in {
       };
       name = mkOption {
         type = types.str;
-        default = "infernix-hub";
+        default = "fleetix-hub";
         description = "PostgreSQL database name.";
       };
       url = mkOption {
         type = types.str;
-        default = "postgres:///infernix-hub?host=/run/postgresql";
+        default = "postgres:///fleetix-hub?host=/run/postgresql";
         description = ''
           Connection URL without an embedded role: peer auth over the unix
           socket resolves the role from the system user (runtime user for the
@@ -540,35 +540,35 @@ in {
       assertions = [
         {
           assertion = cfg.integrations.windmill != "fixture" || cfg.integrations.comfy == "fixture";
-          message = "infernix-hub: a fixture Windmill runs procedures in-process and needs a fixture ComfyUI.";
+          message = "fleetix-hub: a fixture Windmill runs procedures in-process and needs a fixture ComfyUI.";
         }
         {
           assertion = cfg.integrations.paperclip != "live" || cfg.credentials.paperclipToken != null;
-          message = "infernix-hub: live Paperclip needs credentials.paperclipToken.";
+          message = "fleetix-hub: live Paperclip needs credentials.paperclipToken.";
         }
         {
           assertion = cfg.integrations.windmill != "live" || cfg.credentials.windmillToken != null;
-          message = "infernix-hub: live Windmill needs credentials.windmillToken.";
+          message = "fleetix-hub: live Windmill needs credentials.windmillToken.";
         }
         {
           assertion = cfg.integrations.publisher != "live" || cfg.integrations.paperclip == "live";
-          message = "infernix-hub: a live publisher needs live Paperclip; fixture approvals cannot authorize real posts.";
+          message = "fleetix-hub: a live publisher needs live Paperclip; fixture approvals cannot authorize real posts.";
         }
         {
           assertion = cfg.integrations.publisher != "live" || cfg.credentials.postizToken != null;
-          message = "infernix-hub: a live publisher needs credentials.postizToken.";
+          message = "fleetix-hub: a live publisher needs credentials.postizToken.";
         }
         {
           assertion = allFixture || cfg.companyId != null;
-          message = "infernix-hub: companyId (the Paperclip company id) is required unless every integration is fixture.";
+          message = "fleetix-hub: companyId (the Paperclip company id) is required unless every integration is fixture.";
         }
         {
           assertion = cfg.integrations.assistant != "live" || llmUrl != null;
-          message = "infernix-hub: a live assistant needs an endpoint; set assistant.url for endpoint = custom.";
+          message = "fleetix-hub: a live assistant needs an endpoint; set assistant.url for endpoint = custom.";
         }
         {
           assertion = cfg.database.urlFile == null || !cfg.database.createLocally;
-          message = "infernix-hub: database.urlFile is for an external database; leave database.createLocally = false.";
+          message = "fleetix-hub: database.urlFile is for an external database; leave database.createLocally = false.";
         }
       ];
 
@@ -582,8 +582,8 @@ in {
         "d ${toString cfg.assetDir} 0750 ${runtimeUser} ${runtimeGroup} -"
       ];
 
-      systemd.services.infernix-hub = {
-        description = "infernix-hub API and integration worker";
+      systemd.services.fleetix-hub = {
+        description = "fleetix-hub API and integration worker";
         wantedBy = ["multi-user.target"];
         after =
           ["network-online.target" "postgresql.service"]
@@ -596,7 +596,7 @@ in {
             HUB_BIND = cfg.bind;
             HUB_PUBLIC_URL = cfg.publicUrl;
             HUB_ASSET_DIR = toString cfg.assetDir;
-            HUB_REGISTRY_DIR = "${cfg.package}/share/infernix-hub/registry";
+            HUB_REGISTRY_DIR = "${cfg.package}/share/fleetix-hub/registry";
             HUB_PAPERCLIP = cfg.integrations.paperclip;
             HUB_WINDMILL = cfg.integrations.windmill;
             HUB_COMFY = cfg.integrations.comfy;
@@ -630,7 +630,7 @@ in {
             User = runtimeUser;
             Group = runtimeGroup;
             DynamicUser = false;
-            StateDirectory = "infernix-hub";
+            StateDirectory = "fleetix-hub";
             StateDirectoryMode = "0750";
             LoadCredential = loadCredentials;
             Restart = "on-failure";
@@ -677,9 +677,9 @@ in {
     # Schema ownership belongs to harbor-db; the runtime unit starts only
     # after the migration and its read-only check.
     {
-      services.harbor-db.projects.infernix-hub = mkIf cfg.migrations.enable {
+      services.harbor-db.projects.fleetix-hub = mkIf cfg.migrations.enable {
         enable = true;
-        description = "infernix-hub database migrations";
+        description = "fleetix-hub database migrations";
         runner =
           if cfg.database.urlFile != null
           then {
@@ -688,7 +688,7 @@ in {
           }
           else {
             inherit (cfg) package;
-            executable = "bin/infernix-hubd";
+            executable = "bin/fleetix-hubd";
             args = ["migrate"];
             checkArgs = ["migrate" "--check"];
           };
@@ -701,7 +701,7 @@ in {
             PGUSER = migrationUser;
           }
           // optionalAttrs (cfg.database.urlFile == null) {DATABASE_URL = cfg.database.url;};
-        runtimeUnits = ["infernix-hub.service"];
+        runtimeUnits = ["fleetix-hub.service"];
         postgres =
           {
             enable = cfg.database.createLocally;

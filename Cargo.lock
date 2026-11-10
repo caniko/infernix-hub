@@ -1609,6 +1609,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleetix-hub-desktop"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dioxus",
+ "hub-contracts",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "fleetix-hubd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "hub-contracts",
+ "hub-domain",
+ "hub-integrations",
+ "hub-worker",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "flume"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2571,43 +2608,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a588916bfdfd92e71cacef98a63d9b1f0d74d6599980d11894290e7ddefffcf7"
 dependencies = [
  "cfb",
-]
-
-[[package]]
-name = "infernix-hub-desktop"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dioxus",
- "hub-contracts",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "infernix-hubd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "chrono",
- "clap",
- "hub-contracts",
- "hub-domain",
- "hub-integrations",
- "hub-worker",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

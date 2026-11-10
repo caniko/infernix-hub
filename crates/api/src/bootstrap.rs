@@ -157,7 +157,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
     if env("HUB_MIGRATE_ON_START").as_deref() == Some("0") {
         let pending = domain::pending_migrations(&db).await?;
         if !pending.is_empty() {
-            bail!("database has pending migrations {pending:?}; run `infernix-hubd migrate` first");
+            bail!("database has pending migrations {pending:?}; run `fleetix-hubd migrate` first");
         }
     } else {
         domain::MIGRATOR.run(&db).await.context("running migrations")?;

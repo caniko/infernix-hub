@@ -11,7 +11,7 @@ Date of all retrievals below: 2026-11-09. Host: `atlas`.
 | Paperclip package | `0.3.1-unstable-2026-10-23` |
 | Source commit | `6f1bf1754c4862cbae59a58306652ded8a44cd17` |
 | Schema title/version | `Paperclip API` / `1.0.0` |
-| Full document | `/data/nvme0/can/ProjectState/evidence/infernix-hub/paperclip-openapi.json` (823 paths) |
+| Full document | `/data/nvme0/can/ProjectState/evidence/fleetix-hub/paperclip-openapi.json` (823 paths) |
 | Subset in repo | `docs/contracts/paperclip-openapi-subset.json` |
 
 The subset keeps only the paths used by the adapter plus the `Error` schema and
@@ -29,7 +29,7 @@ subset's `hub_notes`. Approval statuses were checked against the bundled
 | Source URL | `http://127.0.0.1:8040/api/openapi.yaml` (unauthenticated) |
 | Retrieved | 2026-11-09 |
 | Server version | `CE v1.839.0` (`GET /api/version`); spec front matter lags at `1.740.0` |
-| Document | `/data/nvme0/can/ProjectState/evidence/infernix-hub/windmill-openapi.yaml` (1,278,691 B, servers `/api`) |
+| Document | `/data/nvme0/can/ProjectState/evidence/fleetix-hub/windmill-openapi.yaml` (1,278,691 B, servers `/api`) |
 
 Verified operations in that document: `runScriptByPath` (`201 text/plain`
 uuid, `scheduled_for` query), `runScriptByHash`

@@ -1,4 +1,4 @@
-//! infernix-hub desktop console.
+//! fleetix-hub desktop console.
 //!
 //! Milestone C: the donor-derived shell now runs on real hub data through
 //! `hub_contracts::client::HubClient`. The WebSocket bridge is gone; the app
@@ -26,7 +26,7 @@ use state::{Loaded, Store};
 
 fn main() {
     use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
-    let window = WindowBuilder::new().with_title("infernix hub").with_inner_size(LogicalSize::new(1440.0, 900.0));
+    let window = WindowBuilder::new().with_title("fleetix hub").with_inner_size(LogicalSize::new(1440.0, 900.0));
     dioxus::LaunchBuilder::desktop().with_cfg(Config::new().with_window(window)).launch(App);
 }
 
@@ -259,7 +259,7 @@ fn App() -> Element {
     };
 
     rsx! {
-        document::Title { "infernix hub" }
+        document::Title { "fleetix hub" }
         style { dangerous_inner_html: theme::style_sheet() }
         div { class: "app",
             shell::Sidebar { workspace: store.workspace, nav_open: store.nav_open }
@@ -308,7 +308,7 @@ fn App() -> Element {
             shell::StatusBar {
                 connected: live,
                 items: segments,
-                right: format!("API {api_version} · INFERNIX-HUB v0.1.0"),
+                right: format!("API {api_version} · FLEETIX-HUB v0.1.0"),
             }
             if (store.palette_open).cloned() {
                 palette::CommandPalette {

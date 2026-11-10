@@ -12,8 +12,8 @@ Everything below runs on fixtures: no external service is called.
 ```sh
 nix develop                                   # harbor-rs devshell (treefmt, sqlx, psql)
 eval "$(scripts/dev-db.sh)"                   # throwaway PostgreSQL 16 under var/pg
-cargo run -p infernix-hubd -- dev --database-url "$DATABASE_URL"   # API + worker, fixture adapters, demo data
-HUB_URL=http://127.0.0.1:8470 HUB_TOKEN=dev-operator-token cargo run -p infernix-hub-desktop
+cargo run -p fleetix-hubd -- dev --database-url "$DATABASE_URL"   # API + worker, fixture adapters, demo data
+HUB_URL=http://127.0.0.1:8470 HUB_TOKEN=dev-operator-token cargo run -p fleetix-hub-desktop
 HUB_URL=http://127.0.0.1:8470 HUB_TOKEN=dev-operator-token cargo run -p hubctl -- today
 ```
 
@@ -22,7 +22,7 @@ HUB_URL=http://127.0.0.1:8470 HUB_TOKEN=dev-operator-token cargo run -p hubctl -
 `POST /v1/fixtures/paperclip/approvals/{id}/decide` (fixture mode only). The
 desktop shows a "FIXTURE MODE" banner whenever any adapter is simulated.
 
-Production-style commands: `infernix-hubd serve [--no-worker]`, `worker`,
+Production-style commands: `fleetix-hubd serve [--no-worker]`, `worker`,
 `migrate [--check]`, `token --name N --role R [--token-file F]`. Configuration
 is environment only (`crates/api/src/bootstrap.rs`); secrets come from
 `*_TOKEN_FILE`. Adapter modes: `HUB_PAPERCLIP|HUB_WINDMILL|HUB_COMFY|HUB_ASSISTANT`
@@ -49,7 +49,7 @@ the hub-chosen prompt id, targeted cancel, human takeover beats a queued agent
 reply, assets survive engine history cleanup, chat suggestions stay proposals,
 GPU admission, cancel while awaiting admission, unreachable publisher retry.
 
-The module eval checks build the `infernix-hubd` package through Nix. Not
+The module eval checks build the `fleetix-hubd` package through Nix. Not
 run: the desktop and `hubctl` Nix packages, the flake's clippy/nextest/fmt
 checks (evaluated only), any live integration.
 
@@ -79,7 +79,7 @@ checks (evaluated only), any live integration.
    ambiguous create is dead-lettered and the operator links the approval with
    `link-approval` (hash-checked).
 3. **Windmill:** procedures not deployed (`wmill sync push` not run); secret
-   variable `f/infernix_hub/hub_token` not created; workspace token not read.
+   variable `f/fleetix_hub/hub_token` not created; workspace token not read.
 4. **Postiz:** not deployed. When it is, the adapter refuses media that carries
    alt text (the documented API has no alt field) — confirm an alt-text field
    before enabling image posts. Lookup is unsupported, so accepted/ambiguous
@@ -87,7 +87,7 @@ checks (evaluated only), any live integration.
 5. **n8n:** no `X-N8N-API-KEY`; the `X-Studio-Token` webhook secret was not
    read; no news workflow points at `/v1/ingest/news` yet.
 6. **Hub service:** the module is not imported by any host; activation,
-   tokens (`infernix-hubd token`) and agenix wiring are operator steps.
+   tokens (`fleetix-hubd token`) and agenix wiring are operator steps.
 
 No schedule was activated, nothing was published, and no engagement message
 was sent.
@@ -122,7 +122,7 @@ lease column is the upgrade path.
 
 ## Designs
 
-`design/infernix-hub.fig` (OpenPencil): D01 Studio, D02 Today, M01 narrow
+`design/fleetix-hub.fig` (OpenPencil): D01 Studio, D02 Today, M01 narrow
 (390 px). Checked against screenshots of the running app at 1440 and 760 px;
 layout and tokens match. D01 was updated for P1–P3 (status bar wording,
 "Approved" chip, persona name); D02 already used readable labels; M01 shows
