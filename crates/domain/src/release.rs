@@ -252,11 +252,6 @@ pub async fn link_approval(hub: &Hub, actor: &Actor, release_id: Uuid, input: Li
 /// Apply an authoritative approval read (worker reconcile, notification hint).
 pub async fn apply_approval(hub: &Hub, release_id: Uuid, view: &ApprovalView) -> DResult<()> {
     let mut tx = hub.db.begin().await?;
-    // Same lock order as `freeze`: content row first, then the release.
-    sqlx::query("select c.id from content_items c join release_revisions r on r.content_item_id = c.id where r.id = $1 for update of c")
-        .bind(release_id)
-        .execute(&mut *tx)
-        .await?;
     let rel = get_release(&mut tx, release_id, true).await?;
     if rel.state != ReleaseState::InReview || rel.paperclip_approval_id.as_deref() != Some(view.id.as_str()) {
         return Ok(());
@@ -287,12 +282,6 @@ pub async fn apply_approval(hub: &Hub, release_id: Uuid, view: &ApprovalView) ->
         }
         (Ok(()), ApprovalStatus::Pending) => return Ok(()),
     };
-    // The item leaves review: ready to schedule, or back to selecting for a new revision.
-    sqlx::query("update content_items set state = $2, updated_at = now() where id = $1 and state = 'review'")
-        .bind(rel.content_item_id)
-        .bind(if action == "release.approved" { ContentState::Approved } else { ContentState::Selecting }.as_str())
-        .execute(&mut *tx)
-        .await?;
     audit(
         &mut tx,
         &Actor::system(),
@@ -303,6 +292,22 @@ pub async fn apply_approval(hub: &Hub, release_id: Uuid, view: &ApprovalView) ->
     )
     .await?;
     tx.commit().await?;
+    // The item leaves review: ready to schedule, or back to selecting for a
+    // new revision. Its own statement, after the release lock is released, so
+    // this path never holds release and content locks together (freeze takes
+    // content→release, schedule release→content). The state is display only.
+    // Skipped if a refreeze has since superseded this release.
+    let approved = action == "release.approved";
+    sqlx::query(
+        "update content_items set state = $2, updated_at = now() where id = $1 and state = 'review'
+         and (select state from release_revisions where id = $3) = $4",
+    )
+    .bind(rel.content_item_id)
+    .bind(if approved { ContentState::Approved } else { ContentState::Selecting }.as_str())
+    .bind(release_id)
+    .bind(if approved { "approved" } else { "rejected" })
+    .execute(&hub.db)
+    .await?;
     Ok(())
 }
 
