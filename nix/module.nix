@@ -248,7 +248,9 @@ in {
 
         The parent directory is bind-mounted read-only: the file is replaced
         atomically by the writer's timer, so the unit must see the directory
-        (and therefore new inodes) rather than one bound file.
+        (and therefore new inodes) rather than one bound file. The unit runs
+        with `ProtectHome`, so the directory must live outside `/home`,
+        `/root` and `/run/user`.
       '';
     };
 
@@ -553,6 +555,10 @@ in {
     {
       assertions = [
         {
+          assertion = cfg.fleetStatusFile == null || !lib.any (home: lib.hasPrefix home (toString cfg.fleetStatusFile)) ["/home/" "/root/" "/run/user/"];
+          message = "fleetix-hub: fleetStatusFile must live outside /home, /root and /run/user (the unit runs with ProtectHome).";
+        }
+        {
           assertion = cfg.integrations.windmill != "fixture" || cfg.integrations.comfy == "fixture";
           message = "fleetix-hub: a fixture Windmill runs procedures in-process and needs a fixture ComfyUI.";
         }
@@ -660,8 +666,7 @@ in {
           }
           // optionalAttrs (cfg.fleetStatusFile != null) {
             # Bind the directory, not the file: atomic replacement gives the
-            # snapshot a new inode, and ProtectHome/ProtectSystem hide the
-            # default locations. Read-only is all the hub needs.
+            # snapshot a new inode. Read-only is all the hub needs.
             BindReadOnlyPaths = [(builtins.dirOf (toString cfg.fleetStatusFile))];
           };
       };

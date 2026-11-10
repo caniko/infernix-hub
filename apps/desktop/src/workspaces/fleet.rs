@@ -19,6 +19,22 @@ fn ago(value: &str) -> String {
     fleet::parse_ms(value).map(format::rel_time).unwrap_or_else(|| value.to_string())
 }
 
+/// True when the data on screen is not current: the last refresh failed (the
+/// cached snapshot is still shown) or the snapshot itself is old.
+fn not_current(loaded: &Loaded<FleetStatus>) -> bool {
+    loaded.error.is_some() || loaded.data.as_ref().is_some_and(|status| fleet::stale(format::now_ms(), status))
+}
+
+#[component]
+fn NotCurrent() -> Element {
+    rsx! {
+        div { class: "monitoring-error", role: "alert",
+            strong { "This snapshot is not current" }
+            span { " — everything below is the last known state, not evidence of health." }
+        }
+    }
+}
+
 #[component]
 fn Unconfigured() -> Element {
     rsx! {
@@ -33,7 +49,7 @@ fn Unconfigured() -> Element {
 pub fn CommandView() -> Element {
     let store = use_context::<Store>();
     let loaded = (store.fleet).cloned();
-    let now = format::now_ms();
+    let stale = not_current(&loaded);
     rsx! {
         main { class: "work",
             div { class: "work-head",
@@ -44,7 +60,12 @@ pub fn CommandView() -> Element {
                 ErrorCard { code: error.code, message: error.message }
             }
             match loaded.data.clone() {
-                Some(status) => rsx! { CommandBody { status, now } },
+                Some(status) => rsx! {
+                    if stale {
+                        NotCurrent {}
+                    }
+                    CommandBody { status, stale }
+                },
                 None if loaded.error.is_none() => rsx! { Loading { text: "Loading fleet status…".to_string() } },
                 None if unconfigured(&loaded) => rsx! { Unconfigured {} },
                 None => rsx! {},
@@ -54,11 +75,12 @@ pub fn CommandView() -> Element {
 }
 
 #[component]
-fn CommandBody(status: FleetStatus, now: u64) -> Element {
+fn CommandBody(status: FleetStatus, stale: bool) -> Element {
     let store = use_context::<Store>();
     let counts = fleet::counts(&status);
     let rows = fleet::attention_rows(&status);
-    let stale = fleet::stale(now, &status);
+    // Old numbers are shown, but never in the colour of health.
+    let ok = if stale { "" } else { "ok" };
     let age_label = fleet::parse_ms(&status.generated_at).map(format::rel_time).unwrap_or_else(|| "unknown".to_string());
     let today = (store.today).cloned().data;
 
@@ -68,35 +90,38 @@ fn CommandBody(status: FleetStatus, now: u64) -> Element {
                 label: "HOSTS".to_string(),
                 value: fleet::hosts_ratio(counts),
                 detail: Some("healthy / total".to_string()),
-                tone: Some(if counts.healthy < counts.hosts { "warn" } else { "ok" }.to_string()),
+                tone: Some(if counts.healthy < counts.hosts { "warn" } else { ok }.to_string()),
                 on_activate: move |_| store.set_workspace(Workspace::Hosts),
             }
             FleetTile {
                 label: "OUTDATED".to_string(),
                 value: counts.outdated.to_string(),
                 detail: Some("older revision".to_string()),
-                tone: Some(if counts.outdated > 0 { "warn" } else { "ok" }.to_string()),
+                tone: Some(if counts.outdated > 0 { "warn" } else { ok }.to_string()),
                 on_activate: move |_| store.set_workspace(Workspace::Hosts),
             }
             FleetTile {
                 label: "ALERTS".to_string(),
                 value: counts.alerts.to_string(),
                 detail: Some("services down".to_string()),
-                tone: Some(if counts.alerts > 0 { "bad" } else { "ok" }.to_string()),
+                tone: Some(if counts.alerts > 0 { "bad" } else { ok }.to_string()),
                 on_activate: move |_| store.set_workspace(Workspace::Alerts),
             }
             FleetTile {
                 label: "APPROVALS".to_string(),
                 value: counts.approvals.to_string(),
                 detail: Some("waiting for you".to_string()),
-                tone: Some(if counts.approvals > 0 { "warn" } else { "ok" }.to_string()),
+                tone: Some(if counts.approvals > 0 { "warn" } else { ok }.to_string()),
                 on_activate: move |_| store.set_workspace(Workspace::Approvals),
             }
         }
         div { class: "fleet-split",
             Panel { title: "Needs attention".to_string(), caption: Some(rows.len().to_string()),
                 if rows.is_empty() {
-                    EmptyState { title: "Nothing needs you.".to_string(), hint: None }
+                    EmptyState {
+                        title: (if stale { "No known issues in the last snapshot." } else { "Nothing needs you." }).to_string(),
+                        hint: None,
+                    }
                 } else {
                     div { class: "stack",
                         for (index, row) in rows.iter().enumerate() {
@@ -230,6 +255,7 @@ fn AttentionRow(row: fleet::Attention) -> Element {
 pub fn HostsView() -> Element {
     let store = use_context::<Store>();
     let loaded = (store.fleet).cloned();
+    let stale = not_current(&loaded);
     rsx! {
         main { class: "work",
             div { class: "work-head",
@@ -244,12 +270,16 @@ pub fn HostsView() -> Element {
                     EmptyState { title: "The snapshot lists no hosts.".to_string(), hint: None }
                 },
                 Some(status) => rsx! {
+                    if stale {
+                        NotCurrent {}
+                    }
                     div { class: "host-list",
                         for host in status.hosts.iter() {
                             HostRow {
                                 key: "{host.name}",
                                 host: host.clone(),
                                 target: status.target_revision.clone(),
+                                stale,
                             }
                         }
                     }
@@ -263,10 +293,13 @@ pub fn HostsView() -> Element {
 }
 
 #[component]
-fn HostRow(host: HostStatus, target: Option<String>) -> Element {
+fn HostRow(host: HostStatus, target: Option<String>, stale: bool) -> Element {
     let store = use_context::<Store>();
     let selected = (store.selected_host).cloned() == Some(host.name.clone());
-    let (health_label, health_tone) = labels::health(host.health);
+    let (health_label, health_tone) = match labels::health(host.health) {
+        (label, "ok") if stale => (format!("{label} (last known)"), ""),
+        (label, tone) => (label.to_string(), tone),
+    };
     let (update_label, update_tone) = labels::update_state(host.update_state(target.as_deref()));
     let revision = host.revision.clone().unwrap_or_default();
     let name = host.name.clone();
@@ -290,6 +323,7 @@ fn HostRow(host: HostStatus, target: Option<String>) -> Element {
 pub fn AlertsView() -> Element {
     let store = use_context::<Store>();
     let loaded = (store.fleet).cloned();
+    let stale = not_current(&loaded);
     rsx! {
         main { class: "work",
             div { class: "work-head",
@@ -300,7 +334,12 @@ pub fn AlertsView() -> Element {
                 ErrorCard { code: error.code, message: error.message }
             }
             match loaded.data.clone() {
-                Some(status) => rsx! { AlertsBody { status } },
+                Some(status) => rsx! {
+                    if stale {
+                        NotCurrent {}
+                    }
+                    AlertsBody { status, stale }
+                },
                 None if loaded.error.is_none() => rsx! { Loading { text: "Loading alerts…".to_string() } },
                 None if unconfigured(&loaded) => rsx! { Unconfigured {} },
                 None => rsx! {},
@@ -310,7 +349,7 @@ pub fn AlertsView() -> Element {
 }
 
 #[component]
-fn AlertsBody(status: FleetStatus) -> Element {
+fn AlertsBody(status: FleetStatus, stale: bool) -> Element {
     let groups = fleet::alert_groups(&status.monitoring.alerts);
     rsx! {
         if let Some(error) = status.monitoring.error.clone() {
@@ -321,7 +360,7 @@ fn AlertsBody(status: FleetStatus) -> Element {
         }
         if groups.is_empty() {
             EmptyState {
-                title: "No service alerts.".to_string(),
+                title: (if stale { "No service alerts in the last snapshot." } else { "No service alerts." }).to_string(),
                 hint: Some(format!("{} endpoints monitored.", status.monitoring.monitored)),
             }
         } else {
@@ -362,6 +401,7 @@ fn AlertRow(alert: ServiceAlert) -> Element {
 pub fn ApprovalsView() -> Element {
     let store = use_context::<Store>();
     let loaded = (store.fleet).cloned();
+    let stale = not_current(&loaded);
     rsx! {
         main { class: "work",
             div { class: "work-head",
@@ -372,7 +412,12 @@ pub fn ApprovalsView() -> Element {
                 ErrorCard { code: error.code, message: error.message }
             }
             match loaded.data.clone() {
-                Some(status) => rsx! { ApprovalsBody { status } },
+                Some(status) => rsx! {
+                    if stale {
+                        NotCurrent {}
+                    }
+                    ApprovalsBody { status }
+                },
                 None if loaded.error.is_none() => rsx! { Loading { text: "Loading approvals…".to_string() } },
                 None if unconfigured(&loaded) => rsx! { Unconfigured {} },
                 None => rsx! {},

@@ -47,11 +47,17 @@ pub fn parse_ms(value: &str) -> Option<u64> {
     chrono::DateTime::parse_from_rfc3339(value).ok().map(|time| time.timestamp_millis().max(0) as u64)
 }
 
+/// Clock difference tolerated between the snapshot's writer and this machine.
+const CLOCK_SKEW_MS: u64 = 60 * 1000;
+
+/// `None` when the age is unknowable: an unparsable `generatedAt`, or one
+/// further in the future than clock skew explains.
 pub fn snapshot_age_ms(now_ms: u64, status: &FleetStatus) -> Option<u64> {
-    parse_ms(&status.generated_at).map(|then| now_ms.saturating_sub(then))
+    let then = parse_ms(&status.generated_at)?;
+    (then <= now_ms + CLOCK_SKEW_MS).then(|| now_ms.saturating_sub(then))
 }
 
-/// An unparsable `generatedAt` counts as stale: it must not look healthy.
+/// An unknowable age counts as stale: it must not look healthy.
 pub fn stale(now_ms: u64, status: &FleetStatus) -> bool {
     snapshot_age_ms(now_ms, status).is_none_or(|age| age > STALE_AFTER_MS)
 }
@@ -192,6 +198,9 @@ mod tests {
         assert!(stale(generated + 16 * 60 * 1000, &status));
         assert!(stale(generated + STALE_AFTER_MS + 1, &status));
         assert_eq!(snapshot_age_ms(generated + 60_000, &status), Some(60_000));
+
+        assert!(!stale(generated - 30_000, &status), "small clock skew is tolerated");
+        assert!(stale(generated - 3_600_000, &status), "a snapshot from the future has no known age");
 
         let unparsable = snapshot("yesterday-ish");
         assert_eq!(snapshot_age_ms(0, &unparsable), None);

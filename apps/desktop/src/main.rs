@@ -234,6 +234,8 @@ fn App() -> Element {
     // reads as OK.
     let fleet_loaded = (store.fleet).cloned();
     let fleet_segment = match fleet_loaded.data.as_ref() {
+        // A failed refresh outranks the cached snapshot it leaves behind.
+        _ if fleet_loaded.error.is_some() => shell::StatusSeg { label: "FLEET · UNAVAILABLE".into(), tone: "bad".into() },
         None => shell::StatusSeg { label: "FLEET · UNAVAILABLE".into(), tone: "bad".into() },
         Some(snapshot) if fleet::stale(format::now_ms(), snapshot) => {
             shell::StatusSeg { label: "FLEET · STALE".into(), tone: "warn".into() }
