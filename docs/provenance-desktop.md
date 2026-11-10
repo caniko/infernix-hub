@@ -80,6 +80,43 @@ All donor `assets/logos/*` files were omitted.
 |---|---|---|
 | `HUB_URL` | `http://127.0.0.1:8470` | Hub base URL; the client appends `/v1`. |
 | `HUB_TOKEN` | empty | Operator bearer token. Set it when the hub enforces auth. |
+| `HUB_THEME_FILE` | `$XDG_CONFIG_HOME/fleetix-hub/theme.json` (or `~/.config/…`) | Optional JSON palette override; see below. |
+
+### Theme palette file
+
+The console reads a palette at startup (once per process) from
+`HUB_THEME_FILE`, else `$XDG_CONFIG_HOME/fleetix-hub/theme.json`, else
+`~/.config/fleetix-hub/theme.json`. Every key is optional; each value must be
+a `#rrggbb` string, and anything else is dropped:
+
+| Key | CSS variable |
+|---|---|
+| `bg` | `--bg` |
+| `panel` | `--panel` |
+| `card` | `--card` |
+| `elevated` | `--elevated` |
+| `border` | `--border` |
+| `text` | `--text` |
+| `textMuted` | `--text-2` |
+| `accent` | `--honey` |
+| `focus` | `--focus` |
+| `ok` / `warn` / `bad` / `info` | `--ok` / `--warn` / `--bad` / `--info` |
+
+```json
+{"bg": "#f7f4ec", "panel": "#efe9dc", "card": "#ffffff", "text": "#1d1b16", "accent": "#a86f00"}
+```
+
+The overrides become a second `:root{…}` block appended to the built-in
+stylesheet, so only provided keys change. A missing or malformed file keeps
+the built-in dark palette and logs one line; it never fails startup. Values are
+validated as `#` plus six hex digits before interpolation because they are
+operator-supplied CSS.
+
+Text drawn on an accent (selection, primary/sage buttons, the fixture banner)
+uses `var(--bg)`, so a light palette with a dark accent stays readable. Left
+as-is: the built-in `:root` palette, the `rgba(...)` tints/shadows (pale
+translucent accents over any panel), and `color-scheme: dark` on native
+`<select>` widgets — a light palette still gets dark native select popups.
 
 The console polls `/v1/status` plus the base lists and the selected detail on the
 donor's 1.5s cadence. The fleet snapshot has its own 30s cadence (plus the

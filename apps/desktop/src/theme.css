@@ -48,7 +48,7 @@ h4, h5, h6 { font-family: var(--font-body); font-weight: 600; margin: 0; }
 p { margin: 0 0 6px; }
 a { color: var(--honey); text-decoration: none; }
 a:hover { color: var(--focus); text-decoration: underline; }
-::selection { background: var(--honey); color: #000; }
+::selection { background: var(--honey); color: var(--bg); }
 
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 
@@ -202,7 +202,7 @@ a:hover { color: var(--focus); text-decoration: underline; }
 .fixture-banner {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 18px; flex: 0 0 auto;
-  background: var(--honey); color: #000;
+  background: var(--honey); color: var(--bg);
   font-family: var(--font-mono); font-size: 0.68rem; font-weight: 600;
   letter-spacing: 0.06em; text-transform: uppercase;
 }
@@ -215,12 +215,12 @@ a:hover { color: var(--focus); text-decoration: underline; }
   transition: background 0.15s var(--ease), border-color 0.15s var(--ease), color 0.15s var(--ease);
 }
 .btn:disabled { opacity: 0.45; cursor: default; }
-.btn-primary { background: var(--honey); color: #000; }
+.btn-primary { background: var(--honey); color: var(--bg); }
 .btn-primary:not(:disabled):hover { background: var(--focus); }
 .btn-glass { background: var(--card); border-color: var(--border); color: var(--text); }
 .btn-glass:hover { border-color: var(--honey); color: var(--focus); }
 .btn-glass.danger { color: var(--bad); }
-.btn-sage { background: var(--ok); color: #0b0b09; }
+.btn-sage { background: var(--ok); color: var(--bg); }
 .btn-sage:hover { filter: brightness(1.08); }
 .btn-danger-ghost { background: transparent; border-color: var(--bad); color: var(--bad); }
 .btn-xs { padding: 3px 8px; font-size: 11px; }
