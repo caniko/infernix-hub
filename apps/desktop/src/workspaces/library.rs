@@ -3,10 +3,7 @@
 //! Canon is proposal-only: the rules editor submits `CanonProposalIn`; accepting
 //! a proposal is the only path that changes accepted canon.
 
-use contracts::{
-    client::HubClient, CanonBody, CanonDecisionIn, CanonProposalIn, CanonRevision, CanonSource,
-    CanonState, ChatMessageIn,
-};
+use contracts::{CanonBody, CanonDecisionIn, CanonProposalIn, CanonRevision, CanonSource, CanonState, ChatMessageIn, client::HubClient};
 use dioxus::prelude::*;
 use uuid::Uuid;
 
@@ -35,10 +32,7 @@ pub fn LibraryView() -> Element {
     let mut tab = use_signal(|| Tab::Personas);
     let personas = (store.personas).cloned();
     let selected_persona_id = (store.selected_persona).cloned();
-    let persona = personas
-        .data
-        .as_ref()
-        .and_then(|items| items.iter().find(|p| Some(p.id) == selected_persona_id).cloned());
+    let persona = personas.data.as_ref().and_then(|items| items.iter().find(|p| Some(p.id) == selected_persona_id).cloned());
     let canon_load = (store.canon).cloned();
     let revisions: Vec<CanonRevision> = canon_load
         .data
@@ -61,9 +55,7 @@ pub fn LibraryView() -> Element {
         if form_for.cloned() == Some(persona_id) {
             return;
         }
-        let accepted = revisions
-            .iter()
-            .find(|revision| revision.state == CanonState::Accepted && revision.persona_id == persona_id);
+        let accepted = revisions.iter().find(|revision| revision.state == CanonState::Accepted && revision.persona_id == persona_id);
         voice.set(accepted.map(|r| r.body.voice.clone()).unwrap_or_default());
         rules.set(accepted.map(|r| r.body.rules.clone()).unwrap_or_default());
         avoid.set(accepted.map(|r| r.body.avoid.clone()).unwrap_or_default());
@@ -75,16 +67,9 @@ pub fn LibraryView() -> Element {
     let client_submit_proposal = client.clone();
     let submit_proposal = move |_| {
         let Some(persona_id) = (store.selected_persona).cloned() else { return };
-        let base_revision = (store.canon).cloned()
-            .data
-            .as_ref()
-            .and_then(|revisions| {
-                revisions
-                    .iter()
-                    .filter(|revision| revision.state == CanonState::Accepted)
-                    .map(|revision| revision.revision)
-                    .max()
-            });
+        let base_revision = (store.canon).cloned().data.as_ref().and_then(|revisions| {
+            revisions.iter().filter(|revision| revision.state == CanonState::Accepted).map(|revision| revision.revision).max()
+        });
         let body = CanonBody { voice: voice.cloned(), rules: rules.cloned(), avoid: avoid.cloned(), world: world.cloned() };
         let rationale_value = rationale.cloned().trim().to_string();
         let input = CanonProposalIn {
@@ -477,13 +462,7 @@ pub fn LibraryView() -> Element {
 }
 
 fn describe_canon(body: &CanonBody) -> String {
-    format!(
-        "{} · {} rules · {} avoid · {} world",
-        body.voice,
-        body.rules.len(),
-        body.avoid.len(),
-        body.world.len()
-    )
+    format!("{} · {} rules · {} avoid · {} world", body.voice, body.rules.len(), body.avoid.len(), body.world.len())
 }
 
 fn transcript(messages: &[contracts::ChatMessage]) -> Vec<TranscriptLine> {

@@ -4,11 +4,8 @@
 use std::collections::HashMap;
 
 use chrono::{Duration as ChronoDuration, Utc};
-use contracts::{
-    CancelOut, ChatMessageIn, FreezeReleaseIn, GenerateIn, ReleaseState, ScheduleIn, SelectAssetIn,
-    TimingScope,
-};
 use contracts::client::HubClient;
+use contracts::{CancelOut, ChatMessageIn, FreezeReleaseIn, GenerateIn, ReleaseState, ScheduleIn, SelectAssetIn, TimingScope};
 use dioxus::prelude::*;
 use uuid::Uuid;
 
@@ -32,11 +29,7 @@ pub fn StudioView() -> Element {
     let detail = (store.content_detail).cloned();
     let selected_id = (store.selected_content).cloned();
     let detail_error = detail.error.clone();
-    let selected = detail
-        .data
-        .as_ref()
-        .filter(|d| Some(d.item.id) == selected_id)
-        .cloned();
+    let selected = detail.data.as_ref().filter(|d| Some(d.item.id) == selected_id).cloned();
 
     let mut workflow_id = use_signal(|| Option::<Uuid>::None);
     let mut variants = use_signal(|| "4".to_string());
@@ -109,10 +102,7 @@ pub fn StudioView() -> Element {
         spawn(async move {
             match api::timed(client_generate.generate(content_id, &body)).await {
                 Ok(generation) => {
-                    store.notify(
-                        true,
-                        format!("Generation {} dispatched.", format::short_hash(&generation.id.to_string())),
-                    );
+                    store.notify(true, format!("Generation {} dispatched.", format::short_hash(&generation.id.to_string())));
                     api::load_content_detail(store, client_generate.clone(), content_id).await;
                     api::refresh_base(store, client_generate).await;
                 }
@@ -221,7 +211,8 @@ pub fn StudioView() -> Element {
             store.notify(false, "That message has no attached proposal.");
             return;
         };
-        let persona = (store.content_detail).cloned()
+        let persona = (store.content_detail)
+            .cloned()
             .data
             .as_ref()
             .filter(|d| Some(d.item.id) == (store.selected_content).cloned())
@@ -730,9 +721,7 @@ fn transcript(messages: &[contracts::ChatMessage]) -> Vec<TranscriptLine> {
         .map(|message| TranscriptLine {
             role: message.role.clone(),
             text: message.body.clone(),
-            proposal: message
-                .proposal_id
-                .map(|_| "Review canon proposal".to_string()),
+            proposal: message.proposal_id.map(|_| "Review canon proposal".to_string()),
         })
         .collect()
 }

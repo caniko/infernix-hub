@@ -145,22 +145,22 @@ fn App() -> Element {
         );
         while let Ok(message) = eval.recv::<String>().await {
             match message.as_str() {
-                    "palette" => store.set_palette_open(true),
-                    "escape" => {
-                        if (store.palette_open).cloned() {
-                            store.set_palette_open(false);
-                        } else if (store.inspector_open).cloned() {
-                            store.set_inspector_open(false);
-                        } else {
-                            store.set_nav_open(false);
-                        }
+                "palette" => store.set_palette_open(true),
+                "escape" => {
+                    if (store.palette_open).cloned() {
+                        store.set_palette_open(false);
+                    } else if (store.inspector_open).cloned() {
+                        store.set_inspector_open(false);
+                    } else {
+                        store.set_nav_open(false);
                     }
-                    "ws:1" => store.set_workspace(Workspace::Today),
-                    "ws:2" => store.set_workspace(Workspace::News),
-                    "ws:3" => store.set_workspace(Workspace::Studio),
-                    "ws:4" => store.set_workspace(Workspace::Calendar),
-                    "ws:5" => store.set_workspace(Workspace::Relationships),
-                    "ws:6" => store.set_workspace(Workspace::Library),
+                }
+                "ws:1" => store.set_workspace(Workspace::Today),
+                "ws:2" => store.set_workspace(Workspace::News),
+                "ws:3" => store.set_workspace(Workspace::Studio),
+                "ws:4" => store.set_workspace(Workspace::Calendar),
+                "ws:5" => store.set_workspace(Workspace::Relationships),
+                "ws:6" => store.set_workspace(Workspace::Library),
                 _ => {}
             }
         }
@@ -198,45 +198,35 @@ fn App() -> Element {
     if status.data.as_ref().is_some_and(|status| status.production_paused) {
         segments.push(shell::StatusSeg { label: "PRODUCTION PAUSED".into(), tone: "warn".into() });
     }
-    let api_version = status
-        .data
-        .as_ref()
-        .map(|status| status.api_version.clone())
-        .unwrap_or_else(|| "v1".into());
+    let api_version = status.data.as_ref().map(|status| status.api_version.clone()).unwrap_or_else(|| "v1".into());
 
     let inspector_data: Option<inspector::InspectorData> = match (store.workspace).cloned() {
-        Workspace::Studio => (store.content_detail).cloned()
+        Workspace::Studio => (store.content_detail)
+            .cloned()
             .data
             .as_ref()
             .filter(|detail| Some(detail.item.id) == (store.selected_content).cloned())
             .map(inspector::from_content),
-        Workspace::Relationships => (store.relationship_detail).cloned()
+        Workspace::Relationships => (store.relationship_detail)
+            .cloned()
             .data
             .as_ref()
             .filter(|detail| Some(detail.relationship.id) == (store.selected_relationship).cloned())
             .map(inspector::from_relationship),
         Workspace::Library => {
             let canon = (store.canon).cloned();
-            (store.personas).cloned()
+            (store.personas)
+                .cloned()
                 .data
                 .as_ref()
-                .and_then(|personas| {
-                    personas
-                        .iter()
-                        .find(|persona| Some(persona.id) == (store.selected_persona).cloned())
-                })
-                .map(|persona| {
-                    inspector::from_persona(persona, canon.data.as_deref().unwrap_or(&[]))
-                })
+                .and_then(|personas| personas.iter().find(|persona| Some(persona.id) == (store.selected_persona).cloned()))
+                .map(|persona| inspector::from_persona(persona, canon.data.as_deref().unwrap_or(&[])))
         }
-        Workspace::News => (store.news).cloned()
+        Workspace::News => (store.news)
+            .cloned()
             .data
             .as_ref()
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find(|item| Some(item.id) == (store.selected_news).cloned())
-            })
+            .and_then(|items| items.iter().find(|item| Some(item.id) == (store.selected_news).cloned()))
             .map(inspector::from_news),
         _ => None,
     };
@@ -246,9 +236,7 @@ fn App() -> Element {
         store.set_palette_open(false);
         match action {
             actions::Action::Workspace(workspace) => store.set_workspace(workspace),
-            actions::Action::ToggleInspector => {
-                store.toggle_inspector()
-            }
+            actions::Action::ToggleInspector => store.toggle_inspector(),
             actions::Action::Refresh => {
                 let client = action_client.clone();
                 spawn(async move {
@@ -256,9 +244,7 @@ fn App() -> Element {
                     api::refresh_selected(store, client).await;
                 });
             }
-            actions::Action::OpenSubject(subject_type, id) => {
-                actions::open_subject(store, &subject_type, id)
-            }
+            actions::Action::OpenSubject(subject_type, id) => actions::open_subject(store, &subject_type, id),
         }
     };
 

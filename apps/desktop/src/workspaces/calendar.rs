@@ -223,7 +223,5 @@ pub fn CalendarView() -> Element {
 }
 
 fn day_heading(day: &str) -> String {
-    NaiveDate::parse_from_str(day, "%Y-%m-%d")
-        .map(format::fmt_day)
-        .unwrap_or_else(|_| day.to_string())
+    NaiveDate::parse_from_str(day, "%Y-%m-%d").map(format::fmt_day).unwrap_or_else(|_| day.to_string())
 }

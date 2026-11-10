@@ -6,8 +6,7 @@ use dioxus::prelude::*;
 use crate::{
     actions,
     components::{Chip, EmptyState, ErrorCard, Loading, Panel, StatCard},
-    format,
-    labels,
+    format, labels,
     shell::ContextItem,
     state::Store,
 };

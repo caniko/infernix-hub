@@ -124,13 +124,7 @@ pub fn ProposalCard(
 /// the first arms it, the second confirms. Reverting canon is not possible via
 /// the contract, so the confirm pattern is used for irreversible cancels.
 #[component]
-pub fn DeltaRow(
-    seq: String,
-    category: String,
-    description: String,
-    action: Option<String>,
-    on_confirm: EventHandler<()>,
-) -> Element {
+pub fn DeltaRow(seq: String, category: String, description: String, action: Option<String>, on_confirm: EventHandler<()>) -> Element {
     let mut confirming = use_signal(|| false);
     rsx! {
         div { class: "delta-row",
@@ -168,12 +162,7 @@ pub fn DeltaRow(
 /// the parent's signal, so its Save handler reads the live list. Used for
 /// persona rules / avoid / world lists before submitting a canon proposal.
 #[component]
-pub fn ListEditor(
-    title: String,
-    hint: String,
-    items: Signal<Vec<String>>,
-    placeholder: String,
-) -> Element {
+pub fn ListEditor(title: String, hint: String, items: Signal<Vec<String>>, placeholder: String) -> Element {
     let mut items = items;
     let mut draft = use_signal(String::new);
     let add = move |_: MouseEvent| {

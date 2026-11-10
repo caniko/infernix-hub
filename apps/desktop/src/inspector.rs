@@ -41,10 +41,7 @@ fn history(entries: &[contracts::HistoryEntry]) -> Vec<HistoryLine> {
 }
 
 fn optional(label: &str, value: &Option<String>) -> Option<(String, String)> {
-    value
-        .as_ref()
-        .filter(|v| !v.is_empty())
-        .map(|v| (label.to_string(), v.clone()))
+    value.as_ref().filter(|v| !v.is_empty()).map(|v| (label.to_string(), v.clone()))
 }
 
 pub fn from_content(detail: &ContentDetail) -> InspectorData {
@@ -65,12 +62,7 @@ pub fn from_content(detail: &ContentDetail) -> InspectorData {
     for generation in &detail.generations {
         foreign.push((
             format!("workflow {}", short_hash(&generation.workflow_id.to_string())),
-            format!(
-                "request v{} · {} variants · {} attempts",
-                generation.request_version,
-                generation.variants,
-                generation.attempts.len()
-            ),
+            format!("request v{} · {} variants · {} attempts", generation.request_version, generation.variants, generation.attempts.len()),
         ));
     }
     for asset in &detail.assets {
@@ -93,10 +85,7 @@ pub fn from_content(detail: &ContentDetail) -> InspectorData {
         ids: vec![
             ("content id".into(), item.id.to_string()),
             ("persona id".into(), item.persona_id.to_string()),
-            (
-                "news item id".into(),
-                item.news_item_id.map(|id| id.to_string()).unwrap_or_else(|| "—".into()),
-            ),
+            ("news item id".into(), item.news_item_id.map(|id| id.to_string()).unwrap_or_else(|| "—".into())),
             ("state".into(), item.state.to_string()),
             ("created".into(), fmt_dt(item.created_at)),
             ("updated".into(), fmt_dt(item.updated_at)),
@@ -131,15 +120,9 @@ pub fn from_relationship(detail: &RelationshipDetail) -> InspectorData {
             ("thread".into(), relationship.external_thread_id.clone()),
             ("counterpart".into(), relationship.counterpart.clone()),
             ("owner".into(), relationship.owner.to_string()),
-            (
-                "owner user".into(),
-                relationship.owner_user.clone().unwrap_or_else(|| "—".into()),
-            ),
+            ("owner user".into(), relationship.owner_user.clone().unwrap_or_else(|| "—".into())),
             ("owner epoch".into(), relationship.owner_epoch.to_string()),
-            (
-                "follow up".into(),
-                relationship.follow_up_at.map(fmt_dt).unwrap_or_else(|| "—".into()),
-            ),
+            ("follow up".into(), relationship.follow_up_at.map(fmt_dt).unwrap_or_else(|| "—".into())),
         ],
         foreign,
         payload_hash: None,
@@ -149,9 +132,7 @@ pub fn from_relationship(detail: &RelationshipDetail) -> InspectorData {
 }
 
 pub fn from_persona(persona: &Persona, revisions: &[CanonRevision]) -> InspectorData {
-    let accepted = revisions
-        .iter()
-        .find(|revision| revision.state == contracts::CanonState::Accepted);
+    let accepted = revisions.iter().find(|revision| revision.state == contracts::CanonState::Accepted);
     let mut ordered: Vec<&CanonRevision> = revisions.iter().collect();
     ordered.sort_by_key(|revision| std::cmp::Reverse(revision.revision));
     let history: Vec<HistoryLine> = ordered
@@ -169,19 +150,10 @@ pub fn from_persona(persona: &Persona, revisions: &[CanonRevision]) -> Inspector
         ids: vec![
             ("persona id".into(), persona.id.to_string()),
             ("company".into(), persona.company_id.clone()),
-            (
-                "accepted revision".into(),
-                persona
-                    .canon
-                    .as_ref()
-                    .map(|canon| canon.revision.to_string())
-                    .unwrap_or_else(|| "—".into()),
-            ),
+            ("accepted revision".into(), persona.canon.as_ref().map(|canon| canon.revision.to_string()).unwrap_or_else(|| "—".into())),
             ("pending proposals".into(), persona.pending_proposals.to_string()),
         ],
-        foreign: accepted
-            .map(|revision| vec![("canon id".into(), revision.id.to_string())])
-            .unwrap_or_default(),
+        foreign: accepted.map(|revision| vec![("canon id".into(), revision.id.to_string())]).unwrap_or_default(),
         payload_hash: None,
         raw: pretty(&(persona, revisions)),
         history,
@@ -197,10 +169,7 @@ pub fn from_news(item: &NewsItem) -> InspectorData {
             ("coverage".into(), item.coverage.to_string()),
             ("sources".into(), item.sources.join(", ")),
             ("first seen".into(), fmt_dt(item.first_seen_at)),
-            (
-                "content item".into(),
-                item.content_item_id.map(|id| id.to_string()).unwrap_or_else(|| "—".into()),
-            ),
+            ("content item".into(), item.content_item_id.map(|id| id.to_string()).unwrap_or_else(|| "—".into())),
         ],
         foreign: vec![("canonical url".into(), item.canonical_url.clone())],
         payload_hash: None,

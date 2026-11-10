@@ -2,8 +2,8 @@
 //! label as text; the tone only colours the background.
 
 use contracts::{
-    AdapterMode, AssetState, AttemptKind, AttemptState, CanonState, ContentState, Direction,
-    DraftState, GenerationState, IntentState, Owner, ReleaseState, Verification,
+    AdapterMode, AssetState, AttemptKind, AttemptState, CanonState, ContentState, Direction, DraftState, GenerationState, IntentState,
+    Owner, ReleaseState, Verification,
 };
 
 #[cfg(test)]

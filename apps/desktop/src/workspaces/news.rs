@@ -18,10 +18,7 @@ pub fn NewsView() -> Element {
     let client = use_context::<contracts::client::HubClient>();
     let news = (store.news).cloned();
     let selected_id = (store.selected_news).cloned();
-    let selected: Option<NewsItem> = news
-        .data
-        .as_ref()
-        .and_then(|items| items.iter().find(|item| Some(item.id) == selected_id).cloned());
+    let selected: Option<NewsItem> = news.data.as_ref().and_then(|items| items.iter().find(|item| Some(item.id) == selected_id).cloned());
 
     let mut persona = use_signal(|| Option::<Uuid>::None);
     let mut title = use_signal(String::new);

@@ -1,9 +1,6 @@
 //! Relationships: thread, ownership epoch, reply drafts and approval gates.
 
-use contracts::{
-    client::HubClient, DraftDecisionIn, DraftReplyIn, DraftState, FollowUpIn, Owner,
-    RelationshipDetail,
-};
+use contracts::{DraftDecisionIn, DraftReplyIn, DraftState, FollowUpIn, Owner, RelationshipDetail, client::HubClient};
 use dioxus::prelude::*;
 use uuid::Uuid;
 
@@ -22,11 +19,8 @@ pub fn RelationshipsView() -> Element {
     let relationships = (store.relationships).cloned();
     let detail_load = (store.relationship_detail).cloned();
     let selected_id = (store.selected_relationship).cloned();
-    let detail: Option<RelationshipDetail> = detail_load
-        .data
-        .as_ref()
-        .filter(|detail| Some(detail.relationship.id) == selected_id)
-        .cloned();
+    let detail: Option<RelationshipDetail> =
+        detail_load.data.as_ref().filter(|detail| Some(detail.relationship.id) == selected_id).cloned();
 
     let mut draft_body = use_signal(String::new);
     let mut in_reply_to = use_signal(|| Option::<Uuid>::None);
@@ -48,7 +42,8 @@ pub fn RelationshipsView() -> Element {
 
     let client_submit_draft = client.clone();
     let submit_draft = move |_| {
-        let Some(detail) = (store.relationship_detail).cloned()
+        let Some(detail) = (store.relationship_detail)
+            .cloned()
             .data
             .filter(|detail| Some(detail.relationship.id) == (store.selected_relationship).cloned())
         else {
@@ -59,11 +54,7 @@ pub fn RelationshipsView() -> Element {
             store.notify(false, "Draft body cannot be empty.");
             return;
         }
-        let input = DraftReplyIn {
-            in_reply_to: in_reply_to.cloned(),
-            body,
-            owner_epoch: detail.relationship.owner_epoch,
-        };
+        let input = DraftReplyIn { in_reply_to: in_reply_to.cloned(), body, owner_epoch: detail.relationship.owner_epoch };
         let relationship_id = detail.relationship.id;
         let client_submit_draft = client_submit_draft.clone();
         spawn(async move {
@@ -141,11 +132,7 @@ pub fn RelationshipsView() -> Element {
         let client_save_follow_up = client_save_follow_up.clone();
         spawn(async move {
             let path = format!("/relationships/{id}/follow-up");
-            match api::timed(
-                client_save_follow_up.post::<FollowUpIn, contracts::Relationship>(&path, &FollowUpIn { follow_up_at }),
-            )
-            .await
-            {
+            match api::timed(client_save_follow_up.post::<FollowUpIn, contracts::Relationship>(&path, &FollowUpIn { follow_up_at })).await {
                 Ok(_) => {
                     store.notify(true, "Follow-up updated.");
                     api::load_relationship_detail(store, client_save_follow_up, id).await;

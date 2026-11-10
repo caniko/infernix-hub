@@ -36,21 +36,15 @@ pub fn CommandPalette(on_action: EventHandler<Action>, on_close: EventHandler<()
     let needle = query.cloned();
     let all_actions = actions::static_entries();
     let labels: Vec<&str> = all_actions.iter().map(|entry| entry.label.as_str()).collect();
-    let mut entries: Vec<PaletteEntry> = fuzzy_filter(&needle, &labels)
-        .into_iter()
-        .filter_map(|index| all_actions.get(index).cloned())
-        .collect();
+    let mut entries: Vec<PaletteEntry> =
+        fuzzy_filter(&needle, &labels).into_iter().filter_map(|index| all_actions.get(index).cloned()).collect();
     if !needle.trim().is_empty()
         && let Some(hits) = (store.search).cloned().data
     {
         entries.extend(hits.iter().map(actions::search_entry));
     }
 
-    let selected = if entries.is_empty() {
-        0
-    } else {
-        active.cloned().min(entries.len() - 1)
-    };
+    let selected = if entries.is_empty() { 0 } else { active.cloned().min(entries.len() - 1) };
     let key_entries = entries.clone();
     let mut rows: Vec<(bool, PaletteEntry)> = Vec::new();
     let mut previous_kind = "";

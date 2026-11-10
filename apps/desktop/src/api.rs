@@ -7,8 +7,8 @@
 use std::{future::Future, time::Duration};
 
 use contracts::{
-    client::{ClientError, HubClient},
     Asset, AssetState, ContentItem, PublicationIntent,
+    client::{ClientError, HubClient},
 };
 use dioxus::prelude::*;
 use uuid::Uuid;
@@ -30,9 +30,7 @@ pub fn make_client() -> HubClient {
     HubClient::new(base, token)
 }
 
-pub async fn timed<T>(
-    future: impl Future<Output = Result<T, ClientError>>,
-) -> Result<T, UiError> {
+pub async fn timed<T>(future: impl Future<Output = Result<T, ClientError>>) -> Result<T, UiError> {
     match tokio::time::timeout(REQUEST_TIMEOUT, future).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(UiError::from_client(error)),
@@ -107,11 +105,7 @@ pub async fn refresh_base(store: Store, client: HubClient) {
     store.set_poll_busy(false);
 }
 
-fn ensure_selection<T: 'static>(
-    loaded: Loaded<Vec<T>>,
-    mut selection: Signal<Option<Uuid>>,
-    id: impl Fn(&T) -> Uuid,
-) {
+fn ensure_selection<T: 'static>(loaded: Loaded<Vec<T>>, mut selection: Signal<Option<Uuid>>, id: impl Fn(&T) -> Uuid) {
     let Some(items) = loaded.data else { return };
     if let Some(current) = selection.cloned()
         && items.iter().any(|item| id(item) == current)
@@ -162,11 +156,7 @@ pub async fn load_canon(store: Store, client: HubClient, persona: Uuid) {
 }
 
 pub async fn load_chat(store: Store, client: HubClient, subject: &'static str, id: Uuid) {
-    let signal = if subject == "persona" {
-        store.chat_persona
-    } else {
-        store.chat_content
-    };
+    let signal = if subject == "persona" { store.chat_persona } else { store.chat_content };
     match timed(client.chat(subject, id)).await {
         Ok(messages) => put(signal, messages),
         Err(error) => keep(signal, error),
@@ -190,12 +180,7 @@ pub async fn refresh_selected(store: Store, client: HubClient) {
 /// contract does not expose approval state, so this reads content details in
 /// bounded batches (see the contract request in docs/provenance-desktop.md).
 pub async fn load_release_index(store: Store, client: HubClient, content: &[ContentItem]) {
-    let pending: Vec<Uuid> = content
-        .iter()
-        .map(|item| item.id)
-        .filter(|id| !store.is_release_indexed(*id))
-        .take(20)
-        .collect();
+    let pending: Vec<Uuid> = content.iter().map(|item| item.id).filter(|id| !store.is_release_indexed(*id)).take(20).collect();
     for content_id in pending {
         if let Ok(detail) = timed(client.content_detail(content_id)).await {
             for release in detail.releases {
@@ -225,9 +210,7 @@ pub fn data_uri(mime: &str, bytes: &[u8]) -> String {
 /// before it reaches the webview, so a hostile `HandoffOut.url` cannot inject JS.
 pub fn open_external(url: &str) {
     if let Ok(js_url) = serde_json::to_string(url) {
-        let _ = document::eval(&format!(
-            "window.open({js_url}, '_blank', 'noopener,noreferrer');"
-        ));
+        let _ = document::eval(&format!("window.open({js_url}, '_blank', 'noopener,noreferrer');"));
     }
 }
 
@@ -256,11 +239,7 @@ pub fn group_intents(intents: &[PublicationIntent]) -> Vec<IntentDay> {
     let mut days: BTreeMap<String, BTreeMap<String, Vec<PublicationIntent>>> = BTreeMap::new();
     for intent in intents {
         let day = intent.due_at.format("%Y-%m-%d").to_string();
-        days.entry(day)
-            .or_default()
-            .entry(intent.account_id.clone())
-            .or_default()
-            .push(intent.clone());
+        days.entry(day).or_default().entry(intent.account_id.clone()).or_default().push(intent.clone());
     }
     days.into_iter()
         .map(|(day, accounts)| {
@@ -311,11 +290,7 @@ mod tests {
     #[test]
     fn attempt_progress_counts_terminal_states() {
         use contracts::AttemptState;
-        let attempts = [
-            attempt(AttemptState::Succeeded),
-            attempt(AttemptState::Running),
-            attempt(AttemptState::Failed),
-        ];
+        let attempts = [attempt(AttemptState::Succeeded), attempt(AttemptState::Running), attempt(AttemptState::Failed)];
         assert_eq!(attempt_progress(&attempts), (2, 3));
         assert_eq!(attempt_progress(&[]), (0, 0));
     }

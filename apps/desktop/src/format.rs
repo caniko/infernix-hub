@@ -6,10 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Milliseconds since the unix epoch, or 0 when the clock is before it.
 pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// Relative time from a unix-ms timestamp (donor `rel_time`). Timestamps in the
@@ -46,7 +43,6 @@ pub fn preview(text: &str, max: usize) -> String {
         out
     }
 }
-
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
@@ -105,11 +101,8 @@ pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
 
 /// Indices of `haystacks` matching `needle`, best first.
 pub fn fuzzy_filter(needle: &str, haystacks: &[&str]) -> Vec<usize> {
-    let mut matches: Vec<(i32, usize)> = haystacks
-        .iter()
-        .enumerate()
-        .filter_map(|(index, text)| fuzzy_score(needle, text).map(|score| (score, index)))
-        .collect();
+    let mut matches: Vec<(i32, usize)> =
+        haystacks.iter().enumerate().filter_map(|(index, text)| fuzzy_score(needle, text).map(|score| (score, index))).collect();
     matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     matches.into_iter().map(|(_, index)| index).collect()
 }

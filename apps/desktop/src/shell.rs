@@ -31,12 +31,7 @@ pub fn Sidebar(workspace: Signal<Workspace>, nav_open: Signal<bool>) -> Element 
 }
 
 #[component]
-fn NavItem(
-    workspace: Signal<Workspace>,
-    nav_open: Signal<bool>,
-    target: Workspace,
-    index: usize,
-) -> Element {
+fn NavItem(workspace: Signal<Workspace>, nav_open: Signal<bool>, target: Workspace, index: usize) -> Element {
     let active = workspace.cloned() == target;
     let mut workspace = workspace;
     let mut nav_open = nav_open;
@@ -128,12 +123,7 @@ pub fn StatusBar(connected: bool, items: Vec<StatusSeg>, right: String) -> Eleme
 
 /// A context-list row. Always a `<button>`: selection is an action.
 #[component]
-pub fn ContextItem(
-    title: String,
-    meta: String,
-    active: bool,
-    on_select: EventHandler<()>,
-) -> Element {
+pub fn ContextItem(title: String, meta: String, active: bool, on_select: EventHandler<()>) -> Element {
     rsx! {
         button {
             class: if active { "context-item active" } else { "context-item" },

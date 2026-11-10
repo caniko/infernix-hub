@@ -5,9 +5,8 @@
 use std::collections::{HashMap, HashSet};
 
 use contracts::{
-    Account, Asset, CanonRevision, ChatMessage, ContentDetail, ContentItem, NewsItem, Persona,
-    PublicationIntent, Relationship, RelationshipDetail, ReleaseState, SearchHit, SystemStatus, Today,
-    Workflow,
+    Account, Asset, CanonRevision, ChatMessage, ContentDetail, ContentItem, NewsItem, Persona, PublicationIntent, Relationship,
+    RelationshipDetail, ReleaseState, SearchHit, SystemStatus, Today, Workflow,
 };
 use dioxus::prelude::*;
 use uuid::Uuid;
@@ -24,14 +23,8 @@ pub enum Workspace {
 }
 
 impl Workspace {
-    pub const ALL: [Workspace; 6] = [
-        Workspace::Today,
-        Workspace::News,
-        Workspace::Studio,
-        Workspace::Calendar,
-        Workspace::Relationships,
-        Workspace::Library,
-    ];
+    pub const ALL: [Workspace; 6] =
+        [Workspace::Today, Workspace::News, Workspace::Studio, Workspace::Calendar, Workspace::Relationships, Workspace::Library];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -74,14 +67,10 @@ impl UiError {
 
     pub fn from_client(error: contracts::client::ClientError) -> Self {
         match error {
-            contracts::client::ClientError::Api { status, error } => Self {
-                code: error.code,
-                message: format!("{} (HTTP {status})", error.message),
-            },
-            contracts::client::ClientError::Transport(message) => Self {
-                code: "transport".into(),
-                message,
-            },
+            contracts::client::ClientError::Api { status, error } => {
+                Self { code: error.code, message: format!("{} (HTTP {status})", error.message) }
+            }
+            contracts::client::ClientError::Transport(message) => Self { code: "transport".into(), message },
         }
     }
 }
