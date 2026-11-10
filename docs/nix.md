@@ -81,7 +81,7 @@ nix build .#checks.x86_64-linux.module-eval-live
 `services.fleetix-hub`.
 
 - `package`, `bind`, `publicUrl`, `companyId`, `assetDir`, `seedFile`,
-  `environment`.
+  `fleetStatusFile`, `environment`.
 - `database`: `createLocally`, `name`, `url`, `urlFile`,
   `migrationsUser`, `migrationsGroup`; `migrations.enable`.
 - `integrations`: `paperclip`, `windmill`, `comfy`, `assistant`
@@ -205,6 +205,21 @@ Integration credentials (`credentials.paperclipToken`, `windmillToken`,
 `postizToken`) are also `LoadCredential` entries exposed as
 `PAPERCLIP_TOKEN_FILE`, `WINDMILL_TOKEN_FILE`, and `POSTIZ_TOKEN_FILE`. Point
 them at agenix paths; plaintext never goes into the store.
+
+### Fleet status snapshot
+
+`fleetStatusFile` (null by default) points at the `fleetix::status::FleetStatus`
+JSON that `canix fleet status --write` rewrites atomically every few minutes.
+The module exports it as `HUB_FLEET_STATUS_FILE` and `GET /v1/fleet/status`
+re-reads the file per request; the hub never collects fleet data itself. Unset
+means the route answers `404 fleet_status_unconfigured`.
+
+The unit runs with `ProtectHome` and `ProtectSystem=strict`, so the module
+bind-mounts the snapshot's **parent directory** read-only (`BindReadOnlyPaths`).
+Binding the file inode would keep serving the pre-replacement file, because an
+atomic write renames a new inode into place; binding the directory keeps
+replacements visible. Put the file where the writer can atomically rename
+within that directory (for example `/var/lib/fleet-status/fleet.json`).
 
 ### Assertions
 

@@ -2,6 +2,7 @@
 //! call the shared `hub-domain` command, map errors. Business rules live in
 //! the domain so the UI, CLI and agent tools share one authorization path.
 
+use std::path::Path as FsPath;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -22,13 +23,23 @@ pub struct AppState {
     pub hub: Hub,
     /// Present in fixture mode so the operator can act as the Paperclip board.
     pub fixture_paperclip: Option<Arc<integrations::fixture::FixturePaperclip>>,
+    /// Fleet snapshot path; `None` means the hub serves no fleet section.
+    pub fleet_status_file: Option<std::path::PathBuf>,
 }
 
-pub struct ApiErr(DomainError, Option<String>);
+/// An API failure in the wire error shape. Domain outcomes keep their stable
+/// codes; `coded` covers failures outside the domain, such as an unreadable
+/// fleet snapshot.
+pub struct ApiErr {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    correlation_id: Option<String>,
+}
 
-impl IntoResponse for ApiErr {
-    fn into_response(self) -> Response {
-        let status = match &self.0 {
+impl ApiErr {
+    fn domain(error: DomainError, correlation_id: Option<String>) -> Self {
+        let status = match &error {
             DomainError::Forbidden(_) => StatusCode::FORBIDDEN,
             DomainError::NotFound(_) => StatusCode::NOT_FOUND,
             DomainError::Conflict { .. } => StatusCode::CONFLICT,
@@ -36,15 +47,26 @@ impl IntoResponse for ApiErr {
             DomainError::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             DomainError::Db(_) | DomainError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let message = match &self.0 {
+        let message = match &error {
             // Do not leak SQL details to callers.
             DomainError::Db(e) => {
-                tracing::error!(error = %e, correlation_id = ?self.1, "database error");
+                tracing::error!(error = %e, correlation_id = ?correlation_id, "database error");
                 "database error".to_string()
             }
             e => e.to_string(),
         };
-        (status, Json(ApiError { code: self.0.code().into(), message, correlation_id: self.1 })).into_response()
+        Self { status, code: error.code(), message, correlation_id }
+    }
+
+    fn coded(status: StatusCode, code: &'static str, message: impl Into<String>, correlation_id: Option<String>) -> Self {
+        Self { status, code, message: message.into(), correlation_id }
+    }
+}
+
+impl IntoResponse for ApiErr {
+    fn into_response(self) -> Response {
+        let error = ApiError { code: self.code.into(), message: self.message, correlation_id: self.correlation_id };
+        (self.status, Json(error)).into_response()
     }
 }
 
@@ -69,18 +91,18 @@ impl FromRequestParts<AppState> for Caller {
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| ApiErr(DomainError::Forbidden("missing bearer token".into()), Some(correlation_id.clone())))?;
+            .ok_or_else(|| ApiErr::domain(DomainError::Forbidden("missing bearer token".into()), Some(correlation_id.clone())))?;
         let principal = domain::system::authenticate(&state.hub, token)
             .await
-            .map_err(|e| ApiErr(e, Some(correlation_id.clone())))?
-            .ok_or_else(|| ApiErr(DomainError::Forbidden("unknown token".into()), Some(correlation_id.clone())))?;
+            .map_err(|e| ApiErr::domain(e, Some(correlation_id.clone())))?
+            .ok_or_else(|| ApiErr::domain(DomainError::Forbidden("unknown token".into()), Some(correlation_id.clone())))?;
         tracing::Span::current().record("correlation_id", correlation_id.as_str());
         Ok(Caller(Actor { principal, correlation_id: Some(correlation_id) }))
     }
 }
 
 fn err(actor: &Actor) -> impl Fn(DomainError) -> ApiErr + '_ {
-    move |e| ApiErr(e, actor.correlation_id.clone())
+    move |e| ApiErr::domain(e, actor.correlation_id.clone())
 }
 
 macro_rules! call {
@@ -92,6 +114,7 @@ macro_rules! call {
 pub fn router(state: AppState) -> Router {
     let v1 = Router::new()
         .route("/status", get(status))
+        .route("/fleet/status", get(fleet_status))
         .route("/system/pause", post(set_pause))
         .route("/today", get(today))
         .route("/search", get(search))
@@ -153,6 +176,54 @@ async fn openapi() -> impl IntoResponse {
 
 async fn status(State(s): State<AppState>, Caller(a): Caller) -> R<SystemStatus> {
     call!(a, domain::system::status(&s.hub, &a))
+}
+
+/// Why the fleet snapshot could not be served. The codes are stable: the
+/// desktop and CLI branch on them.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FleetStatusError {
+    /// `HUB_FLEET_STATUS_FILE` is not set.
+    Unconfigured,
+    /// The file is missing or unreadable.
+    Unavailable(String),
+    /// Not a snapshot, or a schema version this hub does not know.
+    Invalid(String),
+}
+
+/// Read the snapshot another tool rewrites atomically every few minutes.
+///
+/// Re-read per request: the file is small, and a cache would only add
+/// staleness. `tokio::fs` keeps the read off the runtime threads.
+pub async fn read_fleet_status(path: Option<&FsPath>) -> Result<contracts::fleet::FleetStatus, FleetStatusError> {
+    let Some(path) = path else { return Err(FleetStatusError::Unconfigured) };
+    let body = tokio::fs::read_to_string(path).await.map_err(|e| FleetStatusError::Unavailable(format!("{}: {e}", path.display())))?;
+    let status: contracts::fleet::FleetStatus = serde_json::from_str(&body).map_err(|e| FleetStatusError::Invalid(e.to_string()))?;
+    if status.schema_version != contracts::fleet::SCHEMA_VERSION {
+        return Err(FleetStatusError::Invalid(format!(
+            "schemaVersion {} is not {}",
+            status.schema_version,
+            contracts::fleet::SCHEMA_VERSION
+        )));
+    }
+    Ok(status)
+}
+
+fn fleet_error(error: FleetStatusError, correlation_id: Option<String>) -> ApiErr {
+    match error {
+        FleetStatusError::Unconfigured => {
+            ApiErr::coded(StatusCode::NOT_FOUND, "fleet_status_unconfigured", "HUB_FLEET_STATUS_FILE is not set", correlation_id)
+        }
+        FleetStatusError::Unavailable(message) => {
+            ApiErr::coded(StatusCode::SERVICE_UNAVAILABLE, "fleet_status_unavailable", message, correlation_id)
+        }
+        FleetStatusError::Invalid(message) => ApiErr::coded(StatusCode::BAD_GATEWAY, "fleet_status_invalid", message, correlation_id),
+    }
+}
+
+/// The snapshot is infrastructure state, not content: any authenticated
+/// principal may read it, and the hub never collects fleet data itself.
+async fn fleet_status(State(s): State<AppState>, Caller(a): Caller) -> R<contracts::fleet::FleetStatus> {
+    read_fleet_status(s.fleet_status_file.as_deref()).await.map(Json).map_err(|e| fleet_error(e, a.correlation_id.clone()))
 }
 async fn set_pause(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<PauseIn>) -> R<SystemStatus> {
     call!(a, domain::system::set_pause(&s.hub, &a, b))
@@ -341,7 +412,7 @@ async fn send_chat(
 // Fixture-only board actions. Absent (404) when Paperclip is live.
 fn fixture(s: &AppState, a: &Actor) -> Result<Arc<integrations::fixture::FixturePaperclip>, ApiErr> {
     a.require(domain::OPERATOR).map_err(err(a))?;
-    s.fixture_paperclip.clone().ok_or_else(|| ApiErr(DomainError::NotFound("fixture paperclip"), a.correlation_id.clone()))
+    s.fixture_paperclip.clone().ok_or_else(|| ApiErr::domain(DomainError::NotFound("fixture paperclip"), a.correlation_id.clone()))
 }
 async fn fixture_approvals(State(s): State<AppState>, Caller(a): Caller) -> Result<Json<serde_json::Value>, ApiErr> {
     let f = fixture(&s, &a)?;
@@ -360,6 +431,59 @@ async fn fixture_decide(
     let f = fixture(&s, &a)?;
     let view = f
         .decide(&id, b.approve, &format!("fixture-board:{}", a.principal.name))
-        .map_err(|e| ApiErr(DomainError::Invalid { code: "fixture", message: e.to_string() }, None))?;
+        .map_err(|e| ApiErr::domain(DomainError::Invalid { code: "fixture", message: e.to_string() }, None))?;
     Ok(Json(serde_json::to_value(view).unwrap_or_default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_file(name: &str, body: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("fleet-status-{}-{name}.json", Uuid::new_v4()));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    const SNAPSHOT: &str = r#"{
+      "schemaVersion": 1,
+      "generatedAt": "2026-11-10T03:10:00Z",
+      "targetRevision": "new",
+      "hosts": [
+        {"name": "atlas", "health": "healthy", "revision": "new", "checkedAt": "2026-11-10T03:09:00Z"},
+        {"name": "nomad", "health": "healthy", "revision": "old", "checkedAt": "2026-11-10T03:09:00Z"}
+      ],
+      "monitoring": {"monitored": 4, "alerts": []}
+    }"#;
+
+    #[tokio::test]
+    async fn fleet_status_reads_the_snapshot_and_maps_its_failures() {
+        let ok = temp_file("ok", SNAPSHOT);
+        let status = read_fleet_status(Some(&ok)).await.unwrap();
+        assert_eq!(status.hosts.len(), 2);
+        assert_eq!(status.attention(), 1, "nomad is outdated");
+        std::fs::remove_file(&ok).unwrap();
+
+        assert!(matches!(read_fleet_status(None).await, Err(FleetStatusError::Unconfigured)));
+        let missing = std::env::temp_dir().join(format!("missing-{}.json", Uuid::new_v4()));
+        assert!(matches!(read_fleet_status(Some(&missing)).await, Err(FleetStatusError::Unavailable(_))));
+
+        let broken = temp_file("broken", "{ not json");
+        assert!(matches!(read_fleet_status(Some(&broken)).await, Err(FleetStatusError::Invalid(_))));
+        std::fs::remove_file(&broken).unwrap();
+
+        let stale_schema = temp_file("schema", &SNAPSHOT.replace("\"schemaVersion\": 1", "\"schemaVersion\": 2"));
+        assert!(matches!(read_fleet_status(Some(&stale_schema)).await, Err(FleetStatusError::Invalid(_))));
+        std::fs::remove_file(&stale_schema).unwrap();
+
+        for (error, want_status, want_code) in [
+            (FleetStatusError::Unconfigured, StatusCode::NOT_FOUND, "fleet_status_unconfigured"),
+            (FleetStatusError::Unavailable("gone".into()), StatusCode::SERVICE_UNAVAILABLE, "fleet_status_unavailable"),
+            (FleetStatusError::Invalid("bad".into()), StatusCode::BAD_GATEWAY, "fleet_status_invalid"),
+        ] {
+            let api = fleet_error(error, None);
+            assert_eq!(api.status, want_status);
+            assert_eq!(api.code, want_code);
+        }
+    }
 }

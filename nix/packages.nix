@@ -40,6 +40,11 @@
     inherit version src;
     strictDeps = true;
     nativeBuildInputs = [pkgs.pkg-config];
+    # crane vendors git dependencies into a fixed-output checkout; this is the
+    # NAR hash of the pinned fleetix revision. Bump it with the pin.
+    outputHashes = {
+      "git+https://github.com/caniko/fleetix?rev=f7f9dd198cdacf7596ef9156c8e7d1db69c47b29#f7f9dd198cdacf7596ef9156c8e7d1db69c47b29" = "sha256-pwqTOP1t5SbXWMy/clUNrandhVd1X3OZc3itlzh1Ppo=";
+    };
   };
 
   nativeArgs =

@@ -238,6 +238,20 @@ in {
       '';
     };
 
+    fleetStatusFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description = ''
+        A `fleetix::status::FleetStatus` snapshot written by another tool
+        (`canix fleet status --write`). The server re-reads it on every
+        `/v1/fleet/status` request and never collects fleet data itself.
+
+        The parent directory is bind-mounted read-only: the file is replaced
+        atomically by the writer's timer, so the unit must see the directory
+        (and therefore new inodes) rather than one bound file.
+      '';
+    };
+
     database = {
       createLocally = mkOption {
         type = types.bool;
@@ -612,6 +626,7 @@ in {
             RUST_LOG = "info";
           }
           // optionalAttrs (seedFile != null) {HUB_SEED_FILE = toString seedFile;}
+          // optionalAttrs (cfg.fleetStatusFile != null) {HUB_FLEET_STATUS_FILE = toString cfg.fleetStatusFile;}
           // optionalAttrs (cfg.database.urlFile == null) {DATABASE_URL = cfg.database.url;}
           // optionalAttrs cfg.migrations.enable {HUB_MIGRATE_ON_START = "0";}
           // optionalAttrs (cfg.integrations.assistant == "live" && llmUrl != null) {
@@ -642,6 +657,12 @@ in {
             PrivateDevices = true;
             SystemCallFilter = ["@system-service" "~@privileged"];
             ReadWritePaths = [(toString cfg.assetDir)];
+          }
+          // optionalAttrs (cfg.fleetStatusFile != null) {
+            # Bind the directory, not the file: atomic replacement gives the
+            # snapshot a new inode, and ProtectHome/ProtectSystem hide the
+            # default locations. Read-only is all the hub needs.
+            BindReadOnlyPaths = [(builtins.dirOf (toString cfg.fleetStatusFile))];
           };
       };
     }

@@ -25,6 +25,9 @@ pub struct Settings {
     pub asset_dir: PathBuf,
     pub registry_dir: PathBuf,
     pub seed_file: Option<PathBuf>,
+    /// Fleet snapshot written by `canix fleet status --write`; absent when the
+    /// hub has no fleet configured.
+    pub fleet_status_file: Option<PathBuf>,
     pub company_id: Option<String>,
     pub paperclip: AdapterMode,
     pub windmill: AdapterMode,
@@ -57,6 +60,7 @@ impl Settings {
             asset_dir: env("HUB_ASSET_DIR").map(PathBuf::from).unwrap_or_else(|| "var/assets".into()),
             registry_dir: env("HUB_REGISTRY_DIR").map(PathBuf::from).unwrap_or_else(|| "registry".into()),
             seed_file: env("HUB_SEED_FILE").map(PathBuf::from),
+            fleet_status_file: env("HUB_FLEET_STATUS_FILE").map(PathBuf::from),
             company_id: env("HUB_COMPANY_ID"),
             paperclip: mode("HUB_PAPERCLIP")?,
             windmill: mode("HUB_WINDMILL")?,
@@ -75,6 +79,7 @@ impl Settings {
             asset_dir: "var/assets".into(),
             registry_dir: "registry".into(),
             seed_file: Some("registry/hub.fixture.json".into()),
+            fleet_status_file: None,
             company_id: None,
             paperclip: AdapterMode::Fixture,
             windmill: AdapterMode::Fixture,
@@ -281,7 +286,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         apply_seed(&hub, seed, &hub.config.company_id).await?;
     }
     load_registry(&hub, &s.registry_dir.join("comfyui")).await?;
-    Ok((AppState { hub, fixture_paperclip: fx.paperclip.clone() }, fx))
+    Ok((AppState { hub, fixture_paperclip: fx.paperclip.clone(), fleet_status_file: s.fleet_status_file.clone() }, fx))
 }
 
 #[derive(Debug, Deserialize)]

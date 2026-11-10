@@ -43,7 +43,10 @@
         enable = true;
         modelsDir = "/var/lib/infernix-models";
       };
-      services.fleetix-hub.enable = true;
+      services.fleetix-hub = {
+        enable = true;
+        fleetStatusFile = "/var/lib/fleet-status/fleet.json";
+      };
     })
   ];
 
@@ -62,6 +65,8 @@ in {
   assert fixtureHub.environment.HUB_MIGRATE_ON_START == "0";
   assert !(fixtureHub.environment ? HUB_SEED_FILE);
   assert !(fixtureHub.environment ? LLM_URL);
+  assert !(fixtureHub.environment ? HUB_FLEET_STATUS_FILE);
+  assert !(fixtureHub.serviceConfig ? BindReadOnlyPaths);
   assert fixture.config.services.harbor-db.projects."fleetix-hub".enable;
   assert lib.elem "fleetix-hub.service" fixtureMigration.requiredBy;
   assert lib.elem "fleetix-hub.service" fixtureMigration.before;
@@ -78,6 +83,7 @@ in {
       jq -e '.HUB_MIGRATE_ON_START == "0"' env.json
       jq -e 'has("HUB_SEED_FILE") | not' env.json
       jq -e 'has("LLM_URL") | not' env.json
+      jq -e 'has("HUB_FLEET_STATUS_FILE") | not' env.json
       manifest=$(sed -n 's/.*--manifest //p' ${fixtureCheck.serviceConfig.ExecStart})
       test -f "$manifest"
       grep -F '"migrate","--check"' "$manifest"
@@ -92,6 +98,9 @@ in {
   assert liveHub.environment.LLM_URL == "http://127.0.0.1:8013/v1";
   assert liveHub.environment.LLM_MODEL == "qwen3.8-27b";
   assert liveHub.environment.HUB_MIGRATE_ON_START == "0";
+  assert liveHub.environment.HUB_FLEET_STATUS_FILE == "/var/lib/fleet-status/fleet.json";
+  # The directory, not the file: atomic replacements must stay visible.
+  assert lib.elem "/var/lib/fleet-status" liveHub.serviceConfig.BindReadOnlyPaths;
   assert lib.elem "comfyui.service" liveHub.after;
   assert lib.elem "llama-swap.service" liveHub.after;
   assert lib.elem "comfyui.service" liveHub.wants;
@@ -109,6 +118,7 @@ in {
       jq -e '.HUB_ASSISTANT == "live"' env.json
       jq -e '.LLM_URL == "http://127.0.0.1:8013/v1"' env.json
       jq -e '.HUB_MIGRATE_ON_START == "0"' env.json
+      jq -e '.HUB_FLEET_STATUS_FILE == "/var/lib/fleet-status/fleet.json"' env.json
 
       jq -e '.engines | length == 1' ${liveSeed}
       jq -e '.engines[0].id == "comfy-evalhost"' ${liveSeed}

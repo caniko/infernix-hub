@@ -73,6 +73,10 @@
         "description": "See hub_contracts::DraftReplyIn",
         "type": "object"
       },
+      "FleetStatus": {
+        "description": "See fleetix::status::FleetStatus",
+        "type": "object"
+      },
       "FollowUpIn": {
         "description": "See hub_contracts::FollowUpIn",
         "type": "object"
@@ -911,6 +915,39 @@
           }
         ],
         "x-roles": "see domain command"
+      }
+    },
+    "/v1/fleet/status": {
+      "get": {
+        "operationId": "fleet_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FleetStatus"
+                }
+              }
+            },
+            "description": "FleetStatus"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "any authenticated role"
       }
     },
     "/v1/generations/{id}/cancel": {

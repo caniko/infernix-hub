@@ -103,6 +103,10 @@ impl HubClient {
     pub async fn status(&self) -> Result<SystemStatus, ClientError> {
         self.get("/status").await
     }
+    /// The fleet operations snapshot; read-only, produced by another tool.
+    pub async fn fleet_status(&self) -> Result<fleet::FleetStatus, ClientError> {
+        self.get("/fleet/status").await
+    }
     pub async fn today(&self) -> Result<Today, ClientError> {
         self.get("/today").await
     }

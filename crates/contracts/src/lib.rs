@@ -14,6 +14,10 @@ use uuid::Uuid;
 #[cfg(feature = "client")]
 pub mod client;
 
+/// The fleet operations snapshot (`fleetix::status`), re-exported so the API,
+/// desktop and CLI never disagree about its shape.
+pub use fleetix::status as fleet;
+
 /// Contract version carried in the URL prefix and in hashed payloads.
 pub const API_VERSION: &str = "v1";
 /// Request/response header carrying the shared correlation id.
@@ -653,5 +657,50 @@ mod tests {
         }
         assert_eq!(AttemptKind::ComfyPrompt.as_str(), "comfy_prompt");
         assert_eq!(GenerationState::OutcomeUnknown.as_str(), "outcome_unknown");
+    }
+
+    /// A real-shaped snapshot: two hosts (one outdated), an alert, a pending
+    /// approval and a failed nightly. Guards the contract the hub reads.
+    const SNAPSHOT: &str = r#"{
+      "schemaVersion": 1,
+      "generatedAt": "2026-11-10T03:10:00Z",
+      "targetRevision": "new",
+      "hosts": [
+        {"name": "atlas", "health": "healthy", "revision": "new", "system": "/nix/store/atlas", "failures": [], "checkedAt": "2026-11-10T03:09:00Z"},
+        {"name": "nomad", "health": "degraded", "revision": "old", "failures": ["forgejo: inactive"], "checkedAt": "2026-11-10T03:09:30Z"}
+      ],
+      "monitoring": {"monitored": 12, "alerts": [
+        {"key": "core_forgejo", "name": "forgejo", "group": "core", "since": "2026-11-10T02:00:00Z", "detail": ["[STATUS] == 200"]}
+      ]},
+      "pendingOps": [
+        {"id": "op-1", "host": "nomad", "title": "restart forgejo", "reason": "unit is down", "requestedBy": "nightly", "created": "2026-11-10T03:00:00Z"}
+      ],
+      "nightly": {
+        "startedAt": "2026-11-10T02:00:00Z",
+        "finishedAt": "2026-11-10T02:20:00Z",
+        "revision": "new",
+        "commit": "0123abc",
+        "error": null,
+        "hosts": [{"host": "nomad", "outcome": "failed", "detail": "health check failed"}]
+      }
+    }"#;
+
+    #[test]
+    fn fleet_snapshot_round_trips_through_a_file() {
+        let path = std::env::temp_dir().join(format!("fleet-snapshot-{}.json", Uuid::new_v4()));
+        std::fs::write(&path, SNAPSHOT).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let status: fleet::FleetStatus = serde_json::from_str(&body).unwrap();
+        assert_eq!(status.schema_version, fleet::SCHEMA_VERSION);
+        assert_eq!(status.target_revision.as_deref(), Some("new"));
+        assert_eq!(status.hosts[1].update_state(status.target_revision.as_deref()), fleet::UpdateState::Outdated);
+        assert_eq!(status.monitoring.monitored, 12);
+        assert_eq!(status.monitoring.alerts[0].group, "core");
+        assert_eq!(status.pending_ops[0].id, "op-1");
+        assert!(status.nightly.as_ref().unwrap().failed());
+        assert_eq!(status.attention(), 4);
+        assert_eq!(serde_json::from_str::<fleet::FleetStatus>(&serde_json::to_string(&status).unwrap()).unwrap(), status);
     }
 }
