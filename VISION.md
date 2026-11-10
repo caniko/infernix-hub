@@ -50,8 +50,7 @@ leave no audit trail from an operator action to its external effect.
 The current increment built the API, worker, fixture journey, and live and
 fixture adapters, then migrated the desktop shell to Dioxus 0.8 and documented
 capabilities, contracts, and source provenance. The next visible work is
-turning contract-verified adapters into live-verified ones and finishing the
-console's proposal and inspector flows.
+turning contract-verified adapters into live-verified ones.
 
 ## Place in the fleet
 
