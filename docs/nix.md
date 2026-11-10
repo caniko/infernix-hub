@@ -13,10 +13,11 @@ addresses or unit names into this repository.
 | Input | Pin | Why |
 | --- | --- | --- |
 | `nixpkgs` | `nixpkgs-unstable` | One package set for the hub, harbor-rs, harbor-db, and infernix. |
-| `harbor-rs` | `ed89d0b13fc61dd1b2217bf4bba97f32cec27ba7` (trunk) | `mkToolchain`, `mkCross`, `mkBuildCachePolicy`/`withRustCache`, `mkDevShells`, `mkProjectCliShellTools`, `hardeningProfiles`, `treefmtModules.rust`, and the fleet `sccache` package. |
-| `harbor-db` | `febc9f30022e42e2a9b8cb4e64d71ba28c79b7b1` | `nixosModules.default` and `services.harbor-db.projects.<name>` (migration unit, read-only check, Postgres grants). |
+| `harbor-rs` | `6055d7d2b3a05d7d91d50938c7fb6f862a5eec85` (trunk) | `mkToolchain`, `mkCross`, `mkBuildCachePolicy`/`withRustCache`, `mkDevShells`, `mkProjectCliShellTools`, `hardeningProfiles`, `treefmtModules.rust`, and the fleet `sccache` package. |
+| `harbor-db` | `b00867f501ae43a1ad4fe23fb72476ccfd10f049` | `nixosModules.default` and `services.harbor-db.projects.<name>` (migration unit, read-only check, Postgres grants). |
 | `infernix` | trunk `7e9f2ad435cc0d927c38225ff634d4c8dca32554` at lock time | `nixosModules.default` for ComfyUI, llama-swap, load balancer, and GPU options. Only evaluated on `x86_64-linux`. |
-| `rust-overlay`, `crane`, `treefmt-nix` | follow `harbor-rs` | The toolchain and cache wrapper must match the pinned harbor-rs revision. |
+| `rust-overlay`, `crane` | follow `harbor-rs` | The toolchain and cache wrapper must match the pinned harbor-rs revision. |
+| `treefmt-nix` | direct, follows `nixpkgs` | harbor-rs keeps it in its dev partition; harbor-db follows this one. |
 
 `harbor-rs`, `harbor-db`, and `infernix` all follow this flake's `nixpkgs`;
 infernix also follows this flake's `harbor-rs` so the sccache namespace and the

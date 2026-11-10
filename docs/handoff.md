@@ -49,8 +49,9 @@ the hub-chosen prompt id, targeted cancel, human takeover beats a queued agent
 reply, assets survive engine history cleanup, chat suggestions stay proposals,
 GPU admission, cancel while awaiting admission, unreachable publisher retry.
 
-Not run: Nix package builds of the desktop and server (`nix build .#…`), the
-flake's clippy/nextest/fmt checks (evaluated only), any live integration.
+The module eval checks build the `infernix-hubd` package through Nix. Not
+run: the desktop and `hubctl` Nix packages, the flake's clippy/nextest/fmt
+checks (evaluated only), any live integration.
 
 ## Capability levels
 
