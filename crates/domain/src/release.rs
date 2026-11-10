@@ -293,21 +293,27 @@ pub async fn apply_approval(hub: &Hub, release_id: Uuid, view: &ApprovalView) ->
     .await?;
     tx.commit().await?;
     // The item leaves review: ready to schedule, or back to selecting for a
-    // new revision. Its own statement, after the release lock is released, so
-    // this path never holds release and content locks together (freeze takes
-    // content→release, schedule release→content). The state is display only.
-    // Skipped if a refreeze has since superseded this release.
+    // new revision. A separate transaction after the release lock is gone,
+    // taking only the content lock (freeze holds it while adding a revision),
+    // then re-reading in a fresh statement that this release is still the
+    // latest revision with the decision just written.
     let approved = action == "release.approved";
-    sqlx::query(
-        "update content_items set state = $2, updated_at = now() where id = $1 and state = 'review'
-         and (select state from release_revisions where id = $3) = $4",
-    )
-    .bind(rel.content_item_id)
-    .bind(if approved { ContentState::Approved } else { ContentState::Selecting }.as_str())
-    .bind(release_id)
-    .bind(if approved { "approved" } else { "rejected" })
-    .execute(&hub.db)
-    .await?;
+    let mut tx = hub.db.begin().await?;
+    let content_state: String = sqlx::query_scalar("select state from content_items where id = $1 for update")
+        .bind(rel.content_item_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let latest: Option<(Uuid, String)> =
+        sqlx::query_as("select id, state from release_revisions where content_item_id = $1 order by revision desc limit 1")
+            .bind(rel.content_item_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let expected = if approved { "approved" } else { "rejected" };
+    if content_state == ContentState::Review.as_str() && latest.as_ref().is_some_and(|(id, st)| *id == release_id && st == expected) {
+        crate::content::set_state(&mut tx, rel.content_item_id, if approved { ContentState::Approved } else { ContentState::Selecting })
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
