@@ -83,8 +83,8 @@ nix build .#checks.x86_64-linux.module-eval-live
   `environment`.
 - `database`: `createLocally`, `name`, `url`, `urlFile`,
   `migrationsUser`, `migrationsGroup`; `migrations.enable`.
-- `integrations`: `paperclip`, `windmill`, `comfy`, `publisher`, `assistant`
-  (`fixture` / `live` / `disabled`).
+- `integrations`: `paperclip`, `windmill`, `comfy`, `assistant`
+  (`fixture` / `live`) and `publisher` (`fixture` / `live` / `disabled`).
 - `assistant`: `endpoint` (`llama-swap` / `load-balancer` / `custom`), `url`,
   `model`.
 - `paperclip.url`, `windmill.url`, `windmill.workspace`.
@@ -210,6 +210,8 @@ them at agenix paths; plaintext never goes into the store.
 - fixture Windmill requires fixture ComfyUI (the in-process procedure needs
   the simulated engine),
 - live Paperclip/Windmill/publisher require their credential files,
+- a live publisher requires live Paperclip (fixture approvals never authorize
+  real posts); only the publisher accepts `disabled`,
 - `companyId` is required unless every integration is fixture,
 - a live assistant requires a resolvable endpoint,
 - `database.urlFile` requires `database.createLocally = false`.

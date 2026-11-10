@@ -173,8 +173,12 @@ Built from the public API docs (fetched 2026-11-09): `POST /posts` with
 `type: "now"` (the hub never schedules inside Postiz); media via
 `POST /upload` multipart and `posts[].value[].image[]`. The docs show no
 idempotency key or custom-field filter on `GET /posts`, so an ambiguous submit
-requires manual reconciliation; there is no reply endpoint. Blocker: Postiz
-does not exist in the fleet, so nothing can be contract- or live-verified.
+requires manual reconciliation; there is no reply endpoint. Accepted and
+ambiguous posts are resolved by an operator (`POST /v1/intents/{id}/resolve`).
+The documented upload/post payloads carry no media alt text, so `submit`
+refuses media with alt text (`Unsupported`) rather than publishing the
+approved revision without it. Blocker: Postiz does not exist in the fleet, so
+nothing can be contract- or live-verified.
 
 ## Windmill procedures
 
