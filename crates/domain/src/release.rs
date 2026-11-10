@@ -651,29 +651,9 @@ pub async fn dispatch(hub: &Hub, actor: &Actor, intent_id: Uuid, input: Dispatch
         Err(PortError::Ambiguous(e)) => {
             finish_attempt(hub, intent_id, attempt_id, IntentState::OutcomeUnknown, json!({ "error": e }), None).await
         }
-        // Never reached the provider: back to scheduled, and arm a retry timer
-        // for the same revision (this timer is finishing). The dispatch window
-        // bounds the retries.
+        // Never reached the provider: back to scheduled with a retry timer.
         Err(PortError::Unreachable(e)) => {
-            let out =
-                finish_attempt(hub, intent_id, attempt_id, IntentState::Scheduled, json!({ "error": e, "not_sent": true }), None).await?;
-            let timer = crate::ports::PublicationTimer {
-                intent_id: intent_id.to_string(),
-                schedule_revision: out.intent.schedule_revision,
-                due_at: Utc::now() + chrono::Duration::seconds(UNREACHABLE_RETRY_SECS),
-                dispatch_url: format!("{}/v1/intents/{intent_id}/dispatch", hub.config.public_url),
-            };
-            let mut tx = hub.db.begin().await?;
-            outbox::enqueue(
-                &mut tx,
-                &Actor::system(),
-                outbox::WINDMILL_SCHEDULE_PUBLICATION,
-                &format!("timer:{intent_id}:{}:retry{attempt}", out.intent.schedule_revision),
-                serde_json::to_value(&timer).unwrap_or_default(),
-            )
-            .await?;
-            tx.commit().await?;
-            Ok(out)
+            finish_attempt(hub, intent_id, attempt_id, IntentState::Scheduled, json!({ "error": e, "not_sent": true }), None).await
         }
         Err(e) => finish_attempt(hub, intent_id, attempt_id, IntentState::Failed, json!({ "error": e.to_string() }), None).await,
     }
@@ -710,6 +690,24 @@ async fn finish_attempt(
     audit(&mut tx, &Actor::system(), "intent.delivery", "intent", intent_id, json!({ "state": state, "detail": detail })).await?;
     mark_content_published(&mut tx, intent_id).await?;
     let intent = get_intent(&mut tx, intent_id).await?;
+    if state == IntentState::Scheduled {
+        // The timer that brought us here is finishing; arm a retry for the same
+        // revision in this transaction. The dispatch window bounds the retries.
+        let timer = crate::ports::PublicationTimer {
+            intent_id: intent_id.to_string(),
+            schedule_revision: intent.schedule_revision,
+            due_at: Utc::now() + chrono::Duration::seconds(UNREACHABLE_RETRY_SECS),
+            dispatch_url: format!("{}/v1/intents/{intent_id}/dispatch", hub.config.public_url),
+        };
+        outbox::enqueue(
+            &mut tx,
+            &Actor::system(),
+            outbox::WINDMILL_SCHEDULE_PUBLICATION,
+            &format!("timer:{intent_id}:{}:retry:{attempt_id}", intent.schedule_revision),
+            serde_json::to_value(&timer).unwrap_or_default(),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(DispatchOut { intent, submitted: true })
 }
@@ -745,9 +743,11 @@ pub async fn reconcile_intent(hub: &Hub, intent_id: Uuid, account_id: &str, key:
         Err(PortError::Unsupported(_)) => {
             // Leave it for an operator to resolve; never guess.
             sqlx::query(
-                "update publication_intents set state = 'outcome_unknown', updated_at = now() where id = $1 and state = 'submitting'",
+                "update publication_intents set state = 'outcome_unknown', updated_at = now() where id = $1 and state = 'submitting'
+                 and (select idempotency_key from delivery_attempts where intent_id = $1 order by attempt desc limit 1) = $2",
             )
             .bind(intent_id)
+            .bind(key)
             .execute(&hub.db)
             .await?;
             return Ok(());

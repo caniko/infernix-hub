@@ -651,6 +651,13 @@ pub async fn cancel(hub: &Hub, actor: &Actor, generation_id: Uuid) -> DResult<Ca
     .bind(generation_id)
     .fetch_one(&hub.db)
     .await?;
+    // Drop the command if it is still queued. This waits for the worker's row
+    // lock, so a delivery in progress finishes first and its prompts are then
+    // cancelled on the engine below.
+    sqlx::query("update outbox set state = 'dead', last_error = 'generation cancelled' where idempotency_key = $1 and state = 'pending'")
+        .bind(format!("generation:{generation_id}"))
+        .execute(&hub.db)
+        .await?;
     sqlx::query("update generation_requests set state = 'cancelling', updated_at = now() where id = $1 and state in ('requested', 'dispatched', 'running')")
         .bind(generation_id)
         .execute(&hub.db)

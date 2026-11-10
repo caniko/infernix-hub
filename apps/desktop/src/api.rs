@@ -149,7 +149,12 @@ pub async fn load_relationship_detail(store: Store, client: HubClient, id: Uuid)
 }
 
 pub async fn load_canon(store: Store, client: HubClient, persona: Uuid) {
-    match timed(client.canon(persona)).await {
+    let result = timed(client.canon(persona)).await;
+    // A response for a persona that is no longer selected must not land.
+    if (store.selected_persona).cloned() != Some(persona) {
+        return;
+    }
+    match result {
         Ok(revisions) => put(store.canon, revisions),
         Err(error) => keep(store.canon, error),
     }
