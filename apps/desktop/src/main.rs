@@ -25,7 +25,9 @@ pub use state::Workspace;
 use state::{Loaded, Store};
 
 fn main() {
-    dioxus::launch(App);
+    use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
+    let window = WindowBuilder::new().with_title("infernix hub").with_inner_size(LogicalSize::new(1440.0, 900.0));
+    dioxus::LaunchBuilder::desktop().with_cfg(Config::new().with_window(window)).launch(App);
 }
 
 #[component]
@@ -59,7 +61,11 @@ fn App() -> Element {
         release_content: use_signal(std::collections::HashMap::new),
         release_indexed: use_signal(std::collections::HashSet::new),
         notice: use_signal(|| None),
-        inspector_open: use_signal(|| true),
+        // Below the 1180px breakpoint (theme.css) the inspector is an overlay; start it closed there.
+        inspector_open: use_signal(|| {
+            let w = &dioxus::desktop::window().window;
+            w.inner_size().to_logical::<f64>(w.scale_factor()).width > 1180.0
+        }),
         nav_open: use_signal(|| false),
         palette_open: use_signal(|| false),
         poll_busy: use_signal(|| false),

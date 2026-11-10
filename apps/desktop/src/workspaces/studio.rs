@@ -55,16 +55,16 @@ pub fn StudioView() -> Element {
         if detail.item.id != id || initialized_for.cloned() == Some(id) {
             return;
         }
+        // Prefill only inputs the selected workflow binds; anything else is
+        // rejected by the hub as `unknown_input`.
         let brief = &detail.item.brief;
-        gen_inputs.set(
-            serde_json::json!({
-                "prompt": brief.copy_direction,
-                "angle": brief.angle,
-                "audience": brief.audience,
-                "visual": brief.visual_direction,
-            })
-            .to_string(),
-        );
+        let has_prompt = (store.workflows)
+            .cloned()
+            .data
+            .and_then(|ws| ws.into_iter().find(|w| Some(w.id) == workflow_id.cloned()))
+            .is_some_and(|w| w.bindings.get("prompt").is_some());
+        let prompt = if brief.visual_direction.trim().is_empty() { detail.item.title.clone() } else { brief.visual_direction.clone() };
+        gen_inputs.set(if has_prompt { serde_json::json!({ "prompt": prompt }) } else { serde_json::json!({}) }.to_string());
         release_text.set(String::new());
         not_before.set(format::default_local(Utc::now()));
         not_after.set(format::default_local(Utc::now() + ChronoDuration::hours(24)));
