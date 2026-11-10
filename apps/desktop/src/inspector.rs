@@ -178,6 +178,28 @@ pub fn from_news(item: &NewsItem) -> InspectorData {
     }
 }
 
+/// Hosts are identified by name in the snapshot, so there is no id read; the
+/// inspector carries the full revision, system path and failed checks.
+pub fn from_host(host: &contracts::fleet::HostStatus, target: Option<&str>) -> InspectorData {
+    let update = host.update_state(target);
+    let foreign = host.failures.iter().enumerate().map(|(index, failure)| (format!("failure {}", index + 1), failure.clone())).collect();
+    InspectorData {
+        title: format!("Host · {}", host.name),
+        ids: vec![
+            ("host".into(), host.name.clone()),
+            ("health".into(), crate::labels::health(host.health).0.into()),
+            ("update".into(), crate::labels::update_state(update).0.into()),
+            ("revision".into(), host.revision.clone().unwrap_or_else(|| "—".into())),
+            ("system".into(), host.system.clone().unwrap_or_else(|| "—".into())),
+            ("checked".into(), host.checked_at.clone()),
+        ],
+        foreign,
+        payload_hash: None,
+        raw: pretty(host),
+        history: Vec::new(),
+    }
+}
+
 #[component]
 pub fn Inspector(data: Option<InspectorData>, on_close: EventHandler<()>) -> Element {
     rsx! {

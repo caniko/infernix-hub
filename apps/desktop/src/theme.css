@@ -552,3 +552,76 @@ input[type="checkbox"] { accent-color: var(--honey); }
 .asset-grid.four .asset-tile { min-width: 0; }
 .inspector .panel { margin-bottom: 14px; }
 .inspector h4 { font-family: var(--font-mono); font-size: 0.7rem; color: var(--honey); text-transform: uppercase; letter-spacing: 0.06em; }
+
+/* ── Fleet section ─────────────────────────────────────────────────────── */
+/* Fleet views carry their own columns, so the stage drops the context list. */
+.stage.no-context { grid-template-columns: minmax(0, 1fr) var(--inspector-width); }
+.stage.no-context.inspector-closed { grid-template-columns: minmax(0, 1fr); }
+
+.nav-section { padding: 12px 10px 4px; letter-spacing: 0.12em; }
+.nav-badge {
+  margin-left: auto; min-width: 18px; padding: 1px 5px; border-radius: 9px;
+  background: var(--elevated); color: var(--text);
+  font-family: var(--font-mono); font-size: 0.6rem; text-align: center;
+}
+.nav-badge + .nav-key { margin-left: 6px; }
+
+.fleet-split {
+  display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 16px; align-items: start; margin-bottom: 18px;
+}
+.tile-btn { font: inherit; text-align: left; cursor: pointer; }
+.tile-btn:hover { border-color: var(--honey); }
+
+.attention-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px;
+  width: 100%; text-align: left; font: inherit; cursor: pointer;
+  background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 9px 12px; color: var(--text);
+}
+.attention-row:hover { border-color: var(--honey); }
+.attention-title { font-size: 13.5px; }
+.attention-detail { grid-column: 1; color: var(--text-2); font-size: 12px; }
+.attention-go { grid-row: 1 / span 2; grid-column: 2; align-self: center; color: var(--honey); }
+
+.system-card { display: flex; flex-direction: column; gap: 2px; }
+.kv .v.bad { color: var(--bad); }
+
+.host-list { display: flex; flex-direction: column; gap: 6px; }
+.host-row {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  font: inherit; text-align: left; cursor: pointer;
+  background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; color: var(--text);
+}
+.host-row:hover { border-color: var(--honey); }
+.host-row.active { border-color: var(--honey); box-shadow: inset 3px 0 0 var(--honey); }
+.host-name { font-weight: 600; min-width: 90px; }
+.host-rev { color: var(--text-2); font-size: 0.7rem; }
+.host-checked { margin-left: auto; }
+
+.monitoring-error {
+  display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline;
+  padding: 9px 12px; margin-bottom: 14px; border-radius: 6px;
+  background: var(--card); border: 1px solid var(--bad); color: var(--bad);
+}
+
+.alert-row { display: flex; flex-direction: column; gap: 4px; padding: 11px 13px; }
+.alert-name { font-size: 13.5px; color: var(--text); }
+.alert-detail { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-2); margin: 0; }
+
+.read-only-note { color: var(--text-2); font-size: 12.5px; margin-bottom: 12px; }
+.read-only-note code { font-family: var(--font-mono); color: var(--honey); }
+
+.approval-row { display: flex; flex-direction: column; gap: 6px; padding: 11px 13px; }
+.approval-title { font-size: 13.5px; color: var(--text); }
+
+@media (max-width: 1180px) {
+  .stage.no-context, .stage.no-context.inspector-closed { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 900px) {
+  .fleet-split { grid-template-columns: 1fr; }
+  .host-row { flex-wrap: wrap; }
+  .host-checked { margin-left: 0; }
+}

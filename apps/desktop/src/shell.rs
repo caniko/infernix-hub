@@ -4,10 +4,26 @@
 
 use dioxus::prelude::*;
 
-use crate::{Workspace, icons};
+use crate::{Workspace, fleet, icons, state::Store};
 
 #[component]
 pub fn Sidebar(workspace: Signal<Workspace>, nav_open: Signal<bool>) -> Element {
+    let store = use_context::<Store>();
+    let snapshot = (store.fleet).cloned().data;
+    let badge = move |target: Workspace| -> usize {
+        let Some(status) = snapshot.as_ref() else { return 0 };
+        match target {
+            Workspace::Hosts => fleet::hosts_needing_attention(status),
+            Workspace::Alerts => fleet::alert_count(status),
+            Workspace::Approvals => status.pending_ops.len(),
+            _ => 0,
+        }
+    };
+    let groups: [(&str, Vec<(usize, Workspace)>); 2] = ["FLEET", "STUDIO"].map(|section| {
+        let items = Workspace::ALL.iter().copied().enumerate().filter(|(_, w)| w.section() == section).collect();
+        (section, items)
+    });
+
     rsx! {
         nav {
             class: if nav_open.cloned() { "sidebar open" } else { "sidebar" },
@@ -19,22 +35,34 @@ pub fn Sidebar(workspace: Signal<Workspace>, nav_open: Signal<bool>) -> Element 
                     span { class: "wordmark-sub", "hub console" }
                 }
             }
-            for (i, w) in Workspace::ALL.iter().enumerate() {
-                NavItem { key: "{w.label()}", workspace, nav_open, target: *w, index: i }
+            for (section, items) in groups.iter() {
+                div { class: "nav-section label-tech", key: "section-{section}", "{section}" }
+                for (index, target) in items.iter() {
+                    NavItem {
+                        key: "{target.label()}",
+                        workspace,
+                        nav_open,
+                        target: *target,
+                        index: *index,
+                        badge: badge(*target),
+                    }
+                }
             }
             div { class: "sidebar-foot",
                 p { class: "label-tech", "Ctrl+K · commands" }
-                p { class: "label-tech", "1–6 · workspaces" }
+                p { class: "label-tech", "1–9, 0 · workspaces" }
             }
         }
     }
 }
 
 #[component]
-fn NavItem(workspace: Signal<Workspace>, nav_open: Signal<bool>, target: Workspace, index: usize) -> Element {
+fn NavItem(workspace: Signal<Workspace>, nav_open: Signal<bool>, target: Workspace, index: usize, badge: usize) -> Element {
     let active = workspace.cloned() == target;
     let mut workspace = workspace;
     let mut nav_open = nav_open;
+    // The tenth workspace has no single-digit key; `0` follows `9`.
+    let key = if index == 9 { "0".to_string() } else { (index + 1).to_string() };
     rsx! {
         button {
             class: if active { "nav-item active" } else { "nav-item" },
@@ -45,7 +73,10 @@ fn NavItem(workspace: Signal<Workspace>, nav_open: Signal<bool>, target: Workspa
             },
             span { class: "ico", dangerous_inner_html: icons::workspace(target) }
             span { class: "nav-label", "{target.label()}" }
-            span { class: "nav-key", "{index + 1}" }
+            if badge > 0 {
+                span { class: "nav-badge", "{badge}" }
+            }
+            span { class: "nav-key", "{key}" }
         }
     }
 }

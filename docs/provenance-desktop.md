@@ -15,8 +15,8 @@ Fonts (OFL) and the generic line icons are copied, as permitted.
 | Donor file | Lines | sha256 | Destination | Modifications |
 |---|---|---|---|---|
 | `crates/aivyx-web/src/main.rs` | 225–228 (`main`, `dioxus::launch`) | `9b505bff042125ee81ac9b9b185206a9f38a296feb1e9250be31fb8a31b6eaec` | `apps/desktop/src/main.rs` | `console_error_panic_hook` removed; launch kept. |
-| same | 251–364 (`App`, view dispatch, polling loop) | same | `apps/desktop/src/main.rs` | WebSocket coroutine + `FrontendMessage` queries replaced by `HubClient` polling; `View` replaced by six hub `Workspace`s; theme toggle and onboarding removed. |
-| same | 370–403 (`Sidebar`), 405–415 (`NavItem`) | same | `apps/desktop/src/shell.rs` | Donor logo/wordmark removed; hub workspaces and 1–6 shortcuts; mobile drawer state added. |
+| same | 251–364 (`App`, view dispatch, polling loop) | same | `apps/desktop/src/main.rs` | WebSocket coroutine + `FrontendMessage` queries replaced by `HubClient` polling; `View` replaced by ten hub `Workspace`s (four fleet, six studio); theme toggle and onboarding removed. |
+| same | 370–403 (`Sidebar`), 405–415 (`NavItem`) | same | `apps/desktop/src/shell.rs` | Donor logo/wordmark removed; FLEET/STUDIO sections, count badges, hub workspaces and 1–9/0 shortcuts; mobile drawer state added. |
 | same | 428–446 (`Topbar`) | same | `apps/desktop/src/shell.rs` | Theme toggle and classic-UI link removed; inspector toggle and command-palette trigger added; connection label comes from `/v1/status`. |
 | same | 448–460 (`StatusBar`) | same | `apps/desktop/src/shell.rs` | Segments become hub status + per-integration mode/verification; fixture mode uses a persistent banner. |
 | same | 514–528 (`StatCard`) | same | `apps/desktop/src/components/mod.rs` | Icon prop replaced by a required text label plus optional detail; hub palette classes. |
@@ -82,13 +82,20 @@ All donor `assets/logos/*` files were omitted.
 | `HUB_TOKEN` | empty | Operator bearer token. Set it when the hub enforces auth. |
 
 The console polls `/v1/status` plus the base lists and the selected detail on the
-donor's 1.5s cadence. A failed refresh keeps the last good data and shows the
-`ApiError` code/message; every list has loading, error and empty states.
+donor's 1.5s cadence. The fleet snapshot has its own 30s cadence (plus the
+palette's "Refresh fleet status"); a failed refresh keeps the last good data and
+shows the `ApiError` code/message. Every list has loading, error and empty
+states, and `fleet_status_unconfigured` renders one shared empty state in all
+four fleet views.
 
 ## Workspace → endpoint coverage
 
 | Workspace | Reads | Writes |
 |---|---|---|
+| Command Center | `GET /v1/fleet/status`, `GET /v1/today` | — |
+| Hosts | `GET /v1/fleet/status` | — |
+| Alerts | `GET /v1/fleet/status` | — |
+| Approvals | `GET /v1/fleet/status` | — |
 | Today | `GET /v1/today` | — |
 | News | `GET /v1/news`, `GET /v1/personas` | `POST /v1/content` (brief) |
 | Studio | `GET /v1/content`, `GET /v1/content/{id}`, `GET /v1/workflows`, `GET /v1/accounts`, `GET /v1/assets/{id}/content` | `POST /v1/content/{id}/generations`, `POST /v1/generations/{id}/cancel`, `POST /v1/assets/{id}/select`, `POST /v1/content/{id}/releases`, `POST /v1/releases/{id}/request-review`, `POST /v1/releases/{id}/schedule`, `POST /v1/intents/{id}/cancel` |

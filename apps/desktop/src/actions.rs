@@ -13,6 +13,8 @@ pub enum Action {
     Workspace(Workspace),
     ToggleInspector,
     Refresh,
+    /// Re-read the fleet snapshot now instead of waiting for the 30s cadence.
+    RefreshFleet,
     /// Open a subject by contract `subject_type` (search hits, Today items).
     OpenSubject(String, Uuid),
 }
@@ -47,6 +49,12 @@ pub fn static_entries() -> Vec<PaletteEntry> {
         hint: "reload all workspaces from the hub".into(),
         kind: "command",
         action: Action::Refresh,
+    });
+    entries.push(PaletteEntry {
+        label: "Refresh fleet status".into(),
+        hint: "re-read the snapshot now (every 30s otherwise)".into(),
+        kind: "command",
+        action: Action::RefreshFleet,
     });
     entries
 }
@@ -111,8 +119,9 @@ mod tests {
     #[test]
     fn static_entries_cover_navigation_and_commands() {
         let entries = static_entries();
-        assert_eq!(entries.iter().filter(|e| e.kind == "navigate").count(), 6);
+        assert_eq!(entries.iter().filter(|e| e.kind == "navigate").count(), 10);
         assert!(entries.iter().any(|e| e.action == Action::ToggleInspector));
         assert!(entries.iter().any(|e| e.action == Action::Refresh));
+        assert!(entries.iter().any(|e| e.action == Action::RefreshFleet));
     }
 }
