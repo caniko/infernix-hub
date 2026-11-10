@@ -96,7 +96,10 @@ was sent.
 
 Four Sol review rounds (`openai/gpt-6.1-sol`, xhigh) on the whole tree, the
 fourth for concurrency follow-ups; round 4 approved. Round 1 found 14 issues
-(3 blockers); all fixed or narrowed in `1ce7dcc`, `3b78006` and `5d6b3f1`. Known ceiling: the worker holds the outbox row lock across a
+(3 blockers); all fixed or narrowed in `1ce7dcc`, `3b78006` and `5d6b3f1`.
+The later delta (license, approved state, procedure status, polish, harbor
+bump) had its own four rounds; round 4 approved after lock-order fixes in
+`e418f03`, `f51a350` and `a527cc6`. Known ceiling: the worker holds the outbox row lock across a
 remote call; a crash between a non-idempotent call and its record can still
 replay it (approvals and generations check their recorded effect first). A
 lease column is the upgrade path.
@@ -121,7 +124,9 @@ lease column is the upgrade path.
 
 `design/infernix-hub.fig` (OpenPencil): D01 Studio, D02 Today, M01 narrow
 (390 px). Checked against screenshots of the running app at 1440 and 760 px;
-layout and tokens match. The OpenPencil frames were not updated for P1–P6. 390 px was not
+layout and tokens match. D01 was updated for P1–P3 (status bar wording,
+"Approved" chip, persona name); D02 already used readable labels; M01 shows
+the selecting stage, which is unchanged. 390 px was not
 captured from the app (desktop window minimum in practice is wider).
 
 ## Open decisions for the owner
