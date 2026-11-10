@@ -736,20 +736,33 @@ pub async fn intents_to_reconcile(hub: &Hub) -> DResult<Vec<(Uuid, String, Strin
     .await?)
 }
 
+/// Read under the intent's row lock, in a statement after the lock was taken.
+async fn latest_attempt_key(tx: &mut sqlx::PgConnection, intent_id: Uuid) -> DResult<Option<String>> {
+    Ok(sqlx::query_scalar("select idempotency_key from delivery_attempts where intent_id = $1 order by attempt desc limit 1")
+        .bind(intent_id)
+        .fetch_optional(tx)
+        .await?)
+}
+
 /// Reconcile one intent by its delivery idempotency key.
 pub async fn reconcile_intent(hub: &Hub, intent_id: Uuid, account_id: &str, key: &str) -> DResult<()> {
     let found = match hub.publisher.lookup(account_id, key).await {
         Ok(f) => f,
         Err(PortError::Unsupported(_)) => {
-            // Leave it for an operator to resolve; never guess.
-            sqlx::query(
-                "update publication_intents set state = 'outcome_unknown', updated_at = now() where id = $1 and state = 'submitting'
-                 and (select idempotency_key from delivery_attempts where intent_id = $1 order by attempt desc limit 1) = $2",
-            )
-            .bind(intent_id)
-            .bind(key)
-            .execute(&hub.db)
-            .await?;
+            // Leave it for an operator to resolve; never guess. Lock the intent
+            // first, then confirm `key` is still the latest attempt.
+            let mut tx = hub.db.begin().await?;
+            let current: String = sqlx::query_scalar("select state from publication_intents where id = $1 for update")
+                .bind(intent_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            if current == "submitting" && latest_attempt_key(&mut tx, intent_id).await?.as_deref() == Some(key) {
+                sqlx::query("update publication_intents set state = 'outcome_unknown', updated_at = now() where id = $1")
+                    .bind(intent_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
             return Ok(());
         }
         Err(e) => {
@@ -760,13 +773,10 @@ pub async fn reconcile_intent(hub: &Hub, intent_id: Uuid, account_id: &str, key:
     let mut tx = hub.db.begin().await?;
     let current: String =
         sqlx::query_scalar("select state from publication_intents where id = $1 for update").bind(intent_id).fetch_one(&mut *tx).await?;
-    let latest: Option<String> =
-        sqlx::query_scalar("select idempotency_key from delivery_attempts where intent_id = $1 order by attempt desc limit 1")
-            .bind(intent_id)
-            .fetch_optional(&mut *tx)
-            .await?;
     // A newer attempt superseded this read; its own reconciliation decides.
-    if !matches!(current.as_str(), "accepted" | "outcome_unknown" | "submitting") || latest.as_deref() != Some(key) {
+    if !matches!(current.as_str(), "accepted" | "outcome_unknown" | "submitting")
+        || latest_attempt_key(&mut tx, intent_id).await?.as_deref() != Some(key)
+    {
         return Ok(());
     }
     let next = match &found {

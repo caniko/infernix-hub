@@ -643,6 +643,13 @@ pub fn derive_generation_state(current: GenerationState, attempts: &[AttemptStat
 /// Windmill job alone would not stop ComfyUI, so both are addressed.
 pub async fn cancel(hub: &Hub, actor: &Actor, generation_id: Uuid) -> DResult<CancelOut> {
     actor.require(OPERATOR_OR_AGENT)?;
+    // Drop the command if it is still queued. This waits for the worker's row
+    // lock, so a delivery in progress finishes (and records its Windmill job)
+    // before the attempts are read below.
+    sqlx::query("update outbox set state = 'dead', last_error = 'generation cancelled' where idempotency_key = $1 and state = 'pending'")
+        .bind(format!("generation:{generation_id}"))
+        .execute(&hub.db)
+        .await?;
     let generation = get_generation(hub, generation_id).await?;
     let engine_url: String = sqlx::query_scalar(
         "select e.base_url from generation_requests g join workflows w on w.id = g.workflow_id
@@ -651,19 +658,15 @@ pub async fn cancel(hub: &Hub, actor: &Actor, generation_id: Uuid) -> DResult<Ca
     .bind(generation_id)
     .fetch_one(&hub.db)
     .await?;
-    // Drop the command if it is still queued. This waits for the worker's row
-    // lock, so a delivery in progress finishes first and its prompts are then
-    // cancelled on the engine below.
-    sqlx::query("update outbox set state = 'dead', last_error = 'generation cancelled' where idempotency_key = $1 and state = 'pending'")
-        .bind(format!("generation:{generation_id}"))
-        .execute(&hub.db)
-        .await?;
     sqlx::query("update generation_requests set state = 'cancelling', updated_at = now() where id = $1 and state in ('requested', 'dispatched', 'running')")
         .bind(generation_id)
         .execute(&hub.db)
         .await?;
     let mut actions = vec![];
-    for a in &generation.attempts {
+    // Stop the procedure first so it cannot submit more prompts, then the prompts.
+    let mut attempts = generation.attempts.clone();
+    attempts.sort_by_key(|a| a.kind == AttemptKind::ComfyPrompt);
+    for a in &attempts {
         if terminal(a.state) {
             continue;
         }
