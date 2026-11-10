@@ -209,6 +209,7 @@ impl H {
         let rel = self.freeze(item.id, accounts, "The kiln is lit.").await;
         let rel = self.approve(&rel).await;
         assert_eq!(rel.state, ReleaseState::Approved);
+        assert_eq!(self.op.content_detail(item.id).await.unwrap().item.state, ContentState::Approved);
         (item, rel)
     }
 
@@ -245,6 +246,7 @@ async fn complete_fixture_journey() {
     let detail = h.op.content_detail(item.id).await.unwrap();
     assert_eq!(detail.assets.iter().filter(|a| a.state == AssetState::Ready).count(), 2);
     let root = g.attempts.iter().find(|a| a.kind == AttemptKind::WindmillRoot).expect("root execution tracked");
+    assert_eq!(root.state, AttemptState::Succeeded, "procedure followed to its end state");
     assert!(
         g.attempts.iter().filter(|a| a.kind == AttemptKind::ComfyPrompt).all(|a| a.parent_id == Some(root.id)),
         "prompt receipts linked to the root job"

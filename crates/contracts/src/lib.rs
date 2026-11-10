@@ -53,7 +53,7 @@ wire_enum!(
 
 wire_enum!(CanonState { Proposed = "proposed", Accepted = "accepted", Rejected = "rejected", Superseded = "superseded" });
 wire_enum!(CanonSource { Operator = "operator", Chat = "chat", News = "news", Agent = "agent" });
-wire_enum!(ContentState { Idea = "idea", Brief = "brief", Producing = "producing", Selecting = "selecting", Review = "review", Scheduled = "scheduled", Published = "published", Archived = "archived" });
+wire_enum!(ContentState { Idea = "idea", Brief = "brief", Producing = "producing", Selecting = "selecting", Review = "review", Approved = "approved", Scheduled = "scheduled", Published = "published", Archived = "archived" });
 wire_enum!(GenerationState { Requested = "requested", Dispatched = "dispatched", Running = "running", Succeeded = "succeeded", Failed = "failed", Cancelling = "cancelling", Cancelled = "cancelled", OutcomeUnknown = "outcome_unknown" });
 wire_enum!(AttemptKind { WindmillRoot = "windmill_root", WindmillChild = "windmill_child", ComfyPrompt = "comfy_prompt" });
 wire_enum!(AttemptState { Submitted = "submitted", Queued = "queued", Running = "running", Succeeded = "succeeded", Failed = "failed", Cancelled = "cancelled", OutcomeUnknown = "outcome_unknown" });

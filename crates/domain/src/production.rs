@@ -506,6 +506,33 @@ pub async fn reconcile_prompt(hub: &Hub, p: &OpenPrompt) -> DResult<()> {
     refresh_generation_state(hub, p.generation_id).await
 }
 
+/// Follow open Windmill procedures to their end state. Display only: the
+/// generation's state comes from its prompts, never from the procedure.
+pub async fn reconcile_procedures(hub: &Hub) -> DResult<()> {
+    let open: Vec<(Uuid, String)> = sqlx::query_as(
+        "select id, external_id from execution_attempts where kind = 'windmill_root' and state in ('submitted', 'queued', 'running')",
+    )
+    .fetch_all(&hub.db)
+    .await?;
+    for (id, job) in open {
+        let state = match hub.windmill.job(&job).await {
+            Ok(view) => match view.status {
+                JobStatus::Queued => AttemptState::Queued,
+                JobStatus::Running => AttemptState::Running,
+                JobStatus::Succeeded => AttemptState::Succeeded,
+                JobStatus::Failed => AttemptState::Failed,
+                JobStatus::Cancelled => AttemptState::Cancelled,
+            },
+            Err(e) => {
+                tracing::debug!(%job, error = %e, "procedure status read failed");
+                continue;
+            }
+        };
+        set_attempt(hub, id, state, json!({})).await?;
+    }
+    Ok(())
+}
+
 /// Copy one engine output into durable storage. Idempotent per output.
 async fn import_output(hub: &Hub, p: &OpenPrompt, out: &OutputFile) -> DResult<()> {
     let source_key = format!("{}:{}:{}:{}:{}:{}", p.engine_id, p.prompt_id, out.node_id, out.kind, out.subfolder, out.filename);

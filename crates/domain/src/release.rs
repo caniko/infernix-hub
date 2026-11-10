@@ -282,6 +282,12 @@ pub async fn apply_approval(hub: &Hub, release_id: Uuid, view: &ApprovalView) ->
         }
         (Ok(()), ApprovalStatus::Pending) => return Ok(()),
     };
+    // The item leaves review: ready to schedule, or back to selecting for a new revision.
+    sqlx::query("update content_items set state = $2, updated_at = now() where id = $1 and state = 'review'")
+        .bind(rel.content_item_id)
+        .bind(if action == "release.approved" { ContentState::Approved } else { ContentState::Selecting }.as_str())
+        .execute(&mut *tx)
+        .await?;
     audit(
         &mut tx,
         &Actor::system(),

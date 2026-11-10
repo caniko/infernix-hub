@@ -16,6 +16,7 @@ pub fn content_state(state: ContentState) -> (&'static str, &'static str) {
         ContentState::Producing => ("Producing", "warn"),
         ContentState::Selecting => ("Selecting", "info"),
         ContentState::Review => ("In review", "amber"),
+        ContentState::Approved => ("Approved", "sage"),
         ContentState::Scheduled => ("Scheduled", "info"),
         ContentState::Published => ("Published", "ok"),
         ContentState::Archived => ("Archived", "muted"),

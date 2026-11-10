@@ -208,6 +208,7 @@ pub async fn reconcile(hub: &Hub) -> DResult<()> {
             tracing::warn!(prompt_id = %p.prompt_id, error = %e, "prompt reconcile failed");
         }
     }
+    production::reconcile_procedures(hub).await?;
     for (release_id, approval_id) in release::releases_in_review(hub).await? {
         match hub.paperclip.get_approval(&approval_id).await {
             Ok(view) => release::apply_approval(hub, release_id, &view).await?,
