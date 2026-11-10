@@ -123,7 +123,5 @@ captured from the app (desktop window minimum in practice is wider).
 
 ## Open decisions for the owner
 
-- **License:** `Cargo.toml` says `MIT` provisionally; no `LICENSE` file is
-  committed. Choose the product license.
 - Postiz vs another transport for publishing.
 - Which ComfyUI checkpoint/workflow to register first.

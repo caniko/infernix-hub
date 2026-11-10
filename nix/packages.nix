@@ -62,6 +62,7 @@
           meta = {
             description = "infernix-hub ${name}";
             mainProgram = name;
+            license = pkgs.lib.licenses.eupl12;
           };
         });
     };
@@ -100,6 +101,7 @@ in {
         meta = {
           description = "infernix-hub operator console";
           mainProgram = "infernix-hub-desktop";
+          license = pkgs.lib.licenses.eupl12;
         };
       });
   };
