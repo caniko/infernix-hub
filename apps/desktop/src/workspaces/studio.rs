@@ -270,13 +270,18 @@ pub fn StudioView() -> Element {
                         let (state_label, state_tone) = labels::content_state(item.state);
                         // Releases arrive newest first.
                         let latest_release = detail.releases.first().cloned();
+                        let persona_name = (store.personas)
+                            .cloned()
+                            .data
+                            .and_then(|ps| ps.into_iter().find(|p| p.id == item.persona_id).map(|p| p.name))
+                            .unwrap_or_else(|| format::short_hash(&item.persona_id.to_string()));
                         let reviewable = detail.releases.iter().find(|r| r.state == ReleaseState::Draft).cloned();
                         let approved = detail.releases.iter().find(|r| r.state == ReleaseState::Approved).cloned();
                         rsx! {
                             div { class: "work-head",
                                 div {
                                     h1 { "{item.title}" }
-                                    p { class: "hint", "persona {format::short_hash(&item.persona_id.to_string())} · updated {format::fmt_dt(item.updated_at)}" }
+                                    p { class: "hint", "{persona_name} · updated {format::fmt_dt(item.updated_at)}" }
                                 }
                                 div { class: "spacer" }
                                 Chip { label: state_label.to_string(), tone: Some(state_tone.to_string()) }
@@ -371,7 +376,7 @@ pub fn StudioView() -> Element {
                                                             Chip { label: gen_label.to_string(), tone: Some(gen_tone.to_string()) }
                                                         }
                                                         div { class: "row",
-                                                            span { class: "label-tech", "{generation.variants} variants · request v{generation.request_version} · {done}/{total} attempts done" }
+                                                            span { class: "label-tech", "{generation.variants} variants · request v{generation.request_version} · {done}/{total} prompts done" }
                                                         }
                                                         div { class: "progress", div { class: "fill", style: "width: {pct}%;" } }
                                                         if !generation.attempts.is_empty() {

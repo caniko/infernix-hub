@@ -219,9 +219,11 @@ pub fn open_external(url: &str) {
     }
 }
 
-/// Count completed vs total attempts for the progress bar.
+/// Count completed vs total ComfyUI prompts (one per variant) for the progress
+/// bar; the Windmill procedure that submits them is not a unit of output.
 pub fn attempt_progress(attempts: &[contracts::ExecutionAttempt]) -> (usize, usize) {
-    let done = attempts
+    let prompts: Vec<_> = attempts.iter().filter(|a| a.kind == contracts::AttemptKind::ComfyPrompt).collect();
+    let done = prompts
         .iter()
         .filter(|a| {
             matches!(
@@ -233,7 +235,7 @@ pub fn attempt_progress(attempts: &[contracts::ExecutionAttempt]) -> (usize, usi
             )
         })
         .count();
-    (done, attempts.len())
+    (done, prompts.len())
 }
 
 /// Group intents by UTC day, then account, ordered by due time.
@@ -283,7 +285,7 @@ mod tests {
         contracts::ExecutionAttempt {
             id: Uuid::new_v4(),
             parent_id: None,
-            kind: contracts::AttemptKind::WindmillRoot,
+            kind: contracts::AttemptKind::ComfyPrompt,
             external_id: "ext".into(),
             engine_instance_id: None,
             state,
@@ -295,8 +297,9 @@ mod tests {
     #[test]
     fn attempt_progress_counts_terminal_states() {
         use contracts::AttemptState;
-        let attempts = [attempt(AttemptState::Succeeded), attempt(AttemptState::Running), attempt(AttemptState::Failed)];
-        assert_eq!(attempt_progress(&attempts), (2, 3));
+        let root = contracts::ExecutionAttempt { kind: contracts::AttemptKind::WindmillRoot, ..attempt(AttemptState::Running) };
+        let attempts = [attempt(AttemptState::Succeeded), attempt(AttemptState::Running), attempt(AttemptState::Failed), root];
+        assert_eq!(attempt_progress(&attempts), (2, 3), "the Windmill root is not a prompt");
         assert_eq!(attempt_progress(&[]), (0, 0));
     }
 

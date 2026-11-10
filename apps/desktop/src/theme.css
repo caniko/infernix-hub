@@ -196,6 +196,7 @@ a:hover { color: var(--focus); text-decoration: underline; }
 .statusbar .seg.live .dot { background: var(--ok); }
 .statusbar .seg.warn .dot { background: var(--warn); }
 .statusbar .grow { flex: 1; }
+.statusbar .seg:last-child { flex-shrink: 0; }
 
 /* ── Fixture banner ────────────────────────────────────────────────────── */
 .fixture-banner {

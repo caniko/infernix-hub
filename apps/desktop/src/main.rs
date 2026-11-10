@@ -192,9 +192,13 @@ fn App() -> Element {
                 .iter()
                 .map(|integration| {
                     let (mode_label, mode_tone) = labels::adapter_mode(integration.mode);
-                    let (verification_label, _) = labels::verification(integration.verification);
+                    // Fixture is always "fixture tested"; only live needs its evidence level.
+                    let detail = match integration.mode {
+                        contracts::AdapterMode::Live => labels::verification(integration.verification).0,
+                        _ => mode_label,
+                    };
                     shell::StatusSeg {
-                        label: format!("{} · {} · {}", integration.name, mode_label, verification_label),
+                        label: format!("{} · {}", integration.name, detail),
                         tone: if mode_tone == "ok" { "live".to_string() } else { mode_tone.to_string() },
                     }
                 })

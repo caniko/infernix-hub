@@ -106,14 +106,15 @@ fn TodayRow(item: TodayItem) -> Element {
     let store = use_context::<Store>();
     let subject_type = item.subject_type.clone();
     let tone = labels::status_tone(&item.status).to_string();
+    let kind = item.kind.replace('_', " ");
     rsx! {
         div { class: "glass-card today-row",
             div { class: "spread",
                 span { class: "today-title", "{item.title}" }
-                Chip { label: item.status.clone(), tone: Some(tone) }
+                Chip { label: item.status.replace('_', " "), tone: Some(tone) }
             }
             div { class: "row",
-                span { class: "label-tech", "{item.kind} · {item.subject_type}" }
+                span { class: "label-tech", "{kind} · {item.subject_type}" }
                 if let Some(at) = item.at {
                     span { class: "label-tech", "{format::rel_time(at.timestamp_millis().max(0) as u64)}" }
                 }

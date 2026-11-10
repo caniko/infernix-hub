@@ -109,16 +109,18 @@ lease column is the upgrade path.
 | D3 | Window opened at the 800 px default; inspector overlay covered the app | fixed `4033231` |
 | D4 | Latest release read from the wrong end of the list | fixed `1ce7dcc` |
 | D5 | Canon editor could fill from the previous persona | fixed `1ce7dcc`, `3b78006` |
-| P1 | Status bar truncates at 1440 px | open |
-| P2 | Content list shows "IN REVIEW" after approval | open |
-| P3 | Studio header shows the persona id instead of its name | open |
-| P4 | "3/4 attempts" counts the Windmill root | open |
+| P1 | Status bar truncated at 1440 px (repeated "fixture · fixture tested") | fixed: fixture shows the mode, live shows its evidence level |
+| P2 | Content list said "In review" after approval | fixed: new `approved` content state; rejection returns to `selecting` |
+| P3 | Studio header showed the persona id | fixed: persona name |
+| P4 | "3/4 attempts" counted the Windmill root | fixed: counts prompts ("2/2 prompts done") |
+| P5 | Windmill root attempt stayed "submitted" after success | fixed: worker follows procedure status (display only) |
+| P6 | Today chips showed raw ids (`IN_REVIEW`, `REPLY_REVIEW`) | fixed |
 
 ## Designs
 
 `design/infernix-hub.fig` (OpenPencil): D01 Studio, D02 Today, M01 narrow
 (390 px). Checked against screenshots of the running app at 1440 and 760 px;
-layout and tokens match, the P-items above are the known drift. 390 px was not
+layout and tokens match. The OpenPencil frames were not updated for P1–P6. 390 px was not
 captured from the app (desktop window minimum in practice is wider).
 
 ## Open decisions for the owner
