@@ -149,14 +149,30 @@
 
   # A raw URL file (agenix/secret mount) is read at exec time; nothing but the
   # path enters the store.
-  launcher =
+  mkLauncher = name: exe:
     if cfg.database.urlFile != null
     then
-      pkgs.writeShellScript "fleetix-hubd-db-url" ''
+      pkgs.writeShellScript "${name}-db-url" ''
         export DATABASE_URL="$(cat ${toString cfg.database.urlFile})"
-        exec ${cfg.package}/bin/fleetix-hubd "$@"
+        exec ${exe} "$@"
       ''
-    else "${cfg.package}/bin/fleetix-hubd";
+    else exe;
+  coreExecutable = "${cfg.package}/bin/fleetix-hubd";
+  # `serve` runs the product binary (it carries the packs); tokens and
+  # migrations are core and always run the upstream binary.
+  launcher = mkLauncher "fleetix-hub-serve" cfg.executable;
+  coreLauncher = mkLauncher "fleetix-hubd" coreExecutable;
+
+  # --- packs --------------------------------------------------------------
+  enabledPacks = lib.filterAttrs (_: pack: pack.enable) cfg.packs;
+
+  # Only enabled packs are serialized, so a disabled pack cannot make startup
+  # fail with "unknown pack" and its credentials are never loaded.
+  packsFile =
+    if enabledPacks == {}
+    then null
+    else pkgs.writeText "fleetix-hub-packs.json" (builtins.toJSON (lib.mapAttrs (_: pack: pack.config) enabledPacks));
+  packsArg = lib.optionalString (packsFile != null) " --packs-config ${packsFile}";
 
   # --- credentials --------------------------------------------------------
   credentials = lib.filterAttrs (_: value: value != null) {
@@ -165,10 +181,28 @@
     postiz-token = cfg.credentials.postizToken;
   };
   tokenCredentials = lib.mapAttrs' (name: token: lib.nameValuePair "token-${name}" token.file) cfg.tokens;
-  loadCredentials = lib.mapAttrsToList (name: path: "${name}:${path}") (credentials // tokenCredentials);
+  # Credential ids must be `<id>-<name>`: the pack reads them from
+  # `$CREDENTIALS_DIRECTORY` under that name.
+  packCredentials = lib.concatLists (lib.mapAttrsToList
+    (id: pack: lib.mapAttrsToList (name: path: "${id}-${name}:${path}") pack.credentials)
+    enabledPacks);
+  loadCredentials =
+    lib.mapAttrsToList (name: path: "${name}:${path}") (credentials // tokenCredentials)
+    ++ packCredentials;
+  # `LoadCredential` silently keeps one entry per repeated id, and an id is
+  # ambiguous: `foo` + `bar-baz` and `foo-bar` + `baz` both render
+  # `foo-bar-baz`, and a pack credential can shadow a built-in `token-<name>`.
+  # Assert over the complete generated list, built-ins and tokens included.
+  credentialIds =
+    lib.attrNames credentials
+    ++ lib.attrNames tokenCredentials
+    ++ lib.concatLists (lib.mapAttrsToList
+      (id: pack: lib.mapAttrsToList (name: _: "${id}-${name}") pack.credentials)
+      enabledPacks);
+  credentialIdsUnique = lib.length credentialIds == lib.length (lib.unique credentialIds);
 
   tokenCommands =
-    lib.mapAttrsToList (name: token: "${launcher} token --name ${lib.escapeShellArg name} --role ${token.role} --token-file %d/token-${name}")
+    lib.mapAttrsToList (name: token: "${coreLauncher} token --name ${lib.escapeShellArg name} --role ${token.role} --token-file %d/token-${name}")
     cfg.tokens;
 
   # --- unit ordering ------------------------------------------------------
@@ -203,6 +237,18 @@ in {
       default = self.packages.${system}.fleetix-hubd;
       defaultText = lib.literalExpression "fleetix-hub.packages.\${system}.fleetix-hubd";
       description = "Server package; must ship registry/ under share/fleetix-hub.";
+    };
+
+    executable = mkOption {
+      type = types.path;
+      default = "${cfg.package}/bin/fleetix-hubd";
+      defaultText = lib.literalExpression ''"''${cfg.package}/bin/fleetix-hubd"'';
+      description = ''
+        Binary used for `serve`. A downstream product points this at its own
+        entry point, for example the `canix-hub` binary, which must accept
+        `serve [--packs-config FILE]`. Token registration and migrations are
+        core and always run `''${cfg.package}/bin/fleetix-hubd`.
+      '';
     };
 
     bind = mkOption {
@@ -549,6 +595,50 @@ in {
         default = null;
       };
     };
+
+    packs = mkOption {
+      type = types.attrsOf (types.submodule ({name, ...}: {
+        options = {
+          enable = mkEnableOption "pack ${name}";
+          config = mkOption {
+            type = types.attrsOf types.anything;
+            default = {};
+            description = ''
+              Pack config, serialized as JSON into `packs.json`. Rust
+              registration does not generate Nix options, so the module checks
+              the shape (an attrset that `builtins.toJSON` can render) and the
+              pack parses its own fields.
+            '';
+          };
+          credentials = mkOption {
+            type = types.attrsOf types.path;
+            default = {};
+            description = ''
+              Pack secrets as name -> file path, typically agenix paths. Each
+              becomes the systemd credential `<id>-<name>`, readable by the
+              pack from `$CREDENTIALS_DIRECTORY`; only the path enters the
+              store.
+            '';
+          };
+        };
+      }));
+      default = {};
+      example = lib.literalExpression ''
+        {
+          plinth = {
+            enable = true;
+            config = {baseUrl = "https://example.com";};
+            credentials.token = config.age.secrets.plinth-token.path;
+          };
+        }
+      '';
+      description = ''
+        Compile-time packs installed by the executable. Enabled packs are
+        rendered to `packs.json` (id -> config) and passed as
+        `--packs-config`; startup fails when an id has no matching pack in the
+        binary.
+      '';
+    };
   };
 
   config = mkIf cfg.enable (lib.mkMerge [
@@ -589,6 +679,16 @@ in {
         {
           assertion = cfg.database.urlFile == null || !cfg.database.createLocally;
           message = "fleetix-hub: database.urlFile is for an external database; leave database.createLocally = false.";
+        }
+        {
+          assertion =
+            lib.all (id: builtins.match "[a-z0-9-]+" id != null) (lib.attrNames enabledPacks)
+            && lib.all (pack: lib.all (name: builtins.match "[A-Za-z0-9_.-]+" name != null) (lib.attrNames pack.credentials)) (lib.attrValues enabledPacks);
+          message = "fleetix-hub: pack ids must match [a-z0-9-]+ and credential names [A-Za-z0-9_.-]+, so `<id>-<name>` is a valid systemd credential id.";
+        }
+        {
+          assertion = credentialIdsUnique;
+          message = "fleetix-hub: generated LoadCredential ids must be unique across credentials, tokens and packs. `foo` + `bar-baz` and `foo-bar` + `baz` both render `foo-bar-baz`, and a pack `token` + `x` collides with the token credential `token-x`; systemd silently keeps one entry per repeated id. Rename the colliding pack or credential.";
         }
       ];
 
@@ -646,7 +746,7 @@ in {
         serviceConfig =
           harbor-rs.lib.hardeningProfiles.network-service
           // {
-            ExecStart = "${launcher} serve";
+            ExecStart = "${launcher} serve${packsArg}";
             ExecStartPre = tokenCommands;
             User = runtimeUser;
             Group = runtimeGroup;
@@ -709,12 +809,11 @@ in {
         runner =
           if cfg.database.urlFile != null
           then {
-            command = "${launcher} migrate";
-            checkCommand = "${launcher} migrate --check";
+            command = "${coreLauncher} migrate";
+            checkCommand = "${coreLauncher} migrate --check";
           }
           else {
-            inherit (cfg) package;
-            executable = "bin/fleetix-hubd";
+            executable = coreExecutable;
             args = ["migrate"];
             checkArgs = ["migrate" "--check"];
           };
