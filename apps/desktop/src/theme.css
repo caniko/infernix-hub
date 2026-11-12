@@ -411,7 +411,9 @@ input[type="checkbox"] { accent-color: var(--honey); }
   aspect-ratio: 1 / 1; background: var(--bg); border: 1px solid var(--border);
   border-radius: 5px; overflow: hidden; display: flex; align-items: center; justify-content: center;
 }
-.asset-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.asset-frame img, .asset-frame video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.asset-frame video { background: #000; }
+.asset-tile a.btn { text-decoration: none; display: inline-flex; align-items: center; }
 .asset-frame .asset-missing { color: var(--text-2); font-family: var(--font-mono); font-size: 0.6rem; text-align: center; padding: 8px; }
 .asset-tile.selected { border-color: var(--honey); box-shadow: 0 0 0 1px var(--honey); }
 .asset-meta { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }

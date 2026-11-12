@@ -4,6 +4,7 @@
 //! from `*_TOKEN_FILE` paths (systemd credentials / agenix), never from argv,
 //! and never leave the server.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,6 +35,10 @@ pub struct Settings {
     pub comfy: AdapterMode,
     pub publisher: AdapterMode,
     pub assistant: AdapterMode,
+    /// Pack enablement and per-pack JSON config (id -> object).
+    pub packs_config: Option<PathBuf>,
+    /// Do not start the outbox worker with `serve`.
+    pub no_worker: bool,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -67,6 +72,8 @@ impl Settings {
             comfy: mode("HUB_COMFY")?,
             publisher: mode("HUB_PUBLISHER")?,
             assistant: mode("HUB_ASSISTANT")?,
+            packs_config: env("HUB_PACKS_CONFIG").map(PathBuf::from),
+            no_worker: matches!(env("HUB_NO_WORKER").as_deref(), Some("1" | "true")),
         })
     }
 
@@ -86,6 +93,8 @@ impl Settings {
             comfy: AdapterMode::Fixture,
             publisher: AdapterMode::Fixture,
             assistant: AdapterMode::Fixture,
+            packs_config: None,
+            no_worker: false,
         }
     }
 }
@@ -135,6 +144,33 @@ fn status(name: &str, mode: AdapterMode, live: Verification, detail: &str) -> In
     IntegrationStatus { name: name.into(), mode, verification, detail }
 }
 
+/// Fixture approvals can never authorize a real post, whatever `HUB_PUBLISHER`
+/// says. Only a channel backed by the in-process fixture adapter (or the
+/// disabled publisher) is simulated; every other transport — the built-in live
+/// adapter, each `n8n:<platform>` channel and any pack channel — publishes for
+/// real and therefore needs live Paperclip approvals.
+pub(crate) fn require_live_approvals(
+    paperclip: AdapterMode,
+    publisher: AdapterMode,
+    builtin: &Arc<dyn ports::Publisher>,
+    channels: &BTreeMap<String, Arc<dyn ports::Publisher>>,
+) -> anyhow::Result<()> {
+    if paperclip == AdapterMode::Live {
+        return Ok(());
+    }
+    let simulated = |channel: &Arc<dyn ports::Publisher>| publisher != AdapterMode::Live && Arc::ptr_eq(channel, builtin);
+    for (transport, channel) in channels {
+        if !simulated(channel) {
+            bail!(
+                "publishing channel {transport:?} posts for real, but HUB_PAPERCLIP={}: \
+                 fixture approvals cannot authorize real publishing (set HUB_PAPERCLIP=live or remove the channel)",
+                paperclip
+            );
+        }
+    }
+    Ok(())
+}
+
 pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
     // Only the publisher has a real disabled mode; the others would silently
     // fall back to a simulation that the status page reports as disabled.
@@ -145,7 +181,9 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
             bail!("{name}=disabled is not supported; use fixture or live");
         }
     }
-    // Simulated approvals must never authorize a real post.
+    // Simulated approvals must never authorize a real post. This early check
+    // covers the built-in adapter before the database is touched; the
+    // per-channel guard below also covers n8n and pack channels.
     if s.publisher == AdapterMode::Live && s.paperclip != AdapterMode::Live {
         bail!("HUB_PUBLISHER=live requires HUB_PAPERCLIP=live (fixture approvals cannot authorize real publishing)");
     }
@@ -172,6 +210,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
     let mut fx = Fixtures::default();
+    let mut windmill_client: Option<integrations::live::WindmillClient> = None;
 
     let paperclip: Arc<dyn ports::Paperclip> = match s.paperclip {
         AdapterMode::Live => Arc::new(integrations::live::PaperclipClient::new(
@@ -206,14 +245,18 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         }
     };
     let windmill: Arc<dyn ports::Windmill> = match s.windmill {
-        AdapterMode::Live => Arc::new(integrations::live::WindmillClient::new(
-            http.clone(),
-            integrations::live::WindmillConfig::new(
-                env("WINDMILL_URL").unwrap_or_else(|| "http://127.0.0.1:8040".into()),
-                env("WINDMILL_WORKSPACE").unwrap_or_else(|| "studio".into()),
-                secret("WINDMILL_TOKEN")?,
-            ),
-        )),
+        AdapterMode::Live => {
+            let client = integrations::live::WindmillClient::new(
+                http.clone(),
+                integrations::live::WindmillConfig::new(
+                    env("WINDMILL_URL").unwrap_or_else(|| "http://127.0.0.1:8040".into()),
+                    env("WINDMILL_WORKSPACE").unwrap_or_else(|| "studio".into()),
+                    secret("WINDMILL_TOKEN")?,
+                ),
+            );
+            windmill_client = Some(client.clone());
+            Arc::new(client)
+        }
         _ => {
             let f = FixtureWindmill::new(fx.comfy.clone().expect("checked above"));
             fx.windmill = Some(f.clone());
@@ -271,6 +314,50 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         dispatch_early_secs: 30,
         dispatch_window_secs: 15 * 60,
     };
+    // Publishing channels are addressed by `accounts.transport`. The built-in
+    // adapter answers under its own real name only; a `fixture` deployment
+    // aliases the seeded account transports to the in-process fixture adapter
+    // so core dispatch keeps working. In live mode an unregistered transport
+    // stays `Dead` for an operator; it never falls back to another provider.
+    let mut channels: BTreeMap<String, Arc<dyn ports::Publisher>> = BTreeMap::new();
+    let builtin_transport = match s.publisher {
+        AdapterMode::Live => "postiz",
+        AdapterMode::Fixture => "fixture",
+        AdapterMode::Disabled => "disabled",
+    };
+    channels.insert(builtin_transport.to_string(), publisher.clone());
+    if s.publisher == AdapterMode::Fixture {
+        if let Some(seed) = &seed {
+            for account in &seed.accounts {
+                channels.insert(account.transport.clone(), publisher.clone());
+            }
+        }
+    }
+    // n8n contract v1: one live channel per platform workflow,
+    // `n8n:<platform>`. It replaces a fixture alias of the same name.
+    if let Some(platforms) = env("N8N_PUBLISH_PLATFORMS") {
+        let url = env("N8N_PUBLISH_URL").context("N8N_PUBLISH_URL is required with N8N_PUBLISH_PLATFORMS")?;
+        let token = secret("N8N_WEBHOOK_TOKEN")?;
+        for platform in platforms.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let cfg = integrations::live::N8nPublisherConfig::new(url.clone(), token.clone(), platform);
+            channels.insert(format!("n8n:{platform}"), Arc::new(integrations::live::N8nPublisher::new(http.clone(), cfg)));
+        }
+    }
+    require_live_approvals(s.paperclip, s.publisher, &publisher, &channels).context("publishing channels")?;
+    // Built-in pipelines are the upstream registry's pipeline workflows: one
+    // generic Windmill script per `pipeline_id` (or its in-process stand-in).
+    // Packs register their own pipelines and workflow rows.
+    let mut pipelines: BTreeMap<String, Arc<dyn ports::Pipeline>> = BTreeMap::new();
+    for spec in read_registry(&s.registry_dir.join("pipeline"))? {
+        let Some(id) = spec.pipeline_id.clone() else { continue };
+        let pipeline: Arc<dyn ports::Pipeline> = match &windmill_client {
+            Some(client) => Arc::new(integrations::live::WindmillPipeline::new(client.clone(), spec.windmill_path.clone())),
+            None => Arc::new(integrations::fixture::FixturePipeline::new(
+                fx.windmill.clone().context("fixture windmill is required for a fixture pipeline")?,
+            )),
+        };
+        pipelines.insert(id, pipeline);
+    }
     let hub = Hub {
         db,
         config: Arc::new(config),
@@ -281,11 +368,15 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         assistant,
         gpu_peer,
         assets: Arc::new(integrations::store::LocalAssetStore::new(&s.asset_dir)),
+        channels: Arc::new(channels),
+        pipelines: Arc::new(pipelines),
+        topics: Arc::new(BTreeMap::new()),
     };
     if let Some(seed) = &seed {
         apply_seed(&hub, seed, &hub.config.company_id).await?;
     }
     load_registry(&hub, &s.registry_dir.join("comfyui")).await?;
+    load_registry(&hub, &s.registry_dir.join("pipeline")).await?;
     Ok((AppState { hub, fixture_paperclip: fx.paperclip.clone(), fleet_status_file: s.fleet_status_file.clone() }, fx))
 }
 
@@ -382,24 +473,102 @@ pub async fn apply_seed(hub: &Hub, seed: &Seed, company_id: &str) -> anyhow::Res
     Ok(())
 }
 
-/// Register every `registry/comfyui/*.json` workflow version.
+/// Register every `registry/comfyui/*.json` or `registry/pipeline/*.json`
+/// workflow version it can satisfy.
 pub async fn load_registry(hub: &Hub, dir: &Path) -> anyhow::Result<()> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()) };
+    for spec in read_registry(dir)? {
+        if let Some(engine) = &spec.engine_instance_id {
+            let known: Option<String> =
+                domain::sqlx::query_scalar("select id from engine_instances where id = $1").bind(engine).fetch_optional(&hub.db).await?;
+            if known.is_none() {
+                tracing::warn!(workflow = %spec.name, engine = %engine, "engine not registered; skipping workflow");
+                continue;
+            }
+        }
+        domain::production::register_workflow(hub, &spec).await.with_context(|| format!("registering {} v{}", spec.name, spec.version))?;
+    }
+    Ok(())
+}
+
+fn read_registry(dir: &Path) -> anyhow::Result<Vec<domain::production::WorkflowSpec>> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(Vec::new()) };
     let mut paths: Vec<_> =
         entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "json")).collect();
     paths.sort();
-    for p in paths {
+    // One id, one definition: the pipeline registry is keyed by `pipeline_id`,
+    // so a second file would silently win by sort order.
+    let mut pipeline_files: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut specs = Vec::with_capacity(paths.len());
+    for path in &paths {
         let spec: domain::production::WorkflowSpec =
-            serde_json::from_str(&std::fs::read_to_string(&p)?).with_context(|| format!("parsing {}", p.display()))?;
-        let engine: Option<String> = domain::sqlx::query_scalar("select id from engine_instances where id = $1")
-            .bind(&spec.engine_instance_id)
-            .fetch_optional(&hub.db)
-            .await?;
-        if engine.is_none() {
-            tracing::warn!(workflow = %spec.name, engine = %spec.engine_instance_id, "engine not registered; skipping workflow");
-            continue;
+            serde_json::from_str(&std::fs::read_to_string(path)?).with_context(|| format!("parsing {}", path.display()))?;
+        if let Some(id) = &spec.pipeline_id {
+            if let Some(first) = pipeline_files.insert(id.clone(), path.clone()) {
+                bail!("pipeline id {id:?} is defined by both {} and {}", first.display(), path.display());
+            }
         }
-        domain::production::register_workflow(hub, &spec).await.with_context(|| format!("registering {}", p.display()))?;
+        specs.push(spec);
     }
-    Ok(())
+    Ok(specs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel(name: &'static str) -> Arc<dyn ports::Publisher> {
+        Arc::new(Disabled(name))
+    }
+
+    #[test]
+    fn every_non_fixture_channel_needs_live_paperclip_approvals() {
+        let builtin = channel("fixture");
+        let aliases = BTreeMap::from([("fixture".to_string(), builtin.clone()), ("mastodon".to_string(), builtin.clone())]);
+        assert!(require_live_approvals(AdapterMode::Fixture, AdapterMode::Fixture, &builtin, &aliases).is_ok());
+
+        // A live n8n workflow and a pack channel post for real whatever the
+        // built-in publisher mode says.
+        let live = BTreeMap::from([
+            ("fixture".to_string(), builtin.clone()),
+            ("n8n:youtube".to_string(), channel("n8n")),
+            ("plinth".to_string(), channel("plinth")),
+        ]);
+        let err = require_live_approvals(AdapterMode::Fixture, AdapterMode::Fixture, &builtin, &live).unwrap_err().to_string();
+        assert!(err.contains("publishing channel"), "the guard explains itself: {err}");
+        for transport in ["n8n:youtube", "plinth"] {
+            let single = BTreeMap::from([("fixture".to_string(), builtin.clone()), (transport.to_string(), channel(transport))]);
+            let err = require_live_approvals(AdapterMode::Fixture, AdapterMode::Fixture, &builtin, &single).unwrap_err().to_string();
+            assert!(err.contains(transport), "the failing channel is named: {err}");
+        }
+        assert!(
+            require_live_approvals(AdapterMode::Live, AdapterMode::Fixture, &builtin, &live).is_ok(),
+            "live approvals authorize every channel"
+        );
+
+        // The disabled publisher simulates like the fixture one, so it needs no
+        // live approvals; a pack channel alongside it still does.
+        let disabled = channel("disabled");
+        let off = BTreeMap::from([("disabled".to_string(), disabled.clone())]);
+        assert!(require_live_approvals(AdapterMode::Fixture, AdapterMode::Disabled, &disabled, &off).is_ok());
+        let mut mixed = off;
+        mixed.insert("plinth".to_string(), channel("plinth"));
+        assert!(require_live_approvals(AdapterMode::Fixture, AdapterMode::Disabled, &disabled, &mixed).is_err());
+    }
+
+    #[test]
+    fn duplicate_builtin_pipeline_ids_fail_startup_naming_both_files() {
+        let dir = std::env::temp_dir().join(format!("hub-pipeline-dup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, path) in [("a.json", "f/studio/a"), ("b.json", "f/studio/b")] {
+            std::fs::write(
+                dir.join(file),
+                format!(r#"{{"name":"{file}","version":1,"pipeline_id":"studio.render","windmill_path":"{path}"}}"#),
+            )
+            .unwrap();
+        }
+        let err = read_registry(&dir).unwrap_err().to_string();
+        assert!(err.contains("a.json") && err.contains("b.json"), "both files are named: {err}");
+        assert!(err.contains("studio.render"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

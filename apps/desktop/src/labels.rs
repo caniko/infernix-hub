@@ -54,6 +54,7 @@ pub fn attempt_kind(kind: AttemptKind) -> &'static str {
         AttemptKind::WindmillRoot => "windmill root",
         AttemptKind::WindmillChild => "windmill child",
         AttemptKind::ComfyPrompt => "comfy prompt",
+        AttemptKind::PipelineRun => "pipeline run",
     }
 }
 

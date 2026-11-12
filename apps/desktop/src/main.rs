@@ -13,6 +13,7 @@ mod icons;
 mod inspector;
 mod labels;
 mod palette;
+mod platform;
 mod shell;
 mod state;
 mod theme;

@@ -950,6 +950,77 @@
         "x-roles": "any authenticated role"
       }
     },
+    "/v1/generations/{id}/artifacts": {
+      "post": {
+        "operationId": "upload_artifact",
+        "description": "Raw output bytes from a pipeline procedure. Headers: x-artifact-source, content-type, x-sha256.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-artifact-source",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-sha256",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerationRequest"
+                }
+              }
+            },
+            "description": "GenerationRequest"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "procedure"
+      }
+    },
     "/v1/generations/{id}/cancel": {
       "post": {
         "operationId": "cancel_generation",
@@ -1625,6 +1696,49 @@
               }
             },
             "description": "RelationshipDetail"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "see domain command"
+      }
+    },
+    "/v1/relationships/{id}/draft-reply": {
+      "post": {
+        "operationId": "draft_assistant_reply",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplyDraft"
+                }
+              }
+            },
+            "description": "Relationship"
           },
           "4XX": {
             "content": {

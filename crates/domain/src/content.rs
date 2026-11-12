@@ -1,7 +1,7 @@
 //! Content items, briefs, creative chat, Today and search.
 
 use contracts::{
-    CanonSource, ChatMessage, ChatMessageIn, ContentDetail, ContentItem, ContentState, CreateBriefIn, SearchHit, Today, TodayItem,
+    CanonSource, ChatMessage, ChatMessageIn, ContentDetail, ContentItem, ContentState, CreateBriefIn, Producer, SearchHit, Today, TodayItem,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -58,21 +58,34 @@ pub async fn create_brief(hub: &Hub, actor: &Actor, input: CreateBriefIn) -> DRe
     if let Some((title, url)) = &news {
         description.push_str(&format!("\nSource: {title} — {url}"));
     }
-    outbox::enqueue(
-        &mut tx,
-        actor,
-        outbox::PAPERCLIP_CREATE_ISSUE,
-        &format!("issue:content:{id}"),
-        json!({ "content_item_id": id, "company_id": hub.config.company_id, "title": input.title, "description": description, "origin_key": format!("fleetix-hub:content:{id}") }),
-    )
-    .await?;
+    // The producer decides who starts the work. `delegated` files the issue
+    // with the studio org (project and assignee from the `paperclip_studio`
+    // setting, when configured); `direct` runs the pipeline in the hub. The
+    // hub publishes in both modes.
+    if input.brief.producer == Producer::Delegated {
+        let studio: Option<Value> =
+            sqlx::query_scalar("select value from settings where key = 'paperclip_studio'").fetch_optional(&mut *tx).await?;
+        let field = |key: &str| studio.as_ref().and_then(|v| v[key].as_str()).map(str::to_string);
+        outbox::enqueue(
+            &mut tx,
+            actor,
+            outbox::PAPERCLIP_CREATE_ISSUE,
+            &format!("issue:content:{id}"),
+            json!({
+                "content_item_id": id, "company_id": hub.config.company_id, "title": input.title, "description": description,
+                "origin_key": format!("fleetix-hub:content:{id}"),
+                "project_id": field("project_id"), "assignee_agent_id": field("assignee_agent_id"),
+            }),
+        )
+        .await?;
+    }
     audit(
         &mut tx,
         actor,
         "content.brief_created",
         "content",
         id,
-        json!({ "news_item_id": input.news_item_id, "persona_id": input.persona_id }),
+        json!({ "news_item_id": input.news_item_id, "persona_id": input.persona_id, "producer": input.brief.producer }),
     )
     .await?;
     let item = get_item(&mut tx, id).await?;

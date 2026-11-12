@@ -3,6 +3,7 @@
 //! the caller's role, changes state and records outbound commands in one
 //! transaction.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use contracts::{Principal, Role};
@@ -89,6 +90,13 @@ pub struct Hub {
     pub assets: Arc<dyn ports::AssetStore>,
     pub assistant: Arc<dyn ports::Assistant>,
     pub gpu_peer: Arc<dyn ports::GpuPeer>,
+    /// Publishing channels keyed by `accounts.transport`; dispatch uses only
+    /// the transport frozen into the release action.
+    pub channels: Arc<BTreeMap<String, Arc<dyn ports::Publisher>>>,
+    /// Generation pipelines keyed by `workflows.pipeline_id`.
+    pub pipelines: Arc<BTreeMap<String, Arc<dyn ports::Pipeline>>>,
+    /// Pack-provided outbox topics. Core topics stay in the worker's match.
+    pub topics: Arc<BTreeMap<String, Arc<dyn outbox::OutboxHandler>>>,
 }
 
 /// The authenticated caller plus the request's correlation id.

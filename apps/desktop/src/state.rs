@@ -187,7 +187,7 @@ pub struct Store {
     /// Set by a chat proposal link so Library highlights the matching card.
     pub focus_proposal: Signal<Option<Uuid>>,
 
-    /// Asset id → `data:` URI, loaded from `/v1/assets/{id}/content`.
+    /// Asset id → `data:` URI (image or video), loaded from `/v1/assets/{id}/content`.
     pub asset_images: Signal<HashMap<Uuid, String>>,
     /// Release revision id → approval state, built from content details.
     pub release_states: Signal<HashMap<Uuid, ReleaseState>>,

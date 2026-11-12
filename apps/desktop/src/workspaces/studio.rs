@@ -16,7 +16,7 @@ use crate::{
         chat::{ChatPanel, TranscriptLine},
         proposal::DeltaRow,
     },
-    format, labels,
+    format, labels, platform,
     shell::ContextItem,
     state::{Loaded, Store, Workspace},
 };
@@ -41,7 +41,11 @@ pub fn StudioView() -> Element {
     let mut not_before = use_signal(String::new);
     let mut not_after = use_signal(String::new);
     let mut schedule_at = use_signal(String::new);
+    let mut settings = use_signal(platform::SettingsDraft::default);
+    let mut settings_base = use_signal(serde_json::Value::default);
     let mut initialized_for = use_signal(|| Option::<Uuid>::None);
+    let draft = settings.cloned();
+    let frozen_json = serde_json::to_string_pretty(&settings_base.cloned()).unwrap_or_default();
 
     use_effect(move || {
         if workflow_id.cloned().is_none() {
@@ -70,6 +74,18 @@ pub fn StudioView() -> Element {
         not_after.set(format::default_local(Utc::now() + ChronoDuration::hours(24)));
         schedule_at.set(format::default_local(Utc::now() + ChronoDuration::hours(1)));
         account_ids.set(Vec::new());
+        // Start from the latest revision's frozen settings so a re-freeze only
+        // changes what the operator actually edited.
+        let frozen = detail
+            .releases
+            .first()
+            .and_then(|release| release.actions.first())
+            .map(|action| action.platform_settings.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        // The editor starts empty; selecting an account syncs its channel's
+        // drafts from the frozen value.
+        settings.set(platform::SettingsDraft::default());
+        settings_base.set(frozen);
         let mut drafts = alt.cloned();
         for asset in &detail.assets {
             drafts.entry(asset.id).or_insert_with(|| asset.alt_text.clone());
@@ -134,10 +150,16 @@ pub fn StudioView() -> Element {
             store.notify(false, "The timing window ends before it starts.");
             return;
         }
+        let conflicts = settings.cloned().conflicts();
+        if !conflicts.is_empty() {
+            let message = conflicts.iter().map(platform::Conflict::message).collect::<Vec<_>>().join(" ");
+            store.notify(false, format!("Cannot freeze: {message}"));
+            return;
+        }
         let body = FreezeReleaseIn {
             account_ids: accounts,
             text,
-            platform_settings: serde_json::json!({}),
+            platform_settings: settings.cloned().apply(&settings_base.cloned()),
             reply_to: None,
             timing: TimingScope { not_before: not_before_at, not_after: not_after_at },
         };
@@ -145,6 +167,13 @@ pub fn StudioView() -> Element {
         spawn(async move {
             match api::timed(client_freeze.freeze_release(content_id, &body)).await {
                 Ok(release) => {
+                    let frozen =
+                        release.actions.first().map(|action| action.platform_settings.clone()).unwrap_or_else(|| serde_json::json!({}));
+                    let roster = (store.accounts).cloned().data.unwrap_or_default();
+                    let mut next = platform::SettingsDraft::default();
+                    next.sync(&frozen, &platform::profiles_for(&roster, &account_ids.cloned()));
+                    settings.set(next);
+                    settings_base.set(frozen);
                     store.notify(true, format!("Release revision {} frozen.", release.revision));
                     api::load_content_detail(store, client_freeze.clone(), content_id).await;
                     api::refresh_base(store, client_freeze).await;
@@ -455,8 +484,17 @@ pub fn StudioView() -> Element {
                                                 rsx! {
                                                     div { class: if asset.selected { "glass-card asset-tile selected" } else { "glass-card asset-tile" }, key: "{asset.id}",
                                                         div { class: "asset-frame",
-                                                            if let Some(uri) = image {
-                                                                img { src: "{uri}", alt: "{current_alt}" }
+                                                            if let Some(uri) = image.clone() {
+                                                                if format::is_video(&asset.mime) {
+                                                                    video {
+                                                                        class: "asset-video",
+                                                                        controls: true,
+                                                                        src: "{uri}",
+                                                                        "video preview unavailable ({asset.mime})"
+                                                                    }
+                                                                } else {
+                                                                    img { src: "{uri}", alt: "{current_alt}" }
+                                                                }
                                                             } else {
                                                                 span { class: "asset-missing", "{asset_label} · {asset.mime} · {asset.bytes} B" }
                                                             }
@@ -466,6 +504,16 @@ pub fn StudioView() -> Element {
                                                             span { class: "chip muted", "sha {format::short_hash(&asset.sha256)}" }
                                                             if asset.selected {
                                                                 span { class: "chip sage", "selected" }
+                                                            }
+                                                            if format::is_video(&asset.mime) {
+                                                                if let Some(uri) = image {
+                                                                    a {
+                                                                        class: "btn btn-glass btn-xs",
+                                                                        href: "{uri}",
+                                                                        download: "{format::media_name(&asset.mime, &asset.sha256)}",
+                                                                        "Download"
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                         div { class: "field-row",
@@ -509,6 +557,118 @@ pub fn StudioView() -> Element {
                                             }
                                         }
                                     }
+                                }
+                            }
+                            Panel { title: "Platform settings".to_string(), caption: Some("only the keys the selected channels read".to_string()),
+                                div { class: "form-grid",
+                                    if draft.drafts().is_empty() {
+                                        if account_ids.cloned().is_empty() {
+                                            p { class: "label-tech", "Select an account: its channel decides which settings appear." }
+                                        } else {
+                                            p { class: "label-tech", "The selected accounts' channels have no known settings keys; no editor is shown rather than freezing keys nothing reads." }
+                                        }
+                                    }
+                                    for channel in draft.drafts() {
+                                        {
+                                            let profile = channel.profile();
+                                            rsx! {
+                                                div { class: "glass-card", key: "{profile.id}",
+                                                    span { class: "label-tech", "{profile.label}" }
+                                                    for field in profile.fields {
+                                                        {
+                                                            let key = field.key;
+                                                            let label = field.label;
+                                                            let id = format!("settings-{}-{key}", profile.id.replace(':', "-"));
+                                                            let value = channel.text(key).to_string();
+                                                            let checked = channel.flag(key);
+                                                            match field.kind {
+                                                                platform::Kind::Text => rsx! {
+                                                                    div { class: "field-row",
+                                                                        label { class: "label-tech", r#for: "{id}", "{label}" }
+                                                                        input {
+                                                                            id: "{id}", class: "input", value: "{value}",
+                                                                            oninput: move |e| {
+                                                                                let mut next = settings.cloned();
+                                                                                next.set_text(profile.id, key, e.value());
+                                                                                settings.set(next);
+                                                                            },
+                                                                        }
+                                                                    }
+                                                                },
+                                                                platform::Kind::LongText => rsx! {
+                                                                    div { class: "field-row",
+                                                                        label { class: "label-tech", r#for: "{id}", "{label}" }
+                                                                        textarea {
+                                                                            id: "{id}", class: "input", value: "{value}",
+                                                                            oninput: move |e| {
+                                                                                let mut next = settings.cloned();
+                                                                                next.set_text(profile.id, key, e.value());
+                                                                                settings.set(next);
+                                                                            },
+                                                                        }
+                                                                    }
+                                                                },
+                                                                platform::Kind::Tags => rsx! {
+                                                                    div { class: "field-row",
+                                                                        label { class: "label-tech", r#for: "{id}", "{label}" }
+                                                                        input {
+                                                                            id: "{id}", class: "input", placeholder: "comma separated",
+                                                                            value: "{value}",
+                                                                            oninput: move |e| {
+                                                                                let mut next = settings.cloned();
+                                                                                next.set_text(profile.id, key, e.value());
+                                                                                settings.set(next);
+                                                                            },
+                                                                        }
+                                                                    }
+                                                                },
+                                                                platform::Kind::Choice(values) => rsx! {
+                                                                    div { class: "field-row",
+                                                                        label { class: "label-tech", r#for: "{id}", "{label}" }
+                                                                        select {
+                                                                            id: "{id}", class: "input", value: "{value}",
+                                                                            onchange: move |e| {
+                                                                                let mut next = settings.cloned();
+                                                                                next.set_text(profile.id, key, e.value());
+                                                                                settings.set(next);
+                                                                            },
+                                                                            option { value: "", "channel default" }
+                                                                            for choice in values {
+                                                                                option { value: "{choice}", "{choice}" }
+                                                                            }
+                                                                            if !value.is_empty() && !values.contains(&value.as_str()) {
+                                                                                option { value: "{value}", "{value}" }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                },
+                                                                platform::Kind::Flag { .. } => rsx! {
+                                                                    div { class: "field-row",
+                                                                        label { class: "row",
+                                                                            input {
+                                                                                r#type: "checkbox", checked,
+                                                                                onchange: move |e| {
+                                                                                    let mut next = settings.cloned();
+                                                                                    next.set_flag(profile.id, key, e.checked());
+                                                                                    settings.set(next);
+                                                                                },
+                                                                            }
+                                                                            "{label}"
+                                                                        }
+                                                                    }
+                                                                },
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    div { class: "field-row",
+                                        span { class: "label-tech", "Frozen in the latest revision" }
+                                        pre { class: "raw-json", "{frozen_json}" }
+                                    }
+                                    p { class: "label-tech", "Only these keys are editable; other frozen keys are preserved. A channel with no disclosure field carries it in the post text, which the approval hash covers." }
                                 }
                             }
                             Panel { title: "Release".to_string(), caption: Some(format!("{} revision(s)", detail.releases.len())),
@@ -565,7 +725,13 @@ pub fn StudioView() -> Element {
                                                                         } else {
                                                                             current.retain(|value| value != &id);
                                                                         }
-                                                                        account_ids.set(current);
+                                                                        account_ids.set(current.clone());
+                                                                        // Each selected channel contributes its
+                                                                        // own keys; unselected ones are not written.
+                                                                        let roster = (store.accounts).cloned().data.unwrap_or_default();
+                                                                        let mut next = settings.cloned();
+                                                                        next.sync(&settings_base.cloned(), &platform::profiles_for(&roster, &current));
+                                                                        settings.set(next);
                                                                     },
                                                                 }
                                                                 "{account.handle} · {account.platform}"

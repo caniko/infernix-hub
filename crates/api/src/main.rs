@@ -20,6 +20,9 @@ enum Cmd {
     Serve {
         #[arg(long)]
         no_worker: bool,
+        /// JSON object mapping enabled pack id to that pack's config.
+        #[arg(long)]
+        packs_config: Option<std::path::PathBuf>,
     },
     /// Run the worker only.
     Worker,
@@ -96,13 +99,11 @@ async fn main() -> anyhow::Result<()> {
                 None => println!("{}", domain::system::issue_token(&db, &name, role, None).await?),
             }
         }
-        Cmd::Serve { no_worker } => {
-            let s = Settings::from_env()?;
-            let (state, _fx) = bootstrap::build(&s).await?;
-            if !no_worker {
-                tokio::spawn(worker::run(state.hub.clone(), Duration::from_secs(2)));
-            }
-            serve(&s.bind, state).await?;
+        Cmd::Serve { no_worker, packs_config } => {
+            let mut s = Settings::from_env()?;
+            s.no_worker |= no_worker;
+            s.packs_config = packs_config.or(s.packs_config);
+            fleetix_hubd::run(s, Vec::new()).await?;
         }
         Cmd::Worker => {
             let s = Settings::from_env()?;

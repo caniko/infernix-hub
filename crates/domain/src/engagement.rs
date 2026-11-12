@@ -5,14 +5,16 @@
 //! and invalidates drafts written under the old epoch, so a queued agent
 //! reply can never be delivered after a human takes over.
 
+use std::sync::Arc;
+
 use contracts::{
-    Direction, DraftDecisionIn, DraftReplyIn, DraftState, FollowUpIn, HandoffOut, IngestReceipt, InteractionIn, Owner, Relationship,
-    RelationshipDetail, ReplyDraft, Role,
+    Direction, DraftDecisionIn, DraftReplyIn, DraftState, FollowUpIn, HandoffOut, IngestReceipt, Interaction, InteractionIn, Owner,
+    Relationship, RelationshipDetail, ReplyDraft, Role,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::ports::{PortError, ProviderState, ReplyRequest};
+use crate::ports::{AssistantTurn, PortError, ProviderState, Publisher, ReplyRequest};
 use crate::{Actor, DResult, DomainError, Hub, OPERATOR, OPERATOR_OR_AGENT, audit, conflict, decode, decode_one, invalid, outbox};
 
 const REL_COLS: &str = "id, account_id, external_thread_id, counterpart, owner, owner_user, owner_epoch, follow_up_at, last_inbound_at, content_item_id, permalink";
@@ -121,6 +123,18 @@ async fn get_draft(conn: &mut sqlx::PgConnection, id: Uuid) -> DResult<ReplyDraf
     decode_one(row.ok_or(DomainError::NotFound("reply draft"))?)
 }
 
+/// The publisher registered for an account's transport. Replies use the same
+/// channel selection as release dispatch; an account whose transport has no
+/// channel fails closed instead of falling back to the built-in publisher.
+async fn publisher_for_account(hub: &Hub, conn: &mut sqlx::PgConnection, account_id: &str) -> DResult<Arc<dyn Publisher>> {
+    let transport: String = sqlx::query_scalar("select transport from accounts where id = $1")
+        .bind(account_id)
+        .fetch_optional(conn)
+        .await?
+        .ok_or(DomainError::NotFound("account"))?;
+    Ok(crate::release::publisher_for(&hub.channels, &hub.publisher, Some(&transport))?.clone())
+}
+
 pub async fn detail(hub: &Hub, actor: &Actor, id: Uuid) -> DResult<RelationshipDetail> {
     actor.require(crate::ANY_READER)?;
     let mut conn = hub.db.acquire().await?;
@@ -187,6 +201,107 @@ pub async fn draft_reply(hub: &Hub, actor: &Actor, rel_id: Uuid, input: DraftRep
 /// drafts only while the agent still owns the conversation.
 pub fn draft_current(d: &ReplyDraft, rel: &Relationship) -> bool {
     d.owner_epoch == rel.owner_epoch && !(d.author_kind == Owner::Agent && rel.owner == Owner::Human)
+}
+
+/// Ask the assistant to draft a reply to the thread's latest inbound message.
+///
+/// Operator-only, and only while the agent owns the conversation. The draft is
+/// stored `in_review` like a manual one: an operator approves it, then the
+/// approved channel sends it. There is no public fan chat in v1.
+pub async fn draft_assistant_reply(hub: &Hub, actor: &Actor, rel_id: Uuid) -> DResult<ReplyDraft> {
+    actor.require(OPERATOR)?;
+    let (rel, persona_id) = {
+        let mut conn = hub.db.acquire().await?;
+        let rel = get_rel(&mut conn, rel_id, false).await?;
+        if rel.owner == Owner::Human {
+            return Err(conflict("human_owns_conversation", "a human owns this conversation; reply from the platform"));
+        }
+        let persona_id: Option<Uuid> =
+            sqlx::query_scalar("select persona_id from accounts where id = $1").bind(&rel.account_id).fetch_one(&mut *conn).await?;
+        (rel, persona_id)
+    };
+    // Ownership may move while the assistant writes; the draft must keep the
+    // epoch it started under, not the one it finished under.
+    let owner_epoch = rel.owner_epoch;
+    let persona = match persona_id {
+        Some(id) => Some(crate::canon::get_persona(hub, actor, id).await?),
+        None => None,
+    };
+    let interactions: Vec<Interaction> = {
+        let mut conn = hub.db.acquire().await?;
+        let rows: Vec<Value> = sqlx::query_scalar(
+            "select to_jsonb(t) from (select id, direction, external_id, author, body, occurred_at from interactions
+             where relationship_id = $1 order by occurred_at desc, id desc limit 20) t",
+        )
+        .bind(rel_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut interactions: Vec<Interaction> = decode(rows)?;
+        interactions.reverse();
+        interactions
+    };
+    if interactions.is_empty() {
+        return Err(conflict("no_interactions", "the thread has no messages to reply to"));
+    }
+    let context = json!({
+        "task": "draft one reply to the latest message in the persona's voice; an operator reviews it before it is sent",
+        "persona": persona.map(|p| json!({ "name": p.name, "canon": p.canon })),
+        "relationship": { "counterpart": rel.counterpart, "account_id": rel.account_id, "permalink": rel.permalink },
+        "thread": interactions,
+    });
+    let turns: Vec<AssistantTurn> = interactions
+        .iter()
+        .map(|i| AssistantTurn { role: if i.direction == Direction::Inbound { "user" } else { "assistant" }.into(), body: i.body.clone() })
+        .collect();
+    let reply = hub
+        .assistant
+        .reply(&context, &turns)
+        .await
+        .map_err(|e| DomainError::Unavailable { code: "assistant_unavailable", message: e.to_string() })?;
+    if reply.body.trim().is_empty() {
+        return Err(DomainError::Unavailable { code: "assistant_unavailable", message: "the assistant returned an empty draft".into() });
+    }
+    let in_reply_to = interactions.iter().rev().find(|i| i.direction == Direction::Inbound).map(|i| i.id);
+    let mut tx = hub.db.begin().await?;
+    // Ownership may have moved while the assistant was writing. A takeover and
+    // release back to the agent changes the epoch even though the agent owns it
+    // again, so the epoch, not just the owner, decides.
+    let rel = get_rel(&mut tx, rel_id, true).await?;
+    if rel.owner_epoch != owner_epoch {
+        return Err(conflict(
+            "owner_changed",
+            format!("ownership changed while the draft was written (epoch {owner_epoch} → {})", rel.owner_epoch),
+        ));
+    }
+    if rel.owner == Owner::Human {
+        return Err(conflict("human_owns_conversation", "a human took over while the draft was written"));
+    }
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "insert into reply_drafts (id, relationship_id, in_reply_to, body, author_kind, author, owner_epoch, state)
+         values ($1, $2, $3, $4, $5, $6, $7, 'in_review')",
+    )
+    .bind(id)
+    .bind(rel_id)
+    .bind(in_reply_to)
+    .bind(&reply.body)
+    .bind(Owner::Agent.as_str())
+    .bind(format!("assistant:{}", reply.model))
+    .bind(rel.owner_epoch)
+    .execute(&mut *tx)
+    .await?;
+    audit(
+        &mut tx,
+        actor,
+        "reply.drafted",
+        "relationship",
+        rel_id,
+        json!({ "draft_id": id, "owner_epoch": rel.owner_epoch, "assistant": reply.model }),
+    )
+    .await?;
+    let d = get_draft(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok(d)
 }
 
 pub async fn decide_draft(hub: &Hub, actor: &Actor, draft_id: Uuid, decision: DraftDecisionIn) -> DResult<ReplyDraft> {
@@ -345,6 +460,31 @@ pub async fn deliver_reply(hub: &Hub, draft_id: Uuid) -> DResult<ReplyDelivery> 
         Some(i) => sqlx::query_scalar("select external_id from interactions where id = $1").bind(i).fetch_optional(&mut *tx).await?,
         None => None,
     };
+    // The account's transport decides the channel, exactly as for a release; a
+    // transport with no registered channel is never sent through the built-in
+    // publisher. Approval queued it, so the attempt is what fails closed.
+    let publisher = match publisher_for_account(hub, &mut tx, &rel.account_id).await {
+        Ok(p) => p,
+        Err(e) if e.code() == "transport_unavailable" => {
+            sqlx::query("update reply_drafts set state = 'rejected', updated_at = now() where id = $1")
+                .bind(draft_id)
+                .execute(&mut *tx)
+                .await?;
+            let out = ReplyDelivery::Failed(e.to_string());
+            audit(
+                &mut tx,
+                &Actor::system(),
+                "reply.delivery",
+                "relationship",
+                rel.id,
+                json!({ "draft_id": draft_id, "result": format!("{out:?}"), "code": e.code() }),
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(out);
+        }
+        Err(e) => return Err(e),
+    };
     sqlx::query("update reply_drafts set state = 'sending', updated_at = now() where id = $1").bind(draft_id).execute(&mut *tx).await?;
     tx.commit().await?;
 
@@ -355,7 +495,7 @@ pub async fn deliver_reply(hub: &Hub, draft_id: Uuid) -> DResult<ReplyDelivery> 
         in_reply_to,
         text: d.body.clone(),
     };
-    let result = hub.publisher.reply(&req).await;
+    let result = publisher.reply(&req).await;
     let mut tx = hub.db.begin().await?;
     let out = match result {
         Ok(post) if post.state != ProviderState::Failed => {
@@ -423,14 +563,39 @@ pub async fn deliver_reply(hub: &Hub, draft_id: Uuid) -> DResult<ReplyDelivery> 
 
 /// Worker: confirm `outcome_unknown` replies before anything else happens.
 pub async fn reconcile_replies(hub: &Hub) -> DResult<()> {
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(
-        "select d.id, r.account_id from reply_drafts d join relationships r on r.id = d.relationship_id
+    // Read back through the channel the account's transport names, the same
+    // one delivery uses.
+    let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "select d.id, r.account_id, a.transport from reply_drafts d
+         join relationships r on r.id = d.relationship_id
+         join accounts a on a.id = r.account_id
          where d.state = 'outcome_unknown' or (d.state = 'sending' and d.updated_at < now() - interval '2 minutes')",
     )
     .fetch_all(&hub.db)
     .await?;
-    for (id, account) in rows {
-        match hub.publisher.lookup_reply(&account, &format!("ihub-reply-{id}")).await {
+    for (id, account, transport) in rows {
+        let publisher = match crate::release::publisher_for(&hub.channels, &hub.publisher, Some(&transport)) {
+            Ok(p) => p.clone(),
+            Err(e) => {
+                tracing::warn!(%id, %e, "no channel to reconcile a reply through");
+                continue;
+            }
+        };
+        match publisher.lookup_reply(&account, &format!("ihub-reply-{id}")).await {
+            // The provider recorded a definite failure: not sent.
+            Ok(Some(post)) if post.state == ProviderState::Failed => {
+                sqlx::query("update reply_drafts set state = 'rejected', updated_at = now() where id = $1")
+                    .bind(id)
+                    .execute(&hub.db)
+                    .await?;
+            }
+            // A record without a provider id confirms nothing; keep it for the operator.
+            Ok(Some(post)) if post.provider_id.is_empty() => {
+                sqlx::query("update reply_drafts set state = 'outcome_unknown', updated_at = now() where id = $1 and state = 'sending'")
+                    .bind(id)
+                    .execute(&hub.db)
+                    .await?;
+            }
             Ok(Some(post)) => {
                 sqlx::query("update reply_drafts set state = 'sent', provider_reply_id = $2, updated_at = now() where id = $1")
                     .bind(id)

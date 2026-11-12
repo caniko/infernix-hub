@@ -82,17 +82,30 @@ fn parse_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(text).ok().map(|dt| dt.with_timezone(&Utc))
 }
 
+/// Create-issue body. Project and assignee are sent only when the hub knows
+/// them, so an unconfigured deployment keeps the previous request shape.
+fn issue_body(req: &IssueRequest) -> Value {
+    let mut body = json!({
+        "title": req.title,
+        "description": req.description,
+        // Server-supported idempotency: a retried create with the same key
+        // replays the original issue instead of making a duplicate.
+        "idempotencyKey": req.origin_key,
+    });
+    if let Some(project) = &req.project_id {
+        body["projectId"] = json!(project);
+    }
+    if let Some(agent) = &req.assignee_agent_id {
+        body["assigneeAgentId"] = json!(agent);
+    }
+    body
+}
+
 #[async_trait]
 impl Paperclip for PaperclipClient {
     async fn create_issue(&self, req: &IssueRequest) -> PortResult<ForeignRef> {
         let url = self.url(&format!("/api/companies/{}/issues", req.company_id));
-        let body = json!({
-            "title": req.title,
-            "description": req.description,
-            // Server-supported idempotency: a retried create with the same key
-            // replays the original issue instead of making a duplicate.
-            "idempotencyKey": req.origin_key,
-        });
+        let body = issue_body(req);
         let resp = self.auth(self.http.post(url)).json(&body).send().await.map_err(|e| transport_error(e, true))?;
         let value = read_json(resp, false, true).await?;
         let id = value
@@ -179,6 +192,26 @@ mod tests {
     #[test]
     fn base_url_trailing_slashes_are_trimmed() {
         assert_eq!(config().base_url, "http://127.0.0.1:3117");
+    }
+
+    #[test]
+    fn issue_body_carries_project_and_assignee_when_set() {
+        let mut req = IssueRequest {
+            company_id: "studio".into(),
+            title: "Kiln story".into(),
+            description: "brief".into(),
+            origin_key: "fleetix-hub:content:1".into(),
+            project_id: None,
+            assignee_agent_id: None,
+        };
+        let body = issue_body(&req);
+        assert_eq!(body["idempotencyKey"], "fleetix-hub:content:1");
+        assert!(body.get("projectId").is_none() && body.get("assigneeAgentId").is_none(), "unset ids are not sent");
+        req.project_id = Some("project_studio_content".into());
+        req.assignee_agent_id = Some("agent_studio_showrunner".into());
+        let body = issue_body(&req);
+        assert_eq!(body["projectId"], "project_studio_content");
+        assert_eq!(body["assigneeAgentId"], "agent_studio_showrunner");
     }
 
     #[test]

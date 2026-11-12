@@ -2,8 +2,10 @@
 //! call the shared `hub-domain` command, map errors. Business rules live in
 //! the domain so the UI, CLI and agent tools share one authorization path.
 
+use std::collections::BTreeMap;
 use std::path::Path as FsPath;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Path, Query, State};
@@ -13,10 +15,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use contracts::*;
 use domain::{Actor, DomainError, Hub};
+use plugin::{Pack, ServerContext, ServerHost, valid_pack_id, validate_packs};
 use serde::Deserialize;
+use serde_json::Value;
 use uuid::Uuid;
 
 pub mod bootstrap;
+pub mod mcp;
+pub mod plugin;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,7 +44,9 @@ pub struct ApiErr {
 }
 
 impl ApiErr {
-    fn domain(error: DomainError, correlation_id: Option<String>) -> Self {
+    /// Map a domain outcome onto the wire error shape. Pack routes use this so
+    /// their errors look like core ones.
+    pub fn domain(error: DomainError, correlation_id: Option<String>) -> Self {
         let status = match &error {
             DomainError::Forbidden(_) => StatusCode::FORBIDDEN,
             DomainError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -112,7 +120,13 @@ macro_rules! call {
 }
 
 pub fn router(state: AppState) -> Router {
-    let v1 = Router::new()
+    router_with(state, Vec::new())
+}
+
+/// Build the HTTP router, nesting each pack at `/v1/p/<id>`. Pack routers are
+/// `Router<AppState>`; the state is attached once, after registration.
+pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>) -> Router {
+    let mut v1 = Router::new()
         .route("/status", get(status))
         .route("/fleet/status", get(fleet_status))
         .route("/system/pause", post(set_pause))
@@ -135,6 +149,8 @@ pub fn router(state: AppState) -> Router {
         .route("/content/{id}/releases", post(freeze))
         .route("/generations/{id}/cancel", post(cancel_generation))
         .route("/generations/{id}/receipts", post(receipt))
+        // Artifact bytes (renders, videos) are far past the JSON body limit.
+        .route("/generations/{id}/artifacts", post(upload_artifact).layer(axum::extract::DefaultBodyLimit::max(MAX_ARTIFACT_BYTES)))
         .route("/assets", get(assets))
         .route("/assets/{id}/select", post(select_asset))
         .route("/assets/{id}/content", get(asset_content))
@@ -148,6 +164,7 @@ pub fn router(state: AppState) -> Router {
         .route("/relationships", get(relationships))
         .route("/relationships/{id}", get(relationship))
         .route("/relationships/{id}/drafts", post(draft_reply))
+        .route("/relationships/{id}/draft-reply", post(draft_assistant_reply))
         .route("/relationships/{id}/takeover", post(takeover))
         .route("/relationships/{id}/release", post(release_rel))
         .route("/relationships/{id}/handoff", post(handoff))
@@ -156,6 +173,9 @@ pub fn router(state: AppState) -> Router {
         .route("/chat/{subject_type}/{id}", get(chat).post(send_chat))
         .route("/fixtures/paperclip/approvals", get(fixture_approvals))
         .route("/fixtures/paperclip/approvals/{id}/decide", post(fixture_decide));
+    for (id, routes) in pack_routes {
+        v1 = v1.nest(&format!("/p/{id}"), routes);
+    }
     Router::new()
         .nest("/v1", v1)
         .route("/openapi.json", get(openapi))
@@ -166,6 +186,121 @@ pub fn router(state: AppState) -> Router {
         }))
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(state)
+}
+
+/// Library entry point used by `fleetix-hubd serve` and `canix-hub serve`.
+///
+/// Builds the state exactly as the upstream binary does, installs the packs
+/// enabled by `packs.json`, mounts their routes and serves until Ctrl-C.
+/// Startup fails when `packs.json` enables an id this binary lacks.
+pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    validate_packs(&packs)?;
+    let (mut state, _fixtures) = bootstrap::build(&settings).await?;
+    let configs = read_packs_config(settings.packs_config.as_deref())?;
+    for id in configs.keys() {
+        anyhow::ensure!(packs.iter().any(|p| p.id() == id), "packs.json enables unknown pack {id:?}; this binary has no such pack");
+    }
+    let base = ServerContext {
+        db: state.hub.db.clone(),
+        // Same bounds as the built-in adapters: a pack call can never hang
+        // the worker while it holds an outbox row.
+        http: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()?,
+        public_url: settings.public_url.clone(),
+        state_dir: settings.asset_dir.clone(),
+        config: Value::Null,
+        credentials_dir: std::env::var_os("CREDENTIALS_DIRECTORY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| settings.asset_dir.join("credentials")),
+    };
+    let mut channels = (*state.hub.channels).clone();
+    let mut pipelines = (*state.hub.pipelines).clone();
+    let mut topics: BTreeMap<String, Arc<dyn domain::outbox::OutboxHandler>> = BTreeMap::new();
+    let mut routes = Vec::new();
+    let mut integrations = state.hub.config.integrations.clone();
+    for pack in &packs {
+        let Some(config) = configs.get(pack.id()) else { continue };
+        let ctx = ServerContext { config: config.clone(), ..base.clone() };
+        let mut host = ServerHost::new(pack.id(), &ctx);
+        pack.install(&mut host)?;
+        let regs = host.finish();
+        merge_pack_channels(regs.pack_id, &mut channels, regs.channels, settings.publisher == AdapterMode::Fixture, &state.hub.publisher)?;
+        for (id, pipeline) in regs.pipelines {
+            anyhow::ensure!(!pipelines.contains_key(&id), "pack {}: pipeline {id} is registered twice", regs.pack_id);
+            pipelines.insert(id, pipeline);
+        }
+        for (topic, handler) in regs.topics {
+            anyhow::ensure!(!topics.contains_key(&topic), "pack {}: topic {topic} is registered twice", regs.pack_id);
+            topics.insert(topic, handler);
+        }
+        if let Some(router) = regs.routes {
+            routes.push((regs.pack_id.to_string(), router));
+        }
+        integrations.extend(regs.integrations);
+    }
+    // A pack channel is live even when `HUB_PUBLISHER` is a fixture adapter, so
+    // the approval guard runs again over the complete channel registry.
+    bootstrap::require_live_approvals(settings.paperclip, settings.publisher, &state.hub.publisher, &channels)
+        .context("publishing channels")?;
+    let mut hub = state.hub.clone();
+    hub.config = Arc::new(domain::HubConfig { integrations, ..(*state.hub.config).clone() });
+    hub.channels = Arc::new(channels);
+    hub.pipelines = Arc::new(pipelines);
+    hub.topics = Arc::new(topics);
+    state.hub = hub;
+
+    if !settings.no_worker {
+        tokio::spawn(worker::run(state.hub.clone(), Duration::from_secs(2)));
+    }
+    let listener = tokio::net::TcpListener::bind(&settings.bind).await.with_context(|| format!("binding {}", settings.bind))?;
+    tracing::info!(bind = %settings.bind, "listening");
+    axum::serve(listener, router_with(state, routes))
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    Ok(())
+}
+
+/// Merge one pack's channels into the registry.
+///
+/// A pack channel posts for real, so it may replace a fixture-only alias (a
+/// seeded account transport or the built-in `fixture` name) instead of
+/// colliding with it. A collision with a live built-in or an earlier pack still
+/// fails startup.
+fn merge_pack_channels(
+    pack: &str,
+    channels: &mut BTreeMap<String, Arc<dyn domain::ports::Publisher>>,
+    incoming: BTreeMap<String, Arc<dyn domain::ports::Publisher>>,
+    fixture_only: bool,
+    builtin: &Arc<dyn domain::ports::Publisher>,
+) -> anyhow::Result<()> {
+    for (name, publisher) in incoming {
+        let replaces_fixture_alias = fixture_only && channels.get(&name).is_some_and(|existing| Arc::ptr_eq(existing, builtin));
+        anyhow::ensure!(
+            replaces_fixture_alias || !channels.contains_key(&name),
+            "pack {pack}: channel {name} collides with a built-in channel or an earlier pack"
+        );
+        channels.insert(name, publisher);
+    }
+    Ok(())
+}
+
+/// `packs.json`: a JSON object mapping pack id to that pack's config object.
+fn read_packs_config(path: Option<&FsPath>) -> anyhow::Result<BTreeMap<String, Value>> {
+    use anyhow::Context as _;
+
+    let Some(path) = path else { return Ok(BTreeMap::new()) };
+    let body = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let configs: BTreeMap<String, Value> = serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
+    for id in configs.keys() {
+        anyhow::ensure!(valid_pack_id(id), "pack id {id:?} must match [a-z0-9-]+");
+    }
+    Ok(configs)
 }
 
 pub const OPENAPI: &str = include_str!("../openapi.json");
@@ -318,6 +453,29 @@ async fn cancel_generation(State(s): State<AppState>, Caller(a): Caller, Path(id
 async fn receipt(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<ReceiptIn>) -> R<GenerationRequest> {
     call!(a, domain::production::record_receipt(&s.hub, &a, id, b))
 }
+
+/// Largest artifact a pipeline may upload. The bytes are buffered while the
+/// hash is verified and the object is finalized, so this is a memory bound too.
+const MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
+
+fn header(h: &HeaderMap, name: &str) -> Option<String> {
+    h.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+}
+
+/// `POST /v1/generations/{id}/artifacts`: raw output bytes with
+/// `x-artifact-source`, `content-type` and `x-sha256`.
+async fn upload_artifact(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    h: HeaderMap,
+    body: axum::body::Bytes,
+) -> R<GenerationRequest> {
+    let source = header(&h, "x-artifact-source").unwrap_or_default();
+    let sha256 = header(&h, "x-sha256").unwrap_or_default();
+    let mime = header(&h, axum::http::header::CONTENT_TYPE.as_str()).unwrap_or_else(|| "application/octet-stream".into());
+    call!(a, domain::production::upload_artifact(&s.hub, &a, id, &source, &mime, &sha256, &body))
+}
 async fn assets(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Asset>> {
     call!(a, domain::production::all_assets(&s.hub, &a))
 }
@@ -381,6 +539,9 @@ async fn relationship(State(s): State<AppState>, Caller(a): Caller, Path(id): Pa
 }
 async fn draft_reply(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<DraftReplyIn>) -> R<ReplyDraft> {
     call!(a, domain::engagement::draft_reply(&s.hub, &a, id, b))
+}
+async fn draft_assistant_reply(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<ReplyDraft> {
+    call!(a, domain::engagement::draft_assistant_reply(&s.hub, &a, id))
 }
 async fn takeover(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<Relationship> {
     call!(a, domain::engagement::takeover(&s.hub, &a, id))
@@ -455,6 +616,35 @@ mod tests {
       ],
       "monitoring": {"monitored": 4, "alerts": []}
     }"#;
+
+    #[test]
+    fn a_pack_channel_replaces_a_fixture_alias_but_not_a_live_one() {
+        let builtin: Arc<dyn domain::ports::Publisher> = Arc::new(integrations::fixture::FixturePublisher::default());
+        let pack: Arc<dyn domain::ports::Publisher> = Arc::new(integrations::fixture::FixturePublisher::default());
+        let mut channels = BTreeMap::from([("plinth".to_string(), builtin.clone()), ("fixture".to_string(), builtin.clone())]);
+
+        // Fixture mode: the pack wins over a seeded transport alias and over
+        // the built-in `fixture` name.
+        for name in ["plinth", "fixture"] {
+            let incoming = BTreeMap::from([(name.to_string(), pack.clone())]);
+            merge_pack_channels("plinth", &mut channels, incoming, true, &builtin).unwrap();
+            assert!(Arc::ptr_eq(channels.get(name).unwrap(), &pack), "{name} belongs to the pack");
+        }
+
+        // A live collision is still a startup failure: an earlier pack's
+        // channel, and the built-in adapter outside fixture mode.
+        let mut taken = BTreeMap::from([("plinth".to_string(), pack.clone())]);
+        let err = merge_pack_channels("studio", &mut taken, BTreeMap::from([("plinth".to_string(), pack.clone())]), true, &builtin)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("studio") && err.contains("plinth"), "the pack and channel are named: {err}");
+
+        let mut live = BTreeMap::from([("postiz".to_string(), builtin.clone())]);
+        let err = merge_pack_channels("plinth", &mut live, BTreeMap::from([("postiz".to_string(), pack.clone())]), false, &builtin)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plinth") && err.contains("postiz"), "the pack and channel are named: {err}");
+    }
 
     #[tokio::test]
     async fn fleet_status_reads_the_snapshot_and_maps_its_failures() {

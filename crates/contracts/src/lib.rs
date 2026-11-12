@@ -59,7 +59,12 @@ wire_enum!(CanonState { Proposed = "proposed", Accepted = "accepted", Rejected =
 wire_enum!(CanonSource { Operator = "operator", Chat = "chat", News = "news", Agent = "agent" });
 wire_enum!(ContentState { Idea = "idea", Brief = "brief", Producing = "producing", Selecting = "selecting", Review = "review", Approved = "approved", Scheduled = "scheduled", Published = "published", Archived = "archived" });
 wire_enum!(GenerationState { Requested = "requested", Dispatched = "dispatched", Running = "running", Succeeded = "succeeded", Failed = "failed", Cancelling = "cancelling", Cancelled = "cancelled", OutcomeUnknown = "outcome_unknown" });
-wire_enum!(AttemptKind { WindmillRoot = "windmill_root", WindmillChild = "windmill_child", ComfyPrompt = "comfy_prompt" });
+wire_enum!(AttemptKind {
+    WindmillRoot = "windmill_root",
+    WindmillChild = "windmill_child",
+    ComfyPrompt = "comfy_prompt",
+    PipelineRun = "pipeline_run"
+});
 wire_enum!(AttemptState { Submitted = "submitted", Queued = "queued", Running = "running", Succeeded = "succeeded", Failed = "failed", Cancelled = "cancelled", OutcomeUnknown = "outcome_unknown" });
 wire_enum!(AssetState { Importing = "importing", Ready = "ready", Failed = "failed" });
 wire_enum!(ReleaseState { Draft = "draft", InReview = "in_review", Approved = "approved", Rejected = "rejected", Superseded = "superseded" });
@@ -73,6 +78,22 @@ wire_enum!(
     Verification { Built = "built", FixtureTested = "fixture_tested", ContractVerified = "contract_verified", LiveVerified = "live_verified" }
 );
 wire_enum!(AdapterMode { Fixture = "fixture", Live = "live", Disabled = "disabled" });
+
+wire_enum!(
+    #[doc = "Terminal state of a generation job. The wire names match the Windmill port enum; this copy lets receipts carry a terminal status in the contract crate."]
+    JobStatus { Queued = "queued", Running = "running", Succeeded = "succeeded", Failed = "failed", Cancelled = "cancelled" }
+);
+
+wire_enum!(
+    #[doc = "Who produces a brief's work: the delegated Paperclip studio org or the hub running a pipeline directly. Publication stays hub-owned in both modes."]
+    Producer { Delegated = "delegated", Direct = "direct" }
+);
+
+impl Default for Producer {
+    fn default() -> Self {
+        Self::Delegated
+    }
+}
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -235,6 +256,10 @@ pub struct Brief {
     pub audience: String,
     pub copy_direction: String,
     pub visual_direction: String,
+    /// Delegated creates the Paperclip issue (the historical behaviour);
+    /// direct means the hub runs the pipeline itself.
+    #[serde(default)]
+    pub producer: Producer,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -276,7 +301,8 @@ pub struct Workflow {
     pub id: Uuid,
     pub name: String,
     pub version: i32,
-    pub engine_instance_id: String,
+    /// The ComfyUI engine, or the admission target for a pipeline workflow.
+    pub engine_instance_id: Option<String>,
     pub graph_sha256: String,
     /// Named inputs: `{ "prompt": {"node": "6", "input": "text"} }`.
     pub bindings: Value,
@@ -326,8 +352,24 @@ pub struct ReceiptIn {
     /// External id of the parent attempt (e.g. the Windmill root job).
     pub parent_external_id: Option<String>,
     pub engine_instance_id: Option<String>,
+    /// Terminal status of a pipeline run; absent for ComfyUI receipts.
+    #[serde(default)]
+    pub status: Option<JobStatus>,
+    /// Complete output manifest; required when `status` is `succeeded`.
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactRef>,
     #[serde(default)]
     pub raw: Value,
+}
+
+/// One durable output of a generation. `source` is the pipeline's stable name
+/// for it and is unique within the generation request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    pub source: String,
+    pub sha256: String,
+    pub mime: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -396,6 +438,10 @@ pub struct MediaRef {
 pub struct ReleaseAction {
     pub company_id: String,
     pub account_id: String,
+    /// Transport channel (`accounts.transport`) recorded when the release is
+    /// frozen; dispatch only uses the frozen value, never a live lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
     pub text: String,
     pub media: Vec<MediaRef>,
     #[serde(default)]
@@ -647,6 +693,7 @@ pub struct CancelOut {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn wire_names_match_serde() {
@@ -657,6 +704,36 @@ mod tests {
         }
         assert_eq!(AttemptKind::ComfyPrompt.as_str(), "comfy_prompt");
         assert_eq!(GenerationState::OutcomeUnknown.as_str(), "outcome_unknown");
+        assert_eq!(JobStatus::Succeeded.as_str(), "succeeded");
+    }
+
+    /// The pack-contract fields are additive: JSON written before them still
+    /// decodes, and the new values survive a round trip.
+    #[test]
+    fn pack_contract_fields_are_backward_compatible() {
+        let old_receipt = json!({"kind": "comfy_prompt", "external_id": "p1", "parent_external_id": null, "engine_instance_id": null});
+        let receipt: ReceiptIn = serde_json::from_value(old_receipt).unwrap();
+        assert_eq!(receipt.status, None);
+        assert!(receipt.artifacts.is_empty());
+
+        let receipt = ReceiptIn {
+            kind: AttemptKind::ComfyPrompt,
+            external_id: "p1".into(),
+            parent_external_id: None,
+            engine_instance_id: None,
+            status: Some(JobStatus::Succeeded),
+            artifacts: vec![ArtifactRef { source: "render".into(), sha256: "ab".into(), mime: "video/mp4".into(), size: 12 }],
+            raw: Value::Null,
+        };
+        let round: ReceiptIn = serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
+        assert_eq!(round, receipt);
+
+        let old_brief = json!({"angle": "a", "audience": "b", "copy_direction": "c", "visual_direction": "d"});
+        let brief: Brief = serde_json::from_value(old_brief).unwrap();
+        assert_eq!(brief.producer, Producer::Delegated);
+        assert_eq!(serde_json::to_value(&brief).unwrap()["producer"], "delegated");
+
+        assert_eq!(serde_json::from_value::<Producer>(json!("direct")).unwrap(), Producer::Direct);
     }
 
     /// A real-shaped snapshot: two hosts (one outdated), an alert, a pending

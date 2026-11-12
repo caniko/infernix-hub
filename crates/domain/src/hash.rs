@@ -64,6 +64,7 @@ mod tests {
         ReleaseAction {
             company_id: "c1".into(),
             account_id: "acct".into(),
+            transport: None,
             text: text.into(),
             media: vec![MediaRef { asset_id: uuid::Uuid::nil(), sha256: "ab".into(), mime: "image/png".into(), alt_text: "alt".into() }],
             platform_settings: json!({"b": 1, "a": [2, {"z": 1, "y": 2}]}),

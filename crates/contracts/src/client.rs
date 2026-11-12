@@ -164,6 +164,10 @@ impl HubClient {
     pub async fn draft_reply(&self, rel: Uuid, body: &DraftReplyIn) -> Result<ReplyDraft, ClientError> {
         self.post(&format!("/relationships/{rel}/drafts"), body).await
     }
+    /// Ask the assistant for a reply draft (operator only).
+    pub async fn draft_assistant_reply(&self, rel: Uuid) -> Result<ReplyDraft, ClientError> {
+        self.post(&format!("/relationships/{rel}/draft-reply"), &()).await
+    }
     pub async fn decide_draft(&self, draft: Uuid, body: &DraftDecisionIn) -> Result<ReplyDraft, ClientError> {
         self.post(&format!("/drafts/{draft}/decision"), body).await
     }

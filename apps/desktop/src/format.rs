@@ -112,6 +112,20 @@ pub fn short_hash(value: &str) -> String {
     value.chars().take(12).collect()
 }
 
+/// `video/*` assets preview with `<video>`; everything else with `<img>`.
+pub fn is_video(mime: &str) -> bool {
+    mime.trim().to_ascii_lowercase().starts_with("video/")
+}
+
+/// Download filename for an asset's data URI: `<sha12>.<ext>`.
+pub fn media_name(mime: &str, sha256: &str) -> String {
+    let subtype = mime.split(';').next().unwrap_or(mime).rsplit('/').next().unwrap_or("");
+    let extension: String = subtype.chars().filter(char::is_ascii_alphanumeric).collect();
+    let usable = !extension.is_empty() && extension.len() <= 5;
+    let extension = if usable { extension.to_ascii_lowercase() } else { "bin".to_string() };
+    format!("{}.{extension}", short_hash(sha256))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +176,14 @@ mod tests {
     fn short_hash_caps() {
         assert_eq!(short_hash("0123456789abcdef"), "0123456789ab");
         assert_eq!(short_hash("abc"), "abc");
+    }
+
+    #[test]
+    fn media_kind_and_download_name() {
+        assert!(is_video("video/mp4"));
+        assert!(is_video("VIDEO/WEBM"));
+        assert!(!is_video("image/png"));
+        assert_eq!(media_name("video/mp4", "0123456789abcdef"), "0123456789ab.mp4");
+        assert_eq!(media_name("application/octet-stream", "abc"), "abc.bin");
     }
 }

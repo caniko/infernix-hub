@@ -15,7 +15,11 @@
 
 use async_trait::async_trait;
 use chrono::SecondsFormat;
-use domain::ports::{GenerationJob, JobStatus, JobView, PortError, PortResult, PublicationTimer, Windmill};
+use contracts::ArtifactRef;
+use domain::ports::{
+    CancelOutcome, GenerationJob, JobStatus, JobView, Pipeline, PipelineRequest, PipelineRun, PipelineStatus, PortError, PortResult,
+    PublicationTimer, Windmill,
+};
 use serde_json::{Value, json};
 
 use super::{read_json, read_text, transport_error, trim_base};
@@ -48,11 +52,11 @@ impl std::fmt::Debug for WindmillConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct WindmillClient {
     http: reqwest::Client,
     config: WindmillConfig,
 }
-
 impl WindmillClient {
     pub fn new(http: reqwest::Client, config: WindmillConfig) -> Self {
         Self { http, config }
@@ -74,7 +78,8 @@ impl WindmillClient {
         }
     }
 
-    async fn run(&self, path: &str, scheduled_for: Option<String>, body: &Value) -> PortResult<String> {
+    /// Run a script path; `body` is the script's argument object.
+    pub(crate) async fn run(&self, path: &str, scheduled_for: Option<String>, body: &Value) -> PortResult<String> {
         let (path, hash) = Self::split_pinned_path(path);
         let path = path.trim_start_matches('/');
         let mut url = match hash {
@@ -160,6 +165,79 @@ impl Windmill for WindmillClient {
     }
 }
 
+/// The generic built-in pipeline: one Windmill script per registered
+/// `pipeline_id`. The script receives `main(request: PipelineRequest)` and
+/// returns its manifest as `result.artifacts`.
+pub struct WindmillPipeline {
+    client: WindmillClient,
+    path: String,
+}
+
+impl WindmillPipeline {
+    /// `path` is the version-pinned script path (`f/...@<hash>` supported).
+    pub fn new(client: WindmillClient, path: impl Into<String>) -> Self {
+        Self { client, path: path.into() }
+    }
+}
+
+/// Read the manifest a completed script returned. A completed job without a
+/// valid manifest is a terminal failure of that run, not a transient read: the
+/// hub must end the run, never retry its status forever.
+fn manifest(raw: &Value) -> Result<Vec<ArtifactRef>, String> {
+    let result = raw.get("result").unwrap_or(&Value::Null);
+    let Some(artifacts) = result.get("artifacts") else {
+        return Err("the completed run returned no artifact manifest".into());
+    };
+    serde_json::from_value::<Vec<ArtifactRef>>(artifacts.clone())
+        .map_err(|e| format!("the completed run's artifact manifest is malformed: {e}"))
+}
+
+/// The deferral protocol: a script that cannot run now returns
+/// `{"deferred": "<reason>"}` and succeeds, with no artifacts and no receipt.
+fn deferred(raw: &Value) -> Option<String> {
+    raw.get("result")?.get("deferred")?.as_str().map(str::to_string)
+}
+
+/// Map a finished job onto the pipeline's status. A succeeded job that carried
+/// a deferral is *not* a completed run: it never did the work. A succeeded job
+/// whose result is not a valid manifest failed to report its output, so the run
+/// is failed with the reason instead of being retried as a transient read.
+fn pipeline_status(status: JobStatus, raw: &Value) -> PipelineStatus {
+    match status {
+        JobStatus::Queued => PipelineStatus::Pending,
+        JobStatus::Running => PipelineStatus::Running { progress: None },
+        JobStatus::Succeeded => match deferred(raw) {
+            Some(reason) => PipelineStatus::Deferred { reason },
+            None => match manifest(raw) {
+                Ok(artifacts) => PipelineStatus::Succeeded { artifacts },
+                Err(reason) => PipelineStatus::Failed { reason },
+            },
+        },
+        JobStatus::Failed => {
+            PipelineStatus::Failed { reason: raw.get("result").and_then(Value::as_str).unwrap_or("the job failed").to_string() }
+        }
+        JobStatus::Cancelled => PipelineStatus::Cancelled,
+    }
+}
+
+#[async_trait]
+impl Pipeline for WindmillPipeline {
+    async fn submit(&self, req: &PipelineRequest) -> PortResult<PipelineRun> {
+        let id = self.client.run(&self.path, None, &json!({ "request": req })).await?;
+        Ok(PipelineRun { external_id: id, raw: json!({ "path": self.path }) })
+    }
+
+    async fn status(&self, run: &PipelineRun) -> PortResult<PipelineStatus> {
+        let view = self.client.job(&run.external_id).await?;
+        Ok(pipeline_status(view.status, &view.raw))
+    }
+
+    async fn cancel(&self, run: &PipelineRun) -> PortResult<CancelOutcome> {
+        self.client.cancel_job(&run.external_id).await?;
+        Ok(CancelOutcome::Interrupted)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +290,56 @@ mod tests {
     fn unknown_job_type_is_unsupported() {
         let err = parse_job("j3", json!({"type": "MysteryJob"})).unwrap_err();
         assert!(matches!(err, PortError::Unsupported(_)));
+    }
+
+    #[test]
+    fn completed_job_manifest_parses_or_fails_the_run() {
+        let refs = manifest(&json!({"result": {"artifacts": [
+            {"source": "render", "sha256": "ab", "mime": "video/mp4", "size": 12}
+        ]}}))
+        .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].source, "render");
+        // A completed job without a manifest is a terminal failure of that run,
+        // never a transient read: reconciliation must stop retrying it.
+        assert!(manifest(&json!({"result": "done"})).is_err());
+        assert!(manifest(&json!({})).is_err());
+        assert!(manifest(&json!({"result": {"artifacts": "nope"}})).is_err(), "a malformed manifest is a failed run");
+        assert!(
+            manifest(&json!({"result": {"artifacts": [{"source": "render"}]}})).is_err(),
+            "an incomplete artifact entry is a failed run"
+        );
+    }
+
+    #[test]
+    fn a_completed_job_without_a_manifest_fails_the_run_with_its_reason() {
+        let missing = pipeline_status(JobStatus::Succeeded, &json!({"type": "CompletedJob", "success": true, "result": "done"}));
+        match missing {
+            PipelineStatus::Failed { reason } => assert!(reason.contains("no artifact manifest"), "{reason}"),
+            other => panic!("a completed run without a manifest is not a success: {other:?}"),
+        }
+        let malformed = pipeline_status(
+            JobStatus::Succeeded,
+            &json!({"type": "CompletedJob", "success": true, "result": {"artifacts": [{"source": "render", "sha256": 7}]}}),
+        );
+        match malformed {
+            PipelineStatus::Failed { reason } => assert!(reason.contains("malformed"), "{reason}"),
+            other => panic!("a malformed manifest is a failed run: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_succeeded_job_that_deferred_is_deferred_not_succeeded() {
+        let raw = json!({"type": "CompletedJob", "success": true, "result": {"deferred": "GPU busy"}});
+        assert_eq!(
+            pipeline_status(JobStatus::Succeeded, &raw),
+            PipelineStatus::Deferred { reason: "GPU busy".into() },
+            "a deferring script ran to completion without doing the work"
+        );
+        // Only a succeeded job defers: a failed or running one keeps its meaning.
+        assert_eq!(pipeline_status(JobStatus::Running, &raw), PipelineStatus::Running { progress: None });
+        assert!(matches!(pipeline_status(JobStatus::Failed, &json!({"result": "boom"})), PipelineStatus::Failed { .. }));
+        // Success with neither a deferral nor a manifest is not a success.
+        assert!(matches!(pipeline_status(JobStatus::Succeeded, &json!({"result": "done"})), PipelineStatus::Failed { .. }));
     }
 }

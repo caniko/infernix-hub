@@ -1,0 +1,7 @@
+{
+  "name": "pipeline-svg",
+  "version": 1,
+  "pipeline_id": "fixture.svg",
+  "windmill_path": "f/fleetix_hub/pipeline_svg",
+  "bindings": {}
+}

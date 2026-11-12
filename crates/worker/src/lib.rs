@@ -5,19 +5,13 @@
 
 use std::time::Duration;
 
+use domain::outbox::Delivery;
 use domain::ports::{ApprovalRequest, GenerationJob, IssueRequest, PortError, PublicationTimer};
 use domain::{DResult, Hub, engagement, outbox, production, release};
 use serde_json::Value;
 use uuid::Uuid;
 
 const MAX_ATTEMPTS: i32 = 12;
-
-#[derive(Debug)]
-enum Delivery {
-    Done,
-    Retry(String),
-    Dead(String),
-}
 
 fn classify(e: PortError, ambiguous_retry_safe: bool) -> Delivery {
     match e {
@@ -33,6 +27,19 @@ fn uuid_field(payload: &Value, field: &str) -> Option<Uuid> {
     payload[field].as_str().and_then(|s| Uuid::parse_str(s).ok())
 }
 
+/// A pipeline submission row the outbox dead-letters can never be delivered
+/// again. End its attempt in the same transaction that dead-letters the row, or
+/// the generation waits forever for a run nothing will follow. The submission
+/// claim stays on the attempt, so a run this row may already have started is
+/// never submitted a second time.
+async fn dead_letter_pipeline(tx: &mut domain::sqlx::PgConnection, row: &outbox::OutboxRow, error: &str) -> DResult<()> {
+    if row.topic != production::PIPELINE_RUN {
+        return Ok(());
+    }
+    let Some(attempt_id) = uuid_field(&row.payload, "attempt_id") else { return Ok(()) };
+    production::fail_dead_pipeline_submission(tx, attempt_id, error).await
+}
+
 async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
     let p = &row.payload;
     match row.topic.as_str() {
@@ -43,6 +50,9 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
                 title: p["title"].as_str().unwrap_or_default().into(),
                 description: p["description"].as_str().unwrap_or_default().into(),
                 origin_key: p["origin_key"].as_str().unwrap_or_default().into(),
+                // Frozen when the brief was created (delegated producer only).
+                project_id: p["project_id"].as_str().map(String::from),
+                assignee_agent_id: p["assignee_agent_id"].as_str().map(String::from),
             };
             // Retrying is safe: adapters dedupe on origin_key.
             match hub.paperclip.create_issue(&req).await {
@@ -110,6 +120,18 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
                 Err(e) => classify(e, false),
             }
         }
+        production::PIPELINE_RUN => {
+            let job: production::PipelineJob = match serde_json::from_value(p.clone()) {
+                Ok(j) => j,
+                Err(e) => return Delivery::Dead(format!("bad payload: {e}")),
+            };
+            match production::deliver_pipeline(hub, &job).await {
+                Ok(production::PipelineDelivery::Done) => Delivery::Done,
+                Ok(production::PipelineDelivery::Retry(e)) => Delivery::Retry(e),
+                Ok(production::PipelineDelivery::Dead(e)) => Delivery::Dead(e),
+                Err(e) => Delivery::Dead(e.to_string()),
+            }
+        }
         outbox::WINDMILL_SCHEDULE_PUBLICATION => {
             let timer: PublicationTimer = match serde_json::from_value(p.clone()) {
                 Ok(t) => t,
@@ -135,7 +157,10 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
                 Err(e) => Delivery::Retry(e.to_string()),
             }
         }
-        other => Delivery::Dead(format!("unknown topic {other}")),
+        other => match hub.topics.get(other) {
+            Some(handler) => handler.deliver(hub, row).await,
+            None => Delivery::Dead(format!("unknown topic {other}")),
+        },
     }
 }
 
@@ -152,10 +177,15 @@ pub async fn drain_outbox(hub: &Hub) -> DResult<usize> {
         let Some(row) = rows.into_iter().next() else { return Ok(n) };
         let span = tracing::info_span!("outbox", topic = %row.topic, correlation_id = row.correlation_id.as_deref().unwrap_or(""));
         let _g = span.enter();
-        let gen_id = (row.topic == outbox::WINDMILL_RUN_GENERATION)
-            .then(|| row.payload["generation_request_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()))
-            .flatten();
-        if let Some(gen_id) = gen_id
+        let gen_id = match row.topic.as_str() {
+            outbox::WINDMILL_RUN_GENERATION => row.payload["generation_request_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()),
+            production::PIPELINE_RUN => row.payload["request"]["generation_request_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()),
+            _ => None,
+        };
+        // The ComfyUI procedure records its start; a pipeline submission
+        // guards itself in `deliver_pipeline`.
+        if row.topic == outbox::WINDMILL_RUN_GENERATION
+            && let Some(gen_id) = gen_id
             && let Some((done, why)) = production::dispatch_blocker(hub, gen_id).await?
         {
             tracing::info!(%why, "generation command not sent");
@@ -189,11 +219,20 @@ pub async fn drain_outbox(hub: &Hub) -> DResult<usize> {
             Delivery::Done => outbox::mark_delivered(&mut tx, row.id).await?,
             Delivery::Retry(e) => {
                 tracing::warn!(error = %e, attempts = row.attempts, "outbox delivery will retry");
-                outbox::mark_failed(&mut tx, row.id, &e, true, MAX_ATTEMPTS).await?
+                outbox::mark_failed(&mut tx, row.id, &e, true, MAX_ATTEMPTS).await?;
+                // This delivery spent the last retry: the row is dead now.
+                if row.attempts + 1 >= MAX_ATTEMPTS {
+                    dead_letter_pipeline(&mut tx, &row, &e).await?;
+                }
+            }
+            Delivery::Defer(wait) => {
+                tracing::info!(secs = wait.as_secs(), "outbox delivery deferred by its handler");
+                outbox::defer(&mut tx, row.id, wait.as_secs() as i64, "deferred by topic handler").await?;
             }
             Delivery::Dead(e) => {
                 tracing::error!(error = %e, "outbox delivery dead-lettered");
-                outbox::mark_failed(&mut tx, row.id, &e, false, MAX_ATTEMPTS).await?
+                outbox::mark_failed(&mut tx, row.id, &e, false, MAX_ATTEMPTS).await?;
+                dead_letter_pipeline(&mut tx, &row, &e).await?;
             }
         }
         tx.commit().await?;
@@ -203,6 +242,9 @@ pub async fn drain_outbox(hub: &Hub) -> DResult<usize> {
 
 /// One reconciliation pass over every open external receipt.
 pub async fn reconcile(hub: &Hub) -> DResult<()> {
+    // Local repairs first: pipeline deadlines and stranded generations never
+    // wait behind a remote read.
+    production::reconcile_pipeline_deadlines(hub).await?;
     for p in production::open_prompts(hub).await? {
         if let Err(e) = production::reconcile_prompt(hub, &p).await {
             tracing::warn!(prompt_id = %p.prompt_id, error = %e, "prompt reconcile failed");
@@ -218,15 +260,9 @@ pub async fn reconcile(hub: &Hub) -> DResult<()> {
         release::reconcile_intent(hub, intent, &account, &key).await?;
     }
     engagement::reconcile_replies(hub).await?;
-    // Display only: last, and bounded so a stalled Windmill read cannot hold
-    // up the next outbox drain.
-    match tokio::time::timeout(Duration::from_secs(10), production::reconcile_procedures(hub)).await {
-        Ok(result) => result,
-        Err(_) => {
-            tracing::warn!("procedure status pass timed out; continuing next tick");
-            Ok(())
-        }
-    }
+    // Procedure and pipeline polls read a bounded random batch (20 each, 5 s per
+    // call), so one stalled backend cannot hold the pass for long.
+    production::reconcile_procedures(hub).await
 }
 
 /// Outbox + reconcile, for tests and the `dev` loop.
@@ -235,13 +271,22 @@ pub async fn tick(hub: &Hub) -> DResult<()> {
     reconcile(hub).await
 }
 
-/// Long-running worker: periodic ticks plus a `/ws` progress listener per
-/// engine instance (reconnecting; history reconciliation stays authoritative).
+/// Long-running worker: periodic ticks plus `/ws` progress listeners
+/// (reconnecting; history reconciliation stays authoritative). An engine with
+/// `capabilities.on_demand` (socket-activated, idle-exits) only gets a
+/// job-scoped subscription while one of its prompts is open.
 pub async fn run(hub: Hub, every: Duration) {
-    let engines: Vec<(String, String)> =
-        domain::sqlx::query_as("select id, base_url from engine_instances").fetch_all(&hub.db).await.unwrap_or_default();
-    for (id, url) in engines {
+    let engines: Vec<(String, String, bool)> =
+        domain::sqlx::query_as("select id, base_url, coalesce(capabilities ->> 'on_demand', 'false') = 'true' from engine_instances")
+            .fetch_all(&hub.db)
+            .await
+            .unwrap_or_default();
+    for (id, url, on_demand) in engines {
         let hub = hub.clone();
+        if on_demand {
+            tokio::spawn(async move { listen_on_demand(hub, id, url, every).await });
+            continue;
+        }
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
@@ -251,16 +296,8 @@ pub async fn run(hub: Hub, every: Duration) {
                 let sub = tokio::spawn(async move { comfy.subscribe(&url2, &production::comfy_client_id(), tx).await });
                 while let Some(ev) = rx.recv().await {
                     backoff = Duration::from_secs(1);
-                    match production::record_progress(&hub, &ev).await {
-                        Ok(Some(prompt_id)) => {
-                            if let Ok(open) = production::open_prompts(&hub).await
-                                && let Some(p) = open.iter().find(|p| p.prompt_id == prompt_id)
-                            {
-                                let _ = production::reconcile_prompt(&hub, p).await;
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!(error = %e, "progress update failed"),
+                    if let Err(e) = apply_progress(&hub, &ev).await {
+                        tracing::warn!(error = %e, "progress update failed");
                     }
                 }
                 let result = sub.await;
@@ -275,5 +312,98 @@ pub async fn run(hub: Hub, every: Duration) {
             tracing::error!(error = %e, "worker tick failed");
         }
         tokio::time::sleep(every).await;
+    }
+}
+
+/// Record one progress event and reconcile on a terminal hint.
+async fn apply_progress(hub: &Hub, ev: &domain::ports::ProgressEvent) -> DResult<()> {
+    let Some(prompt_id) = production::record_progress(hub, ev).await? else { return Ok(()) };
+    if let Some(p) = production::open_prompts(hub).await?.into_iter().find(|p| p.prompt_id == prompt_id) {
+        production::reconcile_prompt(hub, &p).await?;
+    }
+    Ok(())
+}
+
+/// A spawned subscription that is aborted when its owner goes away, including
+/// when the owner itself is aborted. A bare `JoinHandle` would leave the socket
+/// blocked and the engine unable to idle-exit.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Subscribe per open prompt, never for the process lifetime: the socket closes
+/// as soon as its prompt reaches a terminal state, so the engine may idle-exit.
+async fn listen_on_demand(hub: Hub, engine_id: String, url: String, every: Duration) {
+    let mut subscribed: std::collections::BTreeMap<String, AbortOnDrop<()>> = std::collections::BTreeMap::new();
+    loop {
+        let open: Vec<String> = production::open_prompts(&hub)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.engine_id == engine_id)
+            .map(|p| p.prompt_id)
+            .collect();
+        // Dropping a guard aborts its socket: that is what lets the engine idle.
+        subscribed.retain(|prompt_id, _| open.contains(prompt_id));
+        for prompt_id in open {
+            if subscribed.contains_key(&prompt_id) {
+                continue;
+            }
+            let hub = hub.clone();
+            let url = url.clone();
+            let task = tokio::spawn(async move {
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let comfy = hub.comfy.clone();
+                // Owning the spawned socket keeps it abortable: dropping this
+                // guard (including by aborting the task) closes the connection.
+                let _sub = AbortOnDrop(tokio::spawn(async move { comfy.subscribe(&url, &production::comfy_client_id(), tx).await }));
+                while let Some(ev) = rx.recv().await {
+                    if let Err(e) = apply_progress(&hub, &ev).await {
+                        tracing::warn!(error = %e, "progress update failed");
+                    }
+                }
+            });
+            subscribed.insert(prompt_id, AbortOnDrop(task));
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The bug this guards: aborting the listener left its separately spawned
+    /// subscription blocked on the socket forever.
+    #[tokio::test]
+    async fn aborting_a_listener_aborts_its_subscription() {
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = Flag(dropped.clone());
+        let sub = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        });
+        // Drop the owner the way `subscribed.retain` does when a prompt ends.
+        let owner = AbortOnDrop(sub);
+        drop(owner);
+        for _ in 0..200 {
+            if dropped.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the subscription outlived its listener");
     }
 }

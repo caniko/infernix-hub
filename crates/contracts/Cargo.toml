@@ -13,7 +13,7 @@ client = ["dep:reqwest"]
 chrono.workspace = true
 # One fleet snapshot type shared by the tool that writes it and every surface
 # that reads it; no CLI/Pkl features belong in the hub.
-fleetix = { git = "https://github.com/caniko/fleetix", rev = "f7f9dd198cdacf7596ef9156c8e7d1db69c47b29", default-features = false }
+fleetix = { version = "0.10.1", default-features = false }
 reqwest = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

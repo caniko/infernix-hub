@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PortError {
@@ -41,6 +42,12 @@ pub struct IssueRequest {
     pub description: String,
     /// Stable hub key so a retried create links the same issue.
     pub origin_key: String,
+    /// Paperclip project (studio company) that owns the issue.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Paperclip agent assigned to start the work (the Showrunner).
+    #[serde(default)]
+    pub assignee_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +239,62 @@ pub trait Comfy: Send + Sync {
     async fn outcome(&self, base_url: &str, prompt_id: &str) -> PortResult<PromptOutcome>;
     async fn fetch(&self, base_url: &str, file: &OutputFile) -> PortResult<Vec<u8>>;
     async fn cancel(&self, base_url: &str, prompt_id: &str) -> PortResult<CancelOutcome>;
+}
+
+// ── Pipelines (additive generation backend) ─────────────────────────────────
+
+/// Versioned input to a registered pipeline (request_version = 1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PipelineRequest {
+    pub request_version: i32,
+    pub generation_request_id: Uuid,
+    /// Registered pipeline id, e.g. `studio.render`.
+    pub pipeline_id: String,
+    /// Pipeline-specific inputs; the pipeline validates them.
+    pub inputs: Value,
+    /// Stable per attempt.
+    pub idempotency_key: String,
+    /// Hub endpoint the pipeline posts receipts to.
+    pub receipt_url: String,
+    /// Hub endpoint that accepts artifact bytes (`POST`).
+    pub artifact_url: String,
+}
+
+/// Opaque external handle for a pipeline run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PipelineRun {
+    pub external_id: String,
+    pub raw: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PipelineStatus {
+    Pending,
+    Running {
+        progress: Option<f32>,
+    },
+    /// Deferred by the pipeline (e.g. VRAM busy); the worker defers the
+    /// outbox row instead of spending a retry.
+    Deferred {
+        reason: String,
+    },
+    /// The complete output manifest.
+    Succeeded {
+        artifacts: Vec<contracts::ArtifactRef>,
+    },
+    Failed {
+        reason: String,
+    },
+    Cancelled,
+}
+
+/// A registered generation pipeline. ComfyUI stays the built-in path; this is
+/// an additive second backend selected by `workflows.pipeline_id`.
+#[async_trait]
+pub trait Pipeline: Send + Sync {
+    async fn submit(&self, req: &PipelineRequest) -> PortResult<PipelineRun>;
+    async fn status(&self, run: &PipelineRun) -> PortResult<PipelineStatus>;
+    async fn cancel(&self, run: &PipelineRun) -> PortResult<CancelOutcome>;
 }
 
 // ── Publishing & engagement transport ───────────────────────────────────────
