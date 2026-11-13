@@ -175,7 +175,7 @@ pub async fn history(db: &PgPool, subject_type: &str, subject_id: &str) -> DResu
     decode(rows)
 }
 
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
 /// Embedded migrations not yet applied successfully (all of them on an empty database).
 pub async fn pending_migrations(db: &PgPool) -> DResult<Vec<i64>> {

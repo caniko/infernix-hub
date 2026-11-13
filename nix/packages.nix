@@ -16,7 +16,6 @@
       ../Cargo.lock
       ../apps
       ../crates
-      ../migrations
       ../registry
     ];
   };

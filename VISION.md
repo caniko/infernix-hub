@@ -43,7 +43,7 @@ leave no audit trail from an operator action to its external effect.
 - `crates/contracts`: shared wire types
 - `apps/desktop`: Dioxus operator console with workspace navigation and
   inspector
-- `migrations/` and `registry/` for persistence and external-service catalogues
+- `crates/domain/migrations/` and `registry/` for persistence and external-service catalogues
 
 ## Direction
 
