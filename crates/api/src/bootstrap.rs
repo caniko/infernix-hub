@@ -326,11 +326,11 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         AdapterMode::Disabled => "disabled",
     };
     channels.insert(builtin_transport.to_string(), publisher.clone());
-    if s.publisher == AdapterMode::Fixture {
-        if let Some(seed) = &seed {
-            for account in &seed.accounts {
-                channels.insert(account.transport.clone(), publisher.clone());
-            }
+    if s.publisher == AdapterMode::Fixture
+        && let Some(seed) = &seed
+    {
+        for account in &seed.accounts {
+            channels.insert(account.transport.clone(), publisher.clone());
         }
     }
     // n8n contract v1: one live channel per platform workflow,
@@ -502,10 +502,10 @@ fn read_registry(dir: &Path) -> anyhow::Result<Vec<domain::production::WorkflowS
     for path in &paths {
         let spec: domain::production::WorkflowSpec =
             serde_json::from_str(&std::fs::read_to_string(path)?).with_context(|| format!("parsing {}", path.display()))?;
-        if let Some(id) = &spec.pipeline_id {
-            if let Some(first) = pipeline_files.insert(id.clone(), path.clone()) {
-                bail!("pipeline id {id:?} is defined by both {} and {}", first.display(), path.display());
-            }
+        if let Some(id) = &spec.pipeline_id
+            && let Some(first) = pipeline_files.insert(id.clone(), path.clone())
+        {
+            bail!("pipeline id {id:?} is defined by both {} and {}", first.display(), path.display());
         }
         specs.push(spec);
     }

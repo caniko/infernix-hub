@@ -149,10 +149,10 @@ fn n8n_profile(platform: &str) -> Option<&'static Profile> {
 pub fn profiles_for(accounts: &[Account], selected: &[String]) -> Vec<&'static Profile> {
     let mut profiles: Vec<&'static Profile> = Vec::new();
     for account in accounts.iter().filter(|account| selected.contains(&account.id)) {
-        if let Some(profile) = profile_for(account) {
-            if !profiles.iter().any(|known| known.id == profile.id) {
-                profiles.push(profile);
-            }
+        if let Some(profile) = profile_for(account)
+            && !profiles.iter().any(|known| known.id == profile.id)
+        {
+            profiles.push(profile);
         }
     }
     profiles

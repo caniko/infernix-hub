@@ -89,6 +89,8 @@ wire_enum!(
     Producer { Delegated = "delegated", Direct = "direct" }
 );
 
+// `wire_enum!` has no `#[default]` passthrough, so the impl stays explicit.
+#[allow(clippy::derivable_impls)]
 impl Default for Producer {
     fn default() -> Self {
         Self::Delegated

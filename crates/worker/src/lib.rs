@@ -128,6 +128,7 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
             match production::deliver_pipeline(hub, &job).await {
                 Ok(production::PipelineDelivery::Done) => Delivery::Done,
                 Ok(production::PipelineDelivery::Retry(e)) => Delivery::Retry(e),
+                Ok(production::PipelineDelivery::Defer(wait)) => Delivery::Defer(wait),
                 Ok(production::PipelineDelivery::Dead(e)) => Delivery::Dead(e),
                 Err(e) => Delivery::Dead(e.to_string()),
             }

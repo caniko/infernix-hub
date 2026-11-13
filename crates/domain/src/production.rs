@@ -65,6 +65,8 @@ pub struct PipelineJob {
 pub enum PipelineDelivery {
     Done,
     Retry(String),
+    /// Wait without spending a delivery attempt (a claimed run's lookup).
+    Defer(std::time::Duration),
     Dead(String),
 }
 
@@ -444,7 +446,7 @@ pub async fn record_receipt(hub: &Hub, actor: &Actor, generation_id: Uuid, r: Re
             WireStatus::Failed => AttemptState::Failed,
             WireStatus::Cancelled => AttemptState::Cancelled,
         };
-        set_attempt_in(&mut *tx, attempt_id, state, json!({ "receipt": r.external_id })).await?;
+        set_attempt_in(&mut tx, attempt_id, state, json!({ "receipt": r.external_id })).await?;
     }
     sqlx::query(
         "update generation_requests set state = 'running', updated_at = now() where id = $1 and state in ('requested', 'dispatched')",
@@ -575,7 +577,7 @@ async fn record_manifest(
                 return Err(conflict("manifest_conflict", format!("{} already has a different terminal manifest", artifact.source)));
             }
         }
-        complete_pipeline_in(&mut *tx, generation_id).await?;
+        complete_pipeline_in(&mut tx, generation_id).await?;
         write_derived_state(&mut tx, generation_id, current).await?;
         tx.commit().await?;
         return Ok(());
@@ -585,7 +587,7 @@ async fn record_manifest(
     if !omitted.is_empty() {
         let names = omitted.join(", ");
         set_attempt_in(
-            &mut *tx,
+            &mut tx,
             attempt_id,
             AttemptState::Failed,
             json!({ "error": format!("the manifest omits uploaded artifact(s): {names}") }),
@@ -642,7 +644,7 @@ async fn record_manifest(
     }
     if let Some(source) = mismatched {
         set_attempt_in(
-            &mut *tx,
+            &mut tx,
             attempt_id,
             AttemptState::Failed,
             json!({ "error": "manifest hash differs from the uploaded artifact", "source": source }),
@@ -679,7 +681,7 @@ async fn record_manifest(
         json!({ "artifacts": artifacts.len(), "missing": missing }),
     )
     .await?;
-    complete_pipeline_in(&mut *tx, generation_id).await?;
+    complete_pipeline_in(&mut tx, generation_id).await?;
     write_derived_state(&mut tx, generation_id, current).await?;
     tx.commit().await?;
     Ok(())
@@ -834,7 +836,7 @@ pub async fn upload_artifact(
     )
     .await?;
     // This upload may be the last one the recorded manifest was waiting for.
-    complete_pipeline_in(&mut *tx, generation_id).await?;
+    complete_pipeline_in(&mut tx, generation_id).await?;
     write_derived_state(&mut tx, generation_id, current).await?;
     tx.commit().await?;
     get_generation(hub, generation_id).await
@@ -968,13 +970,22 @@ pub async fn deliver_pipeline(hub: &Hub, job: &PipelineJob) -> DResult<PipelineD
             Ok(Some(run)) => match record_pipeline_submitted(hub, job.attempt_id, &run).await {
                 Ok(()) => Ok(PipelineDelivery::Done),
                 // The run exists; only the record failed. Keep the claim, so
-                // the next delivery adopts it instead of submitting again.
-                Err(e) => Ok(PipelineDelivery::Retry(format!("pipeline run {} found but not recorded: {e}", run.external_id))),
+                // the next delivery adopts it instead of submitting again. A
+                // deferral spends no delivery attempt, so recovery never runs
+                // out into the dead-letter path.
+                Err(e) => {
+                    tracing::warn!(attempt_id = %job.attempt_id, run = %run.external_id, error = %e, "claimed run found but not recorded");
+                    Ok(PipelineDelivery::Defer(CLAIM_LOOKUP_DEFER))
+                }
             },
             Ok(None) => fail_unknown_submission(hub, generation_id, job.attempt_id).await,
             // A failed lookup proves nothing either way: the claim stays, and
             // a later delivery adopts the run the first submission started.
-            Err(e) => Ok(PipelineDelivery::Retry(format!("cannot look up the claimed submission: {e}"))),
+            // Deferred, not retried, for the same reason as above.
+            Err(e) => {
+                tracing::warn!(attempt_id = %job.attempt_id, error = %e, "cannot look up the claimed submission");
+                Ok(PipelineDelivery::Defer(CLAIM_LOOKUP_DEFER))
+            }
         };
     }
     if generation_state != GenerationState::Requested.as_str() || attempt_state != AttemptState::Submitted.as_str() {
@@ -1019,13 +1030,24 @@ pub async fn deliver_pipeline(hub: &Hub, job: &PipelineJob) -> DResult<PipelineD
     }
 }
 
+/// How long a claimed submission waits before its run is looked up again.
+const CLAIM_LOOKUP_DEFER: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// End a claimed submission the backend has no run for. The claim stays, so
 /// nothing submits it again.
 async fn fail_unknown_submission(hub: &Hub, generation_id: Uuid, attempt_id: Uuid) -> DResult<PipelineDelivery> {
     let mut tx = hub.db.begin().await?;
     // Lock order is generation first, then attempts (as receipts do).
     let current = lock_generation(&mut tx, generation_id).await?;
-    set_attempt_in(&mut *tx, attempt_id, AttemptState::Failed, json!({ "error": SUBMISSION_UNKNOWN })).await?;
+    // The lookup ran outside the lock: a concurrent delivery may have adopted
+    // the run (or the attempt ended) since. Only an unresolved claim fails.
+    let (state, raw): (String, Value) =
+        sqlx::query_as("select state, raw from execution_attempts where id = $1 for update").bind(attempt_id).fetch_one(&mut *tx).await?;
+    if raw.get("run").is_some() || state != AttemptState::Submitted.as_str() {
+        tx.commit().await?;
+        return Ok(PipelineDelivery::Done);
+    }
+    set_attempt_in(&mut tx, attempt_id, AttemptState::Failed, json!({ "error": SUBMISSION_UNKNOWN })).await?;
     write_derived_state(&mut tx, generation_id, current).await?;
     audit(
         &mut tx,
@@ -1811,7 +1833,7 @@ async fn cancel_pipeline(hub: &Hub, actor: &Actor, generation: GenerationRequest
             // commits.
             None => {
                 set_attempt_in(
-                    &mut *tx,
+                    &mut tx,
                     attempt_id,
                     AttemptState::Cancelled,
                     json!({ "cancelled_by": actor.name(), "note": "never submitted" }),

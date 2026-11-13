@@ -1504,9 +1504,19 @@ async fn a_claim_lookup_outage_keeps_the_claim_and_adopts_later() {
     .await
     .unwrap();
     let windmill = h.fx.windmill.as_ref().unwrap();
-    windmill.find_outages.store(1, std::sync::atomic::Ordering::SeqCst);
+    // An outage longer than the whole delivery budget (12 attempts) must not
+    // dead-letter the claim: lookups defer, they do not spend retries.
+    let outages: usize = 15;
+    windmill.find_outages.store(outages, std::sync::atomic::Ordering::SeqCst);
     windmill.adopt_on_find.store(true, std::sync::atomic::Ordering::SeqCst);
-    h.tick().await;
+    for _ in 0..outages {
+        domain::sqlx::query("update outbox set next_attempt_at = now() where idempotency_key = $1")
+            .bind(format!("generation:{}", g.id))
+            .execute(&h.hub.db)
+            .await
+            .unwrap();
+        h.tick().await;
+    }
 
     let raw = h.attempt_raw(g.id).await;
     assert!(raw.get("run").is_none(), "an outage invents no handle: {raw}");
@@ -1517,7 +1527,7 @@ async fn a_claim_lookup_outage_keeps_the_claim_and_adopts_later() {
         .fetch_one(&h.hub.db)
         .await
         .unwrap();
-    assert_eq!((state.as_str(), attempts), ("pending", 1), "the delivery waits for its retry");
+    assert_eq!((state.as_str(), attempts), ("pending", 0), "a deferred lookup spends no delivery attempt");
 
     // The next delivery reaches the backend: the run is adopted, not resubmitted.
     domain::sqlx::query("update outbox set next_attempt_at = now() where idempotency_key = $1")

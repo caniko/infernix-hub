@@ -105,8 +105,11 @@ Follow-up, artifacts and completion:
 - The generation completes only when every manifest row has an uploaded, ready
   asset with a matching digest; otherwise the generation fails at the 30 minute
   upload deadline naming the missing sources.
-- Cancelling stops the run through the pipeline and reports `Cancelled` without
-  waiting for the backend.
+- Cancelling asks the pipeline to stop the run. The outcome decides what
+  follows: `Dequeued` and `Interrupted` end in `Cancelled`, `AlreadyFinished`
+  keeps a recorded manifest's result (without one the request stays
+  `cancelling` until a status read ends it), and `Unsupported` or an error
+  leaves it `cancelling` for the operator.
 
 What ships here: `fixture.svg`, the in-process fixture pipeline behind
 `registry/pipeline/fixture-svg.v1.json`, and `WindmillPipeline`, a generic
