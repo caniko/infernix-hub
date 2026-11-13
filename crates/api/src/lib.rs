@@ -220,6 +220,7 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
     let mut channels = (*state.hub.channels).clone();
     let mut pipelines = (*state.hub.pipelines).clone();
     let mut topics: BTreeMap<String, Arc<dyn domain::outbox::OutboxHandler>> = BTreeMap::new();
+    let mut workflows = Vec::new();
     let mut routes = Vec::new();
     let mut integrations = state.hub.config.integrations.clone();
     for pack in &packs {
@@ -237,6 +238,7 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
             anyhow::ensure!(!topics.contains_key(&topic), "pack {}: topic {topic} is registered twice", regs.pack_id);
             topics.insert(topic, handler);
         }
+        workflows.extend(regs.workflows);
         if let Some(router) = regs.routes {
             routes.push((regs.pack_id.to_string(), router));
         }
@@ -252,6 +254,7 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
     hub.pipelines = Arc::new(pipelines);
     hub.topics = Arc::new(topics);
     state.hub = hub;
+    register_pack_workflows(&state.hub, &workflows).await.context("registering pack workflows")?;
 
     if !settings.no_worker {
         tokio::spawn(worker::run(state.hub.clone(), Duration::from_secs(2)));
@@ -286,6 +289,17 @@ fn merge_pack_channels(
             "pack {pack}: channel {name} collides with a built-in channel or an earlier pack"
         );
         channels.insert(name, publisher);
+    }
+    Ok(())
+}
+
+/// Register every workflow a pack declared. Startup fails on a refused
+/// definition, so no request can name a workflow the hub never recorded.
+async fn register_pack_workflows(hub: &domain::Hub, specs: &[domain::production::WorkflowSpec]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    for spec in specs {
+        domain::production::register_workflow(hub, spec).await.with_context(|| format!("registering {} v{}", spec.name, spec.version))?;
     }
     Ok(())
 }

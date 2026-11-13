@@ -16,6 +16,7 @@ use contracts::IntegrationStatus;
 use contracts::client::HubClient;
 use domain::outbox::{CORE_TOPICS, OutboxHandler};
 use domain::ports::{Pipeline, Publisher};
+use domain::production::WorkflowSpec;
 use domain::sqlx::PgPool;
 use rmcp::handler::server::router::tool::ToolRoute;
 use serde_json::Value;
@@ -64,6 +65,8 @@ pub(crate) struct PackRegistrations {
     pub channels: BTreeMap<String, Arc<dyn Publisher>>,
     pub pipelines: BTreeMap<String, Arc<dyn Pipeline>>,
     pub topics: BTreeMap<String, Arc<dyn OutboxHandler>>,
+    /// Workflow versions to register once the `Hub` exists.
+    pub workflows: Vec<WorkflowSpec>,
     pub routes: Option<Router<AppState>>,
     pub integrations: Vec<IntegrationStatus>,
 }
@@ -75,6 +78,7 @@ pub struct ServerHost<'a> {
     channels: BTreeMap<String, Arc<dyn Publisher>>,
     pipelines: BTreeMap<String, Arc<dyn Pipeline>>,
     topics: BTreeMap<String, Arc<dyn OutboxHandler>>,
+    workflows: Vec<WorkflowSpec>,
     routes: Option<Router<AppState>>,
     integrations: Vec<IntegrationStatus>,
 }
@@ -87,6 +91,7 @@ impl<'a> ServerHost<'a> {
             channels: BTreeMap::new(),
             pipelines: BTreeMap::new(),
             topics: BTreeMap::new(),
+            workflows: Vec::new(),
             routes: None,
             integrations: Vec::new(),
         }
@@ -133,6 +138,31 @@ impl<'a> ServerHost<'a> {
         self.integrations.push(status);
     }
 
+    /// Declare a workflow version this pack ships. The name must be
+    /// `<pack id>.`-prefixed and unique per version, and a pipeline-backed
+    /// workflow must name a pipeline this same pack registered (register the
+    /// pipeline first). The row is written once the `Hub` exists, in `run`.
+    pub fn workflow(&mut self, spec: WorkflowSpec) -> anyhow::Result<()> {
+        self.ensure_pack_prefixed(&spec.name, "workflow")?;
+        if let Some(id) = &spec.pipeline_id {
+            ensure!(
+                self.pipelines.contains_key(id),
+                "pack {}: workflow {} names pipeline {id}, which this pack has not registered",
+                self.pack_id,
+                spec.name
+            );
+        }
+        ensure!(
+            !self.workflows.iter().any(|w| w.name == spec.name && w.version == spec.version),
+            "pack {}: workflow {} v{} is already registered",
+            self.pack_id,
+            spec.name,
+            spec.version
+        );
+        self.workflows.push(spec);
+        Ok(())
+    }
+
     fn ensure_pack_prefixed(&self, name: &str, what: &str) -> anyhow::Result<()> {
         let prefix = format!("{}.", self.pack_id);
         ensure!(name.starts_with(&prefix), "pack {}: {what} {name} must start with {prefix}", self.pack_id);
@@ -146,6 +176,7 @@ impl<'a> ServerHost<'a> {
             channels: self.channels,
             pipelines: self.pipelines,
             topics: self.topics,
+            workflows: self.workflows,
             routes: self.routes,
             integrations: self.integrations,
         }
@@ -302,6 +333,16 @@ mod tests {
                 verification: contracts::Verification::FixtureTested,
                 detail: "test pack".into(),
             });
+            host.pipeline("test-pack.svg", Arc::new(NoopPipeline))?;
+            host.workflow(WorkflowSpec {
+                name: "test-pack.svg".into(),
+                version: 1,
+                engine_instance_id: None,
+                pipeline_id: Some("test-pack.svg".into()),
+                windmill_path: "f/test/svg".into(),
+                bindings: json!({}),
+                graph: None,
+            })?;
             Ok(())
         }
     }
@@ -339,7 +380,7 @@ mod tests {
         s.asset_dir = assets.clone();
         s.registry_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../registry").into();
         s.seed_file = Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../registry/hub.fixture.json").into());
-        let (state, _fx) = crate::bootstrap::build(&s).await.unwrap();
+        let (mut state, _fx) = crate::bootstrap::build(&s).await.unwrap();
         for (name, role, token) in [("operator", contracts::Role::Operator, "op"), ("agent", contracts::Role::Agent, "ag")] {
             domain::system::issue_token(&state.hub.db, name, role, Some(token.into())).await.unwrap();
         }
@@ -356,6 +397,12 @@ mod tests {
         let regs = host.finish();
         assert_eq!(regs.integrations.len(), 1, "pack status entry is recorded");
         let routes = regs.routes.expect("routes registered");
+        // The same order `run` uses: pack pipelines join the registry, then the
+        // pack workflows are registered onto the `Hub`.
+        let mut pipelines = (*state.hub.pipelines).clone();
+        pipelines.extend(regs.pipelines);
+        state.hub.pipelines = Arc::new(pipelines);
+        crate::register_pack_workflows(&state.hub, &regs.workflows).await.unwrap();
         let server = tokio::spawn(async move {
             axum::serve(listener, crate::router_with(state, vec![("test-pack".into(), routes)])).await.unwrap();
         });
@@ -371,6 +418,55 @@ mod tests {
         let coded = op.get::<serde_json::Value>("/p/test-pack/boom").await.unwrap_err();
         assert!(matches!(coded, contracts::client::ClientError::Api { status: 422, .. }), "pack errors keep the core shape: {coded}");
         assert!(op.get::<contracts::SystemStatus>("/status").await.is_ok(), "core routes still work");
+
+        // A pack workflow is a generation target: it is listed with the
+        // registry's own workflows and `generate` queues its pack pipeline.
+        let wf = op.workflows().await.unwrap().into_iter().find(|w| w.name == "test-pack.svg").expect("pack workflow registered");
+        let persona = op.personas().await.unwrap().remove(0);
+        let item = op
+            .create_brief(&contracts::CreateBriefIn {
+                persona_id: persona.id,
+                news_item_id: None,
+                title: "Pack workflow".into(),
+                brief: contracts::Brief {
+                    angle: "a".into(),
+                    audience: "b".into(),
+                    copy_direction: "c".into(),
+                    visual_direction: "d".into(),
+                    producer: contracts::Producer::Delegated,
+                },
+            })
+            .await
+            .unwrap();
+        let g = op
+            .generate(item.id, &contracts::GenerateIn { workflow_id: wf.id, inputs: json!({ "prompt": "a kiln" }), variants: 1 })
+            .await
+            .unwrap();
+        assert_eq!(g.state, contracts::GenerationState::Requested, "the pack pipeline generation was accepted");
+        assert_eq!(g.workflow_id, wf.id);
         server.abort();
+    }
+
+    /// The pack builder refuses a workflow the hub could not honour: a name
+    /// outside the pack namespace, a second definition of one version, and a
+    /// pipeline the pack never registered.
+    #[tokio::test]
+    async fn pack_workflows_are_namespaced_unique_and_pipeline_backed() {
+        let ctx = ctx();
+        let mut host = ServerHost::new("studio", &ctx);
+        let spec = |name: &str, pipeline: Option<&str>| WorkflowSpec {
+            name: name.into(),
+            version: 1,
+            engine_instance_id: None,
+            pipeline_id: pipeline.map(String::from),
+            windmill_path: "f/studio/render".into(),
+            bindings: json!({}),
+            graph: None,
+        };
+        assert!(host.workflow(spec("render", Some("studio.render"))).is_err(), "unprefixed workflow");
+        assert!(host.workflow(spec("studio.render", Some("studio.render"))).is_err(), "the pack has not registered that pipeline");
+        host.pipeline("studio.render", Arc::new(NoopPipeline)).unwrap();
+        assert!(host.workflow(spec("studio.render", Some("studio.render"))).is_ok());
+        assert!(host.workflow(spec("studio.render", Some("studio.render"))).is_err(), "duplicate name and version");
     }
 }
