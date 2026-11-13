@@ -61,6 +61,16 @@ pub struct WindmillState {
     /// Fail this many pipeline submissions as unreachable (a backend that is
     /// down), spending outbox retries.
     pub fail_submit: std::sync::atomic::AtomicUsize,
+    /// Report the run of the next submission claim lookup instead of `None`:
+    /// the crash window where the backend started a run the hub never
+    /// recorded. Answered once.
+    pub adopt_on_find: std::sync::atomic::AtomicBool,
+    /// Fail this many claim lookups as unreachable (the backend is down while
+    /// the hub still holds the claim).
+    pub find_outages: std::sync::atomic::AtomicUsize,
+    /// Pipeline submissions that reached the backend; a crash-window adoption
+    /// must never add to this.
+    pub submits: std::sync::atomic::AtomicUsize,
     timers: Mutex<Vec<PublicationTimer>>,
 }
 
@@ -81,6 +91,9 @@ impl FixtureWindmill {
             status_started: tokio::sync::Notify::new(),
             bad_manifest: Default::default(),
             fail_submit: Default::default(),
+            adopt_on_find: Default::default(),
+            find_outages: Default::default(),
+            submits: Default::default(),
             timers: Mutex::default(),
         }))
     }
@@ -282,6 +295,7 @@ impl Pipeline for FixturePipeline {
             self.0.windmill.fail_submit.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             return Err(PortError::Unreachable("fixture pipeline is down".into()));
         }
+        self.0.windmill.submits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let id = uuid::Uuid::new_v4().to_string();
         let text = req.inputs["prompt"].as_str().unwrap_or("fixture pipeline").to_string();
         let svg = super::comfy::render_svg(&json!({ "1": { "inputs": { "text": text } } }), &id);
@@ -368,6 +382,21 @@ impl Pipeline for FixturePipeline {
             std::future::pending::<()>().await;
         }
         Ok(status)
+    }
+
+    /// The claim lookup: a backend that answers `None` unless a test arms the
+    /// crash window (its run exists, its handle was never recorded).
+    async fn find(&self, req: &PipelineRequest) -> PortResult<Option<PipelineRun>> {
+        if self.0.windmill.find_outages.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.0.windmill.find_outages.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(PortError::Unreachable("fixture pipeline lookup is down".into()));
+        }
+        if !self.0.windmill.adopt_on_find.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let id = format!("adopted-{}", req.idempotency_key);
+        lock(&self.0.runs).entry(id.clone()).or_insert((PipelineStatus::Pending, None));
+        Ok(Some(PipelineRun { external_id: id, raw: json!({ "fixture": true, "adopted": true }) }))
     }
 
     async fn cancel(&self, run: &PipelineRun) -> PortResult<CancelOutcome> {

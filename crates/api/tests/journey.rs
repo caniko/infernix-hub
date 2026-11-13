@@ -1459,6 +1459,80 @@ async fn a_claimed_submission_without_a_run_is_not_resubmitted() {
     h.server.abort();
 }
 
+/// The crash window is recoverable: the claim is committed, the handle is not,
+/// and the backend still knows the run. The delivery adopts it and never
+/// submits the work a second time.
+#[tokio::test]
+async fn a_claimed_submission_adopts_the_run_the_backend_knows() {
+    let Some(h) = harness().await else { return };
+    let item = h.brief(None).await;
+    let g = h.pipeline(item.id).await;
+    // A crash between the committed claim and the record, with the run started.
+    domain::sqlx::query(
+        "update execution_attempts set raw = raw || jsonb_build_object('submit_started_at', now())
+          where generation_request_id = $1 and kind = 'pipeline_run'",
+    )
+    .bind(g.id)
+    .execute(&h.hub.db)
+    .await
+    .unwrap();
+    h.fx.windmill.as_ref().unwrap().adopt_on_find.store(true, std::sync::atomic::Ordering::SeqCst);
+    h.tick().await;
+
+    let raw = h.attempt_raw(g.id).await;
+    let adopted = raw["run"]["external_id"].as_str().unwrap_or_default();
+    assert_eq!(adopted, format!("adopted-generation:{}:pipeline", g.id), "the found run is adopted: {raw}");
+    assert!(matches!(h.generation(item.id, g.id).await.state, GenerationState::Dispatched | GenerationState::Running));
+    assert_eq!(h.attempt(item.id, g.id).await.state, AttemptState::Queued, "the adopted run is followed");
+    assert_eq!(h.fx.windmill.as_ref().unwrap().submits.load(std::sync::atomic::Ordering::SeqCst), 0, "never submitted again");
+    h.server.abort();
+}
+
+/// A lookup that fails proves nothing either way: the claim and the run both
+/// survive, and a later delivery adopts instead of resubmitting.
+#[tokio::test]
+async fn a_claim_lookup_outage_keeps_the_claim_and_adopts_later() {
+    let Some(h) = harness().await else { return };
+    let item = h.brief(None).await;
+    let g = h.pipeline(item.id).await;
+    domain::sqlx::query(
+        "update execution_attempts set raw = raw || jsonb_build_object('submit_started_at', now())
+          where generation_request_id = $1 and kind = 'pipeline_run'",
+    )
+    .bind(g.id)
+    .execute(&h.hub.db)
+    .await
+    .unwrap();
+    let windmill = h.fx.windmill.as_ref().unwrap();
+    windmill.find_outages.store(1, std::sync::atomic::Ordering::SeqCst);
+    windmill.adopt_on_find.store(true, std::sync::atomic::Ordering::SeqCst);
+    h.tick().await;
+
+    let raw = h.attempt_raw(g.id).await;
+    assert!(raw.get("run").is_none(), "an outage invents no handle: {raw}");
+    assert!(raw.get("submit_started_at").is_some(), "the claim stays: {raw}");
+    assert_ne!(h.attempt(item.id, g.id).await.state, AttemptState::Failed, "an outage is not a submission outcome");
+    let (state, attempts): (String, i32) = domain::sqlx::query_as("select state, attempts from outbox where idempotency_key = $1")
+        .bind(format!("generation:{}", g.id))
+        .fetch_one(&h.hub.db)
+        .await
+        .unwrap();
+    assert_eq!((state.as_str(), attempts), ("pending", 1), "the delivery waits for its retry");
+
+    // The next delivery reaches the backend: the run is adopted, not resubmitted.
+    domain::sqlx::query("update outbox set next_attempt_at = now() where idempotency_key = $1")
+        .bind(format!("generation:{}", g.id))
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    h.tick().await;
+    let raw = h.attempt_raw(g.id).await;
+    let adopted = format!("adopted-generation:{}:pipeline", g.id);
+    assert_eq!(raw["run"]["external_id"].as_str(), Some(adopted.as_str()), "{raw}");
+    assert_eq!(h.fx.windmill.as_ref().unwrap().submits.load(std::sync::atomic::Ordering::SeqCst), 0, "never submitted again");
+    h.server.abort();
+}
+
 /// Cancelling while the backend has accepted a run but the hub has not
 /// recorded its handle must stop that run, never adopt it as live.
 #[tokio::test]

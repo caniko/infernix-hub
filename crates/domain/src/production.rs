@@ -960,21 +960,22 @@ pub async fn deliver_pipeline(hub: &Hub, job: &PipelineJob) -> DResult<PipelineD
     }
     if raw.get("submit_started_at").is_some() {
         // Claimed but no handle recorded: the process died between the claim
-        // and the record. Submitting again could run the work twice.
-        set_attempt_in(&mut *tx, job.attempt_id, AttemptState::Failed, json!({ "error": SUBMISSION_UNKNOWN })).await?;
-        write_derived_state(&mut tx, generation_id, GenerationState::parse(&generation_state).unwrap_or(GenerationState::Requested))
-            .await?;
-        audit(
-            &mut tx,
-            &Actor::system(),
-            "generation.pipeline_submission_unknown",
-            "generation",
-            generation_id,
-            json!({ "attempt_id": job.attempt_id }),
-        )
-        .await?;
-        tx.commit().await?;
-        return Ok(PipelineDelivery::Dead(SUBMISSION_UNKNOWN.into()));
+        // and the record. The backend may still know the run, and submitting
+        // again could run the work twice, so ask before deciding. The read is
+        // outside the generation row lock: it is a remote call.
+        drop(tx);
+        return match pipeline.find(&job.request).await {
+            Ok(Some(run)) => match record_pipeline_submitted(hub, job.attempt_id, &run).await {
+                Ok(()) => Ok(PipelineDelivery::Done),
+                // The run exists; only the record failed. Keep the claim, so
+                // the next delivery adopts it instead of submitting again.
+                Err(e) => Ok(PipelineDelivery::Retry(format!("pipeline run {} found but not recorded: {e}", run.external_id))),
+            },
+            Ok(None) => fail_unknown_submission(hub, generation_id, job.attempt_id).await,
+            // A failed lookup proves nothing either way: the claim stays, and
+            // a later delivery adopts the run the first submission started.
+            Err(e) => Ok(PipelineDelivery::Retry(format!("cannot look up the claimed submission: {e}"))),
+        };
     }
     if generation_state != GenerationState::Requested.as_str() || attempt_state != AttemptState::Submitted.as_str() {
         return Ok(PipelineDelivery::Done);
@@ -1016,6 +1017,27 @@ pub async fn deliver_pipeline(hub: &Hub, job: &PipelineJob) -> DResult<PipelineD
             Ok(PipelineDelivery::Dead(why))
         }
     }
+}
+
+/// End a claimed submission the backend has no run for. The claim stays, so
+/// nothing submits it again.
+async fn fail_unknown_submission(hub: &Hub, generation_id: Uuid, attempt_id: Uuid) -> DResult<PipelineDelivery> {
+    let mut tx = hub.db.begin().await?;
+    // Lock order is generation first, then attempts (as receipts do).
+    let current = lock_generation(&mut tx, generation_id).await?;
+    set_attempt_in(&mut *tx, attempt_id, AttemptState::Failed, json!({ "error": SUBMISSION_UNKNOWN })).await?;
+    write_derived_state(&mut tx, generation_id, current).await?;
+    audit(
+        &mut tx,
+        &Actor::system(),
+        "generation.pipeline_submission_unknown",
+        "generation",
+        generation_id,
+        json!({ "attempt_id": attempt_id }),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(PipelineDelivery::Dead(SUBMISSION_UNKNOWN.into()))
 }
 
 /// Apply one authoritative pipeline status to the attempt that owns `run`. A

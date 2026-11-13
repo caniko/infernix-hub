@@ -295,6 +295,14 @@ pub trait Pipeline: Send + Sync {
     async fn submit(&self, req: &PipelineRequest) -> PortResult<PipelineRun>;
     async fn status(&self, run: &PipelineRun) -> PortResult<PipelineStatus>;
     async fn cancel(&self, run: &PipelineRun) -> PortResult<CancelOutcome>;
+    /// The run an earlier submission of this request started, if the backend
+    /// still knows it. Read when the hub holds a submission claim but never
+    /// recorded the handle (a crash between the two), so the run is adopted
+    /// instead of submitted twice. `Ok(None)` means the backend has no such
+    /// run; the default implements a backend that cannot answer.
+    async fn find(&self, _req: &PipelineRequest) -> PortResult<Option<PipelineRun>> {
+        Ok(None)
+    }
 }
 
 // ── Publishing & engagement transport ───────────────────────────────────────
