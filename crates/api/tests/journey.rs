@@ -1533,6 +1533,27 @@ async fn a_claim_lookup_outage_keeps_the_claim_and_adopts_later() {
     h.server.abort();
 }
 
+/// A worker downloads its stage inputs by asset id: the `procedure` role may
+/// read asset bytes, and no other read widens.
+#[tokio::test]
+async fn a_procedure_may_download_asset_bytes_and_nothing_else() {
+    let Some(h) = harness().await else { return };
+    let item = h.brief(None).await;
+    let g = h.produce(item.id, 1).await;
+    assert_eq!(g.state, GenerationState::Succeeded);
+    let asset = h.op.content_detail(item.id).await.unwrap().assets.remove(0);
+
+    let (mime, bytes) = h.procedure.get_bytes(&format!("/assets/{}/content", asset.id)).await.unwrap();
+    assert_eq!(mime, asset.mime);
+    assert_eq!(domain::hash::sha256_hex(&bytes), asset.sha256, "the worker can verify what it downloaded");
+
+    let denied = h.procedure.get::<Vec<ContentItem>>("/content").await.unwrap_err();
+    assert!(matches!(denied, ClientError::Api { status: 403, .. }), "a procedure still cannot read content: {denied}");
+    let denied = h.procedure.assets().await.unwrap_err();
+    assert!(matches!(denied, ClientError::Api { status: 403, .. }), "asset listings are not widened either: {denied}");
+    h.server.abort();
+}
+
 /// Cancelling while the backend has accepted a run but the hub has not
 /// recorded its handle must stop that run, never adopt it as live.
 #[tokio::test]

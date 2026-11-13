@@ -2012,8 +2012,13 @@ pub async fn select_asset(hub: &Hub, actor: &Actor, asset_id: Uuid, input: Selec
     Ok(asset)
 }
 
+/// Asset bytes are the one read a `Procedure` may make: a worker downloads its
+/// stage inputs by asset id and verifies each sha256 itself. Nothing else
+/// widens (listings, content, releases stay reader-only).
+const ASSET_CONTENT_READERS: &[Role] = &[Role::Operator, Role::Agent, Role::Procedure];
+
 pub async fn asset_content(hub: &Hub, actor: &Actor, asset_id: Uuid) -> DResult<(String, Vec<u8>)> {
-    actor.require(crate::ANY_READER)?;
+    actor.require(ASSET_CONTENT_READERS)?;
     let row: Option<(String, String, String)> =
         sqlx::query_as("select storage_key, mime, sha256 from assets where id = $1 and state = 'ready'")
             .bind(asset_id)
