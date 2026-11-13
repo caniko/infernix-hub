@@ -1,188 +1,270 @@
-# Integration capabilities
+# Integration and platform capabilities
 
-Status terms:
+What the hub can do, what has actually been proven, and what does not exist.
+Nothing in this file is deployed: see [Not deployed](#not-deployed).
 
-- **built** — adapter code exists in `crates/integrations/src/live/`.
-- **fixture-tested** — the matching `Fixture*` adapter exists in `fixture.rs`;
-  those adapters are lead-owned and are not evidence for the live adapter.
-- **contract-verified** — request/response shapes checked against a downloaded
-  OpenAPI document or the deployed server source.
-- **live-verified** — a read-only request was actually made to the deployed
-  service. No mutating request was made anywhere.
+## Status terms
 
-No live adapter method below is marked fixture-tested: the fixture adapters in
-`fixture.rs` are lead-owned and were not run as evidence for this track.
+- **built** — the code exists and compiles.
+- **fixture-tested** — a `Fixture*` adapter in `crates/integrations/src/fixture/`
+  or the in-process stand-in was exercised end to end. It is evidence for the
+  hub's own machinery, never for the live adapter.
+- **contract-verified** — request/response shapes were checked against a
+  downloaded OpenAPI document or the deployed server source.
+- **live-verified** — a request was actually made to the deployed service. No
+  mutating request was made anywhere.
 
-All observations are from `atlas`, 2026-11-09.
+A live adapter is never marked fixture-tested by association: the fixture
+adapters are separate code.
 
-## Paperclip
+## Packs
 
-| | |
+A pack is a compile-time extension. The trait is `Pack` in
+`crates/api/src/plugin.rs`; `fleetix_hubd::run(settings, packs)` installs the
+packs it is given once the `Hub` exists. The upstream `fleetix-hubd` binary
+passes an empty list, so everything below is inert unless a product binary
+(such as `canix-hub`) ships a pack.
+
+`Pack::install` gets a `ServerHost`, which registers:
+
+| Registration | Rule |
 | --- | --- |
-| Version | `0.3.1-unstable-2026-10-23`, commit `6f1bf1754c4862cbae59a58306652ded8a44cd17` |
-| URL | `http://127.0.0.1:3117` |
-| Auth | Board API key, agenix `paperclip-operations-operator-key` |
+| `channel(transport, publisher)` | `accounts.transport` name; unique within the pack |
+| `pipeline(id, pipeline)` | id must be `<pack id>.…`; unique |
+| `topic(id, handler)` | `<pack id>.…`; core topics can never be claimed |
+| `routes(router)` | mounted at `/v1/p/<pack id>`, using the core `Caller` extractor |
+| `integration(status)` | one status row for `GET /v1/status` |
+| `workflow(spec)` | name `<pack id>.…`; one definition per name+version; a `pipeline_id` must name a pipeline this same pack registered |
 
-Adapter: `live/paperclip.rs` (`PaperclipClient`). Fixture counterpart:
-`FixturePaperclip` in `fixture.rs` (lead-owned; not exercised by this track).
+`install_mcp` gets an `McpHost` and registers tools with an effect. The MCP
+server's authorizer allows `Read` and `Write` and denies `Destructive`; the
+token's role still decides what the API accepts.
 
-| Method | State |
+Startup fails, rather than resolving a conflict by order, on: a duplicate pack
+id, an id outside `[a-z0-9-]+`, a pack id that collides with a core topic
+namespace, a duplicate or unprefixed pipeline/topic/workflow, a workflow naming
+an unregistered pipeline, a pack channel colliding with a live built-in or an
+earlier pack, and a pipeline or topic registered twice.
+
+Pack workflows are written after the `Hub` exists (that is why they are
+declared through `ServerHost` and not through the registry directory). A
+workflow version is immutable: re-registering the same name and version with a
+different graph or pipeline is refused.
+
+`packs.json` (via `serve --packs-config FILE` or `HUB_PACKS_CONFIG`) is an
+object mapping pack id to that pack's config object. Startup fails when the file
+enables an id the binary does not register. The pack sees its own config as
+`ServerContext.config` (`{}` when absent) and its credential files in
+`$CREDENTIALS_DIRECTORY`.
+
+A pack channel posts for real, so it is subject to the live-approval guard in
+[Channels](#channels-and-publication-transports) even when the built-in
+publisher is a fixture.
+
+## Pipelines
+
+A pipeline is a generation backend behind the `Pipeline` port
+(`crates/domain/src/ports.rs`):
+
+| Method | Meaning |
 | --- | --- |
-| `create_issue` | built, contract-verified |
-| `create_approval` | built, contract-verified |
-| `get_approval` | built, contract-verified |
+| `submit` | start one run; returns an opaque handle |
+| `status` | `Pending`, `Running{progress}`, `Deferred{reason}`, `Succeeded{artifacts}`, `Failed{reason}`, `Cancelled` |
+| `cancel` | stop the run; `Dequeued`, `Interrupted`, `AlreadyFinished`, `Unsupported` |
+| `find` | the run an earlier submission started, if the backend still knows it; default `Ok(None)` |
 
-Contract evidence: `docs/contracts/paperclip-openapi-subset.json` (extracted
-from the live `GET /api/openapi.json`, 823 paths). The issue-create body is
-untyped in OpenAPI; fields come from the same commit's bundled
-`createIssueSchema`/`createApprovalSchema` in the Paperclip store
-(`lib/paperclip/cli/dist/index.js`).
+A workflow row selects it: `workflows.pipeline_id` is set instead of an
+`api_graph`, and `engine_instance_id` is only the admission target (its base
+URL is never polled as a ComfyUI queue).
 
-Field mapping:
+Submission is at-most-once and crash-safe:
 
-- `IssueRequest.company_id` → path `{companyId}`; `title`/`description` →
-  same; `origin_key` → `idempotencyKey` (server replays the original issue for
-  a repeated key; trimmed, 1–255 chars). `status` is omitted so the server
-  default applies.
-- `ApprovalRequest` → `POST /api/companies/{companyId}/approvals` with
-  `type: "request_board_approval"` (the general board approval type) and
-  `payload: {title, summary, release_revision_id, payload_hash, actions,
-  requested_by}`; `issue_id` → `issueIds: [id]`.
-- `get_approval` maps `status`: `pending`→Pending, `approved`→Approved,
-  `rejected`→Rejected, `revision_requested`→RevisionRequested,
-  `cancelled`→Cancelled; unknown values fail closed as `Unsupported`.
-  `decidedByUserId` is the human board user Paperclip records, never the API
-  key identity. `decidedAt` is parsed as RFC3339. `payload_hash` and
-  `release_revision_id` are read from `payload`.
+1. `generate` records the generation, a `pipeline_run` attempt and one outbox
+   `pipeline_run` row.
+2. `deliver_pipeline` commits a submission claim (`submit_started_at`) in its
+   own transaction **before** calling `submit`.
+3. A redelivery that sees a recorded run does nothing.
+4. A redelivery that sees a claim without a run calls `Pipeline::find`: a run
+   comes back and is recorded through the same fenced path a fresh submission
+   uses (so a cancel that won the race stops the run instead of adopting it); no
+   run fails the attempt with `submission outcome unknown`; a lookup error
+   keeps the claim and retries. The work is never submitted twice.
+5. `Unreachable`, and `5xx`/`429`, release the claim and retry. `Ambiguous` and
+   every other answer fail the attempt and leave the claim.
 
-Live-verified: `GET /api/health` and `GET /api/openapi.json` (read-only).
-Blocker: the board key is an agenix secret and was not read, so no authenticated
-call was possible. Approval create has no idempotency field in 0.3.1; a retried
-create must be reconciled by reading the approval the hub recorded.
+Follow-up, artifacts and completion:
 
-## Windmill
+- `reconcile_pipelines` (every worker pass) reads `status` for open runs, in a
+  bounded random batch with a per-call timeout.
+- `Deferred` fails the attempt: the hub's admission check is the GPU gate, not a
+  pipeline-busy signal.
+- `Succeeded` needs a non-empty manifest. Each output is uploaded by the
+  procedure to `POST /v1/generations/{id}/artifacts` with `x-artifact-source`,
+  `content-type` and `x-sha256` (role `procedure`, 256 MiB cap, sha256
+  verified). A replay is accepted only when identical.
+- The generation completes only when every manifest row has an uploaded, ready
+  asset with a matching digest; otherwise the generation fails at the 30 minute
+  upload deadline naming the missing sources.
+- Cancelling asks the pipeline to stop the run. The outcome decides what
+  follows: `Dequeued` and `Interrupted` end in `Cancelled`; `AlreadyFinished`
+  with a recorded manifest still awaiting uploads cancels the attempt and
+  abandons those uploads (without a manifest the request stays `cancelling`
+  until a status read ends it); `Unsupported` or an error leaves it
+  `cancelling` until a later status read or the operator ends it.
 
-| | |
-| --- | --- |
-| Version | `CE v1.839.0` |
-| URL | `http://127.0.0.1:8040`, workspace `studio` |
-| Auth | Workspace bearer token (`paperclip-studio`) |
+What ships here: `fixture.svg`, the in-process fixture pipeline behind
+`registry/pipeline/fixture-svg.v1.json`, and `WindmillPipeline`, a generic
+adapter that runs one Windmill script per `pipeline_id` and reads its terminal
+manifest from the job result. Packs add their own, e.g. the `animation` pack's
+four ledger-backed stage pipelines.
 
-Adapter: `live/windmill.rs` (`WindmillClient`). Fixture counterpart:
-`FixtureWindmill` in `fixture.rs` (lead-owned; not exercised by this track).
+## Channels and publication transports
 
-| Method | State |
-| --- | --- |
-| `run_generation` | built, contract-verified |
-| `schedule_publication` | built, contract-verified |
-| `job` | built, contract-verified |
-| `cancel_job` | built, contract-verified |
+A publishing channel is keyed by `accounts.transport` and implements
+`Publisher` (`submit`, `lookup`, `reply`, `lookup_reply`). A release action
+freezes the account's transport when the release is frozen; dispatch uses only
+that channel, and a transport with no channel fails the intent with
+`transport_unavailable` for an operator. There is no fallback to another
+provider, ever.
 
-Contract evidence: live `GET /api/openapi.yaml` (servers `/api`), downloaded to
-the evidence directory. Verified: `POST /w/{workspace}/jobs/run/p/{path}` →
-`201 text/plain` job uuid with optional `scheduled_for` (RFC3339);
-`POST /w/{workspace}/jobs/run/h/{hash}` for `path@hash`;
-`GET /w/{workspace}/jobs_u/get/{id}` → `CompletedJob | QueuedJob`;
-`POST /w/{workspace}/jobs_u/queue/cancel/{id}` → `200 text/plain`.
+Registered today:
 
-Version pinning: a `windmill_path` containing `@` is split on the last `@` and
-run through `run/h/{hash}`; otherwise `run/p/{path}`. This keeps a queued job
-on the exact script version the hub chose.
+| Name | Adapter | Notes |
+| --- | --- | --- |
+| `fixture` | in-process fixture publisher | simulates a platform; also aliases seeded account transports in fixture mode |
+| `postiz` | `live/postiz.rs` | built from public docs; Postiz is not deployed |
+| `disabled` | no-op | `HUB_PUBLISHER=disabled` |
+| `n8n:<platform>` | `live/n8n.rs` | one channel per platform workflow, when `N8N_PUBLISH_PLATFORMS` is set |
+| pack channels | pack-provided `Publisher` | e.g. `plinth` from the `canix-hub` pack |
 
-Live-verified: `GET /api/version`. No job was started or cancelled. Blocker:
-the workspace token was not read, so run/status/cancel were not exercised end
-to end.
+Only `HUB_PUBLISHER=fixture` aliases the seeded transports to the in-process
+adapter. A live publisher, every `n8n:<platform>` channel and every pack channel
+posts for real, so each requires `HUB_PAPERCLIP=live`: fixture approvals never
+authorize a real post, and startup fails naming the channel otherwise.
 
-## ComfyUI
+## The n8n contract (v1)
 
-| | |
-| --- | --- |
-| Version | `0.37.0` (frontend `1.52.7`) |
-| URL | `http://127.0.0.1:8188` |
-| Auth | none (loopback / wg-home only) |
+One versioned webhook serves every platform. Contract source of truth is
+`studio-pipeline/n8n/README.md`; the only caller is `N8nPublisher`.
 
-Adapter: `live/comfy.rs` (`ComfyClient`). Fixture counterpart: `FixtureComfy`
-in `fixture.rs` (lead-owned; not exercised by this track).
+- `POST {base}/webhook/fleetix-hub/v1/<platform>` as `multipart/form-data`:
+  a JSON `request` part (idempotency key, frozen text and `platform_settings`,
+  and per media `sha256`/`mime`/`alt_text`) plus one binary part per media item,
+  which the workflow verifies against its `sha256` before posting.
+- `Authorization: Bearer <N8N_WEBHOOK_TOKEN>`; no hub asset URL or extra token
+  travels to n8n.
+- Idempotency is claim-first in n8n's Postgres: insert
+  `(platform, key) → 'pending'` on conflict do nothing before any platform call.
+  A won claim posts and records `published` (provider id/url) or `failed`; a lost
+  claim returns the existing row.
+- `GET {base}/webhook/fleetix-hub/v1/<platform>/lookup?key=` answers `absent`,
+  `pending`, `published` or `failed`. `pending` is **uncertain** (crash between
+  claim and result) and stops for the operator; only `absent` means the provider
+  has no record. A workflow without lookup makes the channel answer
+  `Unsupported`.
+- `reply_to` is honoured only by the `mastodon` channel (as
+  `in_reply_to_id`); other platforms answer `Unsupported` rather than posting a
+  new standalone status.
+- No per-post metrics in v1.
 
-| Method | State |
-| --- | --- |
-| `outcome` | built, contract-verified |
-| `fetch` | built, contract-verified |
-| `cancel` | built, contract-verified |
-| `subscribe` | built, contract-verified |
+State: built; the publisher's request shapes and claim mapping are unit-tested
+against a recording server. **Not verified against a live n8n**: the workflow
+exports live in `studio-pipeline/n8n/` marked unverified, no `X-N8N-API-KEY`
+exists on this deployment, and no workflow points at the hub yet.
 
-Contract evidence: deployed source
-`/nix/store/88s35yl2nv1rkb8cqymmkgmrki7qhkv3-comfyui-0.37.0/share/comfyui/`
-(`server.py`, `execution.py`, `comfy_execution/progress.py`). Verified:
-`POST /prompt` honours a client-supplied UUID `prompt_id` and `client_id`;
-`GET /history/{id}` is `{}` when unknown, else `{prompt, outputs, status:
-{status_str, completed, messages}}`; `GET /queue` returns
-`queue_running`/`queue_pending` tuples with the prompt id at index 1;
-`POST /queue {"delete":[ids]}`; `POST /interrupt {"prompt_id": id}` is
-targeted (never sent without `prompt_id`); `/ws?clientId=` emits
-`{"type","data"}` JSON plus binary preview frames.
+## Plinth through a pack
 
-Live-verified: the ignored test
-`live::comfy::tests::live_probe_system_stats_and_queue` passed against
-`http://127.0.0.1:8188` (`GET /system_stats`, `GET /queue`); the same two GETs
-were repeated with curl. No prompt was submitted. Blocker: none for reads;
-mutating calls were forbidden.
+The hub ships no Plinth code. Plinth is reached as a pack channel: a downstream
+binary (`canix-hub`) registers a `plinth` `Publisher` that creates the article
+through Plinth's admin API, and the NixOS module wires its configuration and
+credential:
 
-`OutputFile.kind` is the output category (`images`, `gifs`, `videos`, …).
-`fetch` requests `/view` with `type=output` because the port type does not keep
-the history entry's per-file `type`; queue positions are 0-based indices in
-`queue_pending`.
+```nix
+services.fleetix-hub.packs.plinth = {
+  enable = true;
+  config = {baseUrl = "https://example.com";};
+  credentials.token = config.age.secrets.plinth-token.path;
+};
+```
 
-## n8n
+That renders `packs.json` and a `<id>-<name>` systemd credential; the pack reads
+the token from `$CREDENTIALS_DIRECTORY`. Because it is a pack channel, it posts
+for real and therefore requires live Paperclip approvals. State: the pack
+contract and the module options are tested; the Plinth channel itself lives in
+the `canix-hub` repository and is not deployed.
 
-| | |
-| --- | --- |
-| Version | `2.39.6` |
-| URL | `http://127.0.0.1:5680` |
-| Auth | webhook header `X-Studio-Token`; REST needs `X-N8N-API-KEY` (not provisioned) |
+## Live adapters: evidence
 
-Adapter: `live/n8n.rs` (`N8nClient`), adapted from the MIT donor (see
-`docs/provenance-integrations.md`). n8n has no port trait, so there is no
-fixture counterpart.
+### Paperclip
 
-| Method | State |
-| --- | --- |
-| `trigger_webhook` | built, not contract-verified |
-| `get_json`/`post_json`/`patch_json`/`put_json`/`delete` | built, **unverified** |
+Version `0.3.1-unstable-2026-10-23`, commit `6f1bf1754c4862cbae59a58306652ded8a44cd17`.
+Adapter `live/paperclip.rs`. `create_issue`, `create_approval` and
+`get_approval` are contract-verified against `docs/contracts/paperclip-openapi-subset.json`
+(extracted from the live `GET /api/openapi.json`) plus the `createIssueSchema`/
+`createApprovalSchema` in the same commit's store. `origin_key` → `idempotencyKey`
+on issue create; `get_approval` maps every status and fails closed on unknown
+values; `decidedByUserId` is the human board user, never the API key identity.
+Live-verified: `/api/health` and `/api/openapi.json` reads only. The board key
+is an agenix secret and was not read, so no authenticated call was made.
+Approval create has no idempotency field in 0.3.1: an ambiguous create is
+dead-lettered and the operator links the existing approval (hash-checked).
 
-Live-verified: `GET /healthz` → `{"status":"ok"}`. No webhook was triggered and
-no REST call was made. Blockers: no `X-N8N-API-KEY` exists on this deployment;
-the `X-Studio-Token` value is an agenix secret and was not read. REST methods
-return `InvalidInput` when no API key is configured instead of sending an
-unauthenticated request.
+### Windmill
 
-## Postiz
+`CE v1.839.0`, workspace `studio`. Adapter `live/windmill.rs`: `run_generation`,
+`schedule_publication`, `job`, `cancel_job`, contract-verified against the live
+OpenAPI. A `windmill_path` containing `@` is split on the last `@` and run
+through `/run/h/{hash}`, so a pinned version is honoured. `WindmillPipeline`
+reuses the same client for pipeline workflows. Live-verified: `GET /api/version`
+only; the workspace token was not read and no job was started or cancelled.
 
-**Not deployed** — no module, package, secret, endpoint or DNS record.
+### ComfyUI
 
-Adapter: `live/postiz.rs` (`PostizClient`). Fixture counterpart:
-`FixturePublisher` in `fixture.rs` (lead-owned; not exercised by this track).
+`0.37.0`. Adapter `live/comfy.rs`: `outcome`, `fetch`, `cancel`, `subscribe`,
+`load`, contract-verified against the deployed server source. `POST /prompt`
+honours a hub-chosen `prompt_id` and `client_id`; `GET /history/{id}` is `{}`
+when unknown; `/ws` events are progress hints only and terminal state comes from
+history. Live-verified against `127.0.0.1:8188`: `GET /system_stats` and
+`GET /queue`. No prompt was submitted.
 
-| Method | State |
-| --- | --- |
-| `submit` | built, not contract-verified |
-| `lookup` | returns `Unsupported` |
-| `reply` / `lookup_reply` | return `Unsupported` |
+### n8n
 
-Built from the public API docs (fetched 2026-11-09): `POST /posts` with
-`type: "now"` (the hub never schedules inside Postiz); media via
-`POST /upload` multipart and `posts[].value[].image[]`. The docs show no
-idempotency key or custom-field filter on `GET /posts`, so an ambiguous submit
-requires manual reconciliation; there is no reply endpoint. Accepted and
-ambiguous posts are resolved by an operator (`POST /v1/intents/{id}/resolve`).
-The documented upload/post payloads carry no media alt text, so `submit`
-refuses media with alt text (`Unsupported`) rather than publishing the
-approved revision without it. Blocker: Postiz does not exist in the fleet, so
-nothing can be contract- or live-verified.
+`2.39.6`. Adapter `live/n8n.rs` (see the contract above). Live-verified:
+`GET /healthz` only.
 
-## Windmill procedures
+### Postiz
 
-`registry/windmill/comfy_generate.ts` and `publication_timer.ts` are written
-with version-1 metadata. **Not deployed**: `wmill sync push` was not run and no
-schedule was created. Required secret variable: `f/infernix_hub/hub_token`. See
-`registry/windmill/README.md`.
+Adapter `live/postiz.rs`, built from public docs: `POST /posts` with
+`type: "now"`, media via `POST /upload`. No idempotency key or custom-field
+filter is documented, and there is no reply endpoint, so `lookup` returns
+`Unsupported` and accepted or ambiguous posts are resolved by an operator
+(`POST /v1/intents/{id}/resolve`). The documented upload/post payloads carry no
+media alt text, so `submit` refuses media with alt text instead of publishing
+without it.
+
+## Fixture coverage
+
+Fixture mode is what `dev` and every test runs. It exercises the hub's own
+machinery end to end: briefs, Paperclip issues and approvals, the Windmill
+procedure and publication clock, ComfyUI generation and asset import, the
+pipeline submission/status/cancel paths including the crash-window adoption,
+release freezing, channel dispatch, engagement replies, MCP, the desktop and
+pack registration. It says nothing about a live service.
+
+The desktop shows a `FIXTURE MODE` banner whenever any adapter is simulated,
+and `GET /v1/status` reports the mode and verification level per integration.
+
+## Not deployed
+
+- `fleetix-hubd` / `canix-hub` services: no host imports the NixOS module. No
+  database, token, DNS record or systemd unit exists for the hub.
+- Windmill procedures `registry/windmill/*.ts`: `wmill sync push` was not run and
+  no schedule was created.
+- Packs (including `plinth` and `animation`): compiled in a downstream binary
+  that is not deployed; no `packs.json` is installed on any host.
+- n8n workflows: not imported, no API key, no webhook pointed at the hub.
+- Paperclip approvals: never created against the live board.
+- Postiz: no module, package, secret, endpoint or DNS record.
+
+No release was published, no engagement message was sent, and no live mutating
+request was made anywhere.

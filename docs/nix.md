@@ -1,6 +1,6 @@
 # Nix packaging and NixOS module
 
-`infernix-hub` is packaged with [harbor-rs](https://github.com/caniko/harbor-rs)
+`fleetix-hub` is packaged with [harbor-rs](https://github.com/caniko/harbor-rs)
 toolchain, build-cache, dev-shell, and formatter helpers, and its systemd unit
 is paired with [harbor-db](https://github.com/caniko/harbor-db) for database
 migrations. The NixOS module also reads the
@@ -27,9 +27,9 @@ Rust toolchain are shared.
 
 | Output | Binary | Notes |
 | --- | --- | --- |
-| `infernix-hubd` (also `default`) | `infernix-hubd` | Server + embedded worker. Ships `registry/` at `$out/share/infernix-hub/registry`; the module points `HUB_REGISTRY_DIR` there. |
+| `fleetix-hubd` (also `default`) | `fleetix-hubd` | Server + embedded worker. Ships `registry/` at `$out/share/fleetix-hub/registry`; the module points `HUB_REGISTRY_DIR` there. |
 | `hubctl` | `hubctl` | Operator CLI over the typed API client. |
-| `infernix-hub-desktop` | `infernix-hub-desktop` | Dioxus 0.8 desktop shell. Built separately from the server so WebKitGTK, GTK3, and libsoup-3 never enter the service closure. |
+| `fleetix-hub-desktop` | `fleetix-hub-desktop` | Dioxus 0.8 desktop shell. Built separately from the server so WebKitGTK, GTK3, and libsoup-3 never enter the service closure. |
 
 Builds go through `harbor-rs.lib.mkBuildCachePolicy` with
 `withRustCache`; the wrapper and namespace come from the shared fleet policy
@@ -65,7 +65,7 @@ Formatting is treefmt only (`rustfmt` with edition 2024 and the repo's
 | `checks.<system>.clippy` | Native workspace clippy with `-D warnings`, desktop excluded. |
 | `checks.<system>.nextest` | Native nextest run; database tests self-skip without `HUB_TEST_DATABASE_URL`. |
 | `checks.<system>.fmt` | treefmt check over the flake source. |
-| `checks.x86_64-linux.module-eval-fixture` | The module alone, every integration fixture: fixture company id, no seed file, `HUB_MIGRATE_ON_START=0`, local PostgreSQL, harbor-db migration + `migrate --check` units gating `infernix-hub.service`. |
+| `checks.x86_64-linux.module-eval-fixture` | The module alone, every integration fixture: fixture company id, no seed file, `HUB_MIGRATE_ON_START=0`, local PostgreSQL, harbor-db migration + `migrate --check` units gating `fleetix-hub.service`. |
 | `checks.x86_64-linux.module-eval-live` | The module plus `infernix.nixosModules.default` with ComfyUI and llama-swap enabled: seed engine `comfy-<host>` at `http://127.0.0.1:8188`, admission policy JSON, `LLM_URL` at llama-swap, unit `After`/`Wants` for both services, migration gate enabled. |
 
 ```console
@@ -77,10 +77,11 @@ nix build .#checks.x86_64-linux.module-eval-live
 
 ## Module overview
 
-`nixosModules.default` (alias `nixosModules.infernix-hub`) exposes
-`services.infernix-hub`.
+`nixosModules.default` (alias `nixosModules.fleetix-hub`) exposes
+`services.fleetix-hub`.
 
-- `package`, `bind`, `publicUrl`, `companyId`, `assetDir`, `seedFile`,
+- `executable` (default `${package}/bin/fleetix-hubd`), `package`, `bind`,
+  `publicUrl`, `companyId`, `assetDir`, `seedFile`, `fleetStatusFile`,
   `environment`.
 - `database`: `createLocally`, `name`, `url`, `urlFile`,
   `migrationsUser`, `migrationsGroup`; `migrations.enable`.
@@ -91,16 +92,17 @@ nix build .#checks.x86_64-linux.module-eval-live
 - `paperclip.url`, `windmill.url`, `windmill.workspace`.
 - `engines`, `personas`, `accounts`, `gpuAdmission`.
 - `tokens`, `credentials`.
+- `packs.<id>`: `enable`, `config`, `credentials`.
 
 ### Database and migrations
 
 The module imports `harbor-db.nixosModules.default` and registers
-`services.harbor-db.projects.infernix-hub`:
+`services.harbor-db.projects.fleetix-hub`:
 
-- apply command `infernix-hubd migrate`, check command
-  `infernix-hubd migrate --check`,
-- generated units `harbor-db-infernix-hub.service` (before and required by
-  `infernix-hub.service`) and `harbor-db-infernix-hub-check.service`,
+- apply command `${package}/bin/fleetix-hubd migrate`, check command
+  `fleetix-hubd migrate --check` (always the core binary, never `executable`),
+- generated units `harbor-db-fleetix-hub.service` (before and required by
+  `fleetix-hub.service`) and `harbor-db-fleetix-hub-check.service`,
 - `HUB_MIGRATE_ON_START=0` on the runtime unit, so the server refuses to start
   when the schema is stale instead of racing migrations.
 
@@ -122,12 +124,12 @@ When `services.infernix.comfyui.enable` is set, the module:
 - registers engine `comfy-<hostName>` at
   `http://<host>:<port>` (a `0.0.0.0`/`::` listener is reached over
   `127.0.0.1`),
-- orders `infernix-hub.service` after and wants `comfyui.service`.
+- orders `fleetix-hub.service` after and wants `comfyui.service`.
 
 Additional engines can be declared explicitly, keyed by id:
 
 ```nix
-services.infernix-hub.engines.murph-comfy = {
+services.fleetix-hub.engines.murph-comfy = {
   baseUrl = "http://10.123.0.7:8190";
   capabilities = { };
 };
@@ -167,10 +169,32 @@ unit after/wants `llama-swap.service` or `infernix-lb.service` respectively.
 - Windmill: when `services.windmill` is enabled (or `windmill-server.service`
   exists), `WINDMILL_URL` defaults to `http://127.0.0.1:<serverPort>` (atlas:
   8040) and the hub starts after `windmill-server.service`.
-- n8n: the hub starts after `n8n.service` when the service exists.
+- n8n: the hub starts after `n8n.service` when the service exists. Setting
+  `N8N_PUBLISH_PLATFORMS` (comma list, e.g. `youtube,bluesky,mastodon`)
+  registers one publishing channel `n8n:<platform>` per entry against
+  `N8N_PUBLISH_URL`, authenticated with `N8N_WEBHOOK_TOKEN_FILE` (contract v1,
+  `studio-pipeline/n8n/README.md`). An account publishes through it when its
+  `transport` is `n8n:<platform>`.
 - Paperclip: `PAPERCLIP_URL` defaults to `http://127.0.0.1:3117`. Paperclip is
   a home-manager user service (`paperclip-operations`), so there is no system
-  unit ordering.
+  unit ordering. The optional `paperclip_studio` settings row
+  (`{"project_id": …, "assignee_agent_id": …}`) routes delegated briefs to the
+  studio's project and producer agent.
+
+### Publishing channels and approvals
+
+A release action dispatches only through the channel named by its frozen
+`transport`; a transport with no channel fails the intent for an operator
+instead of falling back to a different provider.
+
+Only `integrations.publisher = "fixture"` aliases the seeded account transports
+to the in-process fixture adapter. A live publisher (`postiz`), every
+`n8n:<platform>` channel and every pack channel posts for real, so each one
+requires `integrations.paperclip = "live"`; startup fails with the channel name
+when fixture approvals would be the only authority for a real post. A pack
+channel may take a name that only exists as a fixture alias (`plinth` next to a
+seeded `transport = "plinth"`); a collision with a live built-in or another
+pack fails startup.
 
 ### Seed, personas, accounts
 
@@ -195,7 +219,7 @@ back to `fixture-company`, so a fixture-only host needs no Paperclip company.
 starts:
 
 ```nix
-ExecStartPre = infernix-hubd token --name <name> --role <role> --token-file %d/token-<name>
+ExecStartPre = fleetix-hubd token --name <name> --role <role> --token-file %d/token-<name>
 ```
 
 with `LoadCredential=token-<name>:<file>`. Registration is idempotent, so
@@ -206,6 +230,59 @@ Integration credentials (`credentials.paperclipToken`, `windmillToken`,
 `PAPERCLIP_TOKEN_FILE`, `WINDMILL_TOKEN_FILE`, and `POSTIZ_TOKEN_FILE`. Point
 them at agenix paths; plaintext never goes into the store.
 
+### Executable override and packs
+
+`executable` (default `${package}/bin/fleetix-hubd`) is the binary behind
+`serve`. A downstream product such as `canix-hub` points it at its own entry
+point, which must accept `serve [--packs-config FILE]`. Token registration and
+the harbor-db `migrate`/`migrate --check` runner are core and always use
+`${package}/bin/fleetix-hubd`.
+
+`packs.<id>` composes a downstream pack without editing the hub:
+
+```nix
+services.fleetix-hub.packs.plinth = {
+  enable = true;
+  config = {baseUrl = "https://example.com";}; # any JSON-serializable attrset
+  credentials.token = config.age.secrets.plinth-token.path;
+};
+```
+
+Enabled packs are rendered to `packs.json` (id -> config), so the unit starts
+as
+
+```text
+<executable> serve --packs-config /nix/store/...-fleetix-hub-packs.json
+```
+
+and startup fails when that file names an id the binary does not register.
+Disabled packs contribute neither config nor credentials.
+
+Each pack credential becomes the systemd credential `<id>-<name>`: only the
+path enters the store, and the pack reads the file from
+`$CREDENTIALS_DIRECTORY`. Pack ids must match `[a-z0-9-]+` (the Rust
+registry's rule) and credential names `[A-Za-z0-9_.-]+`, so `<id>-<name>` is a
+valid systemd credential id. The module asserts that the complete generated
+`LoadCredential` id list is unique — built-in credentials, `token-<name>`
+entries and pack credentials together — because `<id>-<name>` is ambiguous
+(`foo` + `bar-baz` and `foo-bar` + `baz` both render `foo-bar-baz`) and
+systemd silently keeps one entry per repeated id.
+
+### Fleet status snapshot
+
+`fleetStatusFile` (null by default) points at the `fleetix::status::FleetStatus`
+JSON that `canix fleet status --write` rewrites atomically every few minutes.
+The module exports it as `HUB_FLEET_STATUS_FILE` and `GET /v1/fleet/status`
+re-reads the file per request; the hub never collects fleet data itself. Unset
+means the route answers `404 fleet_status_unconfigured`.
+
+The unit runs with `ProtectHome` and `ProtectSystem=strict`, so the module
+bind-mounts the snapshot's **parent directory** read-only (`BindReadOnlyPaths`).
+Binding the file inode would keep serving the pre-replacement file, because an
+atomic write renames a new inode into place; binding the directory keeps
+replacements visible. Put the file where the writer can atomically rename
+within that directory (for example `/var/lib/fleet-status/fleet.json`).
+
 ### Assertions
 
 - fixture Windmill requires fixture ComfyUI (the in-process procedure needs
@@ -213,6 +290,7 @@ them at agenix paths; plaintext never goes into the store.
 - live Paperclip/Windmill/publisher require their credential files,
 - a live publisher requires live Paperclip (fixture approvals never authorize
   real posts); only the publisher accepts `disabled`,
+- generated `LoadCredential` ids are unique across built-ins, tokens and packs,
 - `companyId` is required unless every integration is fixture,
 - a live assistant requires a resolvable endpoint,
 - `database.urlFile` requires `database.createLocally = false`.
@@ -224,9 +302,9 @@ how the options line up with the current atlas services and fleet secrets.
 
 ```nix
 { config, inputs, ... }: {
-  imports = [inputs.infernix-hub.nixosModules.default];
+  imports = [inputs.fleetix-hub.nixosModules.default];
 
-  services.infernix-hub = {
+  services.fleetix-hub = {
     enable = true;
     bind = "127.0.0.1:8470";
     # Paperclip company id from the board; the hub refuses to start without it
@@ -235,7 +313,7 @@ how the options line up with the current atlas services and fleet secrets.
 
     database = {
       createLocally = true;
-      # Migrations run as an operator peer role; the infernix-hub role receives
+      # Migrations run as an operator peer role; the fleetix-hub role receives
       # grants and stays unable to run DDL.
       migrationsUser = "can";
     };
@@ -262,9 +340,9 @@ how the options line up with the current atlas services and fleet secrets.
     };
 
     tokens = {
-      operator.file = config.age.secrets.infernix-hub-operator-token.path;
-      windmill-procedure.file = config.age.secrets.infernix-hub-windmill-token.path;
-      n8n-ingest.file = config.age.secrets.infernix-hub-n8n-token.path;
+      operator.file = config.age.secrets.fleetix-hub-operator-token.path;
+      windmill-procedure.file = config.age.secrets.fleetix-hub-windmill-token.path;
+      n8n-ingest.file = config.age.secrets.fleetix-hub-n8n-token.path;
     };
 
     personas = [

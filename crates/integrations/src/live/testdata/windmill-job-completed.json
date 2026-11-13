@@ -9,7 +9,7 @@
   "completed_at": "2026-11-09T11:00:42.000Z",
   "duration_ms": 41000,
   "success": true,
-  "script_path": "f/infernix_hub/comfy_generate",
+  "script_path": "f/fleetix_hub/comfy_generate",
   "script_hash": "a1b2c3d4e5",
   "args": {
     "request_version": 1,

@@ -2,16 +2,40 @@
 //! causes them; the worker delivers them. Retrying a delivery re-sends the
 //! same command (same idempotency key) — it never re-runs a workflow stage.
 
+use std::time::Duration;
+
+use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{Actor, DResult};
+use crate::{Actor, DResult, Hub};
 
 pub const PAPERCLIP_CREATE_ISSUE: &str = "paperclip.create_issue";
 pub const PAPERCLIP_CREATE_APPROVAL: &str = "paperclip.create_approval";
 pub const WINDMILL_RUN_GENERATION: &str = "windmill.run_generation";
 pub const WINDMILL_SCHEDULE_PUBLICATION: &str = "windmill.schedule_publication";
 pub const PUBLISHER_SEND_REPLY: &str = "publisher.send_reply";
+
+/// Core topics the worker handles itself; packs may not override them.
+pub const CORE_TOPICS: &[&str] =
+    &[PAPERCLIP_CREATE_ISSUE, PAPERCLIP_CREATE_APPROVAL, WINDMILL_RUN_GENERATION, WINDMILL_SCHEDULE_PUBLICATION, PUBLISHER_SEND_REPLY];
+
+/// What to do with a claimed row after a delivery attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Delivery {
+    Done,
+    Retry(String),
+    /// Postpone without spending a retry (e.g. `PipelineStatus::Deferred`).
+    Defer(Duration),
+    Dead(String),
+}
+
+/// A pack-owned outbox topic. The worker's core match stays; only topics it
+/// does not know are looked up in `Hub::topics`.
+#[async_trait]
+pub trait OutboxHandler: Send + Sync {
+    async fn deliver(&self, hub: &Hub, row: &OutboxRow) -> Delivery;
+}
 
 pub async fn enqueue(tx: &mut sqlx::PgConnection, actor: &Actor, topic: &str, idempotency_key: &str, payload: Value) -> DResult<Uuid> {
     let id: Uuid = sqlx::query_scalar(

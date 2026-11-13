@@ -7,6 +7,9 @@
 //! - One intent per (revision, account); duplicate timers converge on it.
 //! - A timeout after submission is `outcome_unknown`, never a resubmit.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use contracts::{
     ContentState, DispatchIn, DispatchOut, FreezeReleaseIn, IntentState, LinkApprovalIn, MediaRef, PublicationIntent, ReleaseAction,
@@ -15,7 +18,7 @@ use contracts::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::ports::{ApprovalStatus, ApprovalView, MediaBlob, PortError, ProviderState, PublishRequest};
+use crate::ports::{ApprovalStatus, ApprovalView, MediaBlob, PortError, ProviderState, PublishRequest, Publisher};
 use crate::{Actor, DResult, DomainError, Hub, OPERATOR, audit, conflict, decode, decode_one, hash, invalid, outbox};
 
 const RELEASE_COLS: &str =
@@ -82,15 +85,20 @@ pub async fn freeze(hub: &Hub, actor: &Actor, content_id: Uuid, input: FreezeRel
     account_ids.sort();
     account_ids.dedup();
     for account in &account_ids {
-        let row: Option<(String, Value)> =
-            sqlx::query_as("select company_id, capabilities from accounts where id = $1").bind(account).fetch_optional(&mut *tx).await?;
-        let (company_id, caps) = row.ok_or(DomainError::NotFound("account"))?;
+        let row: Option<(String, String, Value)> = sqlx::query_as("select company_id, transport, capabilities from accounts where id = $1")
+            .bind(account)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let (company_id, transport, caps) = row.ok_or(DomainError::NotFound("account"))?;
         if caps["publish"] != json!(true) {
             return Err(invalid("account_cannot_publish", format!("account {account} has no publish capability")));
         }
         actions.push(ReleaseAction {
             company_id,
             account_id: account.clone(),
+            // Frozen into the payload so dispatch never depends on a later
+            // change to the account's transport.
+            transport: Some(transport),
             text: input.text.clone(),
             media: media.clone(),
             platform_settings: input.platform_settings.clone(),
@@ -524,6 +532,23 @@ pub async fn production_paused(conn: &mut sqlx::PgConnection) -> DResult<bool> {
     Ok(v.map(|v| v["paused"].as_bool().unwrap_or(true)).unwrap_or(true))
 }
 
+/// The transport decides the channel. A release frozen before transports were
+/// recorded (`transport` absent) keeps the built-in publisher; a transport with
+/// no registered channel fails closed, never falls back. Replies select the
+/// account's transport through the same function.
+pub(crate) fn publisher_for<'a>(
+    channels: &'a BTreeMap<String, Arc<dyn Publisher>>,
+    builtin: &'a Arc<dyn Publisher>,
+    transport: Option<&str>,
+) -> DResult<&'a Arc<dyn Publisher>> {
+    match transport {
+        None => Ok(builtin),
+        Some(t) => {
+            channels.get(t).ok_or_else(|| conflict("transport_unavailable", format!("no publisher is registered for transport {t:?}")))
+        }
+    }
+}
+
 /// Called by the Windmill publication timer at the due time.
 pub async fn dispatch(hub: &Hub, actor: &Actor, intent_id: Uuid, input: DispatchIn) -> DResult<DispatchOut> {
     actor.require(&[Role::Procedure])?;
@@ -661,7 +686,20 @@ pub async fn dispatch(hub: &Hub, actor: &Actor, intent_id: Uuid, input: Dispatch
         platform_settings: action.platform_settings.clone(),
         reply_to: action.reply_to.clone(),
     };
-    match hub.publisher.submit(&req).await {
+    let publisher = match publisher_for(&hub.channels, &hub.publisher, action.transport.as_deref()) {
+        Ok(p) => p.clone(),
+        Err(e) => {
+            // The frozen transport never reached a provider. Terminate the
+            // attempt and leave the intent failed for an operator; a channel
+            // registered later re-arms it through `schedule`.
+            tracing::error!(%intent_id, %e, "frozen transport has no channel; stopping for an operator");
+            let out =
+                finish_attempt(hub, intent_id, attempt_id, IntentState::Failed, json!({ "code": e.code(), "error": e.to_string() }), None)
+                    .await?;
+            return Ok(DispatchOut { intent: out.intent, submitted: false });
+        }
+    };
+    match publisher.submit(&req).await {
         Ok(post) => {
             let state = match post.state {
                 ProviderState::Published => IntentState::Published,
@@ -768,9 +806,26 @@ async fn latest_attempt_key(tx: &mut sqlx::PgConnection, intent_id: Uuid) -> DRe
 
 /// Reconcile one intent by its delivery idempotency key.
 pub async fn reconcile_intent(hub: &Hub, intent_id: Uuid, account_id: &str, key: &str) -> DResult<()> {
-    let found = match hub.publisher.lookup(account_id, key).await {
+    // Read back through the channel the attempt was submitted on.
+    let transport: Option<String> = sqlx::query_scalar(
+        "select a->>'transport' from publication_intents i join release_revisions r on r.id = i.release_revision_id,
+         jsonb_array_elements(r.actions) a where i.id = $1 and a->>'account_id' = i.account_id",
+    )
+    .bind(intent_id)
+    .fetch_optional(&hub.db)
+    .await?
+    .flatten();
+    let publisher = match publisher_for(&hub.channels, &hub.publisher, transport.as_deref()) {
+        Ok(p) => p.clone(),
+        Err(e) => {
+            tracing::warn!(%intent_id, %e, "no channel to reconcile through");
+            return Ok(());
+        }
+    };
+    let found = match publisher.lookup(account_id, key).await {
         Ok(f) => f,
-        Err(PortError::Unsupported(_)) => {
+        // No read, or a claim with no platform result (n8n `pending`).
+        Err(PortError::Unsupported(_) | PortError::Ambiguous(_)) => {
             // Leave it for an operator to resolve; never guess. Lock the intent
             // first, then confirm `key` is still the latest attempt.
             let mut tx = hub.db.begin().await?;
@@ -804,6 +859,11 @@ pub async fn reconcile_intent(hub: &Hub, intent_id: Uuid, account_id: &str, key:
     let next = match &found {
         Some(p) if p.state == ProviderState::Published => "published",
         Some(p) if p.state == ProviderState::Failed => "failed",
+        // The provider holds a pending record for the latest attempt, but no
+        // submit response reached the hub (it crashed after the claim): whether
+        // the post exists is unknown. Hand off to an operator; nothing is
+        // resubmitted automatically.
+        Some(_) if current == "submitting" => "outcome_unknown",
         Some(_) => "accepted",
         // Provider has no record: definitely not published; re-armable via schedule.
         None if current != "accepted" => "failed",
@@ -913,5 +973,35 @@ mod tests {
                 DispatchDecision::Converge
             );
         }
+    }
+
+    struct Stub(&'static str);
+
+    #[async_trait::async_trait]
+    impl Publisher for Stub {
+        async fn submit(&self, _: &PublishRequest) -> crate::ports::PortResult<crate::ports::ProviderPost> {
+            Err(PortError::Unsupported(self.0.into()))
+        }
+        async fn lookup(&self, _: &str, _: &str) -> crate::ports::PortResult<Option<crate::ports::ProviderPost>> {
+            Ok(None)
+        }
+        async fn reply(&self, _: &crate::ports::ReplyRequest) -> crate::ports::PortResult<crate::ports::ProviderPost> {
+            Err(PortError::Unsupported(self.0.into()))
+        }
+        async fn lookup_reply(&self, _: &str, _: &str) -> crate::ports::PortResult<Option<crate::ports::ProviderPost>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn a_frozen_transport_selects_its_channel_and_never_falls_back() {
+        let builtin: Arc<dyn Publisher> = Arc::new(Stub("builtin"));
+        let plinth: Arc<dyn Publisher> = Arc::new(Stub("plinth"));
+        let channels: BTreeMap<String, Arc<dyn Publisher>> = BTreeMap::from([("plinth".to_string(), plinth.clone())]);
+        // A release frozen before transports were recorded keeps working.
+        assert!(Arc::ptr_eq(publisher_for(&channels, &builtin, None).unwrap(), &builtin));
+        assert!(Arc::ptr_eq(publisher_for(&channels, &builtin, Some("plinth")).unwrap(), &plinth));
+        let err = publisher_for(&channels, &builtin, Some("orphan")).err().unwrap();
+        assert_eq!(err.code(), "transport_unavailable");
     }
 }

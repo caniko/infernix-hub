@@ -11,6 +11,9 @@ client = ["dep:reqwest"]
 
 [dependencies]
 chrono.workspace = true
+# One fleet snapshot type shared by the tool that writes it and every surface
+# that reads it; no CLI/Pkl features belong in the hub.
+fleetix = { version = "0.10.1", default-features = false }
 reqwest = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

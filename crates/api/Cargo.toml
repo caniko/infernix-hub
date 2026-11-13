@@ -1,5 +1,5 @@
 [package]
-name = "infernix-hubd"
+name = "fleetix-hubd"
 description = "Hub API server (Axum) with the embedded integration worker."
 version.workspace = true
 edition.workspace = true
@@ -14,8 +14,11 @@ chrono.workspace = true
 clap.workspace = true
 contracts = { workspace = true, features = ["client"] }
 domain.workspace = true
+# MCP server composition; `mcp-server` exposes `fleetix::mcp_server`.
+fleetix = { version = "0.10.1", default-features = false, features = ["mcp-server"] }
 integrations.workspace = true
 reqwest.workspace = true
+rmcp = { version = "3.9.0", default-features = false, features = ["server"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

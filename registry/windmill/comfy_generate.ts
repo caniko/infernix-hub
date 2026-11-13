@@ -1,4 +1,4 @@
-// infernix-hub generation procedure (version 1).
+// fleetix-hub generation procedure (version 1).
 //
 // Input is the hub's `GenerationJob` (crates/domain/src/ports.rs). For each
 // variant it submits the bound ComfyUI API graph with a hub-chosen `prompt_id`
@@ -41,7 +41,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function hubToken(): Promise<string> {
-  return await wmill.getVariable("f/infernix_hub/hub_token");
+  return await wmill.getVariable("f/fleetix_hub/hub_token");
 }
 
 async function promptState(baseUrl: string, promptId: string): Promise<"history" | "queue" | null> {

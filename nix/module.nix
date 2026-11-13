@@ -19,7 +19,7 @@
   options,
   ...
 }: let
-  cfg = config.services.infernix-hub;
+  cfg = config.services.fleetix-hub;
   inherit
     (lib)
     mkEnableOption
@@ -31,8 +31,8 @@
     types
     ;
 
-  runtimeUser = "infernix-hub";
-  runtimeGroup = "infernix-hub";
+  runtimeUser = "fleetix-hub";
+  runtimeGroup = "fleetix-hub";
 
   system = pkgs.stdenv.hostPlatform.system;
 
@@ -126,7 +126,7 @@
     if cfg.seedFile != null
     then cfg.seedFile
     else if engineRecords != [] || cfg.personas != [] || cfg.accounts != []
-    then (pkgs.formats.json {}).generate "infernix-hub-seed.json" seedContent
+    then (pkgs.formats.json {}).generate "fleetix-hub-seed.json" seedContent
     else null;
 
   # --- database -----------------------------------------------------------
@@ -149,14 +149,30 @@
 
   # A raw URL file (agenix/secret mount) is read at exec time; nothing but the
   # path enters the store.
-  launcher =
+  mkLauncher = name: exe:
     if cfg.database.urlFile != null
     then
-      pkgs.writeShellScript "infernix-hubd-db-url" ''
+      pkgs.writeShellScript "${name}-db-url" ''
         export DATABASE_URL="$(cat ${toString cfg.database.urlFile})"
-        exec ${cfg.package}/bin/infernix-hubd "$@"
+        exec ${exe} "$@"
       ''
-    else "${cfg.package}/bin/infernix-hubd";
+    else exe;
+  coreExecutable = "${cfg.package}/bin/fleetix-hubd";
+  # `serve` runs the product binary (it carries the packs); tokens and
+  # migrations are core and always run the upstream binary.
+  launcher = mkLauncher "fleetix-hub-serve" cfg.executable;
+  coreLauncher = mkLauncher "fleetix-hubd" coreExecutable;
+
+  # --- packs --------------------------------------------------------------
+  enabledPacks = lib.filterAttrs (_: pack: pack.enable) cfg.packs;
+
+  # Only enabled packs are serialized, so a disabled pack cannot make startup
+  # fail with "unknown pack" and its credentials are never loaded.
+  packsFile =
+    if enabledPacks == {}
+    then null
+    else pkgs.writeText "fleetix-hub-packs.json" (builtins.toJSON (lib.mapAttrs (_: pack: pack.config) enabledPacks));
+  packsArg = lib.optionalString (packsFile != null) " --packs-config ${packsFile}";
 
   # --- credentials --------------------------------------------------------
   credentials = lib.filterAttrs (_: value: value != null) {
@@ -165,10 +181,28 @@
     postiz-token = cfg.credentials.postizToken;
   };
   tokenCredentials = lib.mapAttrs' (name: token: lib.nameValuePair "token-${name}" token.file) cfg.tokens;
-  loadCredentials = lib.mapAttrsToList (name: path: "${name}:${path}") (credentials // tokenCredentials);
+  # Credential ids must be `<id>-<name>`: the pack reads them from
+  # `$CREDENTIALS_DIRECTORY` under that name.
+  packCredentials = lib.concatLists (lib.mapAttrsToList
+    (id: pack: lib.mapAttrsToList (name: path: "${id}-${name}:${path}") pack.credentials)
+    enabledPacks);
+  loadCredentials =
+    lib.mapAttrsToList (name: path: "${name}:${path}") (credentials // tokenCredentials)
+    ++ packCredentials;
+  # `LoadCredential` silently keeps one entry per repeated id, and an id is
+  # ambiguous: `foo` + `bar-baz` and `foo-bar` + `baz` both render
+  # `foo-bar-baz`, and a pack credential can shadow a built-in `token-<name>`.
+  # Assert over the complete generated list, built-ins and tokens included.
+  credentialIds =
+    lib.attrNames credentials
+    ++ lib.attrNames tokenCredentials
+    ++ lib.concatLists (lib.mapAttrsToList
+      (id: pack: lib.mapAttrsToList (name: _: "${id}-${name}") pack.credentials)
+      enabledPacks);
+  credentialIdsUnique = lib.length credentialIds == lib.length (lib.unique credentialIds);
 
   tokenCommands =
-    lib.mapAttrsToList (name: token: "${launcher} token --name ${lib.escapeShellArg name} --role ${token.role} --token-file %d/token-${name}")
+    lib.mapAttrsToList (name: token: "${coreLauncher} token --name ${lib.escapeShellArg name} --role ${token.role} --token-file %d/token-${name}")
     cfg.tokens;
 
   # --- unit ordering ------------------------------------------------------
@@ -195,14 +229,26 @@
 in {
   imports = [harbor-db.nixosModules.default];
 
-  options.services.infernix-hub = {
-    enable = mkEnableOption "infernix-hub content operations hub";
+  options.services.fleetix-hub = {
+    enable = mkEnableOption "fleetix-hub content operations hub";
 
     package = mkOption {
       type = types.package;
-      default = self.packages.${system}.infernix-hubd;
-      defaultText = lib.literalExpression "infernix-hub.packages.\${system}.infernix-hubd";
-      description = "Server package; must ship registry/ under share/infernix-hub.";
+      default = self.packages.${system}.fleetix-hubd;
+      defaultText = lib.literalExpression "fleetix-hub.packages.\${system}.fleetix-hubd";
+      description = "Server package; must ship registry/ under share/fleetix-hub.";
+    };
+
+    executable = mkOption {
+      type = types.path;
+      default = "${cfg.package}/bin/fleetix-hubd";
+      defaultText = lib.literalExpression ''"''${cfg.package}/bin/fleetix-hubd"'';
+      description = ''
+        Binary used for `serve`. A downstream product points this at its own
+        entry point, for example the `canix-hub` binary, which must accept
+        `serve [--packs-config FILE]`. Token registration and migrations are
+        core and always run `''${cfg.package}/bin/fleetix-hubd`.
+      '';
     };
 
     bind = mkOption {
@@ -225,7 +271,7 @@ in {
 
     assetDir = mkOption {
       type = types.path;
-      default = "/var/lib/infernix-hub/assets";
+      default = "/var/lib/fleetix-hub/assets";
       description = "Durable content-addressed asset volume.";
     };
 
@@ -238,6 +284,22 @@ in {
       '';
     };
 
+    fleetStatusFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description = ''
+        A `fleetix::status::FleetStatus` snapshot written by another tool
+        (`canix fleet status --write`). The server re-reads it on every
+        `/v1/fleet/status` request and never collects fleet data itself.
+
+        The parent directory is bind-mounted read-only: the file is replaced
+        atomically by the writer's timer, so the unit must see the directory
+        (and therefore new inodes) rather than one bound file. The unit runs
+        with `ProtectHome`, so the directory must live outside `/home`,
+        `/root` and `/run/user`.
+      '';
+    };
+
     database = {
       createLocally = mkOption {
         type = types.bool;
@@ -246,12 +308,12 @@ in {
       };
       name = mkOption {
         type = types.str;
-        default = "infernix-hub";
+        default = "fleetix-hub";
         description = "PostgreSQL database name.";
       };
       url = mkOption {
         type = types.str;
-        default = "postgres:///infernix-hub?host=/run/postgresql";
+        default = "postgres:///fleetix-hub?host=/run/postgresql";
         description = ''
           Connection URL without an embedded role: peer auth over the unix
           socket resolves the role from the system user (runtime user for the
@@ -533,42 +595,100 @@ in {
         default = null;
       };
     };
+
+    packs = mkOption {
+      type = types.attrsOf (types.submodule ({name, ...}: {
+        options = {
+          enable = mkEnableOption "pack ${name}";
+          config = mkOption {
+            type = types.attrsOf types.anything;
+            default = {};
+            description = ''
+              Pack config, serialized as JSON into `packs.json`. Rust
+              registration does not generate Nix options, so the module checks
+              the shape (an attrset that `builtins.toJSON` can render) and the
+              pack parses its own fields.
+            '';
+          };
+          credentials = mkOption {
+            type = types.attrsOf types.path;
+            default = {};
+            description = ''
+              Pack secrets as name -> file path, typically agenix paths. Each
+              becomes the systemd credential `<id>-<name>`, readable by the
+              pack from `$CREDENTIALS_DIRECTORY`; only the path enters the
+              store.
+            '';
+          };
+        };
+      }));
+      default = {};
+      example = lib.literalExpression ''
+        {
+          plinth = {
+            enable = true;
+            config = {baseUrl = "https://example.com";};
+            credentials.token = config.age.secrets.plinth-token.path;
+          };
+        }
+      '';
+      description = ''
+        Compile-time packs installed by the executable. Enabled packs are
+        rendered to `packs.json` (id -> config) and passed as
+        `--packs-config`; startup fails when an id has no matching pack in the
+        binary.
+      '';
+    };
   };
 
   config = mkIf cfg.enable (lib.mkMerge [
     {
       assertions = [
         {
+          assertion = cfg.fleetStatusFile == null || !lib.any (home: lib.hasPrefix home (toString cfg.fleetStatusFile)) ["/home/" "/root/" "/run/user/"];
+          message = "fleetix-hub: fleetStatusFile must live outside /home, /root and /run/user (the unit runs with ProtectHome).";
+        }
+        {
           assertion = cfg.integrations.windmill != "fixture" || cfg.integrations.comfy == "fixture";
-          message = "infernix-hub: a fixture Windmill runs procedures in-process and needs a fixture ComfyUI.";
+          message = "fleetix-hub: a fixture Windmill runs procedures in-process and needs a fixture ComfyUI.";
         }
         {
           assertion = cfg.integrations.paperclip != "live" || cfg.credentials.paperclipToken != null;
-          message = "infernix-hub: live Paperclip needs credentials.paperclipToken.";
+          message = "fleetix-hub: live Paperclip needs credentials.paperclipToken.";
         }
         {
           assertion = cfg.integrations.windmill != "live" || cfg.credentials.windmillToken != null;
-          message = "infernix-hub: live Windmill needs credentials.windmillToken.";
+          message = "fleetix-hub: live Windmill needs credentials.windmillToken.";
         }
         {
           assertion = cfg.integrations.publisher != "live" || cfg.integrations.paperclip == "live";
-          message = "infernix-hub: a live publisher needs live Paperclip; fixture approvals cannot authorize real posts.";
+          message = "fleetix-hub: a live publisher needs live Paperclip; fixture approvals cannot authorize real posts.";
         }
         {
           assertion = cfg.integrations.publisher != "live" || cfg.credentials.postizToken != null;
-          message = "infernix-hub: a live publisher needs credentials.postizToken.";
+          message = "fleetix-hub: a live publisher needs credentials.postizToken.";
         }
         {
           assertion = allFixture || cfg.companyId != null;
-          message = "infernix-hub: companyId (the Paperclip company id) is required unless every integration is fixture.";
+          message = "fleetix-hub: companyId (the Paperclip company id) is required unless every integration is fixture.";
         }
         {
           assertion = cfg.integrations.assistant != "live" || llmUrl != null;
-          message = "infernix-hub: a live assistant needs an endpoint; set assistant.url for endpoint = custom.";
+          message = "fleetix-hub: a live assistant needs an endpoint; set assistant.url for endpoint = custom.";
         }
         {
           assertion = cfg.database.urlFile == null || !cfg.database.createLocally;
-          message = "infernix-hub: database.urlFile is for an external database; leave database.createLocally = false.";
+          message = "fleetix-hub: database.urlFile is for an external database; leave database.createLocally = false.";
+        }
+        {
+          assertion =
+            lib.all (id: builtins.match "[a-z0-9-]+" id != null) (lib.attrNames enabledPacks)
+            && lib.all (pack: lib.all (name: builtins.match "[A-Za-z0-9_.-]+" name != null) (lib.attrNames pack.credentials)) (lib.attrValues enabledPacks);
+          message = "fleetix-hub: pack ids must match [a-z0-9-]+ and credential names [A-Za-z0-9_.-]+, so `<id>-<name>` is a valid systemd credential id.";
+        }
+        {
+          assertion = credentialIdsUnique;
+          message = "fleetix-hub: generated LoadCredential ids must be unique across credentials, tokens and packs. `foo` + `bar-baz` and `foo-bar` + `baz` both render `foo-bar-baz`, and a pack `token` + `x` collides with the token credential `token-x`; systemd silently keeps one entry per repeated id. Rename the colliding pack or credential.";
         }
       ];
 
@@ -582,8 +702,8 @@ in {
         "d ${toString cfg.assetDir} 0750 ${runtimeUser} ${runtimeGroup} -"
       ];
 
-      systemd.services.infernix-hub = {
-        description = "infernix-hub API and integration worker";
+      systemd.services.fleetix-hub = {
+        description = "fleetix-hub API and integration worker";
         wantedBy = ["multi-user.target"];
         after =
           ["network-online.target" "postgresql.service"]
@@ -596,7 +716,7 @@ in {
             HUB_BIND = cfg.bind;
             HUB_PUBLIC_URL = cfg.publicUrl;
             HUB_ASSET_DIR = toString cfg.assetDir;
-            HUB_REGISTRY_DIR = "${cfg.package}/share/infernix-hub/registry";
+            HUB_REGISTRY_DIR = "${cfg.package}/share/fleetix-hub/registry";
             HUB_PAPERCLIP = cfg.integrations.paperclip;
             HUB_WINDMILL = cfg.integrations.windmill;
             HUB_COMFY = cfg.integrations.comfy;
@@ -612,6 +732,7 @@ in {
             RUST_LOG = "info";
           }
           // optionalAttrs (seedFile != null) {HUB_SEED_FILE = toString seedFile;}
+          // optionalAttrs (cfg.fleetStatusFile != null) {HUB_FLEET_STATUS_FILE = toString cfg.fleetStatusFile;}
           // optionalAttrs (cfg.database.urlFile == null) {DATABASE_URL = cfg.database.url;}
           // optionalAttrs cfg.migrations.enable {HUB_MIGRATE_ON_START = "0";}
           // optionalAttrs (cfg.integrations.assistant == "live" && llmUrl != null) {
@@ -625,12 +746,12 @@ in {
         serviceConfig =
           harbor-rs.lib.hardeningProfiles.network-service
           // {
-            ExecStart = "${launcher} serve";
+            ExecStart = "${launcher} serve${packsArg}";
             ExecStartPre = tokenCommands;
             User = runtimeUser;
             Group = runtimeGroup;
             DynamicUser = false;
-            StateDirectory = "infernix-hub";
+            StateDirectory = "fleetix-hub";
             StateDirectoryMode = "0750";
             LoadCredential = loadCredentials;
             Restart = "on-failure";
@@ -642,6 +763,11 @@ in {
             PrivateDevices = true;
             SystemCallFilter = ["@system-service" "~@privileged"];
             ReadWritePaths = [(toString cfg.assetDir)];
+          }
+          // optionalAttrs (cfg.fleetStatusFile != null) {
+            # Bind the directory, not the file: atomic replacement gives the
+            # snapshot a new inode. Read-only is all the hub needs.
+            BindReadOnlyPaths = [(builtins.dirOf (toString cfg.fleetStatusFile))];
           };
       };
     }
@@ -677,18 +803,17 @@ in {
     # Schema ownership belongs to harbor-db; the runtime unit starts only
     # after the migration and its read-only check.
     {
-      services.harbor-db.projects.infernix-hub = mkIf cfg.migrations.enable {
+      services.harbor-db.projects.fleetix-hub = mkIf cfg.migrations.enable {
         enable = true;
-        description = "infernix-hub database migrations";
+        description = "fleetix-hub database migrations";
         runner =
           if cfg.database.urlFile != null
           then {
-            command = "${launcher} migrate";
-            checkCommand = "${launcher} migrate --check";
+            command = "${coreLauncher} migrate";
+            checkCommand = "${coreLauncher} migrate --check";
           }
           else {
-            inherit (cfg) package;
-            executable = "bin/infernix-hubd";
+            executable = coreExecutable;
             args = ["migrate"];
             checkArgs = ["migrate" "--check"];
           };
@@ -701,7 +826,7 @@ in {
             PGUSER = migrationUser;
           }
           // optionalAttrs (cfg.database.urlFile == null) {DATABASE_URL = cfg.database.url;};
-        runtimeUnits = ["infernix-hub.service"];
+        runtimeUnits = ["fleetix-hub.service"];
         postgres =
           {
             enable = cfg.database.createLocally;

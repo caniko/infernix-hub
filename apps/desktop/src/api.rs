@@ -20,6 +20,8 @@ use crate::{
 
 /// Donor polling cadence (1500 ms) retained for the active console.
 pub const POLL_INTERVAL_MS: u64 = 1500;
+/// The fleet snapshot is rewritten every few minutes, so 30s is plenty.
+pub const FLEET_POLL_SECS: u64 = 30;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 /// Cap eager asset-byte fetches per detail load; the rest load on next refresh.
 const MAX_ASSET_FETCH: usize = 8;
@@ -46,6 +48,16 @@ fn keep<T: Clone + 'static>(mut signal: Signal<Loaded<T>>, error: UiError) {
 
 fn put<T: 'static>(mut signal: Signal<Loaded<T>>, value: T) {
     signal.set(Loaded::ready(value));
+}
+
+/// Refresh the fleet snapshot. A failure keeps the last good snapshot and
+/// surfaces the error; the hub answers `fleet_status_unconfigured` when no
+/// file is configured.
+pub async fn refresh_fleet(store: Store, client: HubClient) {
+    match timed(client.fleet_status()).await {
+        Ok(status) => put(store.fleet, status),
+        Err(error) => keep(store.fleet, error),
+    }
 }
 
 /// Refresh the data every workspace can need, plus status. Runs sequentially so

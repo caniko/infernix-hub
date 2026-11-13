@@ -1,4 +1,4 @@
-# Desktop provenance — infernix-hub console
+# Desktop provenance — fleetix-hub console
 
 The desktop app (`apps/desktop`) is an adaptation of the pinned donor snapshot
 of **aivyx-pa** (MIT), commit `8097870bdad7c1a726448eeeeb82331027f1e6cf`, at
@@ -7,7 +7,7 @@ Only the donor's `crates/aivyx-web` shell, component kit and stylesheet were
 used. The donor tree was read-only and is not part of the build graph.
 
 The donor's `TRADEMARK.md` was read. No Aivyx name, logo, wordmark, favicon or
-"Stitch" branding is copied or displayed: the app is branded "infernix hub".
+"Stitch" branding is copied or displayed: the app is branded "fleetix hub".
 Fonts (OFL) and the generic line icons are copied, as permitted.
 
 ## Donor files
@@ -15,8 +15,8 @@ Fonts (OFL) and the generic line icons are copied, as permitted.
 | Donor file | Lines | sha256 | Destination | Modifications |
 |---|---|---|---|---|
 | `crates/aivyx-web/src/main.rs` | 225–228 (`main`, `dioxus::launch`) | `9b505bff042125ee81ac9b9b185206a9f38a296feb1e9250be31fb8a31b6eaec` | `apps/desktop/src/main.rs` | `console_error_panic_hook` removed; launch kept. |
-| same | 251–364 (`App`, view dispatch, polling loop) | same | `apps/desktop/src/main.rs` | WebSocket coroutine + `FrontendMessage` queries replaced by `HubClient` polling; `View` replaced by six hub `Workspace`s; theme toggle and onboarding removed. |
-| same | 370–403 (`Sidebar`), 405–415 (`NavItem`) | same | `apps/desktop/src/shell.rs` | Donor logo/wordmark removed; hub workspaces and 1–6 shortcuts; mobile drawer state added. |
+| same | 251–364 (`App`, view dispatch, polling loop) | same | `apps/desktop/src/main.rs` | WebSocket coroutine + `FrontendMessage` queries replaced by `HubClient` polling; `View` replaced by ten hub `Workspace`s (four fleet, six studio); theme toggle and onboarding removed. |
+| same | 370–403 (`Sidebar`), 405–415 (`NavItem`) | same | `apps/desktop/src/shell.rs` | Donor logo/wordmark removed; FLEET/STUDIO sections, count badges, hub workspaces and 1–9/0 shortcuts; mobile drawer state added. |
 | same | 428–446 (`Topbar`) | same | `apps/desktop/src/shell.rs` | Theme toggle and classic-UI link removed; inspector toggle and command-palette trigger added; connection label comes from `/v1/status`. |
 | same | 448–460 (`StatusBar`) | same | `apps/desktop/src/shell.rs` | Segments become hub status + per-integration mode/verification; fixture mode uses a persistent banner. |
 | same | 514–528 (`StatCard`) | same | `apps/desktop/src/components/mod.rs` | Icon prop replaced by a required text label plus optional detail; hub palette classes. |
@@ -51,7 +51,7 @@ All donor `assets/logos/*` files were omitted.
 
 - **Brand assets and copy** (`assets/logos/*`, "Aivyx", "AIVYX", "Stitch", the
   favicon and logomark): prohibited by the donor trademark policy. Replaced by
-  a CSS honey mark and the "infernix hub" wordmark.
+  a CSS honey mark and the "fleetix hub" wordmark.
 - **WebSocket transport** (`ws_task`, `FrontendMessage`, `DaemonEnvelope`,
   `gloo_net::websocket`, `gloo_timers`): the hub exposes a typed HTTP contract
   (`hub_contracts::client::HubClient`), so the desktop talks to it directly and
@@ -80,15 +80,59 @@ All donor `assets/logos/*` files were omitted.
 |---|---|---|
 | `HUB_URL` | `http://127.0.0.1:8470` | Hub base URL; the client appends `/v1`. |
 | `HUB_TOKEN` | empty | Operator bearer token. Set it when the hub enforces auth. |
+| `HUB_THEME_FILE` | `$XDG_CONFIG_HOME/fleetix-hub/theme.json` (or `~/.config/…`) | Optional JSON palette override; see below. |
+
+### Theme palette file
+
+The console reads a palette at startup (once per process) from
+`HUB_THEME_FILE`, else `$XDG_CONFIG_HOME/fleetix-hub/theme.json`, else
+`~/.config/fleetix-hub/theme.json`. Every key is optional; each value must be
+a `#rrggbb` string, and anything else is dropped:
+
+| Key | CSS variable |
+|---|---|
+| `bg` | `--bg` |
+| `panel` | `--panel` |
+| `card` | `--card` |
+| `elevated` | `--elevated` |
+| `border` | `--border` |
+| `text` | `--text` |
+| `textMuted` | `--text-2` |
+| `accent` | `--honey` |
+| `focus` | `--focus` |
+| `ok` / `warn` / `bad` / `info` | `--ok` / `--warn` / `--bad` / `--info` |
+
+```json
+{"bg": "#f7f4ec", "panel": "#efe9dc", "card": "#ffffff", "text": "#1d1b16", "accent": "#a86f00"}
+```
+
+The overrides become a second `:root{…}` block appended to the built-in
+stylesheet, so only provided keys change. A missing or malformed file keeps
+the built-in dark palette and logs one line; it never fails startup. Values are
+validated as `#` plus six hex digits before interpolation because they are
+operator-supplied CSS.
+
+Text drawn on an accent (selection, primary/sage buttons, the fixture banner)
+uses `var(--bg)`, so a light palette with a dark accent stays readable. Left
+as-is: the built-in `:root` palette, the `rgba(...)` tints/shadows (pale
+translucent accents over any panel), and `color-scheme: dark` on native
+`<select>` widgets — a light palette still gets dark native select popups.
 
 The console polls `/v1/status` plus the base lists and the selected detail on the
-donor's 1.5s cadence. A failed refresh keeps the last good data and shows the
-`ApiError` code/message; every list has loading, error and empty states.
+donor's 1.5s cadence. The fleet snapshot has its own 30s cadence (plus the
+palette's "Refresh fleet status"); a failed refresh keeps the last good data and
+shows the `ApiError` code/message. Every list has loading, error and empty
+states, and `fleet_status_unconfigured` renders one shared empty state in all
+four fleet views.
 
 ## Workspace → endpoint coverage
 
 | Workspace | Reads | Writes |
 |---|---|---|
+| Command Center | `GET /v1/fleet/status`, `GET /v1/today` | — |
+| Hosts | `GET /v1/fleet/status` | — |
+| Alerts | `GET /v1/fleet/status` | — |
+| Approvals | `GET /v1/fleet/status` | — |
 | Today | `GET /v1/today` | — |
 | News | `GET /v1/news`, `GET /v1/personas` | `POST /v1/content` (brief) |
 | Studio | `GET /v1/content`, `GET /v1/content/{id}`, `GET /v1/workflows`, `GET /v1/accounts`, `GET /v1/assets/{id}/content` | `POST /v1/content/{id}/generations`, `POST /v1/generations/{id}/cancel`, `POST /v1/assets/{id}/select`, `POST /v1/content/{id}/releases`, `POST /v1/releases/{id}/request-review`, `POST /v1/releases/{id}/schedule`, `POST /v1/intents/{id}/cancel` |
@@ -142,7 +186,7 @@ donor's 1.5s cadence. A failed refresh keeps the last good data and shows the
 
 The app is pinned to **Dioxus `=0.8.0-alpha.3`** (the newest published 0.8
 alpha on crates.io at 2026-11-09), with the `desktop` feature. No `dx` CLI is
-required: `cargo build -p infernix-hub-desktop` builds the binary directly.
+required: `cargo build -p fleetix-hub-desktop` builds the binary directly.
 
 The 0.6 → 0.8-alpha migration touched one API: keyboard matching now uses
 `Key::Named(NamedKey::Enter)` (the 0.6 `Key::Enter` variant is gone).
@@ -153,10 +197,10 @@ The 0.6 → 0.8-alpha migration touched one API: keyboard matching now uses
 
 Final verification ran from the repository root with the checked-in devshell:
 
-- `nix develop -c cargo build -p infernix-hub-desktop` — passes (Dioxus 0.6 for
+- `nix develop -c cargo build -p fleetix-hub-desktop` — passes (Dioxus 0.6 for
   milestone A, 0.8.0-alpha.3 for milestones B/C).
-- `nix develop -c cargo test -p infernix-hub-desktop` — 12 pure-helper tests pass.
-- `nix develop -c cargo clippy -p infernix-hub-desktop --all-targets -- -D warnings`
+- `nix develop -c cargo test -p fleetix-hub-desktop` — 12 pure-helper tests pass.
+- `nix develop -c cargo clippy -p fleetix-hub-desktop --all-targets -- -D warnings`
   — clean.
 - Headless smoke run: Weston headless + a throwaway mock hub (`/v1/status`,
   today, news, content detail, relationships, canon, chat, assets). The app

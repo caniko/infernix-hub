@@ -2,7 +2,7 @@
   "name": "poster-txt2img",
   "version": 1,
   "engine_instance_id": "comfy-atlas",
-  "windmill_path": "f/infernix_hub/comfy_generate",
+  "windmill_path": "f/fleetix_hub/comfy_generate",
   "notes": "Standard SD-style txt2img graph (API format). The `checkpoint` default names a fixture model; atlas has no checkpoints installed (2026-11-09), so live use must pass an installed model name or ComfyUI rejects the prompt.",
   "bindings": {
     "prompt": {
@@ -117,7 +117,7 @@
     "9": {
       "class_type": "SaveImage",
       "inputs": {
-        "filename_prefix": "infernix-hub",
+        "filename_prefix": "fleetix-hub",
         "images": [
           "8",
           0

@@ -1,8 +1,8 @@
 summary: Dispatch an armed publication timer (procedure version 1)
 description: >-
-  infernix-hub publication timer, version 1. Posts
+  fleetix-hub publication timer, version 1. Posts
   {schedule_revision, trigger_id: WM_JOB_ID} to the hub dispatch URL with the
-  f/infernix_hub/hub_token bearer. HTTP 409 stale_schedule_revision or
+  f/fleetix_hub/hub_token bearer. HTTP 409 stale_schedule_revision or
   already_claimed is a successful no-op; the hub owns publishing decisions.
 version: 1
 kind: script

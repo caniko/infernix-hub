@@ -1,6 +1,6 @@
 # Source provenance
 
-infernix-hub is an independent product with its own history, licensed under
+fleetix-hub is an independent product with its own history, licensed under
 the EUPL-1.2 (`LICENSE`). It reuses
 selected code from one pinned historical snapshot of Aivyx PA. Reuse does
 not change its nature: the reused parts are MIT-licensed code from that

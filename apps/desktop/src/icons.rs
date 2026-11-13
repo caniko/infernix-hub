@@ -16,7 +16,11 @@ const SETTINGS: &str = include_str!("../assets/icons/settings.svg");
 /// The nav icon for a workspace.
 pub fn workspace(w: Workspace) -> &'static str {
     match w {
-        Workspace::Today => COMMAND,
+        Workspace::Command => COMMAND,
+        Workspace::Hosts => SETTINGS,
+        Workspace::Alerts => CHANNELS,
+        Workspace::Approvals => AGENTS,
+        Workspace::Today => MISSIONS,
         Workspace::News => DOCUMENTS,
         Workspace::Studio => MISSIONS,
         Workspace::Calendar => CHANNELS,

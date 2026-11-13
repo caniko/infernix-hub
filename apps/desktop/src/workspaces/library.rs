@@ -429,8 +429,17 @@ pub fn LibraryView() -> Element {
                                         rsx! {
                                             div { class: "glass-card asset-tile", key: "{asset.id}",
                                                 div { class: "asset-frame",
-                                                    if let Some(uri) = image {
-                                                        img { src: "{uri}", alt: "{asset.alt_text}" }
+                                                    if let Some(uri) = image.clone() {
+                                                        if format::is_video(&asset.mime) {
+                                                            video {
+                                                                class: "asset-video",
+                                                                controls: true,
+                                                                src: "{uri}",
+                                                                "video preview unavailable ({asset.mime})"
+                                                            }
+                                                        } else {
+                                                            img { src: "{uri}", alt: "{asset.alt_text}" }
+                                                        }
                                                     } else {
                                                         span { class: "asset-missing", "{state_label} · {asset.mime}" }
                                                     }
@@ -440,6 +449,16 @@ pub fn LibraryView() -> Element {
                                                     span { class: "chip muted", "sha {format::short_hash(&asset.sha256)}" }
                                                     if asset.selected {
                                                         span { class: "chip sage", "selected" }
+                                                    }
+                                                    if format::is_video(&asset.mime) {
+                                                        if let Some(uri) = image {
+                                                            a {
+                                                                class: "btn btn-glass btn-xs",
+                                                                href: "{uri}",
+                                                                download: "{format::media_name(&asset.mime, &asset.sha256)}",
+                                                                "Download"
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 div { class: "label-tech", "{asset.alt_text}" }

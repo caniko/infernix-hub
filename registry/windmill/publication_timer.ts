@@ -1,4 +1,4 @@
-// infernix-hub publication timer procedure (version 1).
+// fleetix-hub publication timer procedure (version 1).
 //
 // Input is the hub's `PublicationTimer` (crates/domain/src/ports.rs). The
 // procedure posts the armed revision to the hub's dispatch endpoint. The hub,
@@ -27,7 +27,7 @@ function noopCode(body: unknown): string {
 }
 
 export async function main(timer: PublicationTimer): Promise<unknown> {
-  const token = await wmill.getVariable("f/infernix_hub/hub_token");
+  const token = await wmill.getVariable("f/fleetix_hub/hub_token");
   const triggerId = process.env.WM_JOB_ID ?? "";
 
   const response = await fetch(timer.dispatch_url, {

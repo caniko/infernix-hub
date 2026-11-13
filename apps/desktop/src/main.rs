@@ -1,4 +1,4 @@
-//! infernix-hub desktop console.
+//! fleetix-hub desktop console.
 //!
 //! Milestone C: the donor-derived shell now runs on real hub data through
 //! `hub_contracts::client::HubClient`. The WebSocket bridge is gone; the app
@@ -7,11 +7,13 @@
 mod actions;
 mod api;
 mod components;
+mod fleet;
 mod format;
 mod icons;
 mod inspector;
 mod labels;
 mod palette;
+mod platform;
 mod shell;
 mod state;
 mod theme;
@@ -26,7 +28,7 @@ use state::{Loaded, Store};
 
 fn main() {
     use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
-    let window = WindowBuilder::new().with_title("infernix hub").with_inner_size(LogicalSize::new(1440.0, 900.0));
+    let window = WindowBuilder::new().with_title("fleetix hub").with_inner_size(LogicalSize::new(1440.0, 900.0));
     dioxus::LaunchBuilder::desktop().with_cfg(Config::new().with_window(window)).launch(App);
 }
 
@@ -34,8 +36,9 @@ fn main() {
 fn App() -> Element {
     let client = use_hook(api::make_client);
     let store = Store {
-        workspace: use_signal(|| Workspace::Today),
+        workspace: use_signal(|| Workspace::Command),
         status: use_signal(Loaded::default),
+        fleet: use_signal(Loaded::default),
         today: use_signal(Loaded::default),
         news: use_signal(Loaded::default),
         personas: use_signal(Loaded::default),
@@ -55,6 +58,7 @@ fn App() -> Element {
         selected_news: use_signal(|| None),
         selected_persona: use_signal(|| None),
         selected_relationship: use_signal(|| None),
+        selected_host: use_signal(|| None),
         focus_proposal: use_signal(|| None),
         asset_images: use_signal(std::collections::HashMap::new),
         release_states: use_signal(std::collections::HashMap::new),
@@ -84,6 +88,20 @@ fn App() -> Element {
                 tokio::time::sleep(Duration::from_millis(api::POLL_INTERVAL_MS)).await;
                 api::refresh_base(store, client.clone()).await;
                 api::refresh_selected(store, client.clone()).await;
+            }
+        }
+    });
+
+    // The fleet snapshot has its own cadence: another tool rewrites it every
+    // few minutes, so polling it with the 1.5s content poll would be noise.
+    let fleet_client = client.clone();
+    use_future(move || {
+        let client = fleet_client.clone();
+        async move {
+            api::refresh_fleet(store, client.clone()).await;
+            loop {
+                tokio::time::sleep(Duration::from_secs(api::FLEET_POLL_SECS)).await;
+                api::refresh_fleet(store, client.clone()).await;
             }
         }
     });
@@ -143,7 +161,7 @@ fn App() -> Element {
                     dioxus.send('escape');
                     return;
                 }
-                if (!editing && !event.ctrlKey && !event.metaKey && !event.altKey && /^[1-6]$/.test(event.key)) {
+                if (!editing && !event.ctrlKey && !event.metaKey && !event.altKey && /^[0-9]$/.test(event.key)) {
                     dioxus.send('ws:' + event.key);
                 }
             });
@@ -161,12 +179,17 @@ fn App() -> Element {
                         store.set_nav_open(false);
                     }
                 }
-                "ws:1" => store.set_workspace(Workspace::Today),
-                "ws:2" => store.set_workspace(Workspace::News),
-                "ws:3" => store.set_workspace(Workspace::Studio),
-                "ws:4" => store.set_workspace(Workspace::Calendar),
-                "ws:5" => store.set_workspace(Workspace::Relationships),
-                "ws:6" => store.set_workspace(Workspace::Library),
+                "ws:1" => store.set_workspace(Workspace::Command),
+                "ws:2" => store.set_workspace(Workspace::Hosts),
+                "ws:3" => store.set_workspace(Workspace::Alerts),
+                "ws:4" => store.set_workspace(Workspace::Approvals),
+                "ws:5" => store.set_workspace(Workspace::Today),
+                "ws:6" => store.set_workspace(Workspace::News),
+                "ws:7" => store.set_workspace(Workspace::Studio),
+                "ws:8" => store.set_workspace(Workspace::Calendar),
+                "ws:9" => store.set_workspace(Workspace::Relationships),
+                // `0` is the tenth workspace, after `9`.
+                "ws:0" => store.set_workspace(Workspace::Library),
                 _ => {}
             }
         }
@@ -208,7 +231,31 @@ fn App() -> Element {
     if status.data.as_ref().is_some_and(|status| status.production_paused) {
         segments.push(shell::StatusSeg { label: "PRODUCTION PAUSED".into(), tone: "warn".into() });
     }
+    // Fleet is infrastructure: it leads the bar, and a stale snapshot never
+    // reads as OK.
+    let fleet_loaded = (store.fleet).cloned();
+    let fleet_segment = match fleet_loaded.data.as_ref() {
+        // A failed refresh outranks the cached snapshot it leaves behind.
+        _ if fleet_loaded.error.is_some() => shell::StatusSeg { label: "FLEET · UNAVAILABLE".into(), tone: "bad".into() },
+        None => shell::StatusSeg { label: "FLEET · UNAVAILABLE".into(), tone: "bad".into() },
+        Some(snapshot) if fleet::stale(format::now_ms(), snapshot) => {
+            shell::StatusSeg { label: "FLEET · STALE".into(), tone: "warn".into() }
+        }
+        Some(snapshot) => {
+            let attention = snapshot.attention();
+            shell::StatusSeg {
+                label: if attention == 0 { "FLEET · OK".into() } else { format!("FLEET · {attention} ATTENTION") },
+                tone: if attention == 0 { "live".into() } else { "warn".into() },
+            }
+        }
+    };
+    segments.insert(0, fleet_segment);
     let api_version = status.data.as_ref().map(|status| status.api_version.clone()).unwrap_or_else(|| "v1".into());
+    let stage_class = format!(
+        "stage{}{}",
+        if (store.inspector_open).cloned() { "" } else { " inspector-closed" },
+        if (store.workspace).cloned().full_width() { " no-context" } else { "" }
+    );
 
     let inspector_data: Option<inspector::InspectorData> = match (store.workspace).cloned() {
         Workspace::Studio => (store.content_detail)
@@ -238,6 +285,17 @@ fn App() -> Element {
             .as_ref()
             .and_then(|items| items.iter().find(|item| Some(item.id) == (store.selected_news).cloned()))
             .map(inspector::from_news),
+        Workspace::Hosts => {
+            let loaded = (store.fleet).cloned();
+            let selected = (store.selected_host).cloned();
+            loaded.data.as_ref().and_then(|snapshot| {
+                snapshot
+                    .hosts
+                    .iter()
+                    .find(|host| Some(&host.name) == selected.as_ref())
+                    .map(|host| inspector::from_host(host, snapshot.target_revision.as_deref()))
+            })
+        }
         _ => None,
     };
 
@@ -254,12 +312,16 @@ fn App() -> Element {
                     api::refresh_selected(store, client).await;
                 });
             }
+            actions::Action::RefreshFleet => {
+                let client = action_client.clone();
+                spawn(async move { api::refresh_fleet(store, client).await });
+            }
             actions::Action::OpenSubject(subject_type, id) => actions::open_subject(store, &subject_type, id),
         }
     };
 
     rsx! {
-        document::Title { "infernix hub" }
+        document::Title { "fleetix hub" }
         style { dangerous_inner_html: theme::style_sheet() }
         div { class: "app",
             shell::Sidebar { workspace: store.workspace, nav_open: store.nav_open }
@@ -288,8 +350,12 @@ fn App() -> Element {
                         }
                     }
                 }
-                div { class: if (store.inspector_open).cloned() { "stage" } else { "stage inspector-closed" },
+                div { class: "{stage_class}",
                     match (store.workspace).cloned() {
+                        Workspace::Command => rsx! { workspaces::fleet::CommandView {} },
+                        Workspace::Hosts => rsx! { workspaces::fleet::HostsView {} },
+                        Workspace::Alerts => rsx! { workspaces::fleet::AlertsView {} },
+                        Workspace::Approvals => rsx! { workspaces::fleet::ApprovalsView {} },
                         Workspace::Today => rsx! { workspaces::today::TodayView {} },
                         Workspace::News => rsx! { workspaces::news::NewsView {} },
                         Workspace::Studio => rsx! { workspaces::studio::StudioView {} },
@@ -308,7 +374,7 @@ fn App() -> Element {
             shell::StatusBar {
                 connected: live,
                 items: segments,
-                right: format!("API {api_version} · INFERNIX-HUB v0.1.0"),
+                right: format!("API {api_version} · FLEETIX-HUB v0.1.0"),
             }
             if (store.palette_open).cloned() {
                 palette::CommandPalette {

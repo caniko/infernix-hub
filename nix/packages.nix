@@ -36,7 +36,7 @@
   ];
 
   common = {
-    pname = "infernix-hub";
+    pname = "fleetix-hub";
     inherit version src;
     strictDeps = true;
     nativeBuildInputs = [pkgs.pkg-config];
@@ -47,7 +47,7 @@
     // {
       # default-members already exclude the desktop crate; spell it out so a
       # future member cannot silently pull webkit into the server graph.
-      cargoExtraArgs = "--locked --workspace --exclude infernix-hub-desktop";
+      cargoExtraArgs = "--locked --workspace --exclude fleetix-hub-desktop";
     };
   nativeArtifacts = cacheRust {package = craneLib.buildDepsOnly nativeArgs;};
 
@@ -60,47 +60,47 @@
           cargoExtraArgs = "--locked -p ${name}";
           doCheck = false;
           meta = {
-            description = "infernix-hub ${name}";
+            description = "fleetix-hub ${name}";
             mainProgram = name;
             license = pkgs.lib.licenses.eupl12;
           };
         });
     };
 
-  server = mkBin "infernix-hubd";
+  server = mkBin "fleetix-hubd";
 
   desktopArgs =
     common
     // {
-      pname = "infernix-hub-desktop";
-      cargoExtraArgs = "--locked -p infernix-hub-desktop";
+      pname = "fleetix-hub-desktop";
+      cargoExtraArgs = "--locked -p fleetix-hub-desktop";
       buildInputs = desktopBuildInputs;
     };
 in {
   inherit desktopBuildInputs;
 
-  infernix-hubd = server.overrideAttrs (old: {
+  fleetix-hubd = server.overrideAttrs (old: {
     # The module points HUB_REGISTRY_DIR at this copy; the server reads the
     # ComfyUI workflow JSON from it at startup.
     postInstall =
       (old.postInstall or "")
       + ''
-        install -dm755 "$out/share/infernix-hub"
-        cp -r registry "$out/share/infernix-hub/registry"
+        install -dm755 "$out/share/fleetix-hub"
+        cp -r registry "$out/share/fleetix-hub/registry"
       '';
   });
 
   hubctl = mkBin "hubctl";
 
-  infernix-hub-desktop = cacheRust {
+  fleetix-hub-desktop = cacheRust {
     package = craneLib.buildPackage (desktopArgs
       // {
         cargoArtifacts = cacheRust {package = craneLib.buildDepsOnly desktopArgs;};
         doCheck = false;
         nativeBuildInputs = [pkgs.pkg-config pkgs.wrapGAppsHook3];
         meta = {
-          description = "infernix-hub operator console";
-          mainProgram = "infernix-hub-desktop";
+          description = "fleetix-hub operator console";
+          mainProgram = "fleetix-hub-desktop";
           license = pkgs.lib.licenses.eupl12;
         };
       });

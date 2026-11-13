@@ -68,6 +68,7 @@ pub fn NewsView() -> Element {
                 audience: audience.cloned(),
                 copy_direction: copy.cloned(),
                 visual_direction: visual.cloned(),
+                producer: Default::default(),
             },
         };
         let client = client.clone();

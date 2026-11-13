@@ -11,9 +11,14 @@ use contracts::{
 use dioxus::prelude::*;
 use uuid::Uuid;
 
-/// The six operator workspaces. Sidebar order is the 1–6 keyboard order.
+/// The ten operator workspaces. Fleet leads (the app opens on Command), then
+/// Studio; sidebar order is the 1–9/0 keyboard order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Workspace {
+    Command,
+    Hosts,
+    Alerts,
+    Approvals,
     Today,
     News,
     Studio,
@@ -23,11 +28,25 @@ pub enum Workspace {
 }
 
 impl Workspace {
-    pub const ALL: [Workspace; 6] =
-        [Workspace::Today, Workspace::News, Workspace::Studio, Workspace::Calendar, Workspace::Relationships, Workspace::Library];
+    pub const ALL: [Workspace; 10] = [
+        Workspace::Command,
+        Workspace::Hosts,
+        Workspace::Alerts,
+        Workspace::Approvals,
+        Workspace::Today,
+        Workspace::News,
+        Workspace::Studio,
+        Workspace::Calendar,
+        Workspace::Relationships,
+        Workspace::Library,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
+            Workspace::Command => "Command Center",
+            Workspace::Hosts => "Hosts",
+            Workspace::Alerts => "Alerts",
+            Workspace::Approvals => "Approvals",
             Workspace::Today => "Today",
             Workspace::News => "News",
             Workspace::Studio => "Studio",
@@ -43,6 +62,10 @@ impl Workspace {
 
     pub fn hint(self) -> &'static str {
         match self {
+            Workspace::Command => "fleet health, attention queue and snapshot age",
+            Workspace::Hosts => "health, revision and failed checks per host",
+            Workspace::Alerts => "monitored services that are down",
+            Workspace::Approvals => "privileged operations waiting for the operator",
             Workspace::Today => "reviews, production, due releases, failed work, overdue replies",
             Workspace::News => "coverage, evidence and brief creation",
             Workspace::Studio => "brief, generation, assets, release freeze and scheduling",
@@ -50,6 +73,20 @@ impl Workspace {
             Workspace::Relationships => "threads, ownership, drafts and handoff",
             Workspace::Library => "personas, canon review, assets",
         }
+    }
+
+    /// Sidebar section heading.
+    pub fn section(self) -> &'static str {
+        match self {
+            Workspace::Command | Workspace::Hosts | Workspace::Alerts | Workspace::Approvals => "FLEET",
+            _ => "STUDIO",
+        }
+    }
+
+    /// Fleet workspaces use the whole stage: their lists carry their own
+    /// columns, so there is no separate context list to pin beside them.
+    pub fn full_width(self) -> bool {
+        self.section() == "FLEET"
     }
 }
 
@@ -123,6 +160,8 @@ impl Notice {
 pub struct Store {
     pub workspace: Signal<Workspace>,
     pub status: Signal<Loaded<SystemStatus>>,
+    /// Fleet snapshot; refreshed on its own 30s cadence, not the 1.5s poll.
+    pub fleet: Signal<Loaded<contracts::fleet::FleetStatus>>,
     pub today: Signal<Loaded<Today>>,
     pub news: Signal<Loaded<Vec<NewsItem>>>,
     pub personas: Signal<Loaded<Vec<Persona>>>,
@@ -143,10 +182,12 @@ pub struct Store {
     pub selected_news: Signal<Option<Uuid>>,
     pub selected_persona: Signal<Option<Uuid>>,
     pub selected_relationship: Signal<Option<Uuid>>,
+    /// Hosts are identified by name in the snapshot, not by an id.
+    pub selected_host: Signal<Option<String>>,
     /// Set by a chat proposal link so Library highlights the matching card.
     pub focus_proposal: Signal<Option<Uuid>>,
 
-    /// Asset id → `data:` URI, loaded from `/v1/assets/{id}/content`.
+    /// Asset id → `data:` URI (image or video), loaded from `/v1/assets/{id}/content`.
     pub asset_images: Signal<HashMap<Uuid, String>>,
     /// Release revision id → approval state, built from content details.
     pub release_states: Signal<HashMap<Uuid, ReleaseState>>,
@@ -264,6 +305,10 @@ impl Store {
     }
     pub fn set_selected_relationship(&self, value: Option<Uuid>) {
         let mut signal = self.selected_relationship;
+        signal.set(value);
+    }
+    pub fn set_selected_host(&self, value: Option<String>) {
+        let mut signal = self.selected_host;
         signal.set(value);
     }
     pub fn set_focus_proposal(&self, value: Option<Uuid>) {

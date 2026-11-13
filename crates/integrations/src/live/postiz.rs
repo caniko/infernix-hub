@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use super::{read_json, transport_error, trim_base};
 
-const BOUNDARY: &str = "infernix-hub-postiz-boundary-9f2c4e7a";
+const BOUNDARY: &str = "fleetix-hub-postiz-boundary-9f2c4e7a";
 
 /// Postiz connection settings. `Debug` is manual so the API key cannot leak.
 #[derive(Clone)]

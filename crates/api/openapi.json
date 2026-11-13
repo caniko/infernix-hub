@@ -73,6 +73,10 @@
         "description": "See hub_contracts::DraftReplyIn",
         "type": "object"
       },
+      "FleetStatus": {
+        "description": "See fleetix::status::FleetStatus",
+        "type": "object"
+      },
       "FollowUpIn": {
         "description": "See hub_contracts::FollowUpIn",
         "type": "object"
@@ -195,7 +199,7 @@
   },
   "info": {
     "description": "Hand-maintained index of the hub API. Field-level schemas are the Rust types in crates/contracts (serde JSON, snake_case enums); x-roles names who may call. Headers: Authorization: Bearer <token>, x-correlation-id (echoed in errors), idempotency-key (ingest).",
-    "title": "infernix-hub API",
+    "title": "fleetix-hub API",
     "version": "v1"
   },
   "openapi": "3.1.0",
@@ -913,6 +917,110 @@
         "x-roles": "see domain command"
       }
     },
+    "/v1/fleet/status": {
+      "get": {
+        "operationId": "fleet_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FleetStatus"
+                }
+              }
+            },
+            "description": "FleetStatus"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "any authenticated role"
+      }
+    },
+    "/v1/generations/{id}/artifacts": {
+      "post": {
+        "operationId": "upload_artifact",
+        "description": "Raw output bytes from a pipeline procedure. Headers: x-artifact-source, content-type, x-sha256.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-artifact-source",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-sha256",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerationRequest"
+                }
+              }
+            },
+            "description": "GenerationRequest"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "procedure"
+      }
+    },
     "/v1/generations/{id}/cancel": {
       "post": {
         "operationId": "cancel_generation",
@@ -1588,6 +1696,49 @@
               }
             },
             "description": "RelationshipDetail"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "see domain command"
+      }
+    },
+    "/v1/relationships/{id}/draft-reply": {
+      "post": {
+        "operationId": "draft_assistant_reply",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplyDraft"
+                }
+              }
+            },
+            "description": "Relationship"
           },
           "4XX": {
             "content": {

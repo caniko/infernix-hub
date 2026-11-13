@@ -103,6 +103,10 @@ impl HubClient {
     pub async fn status(&self) -> Result<SystemStatus, ClientError> {
         self.get("/status").await
     }
+    /// The fleet operations snapshot; read-only, produced by another tool.
+    pub async fn fleet_status(&self) -> Result<fleet::FleetStatus, ClientError> {
+        self.get("/fleet/status").await
+    }
     pub async fn today(&self) -> Result<Today, ClientError> {
         self.get("/today").await
     }
@@ -159,6 +163,10 @@ impl HubClient {
     }
     pub async fn draft_reply(&self, rel: Uuid, body: &DraftReplyIn) -> Result<ReplyDraft, ClientError> {
         self.post(&format!("/relationships/{rel}/drafts"), body).await
+    }
+    /// Ask the assistant for a reply draft (operator only).
+    pub async fn draft_assistant_reply(&self, rel: Uuid) -> Result<ReplyDraft, ClientError> {
+        self.post(&format!("/relationships/{rel}/draft-reply"), &()).await
     }
     pub async fn decide_draft(&self, draft: Uuid, body: &DraftDecisionIn) -> Result<ReplyDraft, ClientError> {
         self.post(&format!("/drafts/{draft}/decision"), body).await

@@ -1,14 +1,14 @@
-//! `infernix-hubd`: API server with the embedded integration worker.
+//! `fleetix-hubd`: API server with the embedded integration worker.
 
 use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use contracts::Role;
-use infernix_hubd::bootstrap::{self, Settings};
+use fleetix_hubd::bootstrap::{self, Settings};
 
 #[derive(Parser)]
-#[command(name = "infernix-hubd", version, about = "infernix-hub API server")]
+#[command(name = "fleetix-hubd", version, about = "fleetix-hub API server")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -20,6 +20,9 @@ enum Cmd {
     Serve {
         #[arg(long)]
         no_worker: bool,
+        /// JSON object mapping enabled pack id to that pack's config.
+        #[arg(long)]
+        packs_config: Option<std::path::PathBuf>,
     },
     /// Run the worker only.
     Worker,
@@ -96,13 +99,11 @@ async fn main() -> anyhow::Result<()> {
                 None => println!("{}", domain::system::issue_token(&db, &name, role, None).await?),
             }
         }
-        Cmd::Serve { no_worker } => {
-            let s = Settings::from_env()?;
-            let (state, _fx) = bootstrap::build(&s).await?;
-            if !no_worker {
-                tokio::spawn(worker::run(state.hub.clone(), Duration::from_secs(2)));
-            }
-            serve(&s.bind, state).await?;
+        Cmd::Serve { no_worker, packs_config } => {
+            let mut s = Settings::from_env()?;
+            s.no_worker |= no_worker;
+            s.packs_config = packs_config.or(s.packs_config);
+            fleetix_hubd::run(s, Vec::new()).await?;
         }
         Cmd::Worker => {
             let s = Settings::from_env()?;
@@ -110,7 +111,9 @@ async fn main() -> anyhow::Result<()> {
             worker::run(state.hub, Duration::from_secs(2)).await;
         }
         Cmd::Dev { database_url, bind } => {
-            let s = Settings::fixture(&database_url, &bind);
+            let mut s = Settings::fixture(&database_url, &bind);
+            // Fixtures simulate integrations; the fleet snapshot is a file either way.
+            s.fleet_status_file = std::env::var_os("HUB_FLEET_STATUS_FILE").map(Into::into);
             let (state, fx) = bootstrap::build(&s).await?;
             for (name, role, token) in DEV_TOKENS {
                 domain::system::issue_token(&state.hub.db, name, *role, Some(token.to_string())).await?;
@@ -128,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
             });
             println!("\nFIXTURE MODE — every integration is simulated in-process.");
             println!("API      {}/v1   (OpenAPI: {}/openapi.json)", s.public_url, s.public_url);
-            println!("Desktop  HUB_URL={} HUB_TOKEN=dev-operator-token cargo run -p infernix-hub-desktop", s.public_url);
+            println!("Desktop  HUB_URL={} HUB_TOKEN=dev-operator-token cargo run -p fleetix-hub-desktop", s.public_url);
             println!("CLI      HUB_URL={} HUB_TOKEN=dev-operator-token cargo run -p hubctl -- today\n", s.public_url);
             serve(&bind, state).await?;
         }
@@ -199,10 +202,10 @@ async fn demo_events(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn serve(bind: &str, state: infernix_hubd::AppState) -> anyhow::Result<()> {
+async fn serve(bind: &str, state: fleetix_hubd::AppState) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, "listening");
-    axum::serve(listener, infernix_hubd::router(state))
+    axum::serve(listener, fleetix_hubd::router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

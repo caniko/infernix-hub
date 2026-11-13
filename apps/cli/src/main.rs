@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "hubctl", version, about = "infernix-hub CLI")]
+#[command(name = "hubctl", version, about = "fleetix-hub CLI")]
 struct Cli {
     #[arg(long, env = "HUB_URL", default_value = "http://127.0.0.1:8470")]
     url: String,
@@ -24,6 +24,11 @@ struct Cli {
 enum Cmd {
     /// Integration modes, fixture flag, pause state.
     Status,
+    /// Fleet infrastructure state; read-only.
+    Fleet {
+        #[command(subcommand)]
+        cmd: FleetCmd,
+    },
     Today,
     News,
     Personas,
@@ -117,6 +122,12 @@ enum Cmd {
     Resume,
 }
 
+#[derive(Subcommand)]
+enum FleetCmd {
+    /// The snapshot written by `canix fleet status --write`.
+    Status,
+}
+
 fn print(v: impl serde::Serialize) {
     println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
 }
@@ -127,6 +138,7 @@ async fn main() -> Result<()> {
     let c = HubClient::new(&cli.url, &cli.token);
     match cli.cmd {
         Cmd::Status => print(c.status().await?),
+        Cmd::Fleet { cmd: FleetCmd::Status } => print(c.fleet_status().await?),
         Cmd::Today => print(c.today().await?),
         Cmd::News => print(c.news().await?),
         Cmd::Personas => print(c.personas().await?),

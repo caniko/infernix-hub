@@ -8,7 +8,7 @@
   "started_at": null,
   "scheduled_for": "2026-11-09T11:05:00.000Z",
   "running": false,
-  "script_path": "f/infernix_hub/publication_timer",
+  "script_path": "f/fleetix_hub/publication_timer",
   "script_hash": "f6e5d4c3b2",
   "args": {
     "intent_id": "intent_01",

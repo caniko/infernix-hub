@@ -2,7 +2,7 @@
   "name": "swatch",
   "version": 1,
   "engine_instance_id": "comfy-atlas",
-  "windmill_path": "f/infernix_hub/comfy_generate",
+  "windmill_path": "f/fleetix_hub/comfy_generate",
   "notes": "Model-free contract smoke workflow (core EmptyImage \u2192 SaveImage). Exercises /prompt, /history, /view and asset import without loading a model or claiming VRAM.",
   "bindings": {
     "color": {
@@ -34,7 +34,7 @@
     "2": {
       "class_type": "SaveImage",
       "inputs": {
-        "filename_prefix": "infernix-hub-swatch",
+        "filename_prefix": "fleetix-hub-swatch",
         "images": [
           "1",
           0

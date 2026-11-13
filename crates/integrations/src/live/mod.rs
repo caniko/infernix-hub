@@ -25,10 +25,10 @@ pub mod postiz;
 pub mod windmill;
 
 pub use comfy::ComfyClient;
-pub use n8n::{N8nClient, N8nClientError, N8nConfig, SecretString};
+pub use n8n::{N8nClient, N8nClientError, N8nConfig, N8nPublisher, N8nPublisherConfig, SecretString};
 pub use paperclip::{PaperclipClient, PaperclipConfig};
 pub use postiz::{PostizClient, PostizConfig};
-pub use windmill::{WindmillClient, WindmillConfig};
+pub use windmill::{WindmillClient, WindmillConfig, WindmillPipeline};
 
 /// Largest body snippet echoed into an error. Error strings reach logs, so keep
 /// them small and never include request headers.

@@ -1,6 +1,7 @@
 //! Human labels and chip tones for every wire enum. Chips always render the
 //! label as text; the tone only colours the background.
 
+use contracts::fleet::{Health, UpdateState};
 use contracts::{
     AdapterMode, AssetState, AttemptKind, AttemptState, CanonState, ContentState, Direction, DraftState, GenerationState, IntentState,
     Owner, ReleaseState, Verification,
@@ -53,6 +54,7 @@ pub fn attempt_kind(kind: AttemptKind) -> &'static str {
         AttemptKind::WindmillRoot => "windmill root",
         AttemptKind::WindmillChild => "windmill child",
         AttemptKind::ComfyPrompt => "comfy prompt",
+        AttemptKind::PipelineRun => "pipeline run",
     }
 }
 
@@ -142,6 +144,31 @@ pub fn adapter_mode(mode: AdapterMode) -> (&'static str, &'static str) {
     }
 }
 
+pub fn health(health: Health) -> (&'static str, &'static str) {
+    match health {
+        Health::Healthy => ("Healthy", "ok"),
+        Health::Degraded => ("Degraded", "warn"),
+        Health::Unreachable => ("Unreachable", "bad"),
+    }
+}
+
+pub fn update_state(state: UpdateState) -> (&'static str, &'static str) {
+    match state {
+        UpdateState::Current => ("Current", "ok"),
+        UpdateState::Outdated => ("Outdated", "warn"),
+        UpdateState::Unknown => ("Unknown", "muted"),
+    }
+}
+
+/// Outcome of one host in the nightly rollout.
+pub fn nightly_outcome(outcome: contracts::fleet::NightlyOutcome) -> (&'static str, &'static str) {
+    match outcome {
+        contracts::fleet::NightlyOutcome::Switched => ("switched", "ok"),
+        contracts::fleet::NightlyOutcome::Offline => ("offline", "warn"),
+        contracts::fleet::NightlyOutcome::Failed => ("failed", "bad"),
+    }
+}
+
 /// Tone for a free-form `TodayItem.status` / `HistoryEntry` status string.
 pub fn status_tone(status: &str) -> &'static str {
     match status.to_ascii_lowercase().as_str() {
@@ -199,6 +226,19 @@ mod tests {
         }
         for s in AdapterMode::ALL {
             check(adapter_mode(*s).0, adapter_mode(*s).1);
+        }
+        for h in [Health::Healthy, Health::Degraded, Health::Unreachable] {
+            check(health(h).0, health(h).1);
+        }
+        for s in [UpdateState::Current, UpdateState::Outdated, UpdateState::Unknown] {
+            check(update_state(s).0, update_state(s).1);
+        }
+        for o in [
+            contracts::fleet::NightlyOutcome::Switched,
+            contracts::fleet::NightlyOutcome::Offline,
+            contracts::fleet::NightlyOutcome::Failed,
+        ] {
+            check(nightly_outcome(o).0, nightly_outcome(o).1);
         }
         for k in AttemptKind::ALL {
             assert!(!attempt_kind(*k).is_empty());
