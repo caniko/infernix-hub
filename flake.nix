@@ -73,6 +73,10 @@
         cacheRoot = null;
         namespaceScope = "canix-rust";
         namespaceGeneration = 5;
+        # Hosted CI runners and laptops have no managed cache transport; the
+        # documented opt-in uses a private build-scoped cache instead of
+        # failing every derivation with exit 75.
+        ephemeralFallback = true;
       };
 
       treefmt = treefmt-nix.lib.evalModule pkgs {
