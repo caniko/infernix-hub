@@ -316,6 +316,15 @@ pub async fn today(hub: &Hub, actor: &Actor) -> DResult<Today> {
              order by at",
         )
         .await?,
+        opportunities: today_items(
+            hub,
+            "select 'opportunity' as kind, o.title, 'opportunity' as subject_type, o.id as subject_id,
+               case when o.deadline < now() then 'expired' else o.state end as status, o.deadline as at
+             from opportunities o
+             where o.state in ('shortlisted', 'drafting') and o.deadline is not null and o.deadline < now() + interval '14 days'
+             order by o.deadline",
+        )
+        .await?,
     })
 }
 

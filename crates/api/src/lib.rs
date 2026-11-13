@@ -135,8 +135,12 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/history/{subject_type}/{id}", get(history))
         .route("/ingest/news", post(ingest_news))
         .route("/ingest/interactions", post(ingest_interaction))
+        .route("/ingest/opportunities", post(ingest_opportunity))
         .route("/news", get(news_list))
         .route("/news/{id}", get(news_get))
+        .route("/opportunities", get(opportunity_list))
+        .route("/opportunities/{id}", get(opportunity_get))
+        .route("/opportunities/{id}/decision", post(opportunity_decide))
         .route("/personas", get(personas).post(create_persona))
         .route("/personas/{id}/canon", get(canon_list).post(canon_propose))
         .route("/canon/{id}/decision", post(canon_decide))
@@ -155,6 +159,7 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/assets/{id}/select", post(select_asset))
         .route("/assets/{id}/content", get(asset_content))
         .route("/releases/{id}/request-review", post(request_review))
+        .route("/releases/{id}", get(release_get))
         .route("/releases/{id}/link-approval", post(link_approval))
         .route("/releases/{id}/schedule", post(schedule))
         .route("/intents", get(intents))
@@ -408,6 +413,37 @@ async fn news_list(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<NewsIt
 async fn news_get(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<NewsItem> {
     call!(a, domain::news::get(&s.hub, &a, id))
 }
+async fn ingest_opportunity(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<OpportunityIn>) -> R<Opportunity> {
+    call!(a, domain::opportunities::ingest(&s.hub, &a, b))
+}
+#[derive(Deserialize)]
+struct OpportunityQ {
+    state: Option<String>,
+    due_within_days: Option<i32>,
+}
+async fn opportunity_list(State(s): State<AppState>, Caller(a): Caller, Query(q): Query<OpportunityQ>) -> R<Vec<Opportunity>> {
+    let state = match q.state.as_deref() {
+        None => None,
+        Some(raw) => Some(OpportunityState::parse(raw).ok_or_else(|| {
+            ApiErr::domain(
+                DomainError::Invalid { code: "invalid_state", message: format!("{raw:?} is not an opportunity state") },
+                a.correlation_id.clone(),
+            )
+        })?),
+    };
+    call!(a, domain::opportunities::list(&s.hub, &a, state, q.due_within_days))
+}
+async fn opportunity_get(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<Opportunity> {
+    call!(a, domain::opportunities::get(&s.hub, &a, id))
+}
+async fn opportunity_decide(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<OpportunityDecisionIn>,
+) -> R<Opportunity> {
+    call!(a, domain::opportunities::decide(&s.hub, &a, id, b))
+}
 async fn personas(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Persona>> {
     call!(a, domain::canon::list_personas(&s.hub, &a))
 }
@@ -511,6 +547,11 @@ async fn asset_content(State(s): State<AppState>, Caller(a): Caller, Path(id): P
 }
 async fn request_review(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<ReleaseRevision> {
     call!(a, domain::release::request_review(&s.hub, &a, id))
+}
+/// One frozen revision; the operator's clients read the text, settings and
+/// payload hash before deciding in Paperclip.
+async fn release_get(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<ReleaseRevision> {
+    call!(a, domain::release::show(&s.hub, &a, id))
 }
 async fn link_approval(
     State(s): State<AppState>,

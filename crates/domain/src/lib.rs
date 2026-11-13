@@ -16,6 +16,7 @@ pub mod content;
 pub mod engagement;
 pub mod hash;
 pub mod news;
+pub mod opportunities;
 pub mod outbox;
 pub mod ports;
 pub mod production;

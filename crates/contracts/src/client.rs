@@ -204,4 +204,134 @@ impl HubClient {
     pub async fn set_pause(&self, body: &PauseIn) -> Result<SystemStatus, ClientError> {
         self.post("/system/pause", body).await
     }
+    // ── Opportunities (H1) ──────────────────────────────────────────────
+    pub async fn opportunities(&self, state: Option<&str>, due_within_days: Option<i32>) -> Result<Vec<Opportunity>, ClientError> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(state) = state {
+            query.push(("state", state.to_string()));
+        }
+        if let Some(days) = due_within_days {
+            query.push(("due_within_days", days.to_string()));
+        }
+        self.send(self.http.get(self.url("/opportunities")).query(&query)).await
+    }
+    pub async fn opportunity(&self, id: Uuid) -> Result<Opportunity, ClientError> {
+        self.get(&format!("/opportunities/{id}")).await
+    }
+    pub async fn ingest_opportunity(&self, body: &OpportunityIn) -> Result<Opportunity, ClientError> {
+        self.post("/ingest/opportunities", body).await
+    }
+    pub async fn decide_opportunity(&self, id: Uuid, body: &OpportunityDecisionIn) -> Result<Opportunity, ClientError> {
+        self.post(&format!("/opportunities/{id}/decision"), body).await
+    }
+    // ── Release approval (H2) ───────────────────────────────────────────
+    pub async fn release(&self, id: Uuid) -> Result<ReleaseRevision, ClientError> {
+        self.get(&format!("/releases/{id}")).await
+    }
+    /// Re-read the native approval and bind it to this exact revision.
+    pub async fn link_approval(&self, release: Uuid, body: &LinkApprovalIn) -> Result<ReleaseRevision, ClientError> {
+        self.post(&format!("/releases/{release}/link-approval"), body).await
+    }
+}
+
+/// The operator's own Paperclip board client.
+///
+/// H2 adds no privilege to the hub: the operator's key is read on their
+/// machine and used here, and only the resulting native decision is linked
+/// through [`HubClient::link_approval`]. `Debug` is manual so the key cannot
+/// leak through logs.
+#[derive(Clone)]
+pub struct PaperclipBoard {
+    http: reqwest::Client,
+    base: String,
+    key: String,
+}
+
+impl std::fmt::Debug for PaperclipBoard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaperclipBoard").field("base", &self.base).field("key", &"<redacted>").finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum PaperclipError {
+    Config(String),
+    Transport(String),
+    Api { status: u16, message: String },
+}
+
+impl std::fmt::Display for PaperclipError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaperclipError::Config(message) => write!(f, "paperclip config: {message}"),
+            PaperclipError::Transport(message) => write!(f, "paperclip unreachable: {message}"),
+            PaperclipError::Api { status, message } => write!(f, "paperclip {status}: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for PaperclipError {}
+
+impl PaperclipBoard {
+    pub fn new(base: impl Into<String>, key: impl Into<String>) -> Self {
+        let mut base = base.into();
+        while base.ends_with('/') {
+            base.pop();
+        }
+        Self { http: reqwest::Client::new(), base, key: key.into() }
+    }
+
+    /// The key file and URL use the Paperclip CLI's own variables,
+    /// `PAPERCLIP_API_KEY_FILE` and `PAPERCLIP_API_URL`. Without the first,
+    /// the key is read from `$XDG_CONFIG_HOME/paperclip/api-key` (or
+    /// `~/.config/paperclip/api-key`).
+    pub fn from_env() -> Result<Self, PaperclipError> {
+        let path = match std::env::var_os("PAPERCLIP_API_KEY_FILE").filter(|value| !value.is_empty()) {
+            Some(file) => std::path::PathBuf::from(file),
+            None => std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").filter(|value| !value.is_empty()).map(|home| std::path::PathBuf::from(home).join(".config"))
+                })
+                .ok_or_else(|| PaperclipError::Config("set PAPERCLIP_API_KEY_FILE, XDG_CONFIG_HOME or HOME".into()))?
+                .join("paperclip")
+                .join("api-key"),
+        };
+        let key = std::fs::read_to_string(&path).map_err(|e| PaperclipError::Config(format!("reading {}: {e}", path.display())))?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(PaperclipError::Config(format!("{} is empty", path.display())));
+        }
+        Ok(Self::new(std::env::var("PAPERCLIP_API_URL").unwrap_or_else(|_| "http://127.0.0.1:3117".into()), key))
+    }
+
+    /// Approve or reject one native approval as the board user. The body is
+    /// `resolveApprovalSchema` (`{ decisionNote?: string }`) and the note is
+    /// omitted when absent.
+    pub async fn decide(&self, approval_id: &str, approve: bool, note: Option<&str>) -> Result<serde_json::Value, PaperclipError> {
+        // The id is a path segment; anything else could change the request path.
+        if approval_id.is_empty() || !approval_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return Err(PaperclipError::Config(format!("approval id {approval_id:?} is not a safe path segment")));
+        }
+        let action = if approve { "approve" } else { "reject" };
+        let mut body = serde_json::Map::new();
+        if let Some(note) = note {
+            body.insert("decisionNote".into(), serde_json::Value::String(note.to_string()));
+        }
+        let resp = self
+            .http
+            .post(format!("{}/api/approvals/{approval_id}/{action}", self.base))
+            .bearer_auth(&self.key)
+            .json(&serde_json::Value::Object(body))
+            .send()
+            .await
+            .map_err(|e| PaperclipError::Transport(e.to_string()))?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|e| PaperclipError::Transport(e.to_string()))?;
+        if !status.is_success() {
+            return Err(PaperclipError::Api { status: status.as_u16(), message: String::from_utf8_lossy(&bytes).into_owned() });
+        }
+        serde_json::from_slice(&bytes).map_err(|e| PaperclipError::Transport(format!("decode: {e}")))
+    }
 }

@@ -5,7 +5,9 @@ use std::collections::HashMap;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use contracts::client::HubClient;
-use contracts::{CancelOut, ChatMessageIn, FreezeReleaseIn, GenerateIn, ReleaseState, ScheduleIn, SelectAssetIn, TimingScope};
+use contracts::{
+    CancelOut, ChatMessageIn, FreezeReleaseIn, GenerateIn, LinkApprovalIn, ReleaseState, ScheduleIn, SelectAssetIn, TimingScope,
+};
 use dioxus::prelude::*;
 use uuid::Uuid;
 
@@ -43,6 +45,7 @@ pub fn StudioView() -> Element {
     let mut schedule_at = use_signal(String::new);
     let mut settings = use_signal(platform::SettingsDraft::default);
     let mut settings_base = use_signal(serde_json::Value::default);
+    let mut decision_note = use_signal(String::new);
     let mut initialized_for = use_signal(|| Option::<Uuid>::None);
     let draft = settings.cloned();
     let frozen_json = serde_json::to_string_pretty(&settings_base.cloned()).unwrap_or_default();
@@ -199,6 +202,43 @@ pub fn StudioView() -> Element {
             }
         });
     };
+
+    let client_decide = client.clone();
+    let decide_release = move |(release_id, approve): (Uuid, bool)| {
+        let note = decision_note.cloned();
+        let client_decide = client_decide.clone();
+        spawn(async move {
+            // Fetch the revision again: the operator decides on what the hub
+            // holds now, not on a possibly stale detail pane.
+            let outcome = async {
+                let revision = api::timed(client_decide.release(release_id)).await?;
+                let approval_id = revision.paperclip_approval_id.clone().ok_or_else(|| {
+                    crate::state::UiError::new("missing_approval", "release has no Paperclip approval; request review first")
+                })?;
+                // The operator's own board key, read locally and never sent
+                // to the hub.
+                let board = contracts::client::PaperclipBoard::from_env()
+                    .map_err(|error| crate::state::UiError::new("paperclip_config", error.to_string()))?;
+                board
+                    .decide(&approval_id, approve, (!note.is_empty()).then_some(note.as_str()))
+                    .await
+                    .map_err(|error| crate::state::UiError::new("paperclip", error.to_string()))?;
+                api::timed(client_decide.link_approval(release_id, &LinkApprovalIn { approval_id })).await
+            }
+            .await;
+            match outcome {
+                Ok(revision) => {
+                    store.notify(true, format!("Release {} is {}.", revision.revision, revision.state));
+                    if let Some(content_id) = (store.selected_content).cloned() {
+                        api::load_content_detail(store, client_decide.clone(), content_id).await;
+                    }
+                    api::refresh_base(store, client_decide).await;
+                }
+                Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
+            }
+        });
+    };
+    let reject_release = decide_release.clone();
 
     let client_schedule = client.clone();
     let schedule = move |release_id: Uuid| {
@@ -684,6 +724,34 @@ pub fn StudioView() -> Element {
                                         div { class: "kv", span { class: "k", "payload hash" }, span { class: "v", "{release.payload_hash}" } }
                                         if let Some(approval) = release.paperclip_approval_id.clone() {
                                             div { class: "kv", span { class: "k", "paperclip approval" }, span { class: "v", "{approval}" } }
+                                        }
+                                        if let Some(action) = release.actions.first() {
+                                            div { class: "kv", span { class: "k", "frozen text" }, span { class: "v", "{action.text}" } }
+                                            div { class: "field-row",
+                                                span { class: "label-tech", "frozen settings" }
+                                                pre { class: "raw-json", "{serde_json::to_string_pretty(&action.platform_settings).unwrap_or_default()}" }
+                                            }
+                                        }
+                                        if release.state == ReleaseState::InReview && release.paperclip_approval_id.is_some() {
+                                            div { class: "form-grid",
+                                                div { class: "field-row",
+                                                    label { class: "label-tech", r#for: "decision-note", "Decision note (optional)" }
+                                                    input {
+                                                        id: "decision-note", class: "input", value: "{decision_note}",
+                                                        oninput: move |e| decision_note.set(e.value()),
+                                                    }
+                                                }
+                                                div { class: "form-actions",
+                                                    {
+                                                        let id = release.id;
+                                                        rsx! { button { class: "btn btn-primary", onclick: move |_| decide_release((id, true)), "Approve" } }
+                                                    }
+                                                    {
+                                                        let id = release.id;
+                                                        rsx! { button { class: "btn btn-glass", onclick: move |_| reject_release((id, false)), "Reject" } }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

@@ -209,6 +209,27 @@ is an agenix secret and was not read, so no authenticated call was made.
 Approval create has no idempotency field in 0.3.1: an ambiguous create is
 dead-lettered and the operator links the existing approval (hash-checked).
 
+### Opportunities and operator approval (streams H1/H2)
+
+`POST /v1/ingest/opportunities` accepts the ingest, procedure, operator and
+agent roles and upserts on `(company_id, source, external_id)`, updating facts
+and never the operator's state. `GET /v1/opportunities` filters by `state` and
+`due_within_days`, `GET /v1/opportunities/{id}` shows one call with a derived
+`expired`, and `POST /v1/opportunities/{id}/decision` is operator-only. `/v1/today`
+adds shortlisted or drafting calls due within 14 days. The same commands are
+`hubctl opportunities|opportunity` and the MCP tools `hub_opportunities`,
+`hub_opportunity` and `hub_ingest_opportunity` (Write); deciding stays out of
+MCP.
+
+Approval adds no privilege to the hub. `hubctl approve` and the Studio action
+read the operator's own key from `PAPERCLIP_API_KEY_FILE` (the Paperclip CLI's
+variable; fallback `$XDG_CONFIG_HOME/paperclip/api-key`), use
+`PAPERCLIP_API_URL` (default `http://127.0.0.1:3117`) and call Paperclip's
+`POST /api/approvals/{id}/approve|reject` directly, then the existing
+hash-checked `link-approval`; the key never reaches the hub. Fixture-tested
+against a mock Paperclip HTTP server, including a changed payload after the
+decision. No live board call was made.
+
 ### Windmill
 
 `CE v1.839.0`, workspace `studio`. Adapter `live/windmill.rs`: `run_generation`,
