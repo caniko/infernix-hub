@@ -89,7 +89,9 @@ async fn report_units(client: HubClient) {
                 .collect();
             tokio::time::timeout(
                 Duration::from_secs(15),
-                client.sync_notifications(&SyncNotificationsIn { source: "units".into(), items }),
+                // Per-host source: one token may run a tray on several hosts, and a
+                // sync resolves every row of its source that it does not list.
+                client.sync_notifications(&SyncNotificationsIn { source: key_safe(&format!("units:{}", hostname.trim())), items }),
             )
             .await??;
             Ok::<_, anyhow::Error>(())
