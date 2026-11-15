@@ -55,10 +55,23 @@ fn select(where_: &str) -> String {
     )
 }
 
+/// Serializes notification writers through commit. `nextval` is not
+/// transactional, so without this a writer could allocate seq N, another commit
+/// N+1, and a reader advance its cursor past N before N commits. Under the lock
+/// every snapshot sees a prefix of the allocated seqs.
+// ponytail: one global lock; writes are a handful per minute. Finer locking if that changes.
+async fn lock_writers(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> DResult<()> {
+    sqlx::query("select pg_advisory_xact_lock(hashtext('hub.notifications'))").execute(&mut **tx).await?;
+    Ok(())
+}
+
 /// The only write producers use. `true` when a row changed, i.e. when a new or
 /// reopened condition was announced.
 pub async fn raise(hub: &Hub, raise: &Raise) -> DResult<bool> {
-    let changed = upsert(&hub.db, &hub.config.company_id, raise).await?;
+    let mut tx = hub.db.begin().await?;
+    lock_writers(&mut tx).await?;
+    let changed = upsert(&mut *tx, &hub.config.company_id, raise).await?;
+    tx.commit().await?;
     if changed {
         hub.notified.notify_waiters();
     }
@@ -100,6 +113,7 @@ where
 /// row of that source the pass did not mention. Returns how many rows changed.
 pub async fn sync(hub: &Hub, source: &str, current: Vec<Raise>) -> DResult<usize> {
     let mut tx = hub.db.begin().await?;
+    lock_writers(&mut tx).await?;
     let mut changed = 0;
     for raise in &current {
         changed += usize::from(upsert(&mut *tx, &hub.config.company_id, raise).await?);
@@ -123,31 +137,59 @@ pub async fn sync(hub: &Hub, source: &str, current: Vec<Raise>) -> DResult<usize
     Ok(changed)
 }
 
-/// Rows newer than the caller's cursor, newest first. `cursor` advances past
-/// every row, so a client that echoes it never reads one twice; the counts
-/// always describe *all* open rows.
-pub async fn page(hub: &Hub, actor: &Actor, after: i64, all: bool, limit: i64) -> DResult<NotificationPage> {
+/// Without `after`: a snapshot of the newest open (or all) rows, and `cursor` is
+/// that snapshot's high-water mark. With `after`: the feed. It takes the oldest
+/// `limit` changes past the cursor and advances only through them, so a client
+/// that echoes `cursor` never skips a change it did not receive; `state` then
+/// only filters what is shown from that window. Items are newest first either
+/// way, and the counts always describe *all* open rows.
+pub async fn page(hub: &Hub, actor: &Actor, after: Option<i64>, all: bool, limit: i64) -> DResult<NotificationPage> {
     actor.require(crate::ANY_READER)?;
     let limit = limit.clamp(1, MAX_LIMIT);
-    let rows: Vec<Value> =
-        sqlx::query_scalar(&select(&format!("company_id = $1 and seq > $2 and ($3 or ({OPEN})) order by seq desc limit $4")))
-            .bind(&hub.config.company_id)
-            .bind(after)
-            .bind(all)
-            .bind(limit)
-            .fetch_all(&hub.db)
-            .await?;
-    let (cursor, open, critical): (i64, i64, i64) = sqlx::query_as(&format!(
+    // One snapshot for items, cursor and counts.
+    let mut tx = hub.db.begin().await?;
+    sqlx::query("set transaction isolation level repeatable read, read only").execute(&mut *tx).await?;
+    let company = &hub.config.company_id;
+    let (items, cursor) = match after {
+        None => {
+            let rows: Vec<Value> = sqlx::query_scalar(&select(&format!("company_id = $1 and ($2 or ({OPEN})) order by seq desc limit $3")))
+                .bind(company)
+                .bind(all)
+                .bind(limit)
+                .fetch_all(&mut *tx)
+                .await?;
+            let mut items: Vec<Notification> = decode(rows)?;
+            items.sort_by_key(|n| std::cmp::Reverse(n.seq));
+            let cursor: i64 = sqlx::query_scalar("select coalesce(max(seq), 0) from notifications where company_id = $1")
+                .bind(company)
+                .fetch_one(&mut *tx)
+                .await?;
+            (items, cursor)
+        }
+        Some(after) => {
+            let rows: Vec<Value> = sqlx::query_scalar(&select("company_id = $1 and seq > $2 order by seq limit $3"))
+                .bind(company)
+                .bind(after)
+                .bind(limit)
+                .fetch_all(&mut *tx)
+                .await?;
+            let window: Vec<Notification> = decode(rows)?;
+            let cursor = window.iter().map(|n| n.seq).max().unwrap_or(after);
+            let mut items: Vec<Notification> = window.into_iter().filter(|n| all || n.open).collect();
+            items.sort_by_key(|n| std::cmp::Reverse(n.seq));
+            (items, cursor)
+        }
+    };
+    let (open, critical): (i64, i64) = sqlx::query_as(&format!(
         "select
-           (select coalesce(max(seq), $2) from notifications where company_id = $1 and seq > $2),
            (select count(*) from notifications where company_id = $1 and ({OPEN})),
            (select count(*) from notifications where company_id = $1 and ({OPEN}) and severity = 'critical')"
     ))
-    .bind(&hub.config.company_id)
-    .bind(after)
-    .fetch_one(&hub.db)
+    .bind(company)
+    .fetch_one(&mut *tx)
     .await?;
-    Ok(NotificationPage { items: decode(rows)?, cursor, open, critical })
+    tx.commit().await?;
+    Ok(NotificationPage { items, cursor, open, critical })
 }
 
 /// Operator-only. Acknowledges the given ids, or every open row. One audit row
@@ -158,12 +200,15 @@ pub async fn ack(hub: &Hub, actor: &Actor, input: AckNotificationsIn) -> DResult
         return Err(invalid("nothing_selected", "pass ids or all"));
     }
     let mut tx = hub.db.begin().await?;
-    let ids: Vec<Uuid> = sqlx::query_scalar(
+    lock_writers(&mut tx).await?;
+    // `all` means every *open* row: a row snoozed into the future stays unread
+    // so it resurfaces when the snooze lapses.
+    let ids: Vec<Uuid> = sqlx::query_scalar(&format!(
         "update notifications
          set read_at = now(), seq = nextval('notifications_seq'), updated_at = now()
-         where company_id = $1 and read_at is null and ($2 or id = any($3))
-         returning id",
-    )
+         where company_id = $1 and read_at is null and (($2 and ({OPEN})) or id = any($3))
+         returning id"
+    ))
     .bind(&hub.config.company_id)
     .bind(input.all)
     .bind(&input.ids)
@@ -177,7 +222,7 @@ pub async fn ack(hub: &Hub, actor: &Actor, input: AckNotificationsIn) -> DResult
     if !ids.is_empty() {
         hub.notified.notify_waiters();
     }
-    page(hub, actor, 0, false, MAX_LIMIT).await
+    page(hub, actor, None, false, MAX_LIMIT).await
 }
 
 /// Operator-only. Hides the row until `until`; the producer loop announces a
@@ -188,6 +233,7 @@ pub async fn snooze(hub: &Hub, actor: &Actor, id: Uuid, input: SnoozeNotificatio
         return Err(invalid("past_until", "snooze until must be in the future"));
     }
     let mut tx = hub.db.begin().await?;
+    lock_writers(&mut tx).await?;
     let changed = sqlx::query(
         "update notifications
          set snoozed_until = $3, seq = nextval('notifications_seq'), updated_at = now()

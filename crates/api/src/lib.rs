@@ -493,10 +493,13 @@ async fn notification_list(State(s): State<AppState>, Caller(a): Caller, Query(q
         let notified = s.hub.notified.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let page = domain::notifications::page(&s.hub, &a, q.after.unwrap_or(0), all, q.limit.unwrap_or(domain::notifications::MAX_LIMIT))
+        let page = domain::notifications::page(&s.hub, &a, q.after, all, q.limit.unwrap_or(domain::notifications::MAX_LIMIT))
             .await
             .map_err(err(&a))?;
-        if !page.items.is_empty() || wait == 0 || tokio::time::timeout_at(deadline, notified).await.is_err() {
+        // A feed window of only filtered-out rows still moved the cursor: return
+        // it, or the client would wait on changes it has already passed.
+        let advanced = q.after.is_some_and(|after| page.cursor != after);
+        if !page.items.is_empty() || advanced || wait == 0 || tokio::time::timeout_at(deadline, notified).await.is_err() {
             return Ok(Json(page));
         }
     }

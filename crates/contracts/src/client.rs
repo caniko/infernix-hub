@@ -236,8 +236,13 @@ impl HubClient {
     /// Rows newer than `after`; `wait` seconds holds the request open on the
     /// server until something changes. `all` includes acknowledged and resolved
     /// rows.
-    pub async fn notifications(&self, after: i64, wait: u64, all: bool) -> Result<NotificationPage, ClientError> {
-        let mut query: Vec<(&str, String)> = vec![("after", after.to_string()), ("state", if all { "all".into() } else { "open".into() })];
+    /// `after: None` reads a snapshot of the current set; `Some(cursor)` reads
+    /// the feed of changes past `cursor` (echo the returned `cursor` back).
+    pub async fn notifications(&self, after: Option<i64>, wait: u64, all: bool) -> Result<NotificationPage, ClientError> {
+        let mut query: Vec<(&str, String)> = vec![("state", if all { "all".into() } else { "open".into() })];
+        if let Some(after) = after {
+            query.push(("after", after.to_string()));
+        }
         if wait > 0 {
             query.push(("wait", wait.to_string()));
         }

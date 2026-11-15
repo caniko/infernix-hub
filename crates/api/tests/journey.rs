@@ -2300,18 +2300,18 @@ async fn notifications_dedupe_ack_resolve_and_wake() {
     assert_eq!(again.id, first.id);
     assert_eq!(again.seq, first.seq, "an unchanged condition touches nothing");
     assert_eq!(first.source, "agent", "source defaults to agent");
-    let page = h.op.notifications(0, 0, true).await.unwrap();
+    let page = h.op.notifications(None, 0, true).await.unwrap();
     assert_eq!(page.items.len(), 1);
     assert_eq!((page.open, page.critical), (1, 0));
     assert_eq!(page.cursor, first.seq);
     assert!(page.items[0].open);
-    assert_eq!(h.op.notifications(0, 0, false).await.unwrap().items.len(), 1, "open is the default state");
+    assert_eq!(h.op.notifications(None, 0, false).await.unwrap().items.len(), 1, "open is the default state");
 
     // Acknowledging closes the row, moves the cursor and audits once.
     let after_ack = h.op.ack_notifications(&AckNotificationsIn { ids: vec![first.id], all: false }).await.unwrap();
     assert_eq!(after_ack.open, 0);
     assert!(after_ack.items.is_empty(), "an acknowledged row is not open");
-    let acked = h.op.notifications(0, 0, true).await.unwrap().items.remove(0);
+    let acked = h.op.notifications(None, 0, true).await.unwrap().items.remove(0);
     assert!(acked.read_at.is_some() && !acked.open);
     assert!(acked.seq > first.seq, "the ack moves the cursor");
     let history = h.op.get::<Vec<HistoryEntry>>(&format!("/history/notification/{}", first.id)).await.unwrap();
@@ -2324,9 +2324,9 @@ async fn notifications_dedupe_ack_resolve_and_wake() {
 
     // A producer pass resolves what it no longer reports, and only its source.
     domain::notifications::raise(&h.hub, &notification_raise("today", "today:renewal:abc:due")).await.unwrap();
-    assert_eq!(h.op.notifications(0, 0, false).await.unwrap().open, 1);
+    assert_eq!(h.op.notifications(None, 0, false).await.unwrap().open, 1);
     assert_eq!(domain::notifications::sync(&h.hub, "today", vec![]).await.unwrap(), 1);
-    let rows = h.op.notifications(0, 0, true).await.unwrap();
+    let rows = h.op.notifications(None, 0, true).await.unwrap();
     let today = rows.items.iter().find(|n| n.dedupe_key == "today:renewal:abc:due").unwrap();
     assert!(today.resolved_at.is_some() && !today.open);
     let kept = rows.items.iter().find(|n| n.id == first.id).unwrap();
@@ -2342,7 +2342,7 @@ async fn notifications_dedupe_ack_resolve_and_wake() {
     let snoozed =
         h.op.snooze_notification(reopened.id, &SnoozeNotificationIn { until: Utc::now() + chrono::Duration::hours(1) }).await.unwrap();
     assert!(snoozed.snoozed_until.is_some() && !snoozed.open);
-    assert!(h.op.notifications(0, 0, false).await.unwrap().items.is_empty());
+    assert!(h.op.notifications(None, 0, false).await.unwrap().items.is_empty());
     let past =
         h.op.snooze_notification(reopened.id, &SnoozeNotificationIn { until: Utc::now() - chrono::Duration::hours(1) }).await.unwrap_err();
     assert_eq!(code(past), "past_until");
@@ -2350,10 +2350,10 @@ async fn notifications_dedupe_ack_resolve_and_wake() {
     assert!(history.iter().any(|e| e.action == "notification.snoozed"));
 
     // The long poll: a request started first returns at once when a raise lands.
-    let after = h.op.notifications(0, 0, true).await.unwrap().cursor;
+    let after = h.op.notifications(None, 0, true).await.unwrap().cursor;
     let wake = h.op.clone();
     let started = std::time::Instant::now();
-    let waiter = tokio::spawn(async move { wake.notifications(after, 5, true).await });
+    let waiter = tokio::spawn(async move { wake.notifications(Some(after), 5, true).await });
     tokio::time::sleep(Duration::from_millis(300)).await;
     h.op.raise_notification(&notification_in("agent:wake", "woke")).await.unwrap();
     let woke = waiter.await.unwrap().unwrap();
@@ -2376,9 +2376,35 @@ async fn notifications_dedupe_ack_resolve_and_wake() {
     h.procedure.raise_notification(&notification_in("agent:procedure", "")).await.unwrap();
     assert_eq!(code(h.ingest.raise_notification(&notification_in("agent:ingest", "")).await.unwrap_err()), "forbidden");
 
-    // Acknowledge all clears whatever is still open.
+    // Acknowledge all clears whatever is still open, but not a row snoozed into
+    // the future: that one must resurface when its snooze lapses.
     let cleared = h.op.ack_notifications(&AckNotificationsIn { ids: vec![], all: true }).await.unwrap();
     assert_eq!(cleared.open, 0);
     assert!(cleared.items.is_empty());
-    assert_eq!(h.op.notifications(0, 0, true).await.unwrap().items.iter().filter(|n| n.open).count(), 0);
+    let rows = h.op.notifications(None, 0, true).await.unwrap();
+    assert_eq!(rows.items.iter().filter(|n| n.open).count(), 0);
+    assert!(rows.items.iter().find(|n| n.id == reopened.id).unwrap().read_at.is_none(), "ack all skips a snoozed row");
+}
+
+#[tokio::test]
+async fn notification_feed_never_skips_a_truncated_change() {
+    let Some(h) = harness().await else { return };
+    let op = actor(Role::Operator, "operator");
+    let start = domain::notifications::page(&h.hub, &op, None, true, 200).await.unwrap().cursor;
+    for key in ["agent:feed-a", "agent:feed-b", "agent:feed-c"] {
+        h.op.raise_notification(&notification_in(key, "")).await.unwrap();
+    }
+    // A one-row window walks the changes oldest first and never jumps past one.
+    let mut cursor = start;
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let page = domain::notifications::page(&h.hub, &op, Some(cursor), true, 1).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.cursor, page.items[0].seq, "the cursor stops at the last row delivered");
+        seen.push(page.items[0].dedupe_key.clone());
+        cursor = page.cursor;
+    }
+    assert_eq!(seen, ["agent:feed-a", "agent:feed-b", "agent:feed-c"]);
+    let done = domain::notifications::page(&h.hub, &op, Some(cursor), true, 1).await.unwrap();
+    assert!(done.items.is_empty() && done.cursor == cursor);
 }
