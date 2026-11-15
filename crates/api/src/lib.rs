@@ -295,8 +295,13 @@ pub async fn notify_loop(hub: Hub, fleet_status_file: Option<std::path::PathBuf>
 /// are announced and old rows pruned. A failed step is logged and the others
 /// still run; nothing here is fatal.
 pub async fn notify_pass(hub: &Hub, fleet_status_file: Option<&FsPath>, summary_stale_hours: Option<u32>) {
-    match domain::content::system_today(hub).await {
-        Ok(today) => notify_sync(hub, "today", domain::notifications::today_raises(&today)).await,
+    let today = async {
+        let today = domain::content::system_today(hub).await?;
+        domain::notifications::today_with_stalled(hub, &today).await
+    }
+    .await;
+    match today {
+        Ok(raises) => notify_sync(hub, "today", raises).await,
         Err(error) => tracing::warn!(%error, "notifications: today source skipped"),
     }
     if let Some(path) = fleet_status_file {
