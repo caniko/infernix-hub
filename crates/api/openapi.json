@@ -133,6 +133,10 @@
         "description": "See hub_contracts::NotificationPage",
         "type": "object"
       },
+      "ObserveRenewalIn": {
+        "description": "See hub_contracts::ObserveRenewalIn",
+        "type": "object"
+      },
       "Opportunity": {
         "description": "See hub_contracts::Opportunity",
         "type": "object"
@@ -2707,6 +2711,59 @@
           }
         ],
         "x-roles": "operator"
+      }
+    },
+    "/v1/renewals/{key}/observe": {
+      "post": {
+        "operationId": "renewal_observe",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ObserveRenewalIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Renewal"
+                }
+              }
+            },
+            "description": "Renewal"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "operator, procedure"
       }
     },
     "/v1/search": {

@@ -198,6 +198,19 @@ enum RenewalCmd {
         #[arg(long)]
         due: Option<DateTime<Utc>>,
     },
+    /// Operator or procedure: record a provider observation; never a renewal.
+    Observe {
+        key: String,
+        /// date | never | unverifiable | inactive | not_yet_valid
+        #[arg(long)]
+        outcome: String,
+        /// Required for `date`, refused for every other outcome.
+        #[arg(long)]
+        expires_at: Option<DateTime<Utc>>,
+        /// RFC 3339; defaults to now, refused when over 60 s in the future.
+        #[arg(long)]
+        observed_at: Option<DateTime<Utc>>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -288,6 +301,13 @@ async fn main() -> Result<()> {
         Cmd::Renewals { cmd } => match cmd {
             RenewalCmd::List => print(c.renewals().await?),
             RenewalCmd::Renewed { key, due } => print(c.renewal_renewed(&key, &RenewalRenewedIn { due_at: due }).await?),
+            RenewalCmd::Observe { key, outcome, expires_at, observed_at } => {
+                let outcome = Observation::parse(&outcome).ok_or_else(|| {
+                    anyhow::anyhow!("unknown outcome {outcome:?}; use date, never, unverifiable, inactive or not_yet_valid")
+                })?;
+                let body = ObserveRenewalIn { outcome, expires_at, observed_at: observed_at.unwrap_or_else(Utc::now) };
+                print(c.observe_renewal(&key, &body).await?)
+            }
         },
         Cmd::Notifications { cmd } => match cmd {
             NotificationCmd::List { all } => print(c.notifications(None, 0, all).await?),

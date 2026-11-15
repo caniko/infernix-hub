@@ -2260,6 +2260,121 @@ async fn today_lists_unknown_overdue_and_near_renewals_only() {
 }
 
 #[tokio::test]
+async fn provider_observations_judge_expiry_without_moving_the_renewal_clock() {
+    let Some(h) = harness().await else { return };
+    let mut provider = renewal_seed("provider-token", None, None);
+    provider["expiry_kind"] = json!("provider");
+    let mut never = renewal_seed("never-token", None, None);
+    never["expiry_kind"] = json!("never");
+    let cadence_due = Utc::now() + chrono::Duration::days(3);
+    let cadence = renewal_seed("cadence-token", Some(60), Some(cadence_due));
+    seed_renewals(&h, json!([provider, never, cadence])).await;
+
+    // An unobserved provider renewal is unverifiable, never healthy and never
+    // promoted to `never`; a `never` kind is its own state.
+    let row = renewal(&h, "provider-token").await;
+    assert_eq!(row.expiry_kind, ExpiryKind::Provider);
+    assert_eq!(row.status, "unverifiable");
+    assert!(row.observation.is_none() && row.observed_at.is_none() && row.last_good_at.is_none());
+    let never_row = renewal(&h, "never-token").await;
+    assert_eq!(never_row.expiry_kind, ExpiryKind::Never);
+    assert_eq!(never_row.status, "never");
+    assert_eq!(renewal(&h, "cadence-token").await.status, "due");
+
+    // A procedure collector records a date. The operator clock does not move.
+    let expires = Utc::now() + chrono::Duration::days(2);
+    let observed = h
+        .procedure
+        .observe_renewal(
+            "provider-token",
+            &ObserveRenewalIn { outcome: Observation::Date, expires_at: Some(expires), observed_at: Utc::now() },
+        )
+        .await
+        .unwrap();
+    assert_eq!(observed.observation, Some(Observation::Date));
+    assert!(observed.observed_at.is_some() && observed.last_good_at.is_some());
+    assert!(within(observed.last_good_expires_at.unwrap(), expires));
+    assert_eq!(observed.status, "due", "two days is inside the 14-day warn window");
+    assert!(observed.due_at.is_none() && observed.renewed_at.is_none(), "an observation is not a rotation");
+
+    // Today carries the judgement and never the `never` row.
+    let today = h.op.today().await.unwrap();
+    let provider_id = observed.id;
+    let item = today.renewals.iter().find(|item| item.subject_id == provider_id).unwrap();
+    assert_eq!(item.status, "due");
+    assert!(within(item.at.unwrap(), expires), "the reported date is the deadline");
+    assert!(!today.renewals.iter().any(|item| item.subject_id == never_row.id), "a never-expiring renewal is not a to-do");
+
+    // A provider-confirmed inactive credential is invalid, and keeps the last
+    // good deadline only as context.
+    let inactive = h
+        .procedure
+        .observe_renewal("provider-token", &ObserveRenewalIn { outcome: Observation::Inactive, expires_at: None, observed_at: Utc::now() })
+        .await
+        .unwrap();
+    assert_eq!(inactive.status, "invalid");
+    assert_eq!(inactive.observation, Some(Observation::Inactive));
+    assert_eq!(inactive.last_good_expires_at, observed.last_good_expires_at);
+    let today = h.op.today().await.unwrap();
+    assert_eq!(today.renewals.iter().find(|item| item.subject_id == provider_id).unwrap().status, "invalid");
+
+    // Refusals: a future clock, a missing or unexpected `expires_at`, and a
+    // renewal whose kind no collector may observe.
+    let future = h
+        .procedure
+        .observe_renewal(
+            "provider-token",
+            &ObserveRenewalIn { outcome: Observation::Never, expires_at: None, observed_at: Utc::now() + chrono::Duration::seconds(61) },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(future), "observed_in_future");
+    let missing = h
+        .procedure
+        .observe_renewal("provider-token", &ObserveRenewalIn { outcome: Observation::Date, expires_at: None, observed_at: Utc::now() })
+        .await
+        .unwrap_err();
+    assert_eq!(code(missing), "expires_at_required");
+    let unexpected = h
+        .procedure
+        .observe_renewal(
+            "provider-token",
+            &ObserveRenewalIn { outcome: Observation::Never, expires_at: Some(expires), observed_at: Utc::now() },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(unexpected), "expires_at_unexpected");
+    let wrong_kind = h
+        .procedure
+        .observe_renewal(
+            "cadence-token",
+            &ObserveRenewalIn { outcome: Observation::Date, expires_at: Some(expires), observed_at: Utc::now() },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(wrong_kind), "not_provider");
+    let forbidden = h
+        .agent
+        .observe_renewal("provider-token", &ObserveRenewalIn { outcome: Observation::Never, expires_at: None, observed_at: Utc::now() })
+        .await
+        .unwrap_err();
+    assert_eq!(code(forbidden), "forbidden");
+    assert_eq!(renewal(&h, "provider-token").await.observation, Some(Observation::Inactive), "a refused observation changes nothing");
+
+    // A re-seed refreshes facts but never the observation columns.
+    let mut reseeded = renewal_seed("provider-token", None, None);
+    reseeded["expiry_kind"] = json!("provider");
+    reseeded["title"] = json!("Renamed provider token");
+    seed_renewals(&h, json!([reseeded])).await;
+    let after = renewal(&h, "provider-token").await;
+    assert_eq!(after.title, "Renamed provider token");
+    assert_eq!(after.observation, Some(Observation::Inactive));
+    assert_eq!(after.observed_at, inactive.observed_at);
+    assert_eq!(after.last_good_at, inactive.last_good_at);
+    assert_eq!(after.last_good_expires_at, inactive.last_good_expires_at);
+}
+
+#[tokio::test]
 async fn renewals_stay_inside_the_hubs_company_and_keys_are_slugs() {
     let Some(h) = harness().await else { return };
     let seed = |renewals| serde_json::from_value::<bootstrap::Seed>(json!({ "renewals": renewals })).unwrap();

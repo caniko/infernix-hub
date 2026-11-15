@@ -143,6 +143,7 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/opportunities/{id}/decision", post(opportunity_decide))
         .route("/renewals", get(renewal_list))
         .route("/renewals/{key}/renewed", post(renewal_renewed))
+        .route("/renewals/{key}/observe", post(renewal_observe))
         .route("/notifications", get(notification_list).post(raise_notification))
         .route("/notifications/ack", post(ack_notifications))
         .route("/notifications/{id}/snooze", post(snooze_notification))
@@ -514,6 +515,14 @@ async fn renewal_renewed(
     Json(b): Json<RenewalRenewedIn>,
 ) -> R<Renewal> {
     call!(a, domain::renewals::renewed(&s.hub, &a, &key, b))
+}
+async fn renewal_observe(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(key): Path<String>,
+    Json(b): Json<ObserveRenewalIn>,
+) -> R<Renewal> {
+    call!(a, domain::renewals::observe(&s.hub, &a, &key, b))
 }
 
 #[derive(Deserialize)]
