@@ -245,6 +245,22 @@ the desktop as "Renewals due". `hubctl renewals list|renewed KEY [--due
 RFC3339]` and the read-only MCP tool `hub_renewals` read the same rows; no MCP
 tool can mark a renewal.
 
+### Notifications
+
+One row per condition, keyed by `dedupe_key`: the source sets it, and an
+unchanged condition touches nothing, so an acknowledgement survives a producer
+pass and only a changed or returning one reopens. `seq` is the long-poll cursor
+and moves on every change. `GET /v1/notifications` reads a snapshot (no `after`)
+or the feed past a cursor, optionally holding the request with `wait` seconds;
+`POST /v1/notifications` upserts, and `POST /v1/notifications/ack` and
+`POST /v1/notifications/{id}/snooze` are operator-only. `hubctl notifications
+list|ack|snooze` and `hubctl notify --key --severity --title` drive the same
+routes. The MCP tools are `hub_notifications` (Read, snapshot, optional `all`),
+`hub_notify` (Write, source defaults to `agent` server-side) and
+`hub_post_summary` (Write, one row per day keyed `summary:<YYYY-MM-DD>` with
+title `Daily summary <day>`); the three producer sources `today`, `fleet` and
+`hub` and their key prefixes stay reserved. No MCP tool acknowledges or snoozes.
+
 ### Windmill
 
 `CE v1.839.0`, workspace `studio`. Adapter `live/windmill.rs`: `run_generation`,

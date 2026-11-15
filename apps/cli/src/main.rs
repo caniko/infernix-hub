@@ -131,6 +131,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RenewalCmd,
     },
+    /// Operator notifications: the current set, plus the operator-only
+    /// acknowledge and snooze actions.
+    Notifications {
+        #[command(subcommand)]
+        cmd: NotificationCmd,
+    },
+    /// Raise one notification; the key is its dedupe identity.
+    Notify {
+        #[arg(long)]
+        key: String,
+        /// info|warning|critical.
+        #[arg(long)]
+        severity: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        body: String,
+    },
     /// Approve the release's native Paperclip approval with the operator's own
     /// board key, then link it. `--reject` records a rejection instead.
     Approve {
@@ -179,6 +197,27 @@ enum RenewalCmd {
         key: String,
         #[arg(long)]
         due: Option<DateTime<Utc>>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotificationCmd {
+    /// Snapshot of the newest rows; `--all` includes acknowledged and resolved.
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Operator-only: acknowledge ids, or every open row with `--all`.
+    Ack {
+        ids: Vec<Uuid>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Operator-only: hide one row until a time.
+    Snooze {
+        id: Uuid,
+        #[arg(long)]
+        until: DateTime<Utc>,
     },
 }
 
@@ -250,6 +289,28 @@ async fn main() -> Result<()> {
             RenewalCmd::List => print(c.renewals().await?),
             RenewalCmd::Renewed { key, due } => print(c.renewal_renewed(&key, &RenewalRenewedIn { due_at: due }).await?),
         },
+        Cmd::Notifications { cmd } => match cmd {
+            NotificationCmd::List { all } => print(c.notifications(None, 0, all).await?),
+            NotificationCmd::Ack { ids, all } => print(c.ack_notifications(&AckNotificationsIn { ids, all }).await?),
+            NotificationCmd::Snooze { id, until } => print(c.snooze_notification(id, &SnoozeNotificationIn { until }).await?),
+        },
+        Cmd::Notify { key, severity, title, body } => {
+            let severity = Severity::parse(&severity)
+                .ok_or_else(|| anyhow::anyhow!("unknown severity {severity:?}; use info, warning or critical"))?;
+            print(
+                c.raise_notification(&RaiseNotificationIn {
+                    source: None,
+                    dedupe_key: key,
+                    severity,
+                    title,
+                    body,
+                    subject_type: None,
+                    subject_id: None,
+                    url: None,
+                })
+                .await?,
+            )
+        }
         Cmd::Approve { release, reject, note } => {
             let revision = c.release(release).await?;
             // Show exactly what the approval authorizes before deciding.
