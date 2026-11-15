@@ -53,7 +53,7 @@ enum Cmd {
 }
 
 fn parse_role(s: &str) -> Result<Role, String> {
-    Role::parse(s).ok_or_else(|| "role must be operator|agent|procedure|ingest".into())
+    Role::parse(s).ok_or_else(|| "role must be operator|agent|procedure|ingest|member".into())
 }
 
 /// Fixed tokens for the local fixture journey only.

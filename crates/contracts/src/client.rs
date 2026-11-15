@@ -255,11 +255,14 @@ impl HubClient {
     pub async fn raise_notification(&self, body: &RaiseNotificationIn) -> Result<Notification, ClientError> {
         self.post("/notifications", body).await
     }
-    /// Operator-only: `ids` or `all`; returns the remaining open page.
+    pub async fn sync_notifications(&self, body: &SyncNotificationsIn) -> Result<SyncNotificationsOut, ClientError> {
+        self.post("/notifications/sync", body).await
+    }
+    /// Acknowledge `ids` or `all`; returns the remaining open page.
     pub async fn ack_notifications(&self, body: &AckNotificationsIn) -> Result<NotificationPage, ClientError> {
         self.post("/notifications/ack", body).await
     }
-    /// Operator-only: hide one row until `until`.
+    /// Hide one row until `until`.
     pub async fn snooze_notification(&self, id: Uuid, body: &SnoozeNotificationIn) -> Result<Notification, ClientError> {
         self.post(&format!("/notifications/{id}/snooze"), body).await
     }

@@ -2423,6 +2423,153 @@ fn notification_raise(source: &str, key: &str) -> domain::notifications::Raise {
 }
 
 #[tokio::test]
+async fn member_notifications_are_isolated() {
+    let Some(h) = harness().await else { return };
+    domain::system::issue_token(&h.hub.db, "dejana", Role::Member, Some("member".into())).await.unwrap();
+    domain::system::issue_token(&h.hub.db, "other", Role::Member, Some("other".into())).await.unwrap();
+    let member = HubClient::new(&h.url, "member");
+    let other = HubClient::new(&h.url, "other");
+    assert_eq!(code(member.today().await.unwrap_err()), "forbidden");
+    assert_eq!(code(member.get::<serde_json::Value>("/status").await.unwrap_err()), "forbidden");
+    assert_eq!(code(member.get::<serde_json::Value>("/fleet/status").await.unwrap_err()), "forbidden");
+    let op = h.op.raise_notification(&notification_in("same", "operator")).await.unwrap();
+    let own = member
+        .raise_notification(&RaiseNotificationIn { severity: Severity::Critical, ..notification_in("same", "member") })
+        .await
+        .unwrap();
+    let theirs = other.raise_notification(&notification_in("same", "other")).await.unwrap();
+    assert_eq!(own.dedupe_key, "member:dejana:same");
+    assert_eq!(own.source, "member:dejana:agent");
+    assert_eq!(
+        (member.notifications(None, 0, true).await.unwrap().open, member.notifications(None, 0, true).await.unwrap().critical),
+        (1, 1)
+    );
+    assert_eq!(h.op.notifications(None, 0, true).await.unwrap().items[0].id, op.id);
+    assert_eq!(other.notifications(None, 0, true).await.unwrap().items[0].id, theirs.id);
+    assert!(member.notifications(Some(0), 0, true).await.unwrap().items.iter().all(|row| row.id == own.id));
+    assert!(h.op.notifications(Some(0), 0, true).await.unwrap().items.iter().all(|row| row.id == op.id));
+    let view: NotificationPage = h.op.get("/notifications?owner=dejana&state=all").await.unwrap();
+    assert_eq!(view.items[0].id, own.id);
+    assert_eq!(code(member.get::<NotificationPage>("/notifications?owner=other").await.unwrap_err()), "forbidden");
+    assert_eq!(code(h.agent.get::<NotificationPage>("/notifications?owner=dejana").await.unwrap_err()), "forbidden");
+    let ack = |id| AckNotificationsIn { ids: vec![id], all: false };
+    assert_eq!(code(member.ack_notifications(&ack(op.id)).await.unwrap_err()), "not_found");
+    assert_eq!(code(h.op.ack_notifications(&ack(own.id)).await.unwrap_err()), "not_found");
+    let until = SnoozeNotificationIn { until: Utc::now() + chrono::Duration::hours(1) };
+    assert_eq!(code(member.snooze_notification(op.id, &until).await.unwrap_err()), "not_found");
+    assert_eq!(code(h.op.snooze_notification(own.id, &until).await.unwrap_err()), "not_found");
+    member.snooze_notification(own.id, &until).await.unwrap();
+    assert_eq!(member.notifications(None, 0, true).await.unwrap().open, 0);
+    let _: Notification = h.op.post(&format!("/notifications/{}/snooze?owner=dejana", own.id), &until).await.unwrap();
+    let all = AckNotificationsIn { ids: vec![], all: true };
+    h.op.ack_notifications(&all).await.unwrap();
+    assert!(other.notifications(None, 0, true).await.unwrap().items[0].read_at.is_none());
+    let _: NotificationPage = h.op.post("/notifications/ack?owner=other", &all).await.unwrap();
+    assert!(other.notifications(None, 0, true).await.unwrap().items[0].read_at.is_some());
+    member.ack_notifications(&ack(own.id)).await.unwrap();
+    assert!(member.notifications(None, 0, true).await.unwrap().items[0].read_at.is_some());
+    for client in [&h.op, &h.agent, &h.procedure] {
+        assert_eq!(code(client.raise_notification(&notification_in("member:dejana:x", "")).await.unwrap_err()), "reserved_key");
+        assert_eq!(
+            code(
+                client
+                    .raise_notification(&RaiseNotificationIn { source: Some("member:dejana:units".into()), ..notification_in("x", "") })
+                    .await
+                    .unwrap_err()
+            ),
+            "reserved_key"
+        );
+    }
+    assert_eq!(code(member.raise_notification(&notification_in(&"a".repeat(115), "")).await.unwrap_err()), "invalid_dedupe_key");
+    let item = SyncNotificationItem {
+        dedupe_key: "unit:a".into(),
+        severity: Severity::Warning,
+        title: "failed".into(),
+        body: String::new(),
+        subject_type: None,
+        subject_id: None,
+        url: None,
+    };
+    let pass = SyncNotificationsIn { source: "units".into(), items: vec![item] };
+    assert_eq!(member.sync_notifications(&pass).await.unwrap().changed, 1);
+    assert_eq!(other.sync_notifications(&pass).await.unwrap().changed, 1);
+    assert_eq!(h.op.sync_notifications(&pass).await.unwrap().changed, 1);
+    member.ack_notifications(&all).await.unwrap();
+    assert!(
+        other
+            .notifications(None, 0, true)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .find(|n| n.dedupe_key.ends_with("unit:a"))
+            .unwrap()
+            .read_at
+            .is_none()
+    );
+    assert!(h.op.notifications(None, 0, true).await.unwrap().items.iter().find(|n| n.dedupe_key == "unit:a").unwrap().read_at.is_none());
+    let empty = SyncNotificationsIn { source: "units".into(), items: vec![] };
+    assert_eq!(member.sync_notifications(&empty).await.unwrap().changed, 1);
+    assert!(
+        member
+            .notifications(None, 0, true)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .find(|n| n.dedupe_key.ends_with("unit:a"))
+            .unwrap()
+            .resolved_at
+            .is_some()
+    );
+    assert!(
+        other
+            .notifications(None, 0, true)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .find(|n| n.dedupe_key.ends_with("unit:a"))
+            .unwrap()
+            .resolved_at
+            .is_none()
+    );
+    assert!(
+        h.op.notifications(None, 0, true).await.unwrap().items.iter().find(|n| n.dedupe_key == "unit:a").unwrap().resolved_at.is_none()
+    );
+    assert_eq!(h.op.sync_notifications(&empty).await.unwrap().changed, 1);
+    assert!(
+        other
+            .notifications(None, 0, true)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .find(|n| n.dedupe_key.ends_with("unit:a"))
+            .unwrap()
+            .resolved_at
+            .is_none()
+    );
+    assert_eq!(code(h.ingest.sync_notifications(&empty).await.unwrap_err()), "forbidden");
+    // Rows written before the namespace became reserved must never be overwritten.
+    domain::notifications::raise(&h.hub, &notification_raise("legacy", "member:dejana:legacy")).await.unwrap();
+    assert_eq!(code(member.raise_notification(&notification_in("legacy", "new")).await.unwrap_err()), "not_found");
+    let legacy = SyncNotificationsIn {
+        source: "units".into(),
+        items: vec![SyncNotificationItem { dedupe_key: "legacy".into(), ..pass.items[0].clone() }],
+    };
+    assert_eq!(code(member.sync_notifications(&legacy).await.unwrap_err()), "invalid_dedupe_key");
+    assert!(
+        h.op.notifications(None, 0, true)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|n| n.dedupe_key == "member:dejana:legacy" && n.source == "legacy")
+    );
+}
+
+#[tokio::test]
 async fn notifications_dedupe_ack_resolve_and_wake() {
     let Some(h) = harness().await else { return };
 
@@ -2556,7 +2703,7 @@ async fn summary_notification_replaces_its_day() {
 async fn notification_feed_never_skips_a_truncated_change() {
     let Some(h) = harness().await else { return };
     let op = actor(Role::Operator, "operator");
-    let start = domain::notifications::page(&h.hub, &op, None, true, 200).await.unwrap().cursor;
+    let start = domain::notifications::page(&h.hub, &op, None, None, true, 200).await.unwrap().cursor;
     for key in ["agent:feed-a", "agent:feed-b", "agent:feed-c"] {
         h.op.raise_notification(&notification_in(key, "")).await.unwrap();
     }
@@ -2564,14 +2711,14 @@ async fn notification_feed_never_skips_a_truncated_change() {
     let mut cursor = start;
     let mut seen = Vec::new();
     for _ in 0..3 {
-        let page = domain::notifications::page(&h.hub, &op, Some(cursor), true, 1).await.unwrap();
+        let page = domain::notifications::page(&h.hub, &op, None, Some(cursor), true, 1).await.unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.cursor, page.items[0].seq, "the cursor stops at the last row delivered");
         seen.push(page.items[0].dedupe_key.clone());
         cursor = page.cursor;
     }
     assert_eq!(seen, ["agent:feed-a", "agent:feed-b", "agent:feed-c"]);
-    let done = domain::notifications::page(&h.hub, &op, Some(cursor), true, 1).await.unwrap();
+    let done = domain::notifications::page(&h.hub, &op, None, Some(cursor), true, 1).await.unwrap();
     assert!(done.items.is_empty() && done.cursor == cursor);
 }
 
