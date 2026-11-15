@@ -7,8 +7,11 @@
 //! resolving the rows a source no longer reports. `seq` is the long-poll cursor,
 //! so every change here wakes the waiters after its transaction commits.
 
-use chrono::Utc;
-use contracts::{AckNotificationsIn, Notification, NotificationPage, RaiseNotificationIn, Role, Severity, SnoozeNotificationIn};
+use chrono::{DateTime, Duration, Utc};
+use contracts::fleet::{FleetStatus, Health, NightlyOutcome};
+use contracts::{
+    AckNotificationsIn, Notification, NotificationPage, RaiseNotificationIn, Role, Severity, SnoozeNotificationIn, Today, TodayItem,
+};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -135,6 +138,211 @@ pub async fn sync(hub: &Hub, source: &str, current: Vec<Raise>) -> DResult<usize
         hub.notified.notify_waiters();
     }
     Ok(changed)
+}
+
+// ── Producers ───────────────────────────────────────────────────────────────
+
+/// A snapshot older than this must never look healthy; the same rule the
+/// desktop fleet page applies.
+const FLEET_STALE_AFTER_SECS: i64 = 15 * 60;
+/// Clock difference tolerated between the snapshot's writer and the hub.
+const FLEET_CLOCK_SKEW_SECS: i64 = 60;
+
+/// One raise per Today row the operator must act on: reviews, failed
+/// operations, overdue interactions, renewals and opportunities.
+/// `due_releases` and `active_production` are informational and never notify.
+pub fn today_raises(today: &Today) -> Vec<Raise> {
+    let mut raises = Vec::new();
+    let mut push = |severity: Severity, dedupe_key: String, item: &TodayItem| {
+        raises.push(Raise {
+            source: "today".into(),
+            dedupe_key,
+            severity,
+            title: item.title.clone(),
+            body: item.status.clone(),
+            subject_type: Some(item.subject_type.clone()),
+            subject_id: Some(item.subject_id.to_string()),
+            url: None,
+        });
+    };
+    for item in &today.pending_reviews {
+        push(Severity::Info, format!("today:review:{}:{}", item.kind, item.subject_id), item);
+    }
+    for item in &today.failed_operations {
+        let severity = if item.status == "outcome_unknown" { Severity::Warning } else { Severity::Critical };
+        push(severity, format!("today:failed:{}:{}:{}", item.kind, item.subject_id, item.status), item);
+    }
+    for item in &today.overdue_interactions {
+        push(Severity::Warning, format!("today:overdue:{}", item.subject_id), item);
+    }
+    for item in &today.renewals {
+        let severity = match item.status.as_str() {
+            "overdue" => Severity::Critical,
+            "due" => Severity::Warning,
+            _ => Severity::Info,
+        };
+        push(severity, format!("today:renewal:{}:{}", item.subject_id, item.status), item);
+    }
+    for item in &today.opportunities {
+        push(Severity::Info, format!("today:opportunity:{}:{}", item.subject_id, item.status), item);
+    }
+    raises
+}
+
+/// One raise per operator concern in a snapshot. A host is named only when its
+/// health is not healthy: every host is outdated most of the day, so revision
+/// drift alone never notifies. A snapshot older than 15 minutes, or one whose
+/// age is unknowable, is itself `fleet:stale`.
+pub fn fleet_raises(status: &FleetStatus, now: DateTime<Utc>) -> Vec<Raise> {
+    let mut raises = Vec::new();
+    let mut push = |dedupe_key: String, title: String, body: String| {
+        raises.push(Raise {
+            source: "fleet".into(),
+            dedupe_key,
+            severity: Severity::Warning,
+            title,
+            body,
+            subject_type: None,
+            subject_id: None,
+            url: None,
+        });
+    };
+    for host in &status.hosts {
+        if host.health == Health::Healthy {
+            continue;
+        }
+        let health = match host.health {
+            Health::Healthy => "healthy",
+            Health::Degraded => "degraded",
+            Health::Unreachable => "unreachable",
+        };
+        let body = if host.failures.is_empty() { health.to_string() } else { host.failures.join("; ") };
+        push(format!("fleet:host:{}", host.name), format!("Host {} is {health}", host.name), body);
+    }
+    if let Some(error) = &status.monitoring.error {
+        push("fleet:monitoring".into(), "Monitoring unreadable".into(), error.clone());
+    }
+    for alert in &status.monitoring.alerts {
+        let body = if alert.detail.is_empty() { alert.group.clone() } else { alert.detail.join("; ") };
+        push(format!("fleet:alert:{}", alert.key), format!("Alert: {}", alert.name), body);
+    }
+    for op in &status.pending_ops {
+        let body = if op.reason.is_empty() {
+            format!("{} — approve with `canix host rops`", op.host)
+        } else {
+            format!("{} on {} — approve with `canix host rops`", op.reason, op.host)
+        };
+        push(format!("fleet:op:{}", op.id), format!("Approval waiting: {}", op.title), body);
+    }
+    if let Some(nightly) = &status.nightly
+        && nightly.failed()
+    {
+        let body = nightly.error.clone().unwrap_or_else(|| {
+            let failed: Vec<&str> = nightly.hosts.iter().filter(|h| h.outcome == NightlyOutcome::Failed).map(|h| h.host.as_str()).collect();
+            if failed.is_empty() { "the run failed".to_string() } else { format!("failed on {}", failed.join(", ")) }
+        });
+        // The key constraint is lowercase-only; an RFC 3339 stamp is not.
+        push(format!("fleet:nightly:{}", nightly.started_at.to_ascii_lowercase()), "Nightly update failed".into(), body);
+    }
+    match snapshot_age_secs(status, now) {
+        Some(age) if age > FLEET_STALE_AFTER_SECS => push(
+            "fleet:stale".into(),
+            "Fleet snapshot is stale".into(),
+            format!("no snapshot for {} minutes; fleet status is not evidence the fleet is healthy", age / 60),
+        ),
+        Some(_) => {}
+        None => push("fleet:stale".into(), "Fleet snapshot is stale".into(), "generatedAt is not a time this hub can compare".into()),
+    }
+    raises
+}
+
+/// The single raise a pass uses when the configured snapshot cannot be read.
+pub fn fleet_unreadable(error: &str) -> Raise {
+    Raise {
+        source: "fleet".into(),
+        dedupe_key: "fleet:stale".into(),
+        severity: Severity::Warning,
+        title: "Fleet snapshot is unreadable".into(),
+        body: error.to_string(),
+        subject_type: None,
+        subject_id: None,
+        url: None,
+    }
+}
+
+/// Age of the snapshot in seconds, or `None` when it cannot be trusted: an
+/// unparsable `generatedAt`, or one further in the future than clock skew
+/// explains.
+fn snapshot_age_secs(status: &FleetStatus, now: DateTime<Utc>) -> Option<i64> {
+    let then = DateTime::parse_from_rfc3339(&status.generated_at).ok()?.with_timezone(&Utc);
+    let age = now.signed_duration_since(then).num_seconds();
+    (age >= -FLEET_CLOCK_SKEW_SECS).then_some(age)
+}
+
+/// `hub:summary-stale` while no `summary` row has been written for
+/// `HUB_SUMMARY_STALE_HOURS`. Unset means the rule is off: the source syncs an
+/// empty set, so any raise it left resolves.
+pub async fn summary_raises(hub: &Hub, stale_hours: Option<u32>) -> DResult<Vec<Raise>> {
+    let Some(hours) = stale_hours else { return Ok(Vec::new()) };
+    let fresh: bool = sqlx::query_scalar(
+        "select exists(
+           select 1 from notifications
+           where company_id = $1 and source = 'summary' and updated_at > now() - make_interval(hours => $2))",
+    )
+    .bind(&hub.config.company_id)
+    .bind(hours.min(i32::MAX as u32) as i32)
+    .fetch_one(&hub.db)
+    .await?;
+    Ok(if fresh {
+        Vec::new()
+    } else {
+        vec![Raise {
+            source: "hub".into(),
+            dedupe_key: "hub:summary-stale".into(),
+            severity: Severity::Warning,
+            title: "No daily summary".into(),
+            body: format!("no summary in the last {hours} h: the scheduled task has not run. Run it now."),
+            subject_type: None,
+            subject_id: None,
+            url: None,
+        }]
+    })
+}
+
+/// Clear lapsed snoozes and announce them. Holds the writer lock because the
+/// update bumps `seq`: `nextval` is not transactional, so without it this writer
+/// could commit a lower seq after a concurrent one and a reader would advance
+/// its cursor past a change it never received.
+pub async fn expire_snoozes(hub: &Hub) -> DResult<usize> {
+    let mut tx = hub.db.begin().await?;
+    lock_writers(&mut tx).await?;
+    let changed = sqlx::query(
+        "update notifications
+         set snoozed_until = null, seq = nextval('notifications_seq'), updated_at = now()
+         where company_id = $1 and snoozed_until <= now()",
+    )
+    .bind(&hub.config.company_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected() as usize;
+    tx.commit().await?;
+    if changed > 0 {
+        hub.notified.notify_waiters();
+    }
+    Ok(changed)
+}
+
+/// Drop rows the operator both acknowledged and saw resolve, 30 days on. A
+/// delete allocates no seq, so it needs no writer lock.
+pub async fn prune(hub: &Hub) -> DResult<u64> {
+    Ok(sqlx::query(
+        "delete from notifications
+         where company_id = $1 and resolved_at < now() - interval '30 days' and read_at is not null",
+    )
+    .bind(&hub.config.company_id)
+    .execute(&hub.db)
+    .await?
+    .rows_affected())
 }
 
 /// Without `after`: a snapshot of the newest open (or all) rows, and `cursor` is
@@ -320,5 +528,113 @@ mod tests {
             assert!(!valid_key(bad), "{bad:?} is not a valid key");
         }
         assert!(!valid_key(&format!("a{}", "b".repeat(128))), "129 characters is too long");
+    }
+
+    /// The fleet snapshot fixture the desktop fleet page uses, with murph
+    /// healthy on an old revision: outdated-but-healthy must not notify.
+    const FLEET_SNAPSHOT: &str = r#"{
+      "schemaVersion": 1,
+      "generatedAt": "2026-11-10T03:10:00Z",
+      "targetRevision": "new",
+      "hosts": [
+        {"name": "atlas", "health": "healthy", "revision": "new", "checkedAt": "2026-11-10T03:09:00Z"},
+        {"name": "nomad", "health": "degraded", "revision": "old", "failures": ["forgejo: inactive"], "checkedAt": "2026-11-10T03:09:00Z"},
+        {"name": "murph", "health": "healthy", "revision": "old", "checkedAt": "2026-11-10T03:09:00Z"}
+      ],
+      "monitoring": {
+        "error": "relay refused",
+        "monitored": 12,
+        "alerts": [{"key": "core_forgejo", "name": "forgejo", "group": "core", "since": "2026-11-10T02:00:00Z", "detail": ["[STATUS] == 200"]}]
+      },
+      "pendingOps": [
+        {"id": "op-2", "host": "nomad", "title": "restart forgejo", "reason": "unit is down", "requestedBy": "nightly", "created": "2026-11-10T03:05:00Z"},
+        {"id": "op-1", "host": "atlas", "title": "finish activation", "created": "2026-11-10T03:00:00Z"}
+      ],
+      "nightly": {
+        "startedAt": "2026-11-10T02:00:00Z",
+        "revision": "new",
+        "commit": "0123abc",
+        "hosts": [{"host": "nomad", "outcome": "failed", "detail": "health check failed"}]
+      }
+    }"#;
+
+    fn today_item(kind: &str, subject_type: &str, subject_id: Uuid, status: &str) -> TodayItem {
+        TodayItem {
+            kind: kind.into(),
+            title: format!("{kind} {status}"),
+            subject_type: subject_type.into(),
+            subject_id,
+            status: status.into(),
+            at: None,
+        }
+    }
+
+    #[test]
+    fn producers_map_every_bucket_once() {
+        let id = Uuid::from_u128;
+        let today = Today {
+            pending_reviews: vec![today_item("release_review", "content", id(1), "draft")],
+            // Informational buckets: present in Today, never notified.
+            active_production: vec![today_item("generation", "content", id(9), "running")],
+            due_releases: vec![today_item("publication", "content", id(8), "scheduled")],
+            failed_operations: vec![
+                today_item("publication", "content", id(2), "outcome_unknown"),
+                today_item("generation", "content", id(3), "failed"),
+            ],
+            overdue_interactions: vec![today_item("follow_up", "relationship", id(4), "agent")],
+            opportunities: vec![today_item("opportunity", "opportunity", id(5), "shortlisted")],
+            renewals: vec![
+                today_item("renewal", "renewal", id(6), "overdue"),
+                today_item("renewal", "renewal", id(7), "due"),
+                today_item("renewal", "renewal", id(10), "unknown"),
+            ],
+        };
+        let status: FleetStatus = serde_json::from_str(FLEET_SNAPSHOT).unwrap();
+        let generated = DateTime::parse_from_rfc3339("2026-11-10T03:10:00Z").unwrap().with_timezone(&Utc);
+
+        let from_today = today_raises(&today);
+        let from_fleet = fleet_raises(&status, generated + chrono::Duration::minutes(5));
+        let mut keys: Vec<&str> = from_today.iter().chain(&from_fleet).map(|r| r.dedupe_key.as_str()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "fleet:alert:core_forgejo",
+                "fleet:host:nomad",
+                "fleet:monitoring",
+                // The key constraint is lowercase-only; an RFC 3339 stamp is not.
+                "fleet:nightly:2026-11-10t02:00:00z",
+                "fleet:op:op-1",
+                "fleet:op:op-2",
+                "today:failed:generation:00000000-0000-0000-0000-000000000003:failed",
+                "today:failed:publication:00000000-0000-0000-0000-000000000002:outcome_unknown",
+                "today:opportunity:00000000-0000-0000-0000-000000000005:shortlisted",
+                "today:overdue:00000000-0000-0000-0000-000000000004",
+                "today:renewal:00000000-0000-0000-0000-000000000006:overdue",
+                "today:renewal:00000000-0000-0000-0000-000000000007:due",
+                "today:renewal:00000000-0000-0000-0000-00000000000a:unknown",
+                "today:review:release_review:00000000-0000-0000-0000-000000000001",
+            ]
+        );
+        for quiet in ["000000000008", "000000000009"] {
+            assert!(!keys.iter().any(|key| key.contains(quiet)), "due releases and active production never notify");
+        }
+
+        let severity = |key: &str| from_today.iter().find(|r| r.dedupe_key == key).unwrap().severity;
+        assert_eq!(severity("today:review:release_review:00000000-0000-0000-0000-000000000001"), Severity::Info);
+        assert_eq!(severity("today:failed:publication:00000000-0000-0000-0000-000000000002:outcome_unknown"), Severity::Warning);
+        assert_eq!(severity("today:failed:generation:00000000-0000-0000-0000-000000000003:failed"), Severity::Critical);
+        assert_eq!(severity("today:overdue:00000000-0000-0000-0000-000000000004"), Severity::Warning);
+        assert_eq!(severity("today:renewal:00000000-0000-0000-0000-000000000006:overdue"), Severity::Critical);
+        assert_eq!(severity("today:renewal:00000000-0000-0000-0000-000000000007:due"), Severity::Warning);
+        assert_eq!(severity("today:renewal:00000000-0000-0000-0000-00000000000a:unknown"), Severity::Info);
+        assert_eq!(severity("today:opportunity:00000000-0000-0000-0000-000000000005:shortlisted"), Severity::Info);
+        assert!(from_fleet.iter().all(|r| r.severity == Severity::Warning && r.source == "fleet"));
+
+        // Aged-out or unreadable snapshots are the same `fleet:stale` raise.
+        let stale = fleet_raises(&status, generated + chrono::Duration::minutes(16));
+        assert_eq!(stale.len(), from_fleet.len() + 1);
+        assert_eq!(stale.last().unwrap().dedupe_key, "fleet:stale");
+        assert_eq!(fleet_unreadable("gone").dedupe_key, "fleet:stale");
     }
 }

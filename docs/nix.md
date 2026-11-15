@@ -291,6 +291,35 @@ atomic write renames a new inode into place; binding the directory keeps
 replacements visible. Put the file where the writer can atomically rename
 within that directory (for example `/var/lib/fleet-status/fleet.json`).
 
+### Notifications and the producer loop
+
+`serve` runs one in-process producer loop next to the outbox worker and, like
+the worker, not under `--no-worker`. Every 60 s it:
+
+- syncs the `today` source from the same read behind `GET /v1/today`, with no
+  caller role: pending reviews, failed operations, overdue interactions,
+  renewals and opportunities become `today:*` rows and resolve when their
+  bucket clears. Due releases and active production are informational and never
+  notify;
+- syncs the `fleet` source from `fleetStatusFile`: unhealthy hosts, pending
+  approvals (`fleet:op:<id>`), monitoring errors and alerts, and a failed
+  nightly run. A snapshot older than 15 minutes, or one that cannot be read,
+  raises `fleet:stale`. An outdated-but-healthy host is expected most of the day
+  and never notifies;
+- syncs the `hub` source from summary staleness (below);
+- clears lapsed snoozes, which announces the row again, and deletes rows that
+  were acknowledged and resolved more than 30 days ago.
+
+An unchanged condition touches nothing, so an acknowledgement survives every
+later pass. A failing step is logged and the next pass retries it; nothing in
+the loop is fatal.
+
+`HUB_SUMMARY_STALE_HOURS` (unset by default) turns on `hub:summary-stale`: when
+no `source = summary` notification has been written for that many hours, the hub
+raises a warning, because the daily summary task did not run. Unset means no
+staleness rule: the `hub` source syncs an empty set, which resolves any existing
+raise. Atlas sets `26`, so a missed 07:30 summary shows up the next morning.
+
 ### Assertions
 
 - fixture Windmill requires fixture ComfyUI (the in-process procedure needs

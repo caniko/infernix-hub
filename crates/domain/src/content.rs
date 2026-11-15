@@ -267,6 +267,11 @@ async fn company_today_items(hub: &Hub, sql: &str) -> DResult<Vec<TodayItem>> {
 
 pub async fn today(hub: &Hub, actor: &Actor) -> DResult<Today> {
     actor.require(crate::ANY_READER)?;
+    system_today(hub).await
+}
+
+/// The same read for the producer loop, which has no request and no role.
+pub async fn system_today(hub: &Hub) -> DResult<Today> {
     Ok(Today {
         pending_reviews: today_items(
             hub,
