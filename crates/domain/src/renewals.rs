@@ -154,7 +154,8 @@ fn deadline_of(row: &Renewal) -> Option<DateTime<Utc>> {
 
 async fn all(hub: &Hub) -> DResult<Vec<Renewal>> {
     let rows: Vec<Value> =
-        sqlx::query_scalar(&format!("{SELECT} where r.company_id = $1 order by r.due_at nulls first, r.title limit 200) t"))
+        // ponytail: unbounded read; renewals are a hand-written catalogue (tens of rows). Paginate if that changes.
+        sqlx::query_scalar(&format!("{SELECT} where r.company_id = $1 order by r.due_at nulls first, r.title) t"))
             .bind(&hub.config.company_id)
             .fetch_all(&hub.db)
             .await?;
@@ -184,7 +185,13 @@ pub(crate) async fn today(hub: &Hub) -> DResult<Vec<TodayItem>> {
             at: deadline_of(&row),
         })
         .collect();
-    items.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.title.cmp(&b.title)));
+    // Most urgent first, so the cut never drops an overdue row behind unknowns.
+    let rank = |status: &str| match status {
+        "invalid" | "overdue" => 0,
+        "due" | "unverifiable" => 1,
+        _ => 2,
+    };
+    items.sort_by(|a, b| rank(&a.status).cmp(&rank(&b.status)).then_with(|| a.at.cmp(&b.at)).then_with(|| a.title.cmp(&b.title)));
     items.truncate(50);
     Ok(items)
 }
@@ -227,12 +234,13 @@ pub async fn renewed(hub: &Hub, actor: &Actor, key: &str, input: RenewalRenewedI
 pub async fn observe(hub: &Hub, actor: &Actor, key: &str, input: ObserveRenewalIn) -> DResult<Renewal> {
     actor.require(OPERATOR_OR_PROCEDURE)?;
     let mut tx = hub.db.begin().await?;
-    let kind: Option<String> = sqlx::query_scalar("select expiry_kind from renewals where company_id = $1 and key = $2 for update")
-        .bind(&hub.config.company_id)
-        .bind(key)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let kind = kind.ok_or(DomainError::NotFound("renewal"))?;
+    let current: Option<(String, Option<DateTime<Utc>>)> =
+        sqlx::query_as("select expiry_kind, observed_at from renewals where company_id = $1 and key = $2 for update")
+            .bind(&hub.config.company_id)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let (kind, last_observed) = current.ok_or(DomainError::NotFound("renewal"))?;
     if kind != ExpiryKind::Provider.as_str() {
         return Err(invalid("not_provider", "only a provider expiry kind accepts observations"));
     }
@@ -244,6 +252,14 @@ pub async fn observe(hub: &Hub, actor: &Actor, key: &str, input: ObserveRenewalI
     }
     if input.observed_at > Utc::now() + CLOCK_SKEW {
         return Err(invalid("observed_in_future", "observed_at is more than 60 s in the future"));
+    }
+    // Under the row lock: an older (or replayed) answer must not replace newer
+    // evidence, or it could erase a crossed deadline. PostgreSQL keeps
+    // microseconds, so compare (and store) at that precision or a replay of the
+    // same instant would look newer.
+    let observed_at = chrono::SubsecRound::trunc_subsecs(input.observed_at, 6);
+    if last_observed.is_some_and(|last| observed_at <= last) {
+        return Err(invalid("observation_out_of_order", "observed_at is not newer than the stored observation"));
     }
     let outcome = input.outcome.as_str();
     let id: Uuid = sqlx::query_scalar(
@@ -260,7 +276,7 @@ pub async fn observe(hub: &Hub, actor: &Actor, key: &str, input: ObserveRenewalI
     )
     .bind(&hub.config.company_id)
     .bind(key)
-    .bind(input.observed_at)
+    .bind(observed_at)
     .bind(outcome)
     .bind(input.expires_at)
     .fetch_one(&mut *tx)
@@ -273,7 +289,7 @@ pub async fn observe(hub: &Hub, actor: &Actor, key: &str, input: ObserveRenewalI
         "renewal.observed",
         "renewal",
         id,
-        json!({ "key": key, "outcome": outcome, "expires_at": input.expires_at, "observed_at": input.observed_at }),
+        json!({ "key": key, "outcome": outcome, "expires_at": input.expires_at, "observed_at": observed_at }),
     )
     .await?;
     let row: Value = sqlx::query_scalar(&format!("{SELECT} where r.id = $1) t")).bind(id).fetch_one(&mut *tx).await?;

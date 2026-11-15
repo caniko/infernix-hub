@@ -2610,3 +2610,49 @@ async fn producer_pass_reopens_a_lapsed_snooze_and_tracks_summary_staleness() {
     let rows = h.op.notifications(None, 0, true).await.unwrap();
     assert!(rows.items.iter().find(|n| n.dedupe_key == "hub:summary-stale").unwrap().resolved_at.is_some());
 }
+
+#[tokio::test]
+async fn stale_observations_and_quiet_rows_never_hide_a_crossed_deadline() {
+    let Some(h) = harness().await else { return };
+    let mut provider = renewal_seed("crossed-token", None, None);
+    provider["expiry_kind"] = json!("provider");
+    // Many quiet rows: unknown cadence and never-expiring credentials.
+    let mut rows = vec![provider];
+    for i in 0..210 {
+        let mut quiet = renewal_seed(&format!("quiet-{i:03}"), None, None);
+        if i % 2 == 0 {
+            quiet["expiry_kind"] = json!("never");
+        }
+        rows.push(quiet);
+    }
+    seed_renewals(&h, serde_json::Value::Array(rows)).await;
+
+    // A fresh provider answer: the credential already expired.
+    let now = Utc::now();
+    let expired = h
+        .procedure
+        .observe_renewal(
+            "crossed-token",
+            &ObserveRenewalIn { outcome: Observation::Date, expires_at: Some(now - chrono::Duration::days(1)), observed_at: now },
+        )
+        .await
+        .unwrap();
+    assert_eq!(expired.status, "overdue");
+
+    // An older answer (replayed or delayed) is refused and changes nothing.
+    for observed_at in [now, now - chrono::Duration::hours(49), now - chrono::Duration::hours(1)] {
+        let stale = h
+            .procedure
+            .observe_renewal("crossed-token", &ObserveRenewalIn { outcome: Observation::Never, expires_at: None, observed_at })
+            .await
+            .unwrap_err();
+        assert_eq!(code(stale), "observation_out_of_order");
+    }
+    assert_eq!(renewal(&h, "crossed-token").await.status, "overdue");
+
+    // More than 200 quiet rows never push the overdue renewal out of Today.
+    let today = h.op.today().await.unwrap();
+    let item = today.renewals.iter().find(|item| item.subject_id == expired.id).expect("overdue renewal is in Today");
+    assert_eq!(item.status, "overdue");
+    assert_eq!(today.renewals.first().map(|item| item.subject_id), Some(expired.id), "the most urgent row comes first");
+}

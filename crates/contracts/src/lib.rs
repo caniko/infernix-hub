@@ -333,6 +333,8 @@ wire_enum!(
     ExpiryKind { Cadence = "cadence", Never = "never", Provider = "provider" }
 );
 
+// `wire_enum!` owns the derive list, so the default cannot be `#[default]`.
+#[allow(clippy::derivable_impls)]
 impl Default for ExpiryKind {
     fn default() -> Self {
         Self::Cadence
