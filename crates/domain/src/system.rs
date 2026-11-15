@@ -37,6 +37,7 @@ pub async fn issue_token(db: &sqlx::PgPool, name: &str, role: Role, token: Optio
 }
 
 pub async fn status(hub: &Hub, actor: &Actor) -> DResult<SystemStatus> {
+    actor.require(&[Role::Operator, Role::Agent, Role::Procedure, Role::Ingest])?;
     let mut conn = hub.db.acquire().await?;
     let paused = crate::release::production_paused(&mut conn).await?;
     Ok(SystemStatus {

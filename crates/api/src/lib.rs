@@ -146,6 +146,7 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/renewals/{key}/observe", post(renewal_observe))
         .route("/notifications", get(notification_list).post(raise_notification))
         .route("/notifications/ack", post(ack_notifications))
+        .route("/notifications/sync", post(sync_notifications))
         .route("/notifications/{id}/snooze", post(snooze_notification))
         .route("/personas", get(personas).post(create_persona))
         .route("/personas/{id}/canon", get(canon_list).post(canon_propose))
@@ -440,9 +441,9 @@ fn fleet_error(error: FleetStatusError, correlation_id: Option<String>) -> ApiEr
     }
 }
 
-/// The snapshot is infrastructure state, not content: any authenticated
-/// principal may read it, and the hub never collects fleet data itself.
+/// The hub never collects fleet data itself.
 async fn fleet_status(State(s): State<AppState>, Caller(a): Caller) -> R<contracts::fleet::FleetStatus> {
+    a.require(&[Role::Operator, Role::Agent, Role::Procedure, Role::Ingest]).map_err(err(&a))?;
     read_fleet_status(s.fleet_status_file.as_deref()).await.map(Json).map_err(|e| fleet_error(e, a.correlation_id.clone()))
 }
 async fn set_pause(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<PauseIn>) -> R<SystemStatus> {
@@ -459,7 +460,10 @@ async fn search(State(s): State<AppState>, Caller(a): Caller, Query(q): Query<Se
     call!(a, domain::content::search(&s.hub, &a, &q.q))
 }
 async fn history(State(s): State<AppState>, Caller(a): Caller, Path((t, id)): Path<(String, String)>) -> R<Vec<HistoryEntry>> {
-    a.require(domain::ANY_READER).map_err(err(&a))?;
+    // Notification audit rows name members and what they dismissed; only the
+    // operator may see them.
+    let readers = if t == "notification" { domain::OPERATOR } else { domain::ANY_READER };
+    a.require(readers).map_err(err(&a))?;
     call!(a, domain::history(&s.hub.db, &t, &id))
 }
 
@@ -537,6 +541,7 @@ struct NotificationsQ {
     after: Option<i64>,
     wait: Option<u64>,
     limit: Option<i64>,
+    owner: Option<String>,
 }
 
 /// `GET /v1/notifications`: cursor replay plus a long poll.
@@ -562,9 +567,10 @@ async fn notification_list(State(s): State<AppState>, Caller(a): Caller, Query(q
         let notified = s.hub.notified.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let page = domain::notifications::page(&s.hub, &a, q.after, all, q.limit.unwrap_or(domain::notifications::MAX_LIMIT))
-            .await
-            .map_err(err(&a))?;
+        let page =
+            domain::notifications::page(&s.hub, &a, q.owner.as_deref(), q.after, all, q.limit.unwrap_or(domain::notifications::MAX_LIMIT))
+                .await
+                .map_err(err(&a))?;
         // A feed window of only filtered-out rows still moved the cursor: return
         // it, or the client would wait on changes it has already passed.
         let advanced = q.after.is_some_and(|after| page.cursor != after);
@@ -578,17 +584,28 @@ async fn raise_notification(State(s): State<AppState>, Caller(a): Caller, Json(b
     call!(a, domain::notifications::post(&s.hub, &a, b))
 }
 
-async fn ack_notifications(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<AckNotificationsIn>) -> R<NotificationPage> {
-    call!(a, domain::notifications::ack(&s.hub, &a, b))
+async fn sync_notifications(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<SyncNotificationsIn>) -> R<SyncNotificationsOut> {
+    let changed = domain::notifications::sync_api(&s.hub, &a, b).await.map_err(err(&a))?;
+    Ok(Json(SyncNotificationsOut { changed }))
+}
+
+async fn ack_notifications(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Query(q): Query<NotificationsQ>,
+    Json(b): Json<AckNotificationsIn>,
+) -> R<NotificationPage> {
+    call!(a, domain::notifications::ack(&s.hub, &a, q.owner.as_deref(), b))
 }
 
 async fn snooze_notification(
     State(s): State<AppState>,
     Caller(a): Caller,
     Path(id): Path<Uuid>,
+    Query(q): Query<NotificationsQ>,
     Json(b): Json<SnoozeNotificationIn>,
 ) -> R<Notification> {
-    call!(a, domain::notifications::snooze(&s.hub, &a, id, b))
+    call!(a, domain::notifications::snooze(&s.hub, &a, q.owner.as_deref(), id, b))
 }
 async fn personas(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Persona>> {
     call!(a, domain::canon::list_personas(&s.hub, &a))

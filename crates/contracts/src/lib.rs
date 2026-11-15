@@ -51,8 +51,9 @@ macro_rules! wire_enum {
 
 wire_enum!(
     /// Who is calling. Agents get scoped hub tools only; publisher and human
-    /// approval credentials never map to `Agent`.
-    Role { Operator = "operator", Agent = "agent", Procedure = "procedure", Ingest = "ingest" }
+    /// approval credentials never map to `Agent`. A member is a second human:
+    /// it sees and dismisses only its own notifications.
+    Role { Operator = "operator", Agent = "agent", Procedure = "procedure", Ingest = "ingest", Member = "member" }
 );
 
 wire_enum!(CanonState { Proposed = "proposed", Accepted = "accepted", Rejected = "rejected", Superseded = "superseded" });
@@ -478,6 +479,36 @@ pub struct AckNotificationsIn {
 pub struct SnoozeNotificationIn {
     /// RFC 3339; must be in the future.
     pub until: DateTime<Utc>,
+}
+
+/// `POST /v1/notifications/sync`: one process's whole current set for `source`,
+/// the HTTP twin of a producer pass. Items carry no source — the pass owns it —
+/// and the server namespaces a member's rows with its own name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncNotificationsIn {
+    pub source: String,
+    pub items: Vec<SyncNotificationItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncNotificationItem {
+    pub dedupe_key: String,
+    pub severity: Severity,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub subject_type: Option<String>,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// How many rows the pass announced or resolved; zero means nothing changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncNotificationsOut {
+    pub changed: usize,
 }
 
 // ── Content & briefs ────────────────────────────────────────────────────────

@@ -621,7 +621,7 @@ in {
       type = types.attrsOf (types.submodule {
         options = {
           role = mkOption {
-            type = types.enum ["operator" "agent" "procedure" "ingest"];
+            type = types.enum ["operator" "agent" "procedure" "ingest" "member"];
           };
           file = mkOption {
             type = types.path;
