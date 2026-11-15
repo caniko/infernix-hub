@@ -57,6 +57,20 @@ fn key_safe(key: &str) -> String {
         .collect()
 }
 
+/// The server prefixes a member's keys with `member:<name>:` and caps the
+/// stored key at 128 bytes, so the folded name is cut to 80 bytes. A hash of
+/// the unfolded host and unit keeps keys distinct when folding or cutting
+/// would merge two units.
+// ponytail: DefaultHasher is stable within a build only; a toolchain bump re-keys rows once.
+fn unit_key(host: &str, unit: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (host, unit).hash(&mut hasher);
+    let mut key = key_safe(&format!("unit:{host}:{unit}"));
+    key.truncate(80);
+    format!("{key}:{:08x}", hasher.finish() as u32)
+}
+
 async fn report_units(client: HubClient) {
     let mut last = HashMap::new();
     let mut interval = tokio::time::interval(Duration::from_secs(300));
@@ -78,7 +92,7 @@ async fn report_units(client: HubClient) {
             let items = last
                 .keys()
                 .map(|unit| SyncNotificationItem {
-                    dedupe_key: key_safe(&format!("unit:{}:{unit}", hostname.trim())),
+                    dedupe_key: unit_key(hostname.trim(), unit),
                     severity: Severity::Warning,
                     title: format!("{unit} failed on {}", hostname.trim()),
                     body: "A user unit has failed.".into(),
@@ -380,6 +394,9 @@ async fn main() -> Result<()> {
     let quiet = std::env::var("HUB_QUIET_WHILE_GAMING").as_deref() == Ok("1");
     let mut held = 0;
     let mut gaming_check = tokio::time::interval(Duration::from_secs(10));
+    // The tick is only polled while popups are held; the default `Burst` would
+    // replay every tick missed meanwhile and starve the feed.
+    gaming_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let (sender, mut actions) = mpsc::unbounded_channel();
     let tray = HubTray { view: view(&State::default()), actions: sender };
@@ -603,5 +620,15 @@ mod tests {
         assert_eq!(menu.len(), MENU_ROWS);
         assert_eq!(menu[0], "row 6");
         assert_eq!(menu[4], "row 2");
+    }
+
+    #[test]
+    fn unit_keys_fit_the_member_namespace_and_stay_distinct() {
+        let long = format!("{}.service", "a".repeat(200));
+        let key = unit_key("murph", &long);
+        assert!(format!("member:dejana:{key}").len() <= 128, "{key}");
+        assert_ne!(unit_key("murph", "foo@bar.service"), unit_key("murph", "foo-bar.service"));
+        assert_ne!(unit_key("murph", "x.service"), unit_key("starlord", "x.service"));
+        assert_eq!(unit_key("murph", "x.service"), unit_key("murph", "x.service"));
     }
 }
