@@ -6,14 +6,16 @@
 
 use std::{future::Future, time::Duration};
 
+use chrono::{DateTime, Utc};
 use contracts::{
-    Asset, AssetState, ContentItem, PublicationIntent,
+    AckNotificationsIn, Asset, AssetState, ContentItem, PublicationIntent, RenewalRenewedIn, SnoozeNotificationIn,
     client::{ClientError, HubClient},
 };
 use dioxus::prelude::*;
 use uuid::Uuid;
 
 use crate::{
+    format,
     state::{Loaded, Store, UiError},
     theme,
 };
@@ -216,6 +218,97 @@ pub async fn load_search(store: Store, client: HubClient, query: String) {
     match timed(client.search(&query)).await {
         Ok(hits) => put(store.search, hits),
         Err(error) => keep(store.search, error),
+    }
+}
+
+/// The notification feed: one `all` snapshot, then the change feed held open on
+/// the server. This is not another 1.5s poll: `wait` blocks until a row changes,
+/// and the echoed cursor is what keeps a reconnect from skipping a change.
+pub async fn watch_notifications(store: Store, client: HubClient) {
+    /// The server caps a hold at 55s; the client gives up later than that.
+    const WAIT: u64 = 50;
+    const TIMEOUT: Duration = Duration::from_secs(90);
+    let mut cursor: Option<i64> = None;
+    let mut backoff = 5u64;
+    loop {
+        let wait = if cursor.is_some() { WAIT } else { 0 };
+        let result = match tokio::time::timeout(TIMEOUT, client.notifications(cursor, wait, true)).await {
+            Ok(result) => result.map_err(UiError::from_client),
+            Err(_) => Err(UiError::new("timeout", "the notification feed did not answer within 90s")),
+        };
+        match result {
+            Ok(page) => {
+                // Echo the server's cursor: it never passes a row this page did
+                // not carry, so a short page does not skip changes.
+                let next = page.cursor;
+                if cursor.is_none() {
+                    store.set_notification_snapshot(page);
+                } else {
+                    store.merge_notification_page(page);
+                }
+                cursor = Some(next);
+                backoff = 5;
+            }
+            Err(error) => {
+                // The cursor is kept: the next feed replays everything missed.
+                store.fail_notifications(error);
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+            }
+        }
+    }
+}
+
+// Writes do not re-read the set: the watcher's feed reads every state
+// (`all = true`) and the server wakes it on our own write, so the change
+// arrives in cursor order. A separate snapshot could land after a newer feed
+// page and erase it while the cursor has already moved past.
+
+pub async fn ack_notification(store: Store, client: HubClient, id: Uuid) {
+    let input = AckNotificationsIn { ids: vec![id], all: false };
+    match timed(client.ack_notifications(&input)).await {
+        Ok(_) => {}
+        Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
+    }
+}
+
+pub async fn ack_all_notifications(store: Store, client: HubClient) {
+    let input = AckNotificationsIn { ids: Vec::new(), all: true };
+    match timed(client.ack_notifications(&input)).await {
+        Ok(page) => {
+            store.notify(true, format!("Acknowledged all; {} still open.", page.open));
+        }
+        Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
+    }
+}
+
+pub async fn snooze_notification(store: Store, client: HubClient, id: Uuid, days: i64) {
+    let until = Utc::now() + chrono::Duration::days(days);
+    match timed(client.snooze_notification(id, &SnoozeNotificationIn { until })).await {
+        Ok(_) => {}
+        Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
+    }
+}
+
+/// Renewals back the notification workspace's renewal expansions; one read per
+/// visit is enough, and a failed read keeps the last good list.
+pub async fn refresh_renewals(store: Store, client: HubClient) {
+    match timed(client.renewals()).await {
+        Ok(renewals) => put(store.renewals, renewals),
+        Err(error) => keep(store.renewals, error),
+    }
+}
+
+/// Operator-only: record a renewal. Without a cadence the seed cannot compute
+/// a due date, so the caller must pass one.
+pub async fn mark_renewed(store: Store, client: HubClient, key: String, due: Option<DateTime<Utc>>) {
+    match timed(client.renewal_renewed(&key, &RenewalRenewedIn { due_at: due })).await {
+        Ok(renewal) => {
+            let due = renewal.due_at.map(format::fmt_dt).unwrap_or_else(|| "no due date".into());
+            store.notify(true, format!("Renewed {}; due {due}.", renewal.key));
+            refresh_renewals(store, client).await;
+        }
+        Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
     }
 }
 

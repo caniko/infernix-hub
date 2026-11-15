@@ -27,6 +27,7 @@ jobs:
           - ".#packages.x86_64-linux.fleetix-hubd"
           - ".#packages.x86_64-linux.hubctl"
           - ".#packages.x86_64-linux.fleetix-hub-tray"
+          - ".#packages.x86_64-linux.fleetix-hub-desktop"
     env:
       NIX_CONFIG: "experimental-features = nix-command flakes"
     steps:

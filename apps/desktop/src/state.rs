@@ -5,16 +5,18 @@
 use std::collections::{HashMap, HashSet};
 
 use contracts::{
-    Account, Asset, CanonRevision, ChatMessage, ContentDetail, ContentItem, NewsItem, Persona, PublicationIntent, Relationship,
-    RelationshipDetail, ReleaseState, SearchHit, SystemStatus, Today, Workflow,
+    Account, Asset, CanonRevision, ChatMessage, ContentDetail, ContentItem, NewsItem, Notification, NotificationPage, Persona,
+    PublicationIntent, Relationship, RelationshipDetail, ReleaseState, Renewal, SearchHit, SystemStatus, Today, Workflow,
 };
 use dioxus::prelude::*;
 use uuid::Uuid;
 
-/// The ten operator workspaces. Fleet leads (the app opens on Command), then
-/// Studio; sidebar order is the 1–9/0 keyboard order.
+/// The eleven operator workspaces. Notifications leads the FLEET section (its
+/// key is `n`); the app still opens on Command. The other ten keep their 1–9/0
+/// keyboard slots regardless of list position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Workspace {
+    Notifications,
     Command,
     Hosts,
     Alerts,
@@ -28,7 +30,8 @@ pub enum Workspace {
 }
 
 impl Workspace {
-    pub const ALL: [Workspace; 10] = [
+    pub const ALL: [Workspace; 11] = [
+        Workspace::Notifications,
         Workspace::Command,
         Workspace::Hosts,
         Workspace::Alerts,
@@ -43,6 +46,7 @@ impl Workspace {
 
     pub fn label(self) -> &'static str {
         match self {
+            Workspace::Notifications => "Notifications",
             Workspace::Command => "Command Center",
             Workspace::Hosts => "Hosts",
             Workspace::Alerts => "Alerts",
@@ -56,12 +60,57 @@ impl Workspace {
         }
     }
 
+    /// `--workspace NAME` value; the tray starts the console with
+    /// `--workspace notifications`.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Workspace::Notifications => "notifications",
+            Workspace::Command => "command",
+            Workspace::Hosts => "hosts",
+            Workspace::Alerts => "alerts",
+            Workspace::Approvals => "approvals",
+            Workspace::Today => "today",
+            Workspace::News => "news",
+            Workspace::Studio => "studio",
+            Workspace::Calendar => "calendar",
+            Workspace::Relationships => "relationships",
+            Workspace::Library => "library",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Workspace> {
+        let name = name.trim().to_ascii_lowercase();
+        Self::ALL.iter().copied().find(|workspace| workspace.slug() == name)
+    }
+
+    /// The sidebar's keyboard shortcut.
+    pub fn key(self) -> &'static str {
+        match self {
+            Workspace::Notifications => "n",
+            Workspace::Command => "1",
+            Workspace::Hosts => "2",
+            Workspace::Alerts => "3",
+            Workspace::Approvals => "4",
+            Workspace::Today => "5",
+            Workspace::News => "6",
+            Workspace::Studio => "7",
+            Workspace::Calendar => "8",
+            Workspace::Relationships => "9",
+            Workspace::Library => "0",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Workspace> {
+        Self::ALL.iter().copied().find(|workspace| workspace.key() == key)
+    }
+
     pub fn title(self) -> &'static str {
         self.label()
     }
 
     pub fn hint(self) -> &'static str {
         match self {
+            Workspace::Notifications => "conditions the hub wants you to see, newest first",
             Workspace::Command => "fleet health, attention queue and snapshot age",
             Workspace::Hosts => "health, revision and failed checks per host",
             Workspace::Alerts => "monitored services that are down",
@@ -78,7 +127,7 @@ impl Workspace {
     /// Sidebar section heading.
     pub fn section(self) -> &'static str {
         match self {
-            Workspace::Command | Workspace::Hosts | Workspace::Alerts | Workspace::Approvals => "FLEET",
+            Workspace::Notifications | Workspace::Command | Workspace::Hosts | Workspace::Alerts | Workspace::Approvals => "FLEET",
             _ => "STUDIO",
         }
     }
@@ -87,6 +136,28 @@ impl Workspace {
     /// columns, so there is no separate context list to pin beside them.
     pub fn full_width(self) -> bool {
         self.section() == "FLEET"
+    }
+}
+
+/// The start workspace from `--workspace NAME` (also `--workspace=NAME`).
+/// Without the flag, or with a name that is not a workspace, the console opens
+/// on Command; the unknown name is returned so the caller can report it.
+pub fn start_workspace(args: &[String]) -> (Workspace, Option<String>) {
+    let mut name = None;
+    let mut args = args.iter().skip(1);
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--workspace=") {
+            name = Some(value.to_string());
+        } else if arg == "--workspace" {
+            name = args.next().cloned();
+        }
+    }
+    match name {
+        Some(name) => match Workspace::from_name(&name) {
+            Some(workspace) => (workspace, None),
+            None => (Workspace::Command, Some(name)),
+        },
+        None => (Workspace::Command, None),
     }
 }
 
@@ -155,6 +226,22 @@ impl Notice {
     }
 }
 
+/// The notification feed's client state.
+///
+/// `items` is keyed by id: the first page is a snapshot with `all`, and every
+/// later page is the feed of changed rows, so it folds in instead of replacing
+/// the rest. `open` and `critical` are the server's counts for *all* open rows
+/// and therefore survive any local filter.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Notifications {
+    pub items: HashMap<Uuid, Notification>,
+    pub open: i64,
+    pub critical: i64,
+    /// True once any page (even an empty one) has been applied.
+    pub loaded: bool,
+    pub feed_error: Option<UiError>,
+}
+
 /// All signals the console shares. `Signal` is `Copy`, so `Store` is too.
 #[derive(Clone, Copy)]
 pub struct Store {
@@ -162,6 +249,10 @@ pub struct Store {
     pub status: Signal<Loaded<SystemStatus>>,
     /// Fleet snapshot; refreshed on its own 30s cadence, not the 1.5s poll.
     pub fleet: Signal<Loaded<contracts::fleet::FleetStatus>>,
+    /// The long-polled notification set; see [`Notifications`].
+    pub notifications: Signal<Notifications>,
+    /// Renewals, read on demand by the notification workspace's expansions.
+    pub renewals: Signal<Loaded<Vec<Renewal>>>,
     pub today: Signal<Loaded<Today>>,
     pub news: Signal<Loaded<Vec<NewsItem>>>,
     pub personas: Signal<Loaded<Vec<Persona>>>,
@@ -330,5 +421,78 @@ impl Store {
     pub fn set_poll_busy(&self, value: bool) {
         let mut signal = self.poll_busy;
         signal.set(value);
+    }
+    /// Replace the set: the snapshot carries every row, so absent rows are gone.
+    pub fn set_notification_snapshot(&self, page: NotificationPage) {
+        let mut signal = self.notifications;
+        signal.set(Notifications {
+            items: page.items.into_iter().map(|item| (item.id, item)).collect(),
+            open: page.open,
+            critical: page.critical,
+            loaded: true,
+            feed_error: None,
+        });
+    }
+    /// Fold the change feed in; it only carries rows whose `seq` moved.
+    pub fn merge_notification_page(&self, page: NotificationPage) {
+        let mut signal = self.notifications;
+        let mut current = signal.cloned();
+        for item in page.items {
+            current.items.insert(item.id, item);
+        }
+        current.open = page.open;
+        current.critical = page.critical;
+        current.loaded = true;
+        current.feed_error = None;
+        signal.set(current);
+    }
+    /// A failed feed keeps the rows on screen; the next page clears the error.
+    pub fn fail_notifications(&self, error: UiError) {
+        let mut signal = self.notifications;
+        let mut current = signal.cloned();
+        current.feed_error = Some(error);
+        signal.set(current);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn start_workspace_reads_the_flag() {
+        assert_eq!(start_workspace(&args(&["fleetix-hub-desktop"])), (Workspace::Command, None));
+        assert_eq!(start_workspace(&args(&["app", "--workspace", "notifications"])), (Workspace::Notifications, None));
+        assert_eq!(start_workspace(&args(&["app", "--workspace=today"])), (Workspace::Today, None));
+        assert_eq!(start_workspace(&args(&["app", "--workspace", "TODAY"])), (Workspace::Today, None));
+        // The last flag wins; an unknown name falls back and is reported.
+        assert_eq!(
+            start_workspace(&args(&["app", "--workspace", "news", "--workspace", "nope"])),
+            (Workspace::Command, Some("nope".to_string()))
+        );
+        // A flag without a value is not a workspace request.
+        assert_eq!(start_workspace(&args(&["app", "--workspace"])), (Workspace::Command, None));
+    }
+
+    #[test]
+    fn every_workspace_has_a_unique_key_and_slug() {
+        let mut keys: Vec<&str> = Workspace::ALL.iter().map(|workspace| workspace.key()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), Workspace::ALL.len(), "keyboard keys are unique");
+        for workspace in Workspace::ALL {
+            assert_eq!(Workspace::from_key(workspace.key()), Some(workspace));
+            assert_eq!(Workspace::from_name(workspace.slug()), Some(workspace));
+            assert!(!workspace.label().is_empty());
+        }
+        assert_eq!(Workspace::from_key("x"), None);
+        assert_eq!(Workspace::from_name("nope"), None);
+        assert_eq!(Workspace::Notifications.key(), "n", "Notifications keeps its letter");
+        assert_eq!(Workspace::Command.key(), "1", "the ten original digits do not move");
+        assert_eq!(Workspace::Library.key(), "0");
     }
 }

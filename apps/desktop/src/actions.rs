@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn static_entries_cover_navigation_and_commands() {
         let entries = static_entries();
-        assert_eq!(entries.iter().filter(|e| e.kind == "navigate").count(), 10);
+        assert_eq!(entries.iter().filter(|e| e.kind == "navigate").count(), 11);
         assert!(entries.iter().any(|e| e.action == Action::ToggleInspector));
         assert!(entries.iter().any(|e| e.action == Action::Refresh));
         assert!(entries.iter().any(|e| e.action == Action::RefreshFleet));

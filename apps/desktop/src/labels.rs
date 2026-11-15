@@ -4,7 +4,7 @@
 use contracts::fleet::{Health, UpdateState};
 use contracts::{
     AdapterMode, AssetState, AttemptKind, AttemptState, CanonState, ContentState, Direction, DraftState, GenerationState, IntentState,
-    Owner, ReleaseState, Verification,
+    Owner, ReleaseState, Severity, Verification,
 };
 
 #[cfg(test)]
@@ -152,6 +152,15 @@ pub fn health(health: Health) -> (&'static str, &'static str) {
     }
 }
 
+/// Notification severity. The label is always text; the tone only colours it.
+pub fn severity(severity: Severity) -> (&'static str, &'static str) {
+    match severity {
+        Severity::Info => ("Info", "info"),
+        Severity::Warning => ("Warning", "warn"),
+        Severity::Critical => ("Critical", "bad"),
+    }
+}
+
 pub fn update_state(state: UpdateState) -> (&'static str, &'static str) {
     match state {
         UpdateState::Current => ("Current", "ok"),
@@ -232,6 +241,9 @@ mod tests {
         }
         for s in [UpdateState::Current, UpdateState::Outdated, UpdateState::Unknown] {
             check(update_state(s).0, update_state(s).1);
+        }
+        for s in Severity::ALL {
+            check(severity(*s).0, severity(*s).1);
         }
         for o in [
             contracts::fleet::NightlyOutcome::Switched,
