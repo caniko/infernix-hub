@@ -153,11 +153,27 @@ const STALLED_PENDING_HOURS: i32 = 6;
 
 /// Include every stalled generation, not the capped informational Today list.
 pub async fn today_with_stalled(hub: &Hub, today: &Today) -> DResult<Vec<Raise>> {
+    // Times come from `state_since` (migration 0008), not `updated_at`, which
+    // every progress poll bumps. A `running` generation is judged by its open
+    // attempts: one really executing gets the running bound from when it
+    // started, while attempts still submitted or queued (a pipeline's
+    // `Pending`) get the pending bound from when they were queued.
     let rows: Vec<(Uuid, Uuid, String, String, DateTime<Utc>)> = sqlx::query_as(
-        "select g.id, c.id, c.title, g.state, g.updated_at
-         from generation_requests g join content_items c on c.id = g.content_item_id
-         where (g.state = 'running' and g.updated_at < now() - make_interval(hours => $1))
-            or (g.state in ('requested', 'dispatched') and g.updated_at < now() - make_interval(hours => $2))",
+        "select g.id, c.id, c.title,
+                case when g.state = 'running' then a.label else g.state end,
+                case when g.state = 'running' then a.since else g.state_since end
+         from generation_requests g
+         join content_items c on c.id = g.content_item_id
+         left join lateral (
+             select case when bool_or(x.state = 'running') then 'running' else 'queued' end as label,
+                    coalesce(min(x.state_since) filter (where x.state = 'running'), min(x.state_since)) as since
+             from execution_attempts x
+             where x.generation_request_id = g.id and x.state in ('submitted', 'queued', 'running')
+             having count(*) > 0
+         ) a on true
+         where (g.state in ('requested', 'dispatched') and g.state_since < now() - make_interval(hours => $2))
+            or (g.state = 'running' and a.label = 'running' and a.since < now() - make_interval(hours => $1))
+            or (g.state = 'running' and a.label = 'queued' and a.since < now() - make_interval(hours => $2))",
     )
     .bind(STALLED_RUNNING_HOURS)
     .bind(STALLED_PENDING_HOURS)

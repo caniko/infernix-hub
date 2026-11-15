@@ -2583,11 +2583,13 @@ async fn stalled_generation_notifies_and_resolves() {
     let input = GenerateIn { workflow_id: wf.id, inputs: json!({ "prompt": "test" }), variants: 1 };
     let old = h.op.generate(item.id, &input).await.unwrap();
     let fresh = h.op.generate(item.id, &input).await.unwrap();
-    domain::sqlx::query("update generation_requests set state = 'dispatched', updated_at = now() - interval '7 hours' where id = $1")
-        .bind(old.id)
-        .execute(&h.hub.db)
-        .await
-        .unwrap();
+    // Two statements: the trigger restamps state_since on the state change.
+    for sql in [
+        "update generation_requests set state = 'dispatched' where id = $1",
+        "update generation_requests set state_since = now() - interval '7 hours' where id = $1",
+    ] {
+        domain::sqlx::query(sql).bind(old.id).execute(&h.hub.db).await.unwrap();
+    }
     domain::sqlx::query("update generation_requests set state = 'running', updated_at = now() where id = $1")
         .bind(fresh.id)
         .execute(&h.hub.db)
@@ -2716,4 +2718,48 @@ async fn stale_observations_and_quiet_rows_never_hide_a_crossed_deadline() {
     let item = today.renewals.iter().find(|item| item.subject_id == expired.id).expect("overdue renewal is in Today");
     assert_eq!(item.status, "overdue");
     assert_eq!(today.renewals.first().map(|item| item.subject_id), Some(expired.id), "the most urgent row comes first");
+}
+
+#[tokio::test]
+async fn a_queued_pipeline_run_gets_the_pending_bound_until_it_really_runs() {
+    let Some(h) = harness().await else { return };
+    h.manual_pipeline();
+    let item = h.brief(None).await;
+    let g = h.pipeline(item.id).await;
+    h.tick().await;
+    let key = format!("today:stalled:{}", g.id);
+    let backdate = |hours: i64| {
+        let db = h.hub.db.clone();
+        async move {
+            domain::sqlx::query(
+                "update execution_attempts set state_since = now() - make_interval(hours => $2::int)
+                  where generation_request_id = $1 and state in ('submitted', 'queued', 'running')",
+            )
+            .bind(g.id)
+            .bind(hours as i32)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+    };
+    let stalled = || async {
+        fleetix_hubd::notify_pass(&h.hub, None, None).await;
+        h.op.notifications(None, 0, true).await.unwrap().items.into_iter().find(|n| n.dedupe_key == key && n.open)
+    };
+
+    // The pipeline reports Pending: the hub shows the generation as running,
+    // but a queued run is judged by the 6 h pending bound, not the 2 h one.
+    assert_eq!(h.pipeline_receipt(g.id, JobStatus::Queued, Vec::new()).await.unwrap().state, GenerationState::Running);
+    backdate(3).await;
+    assert!(stalled().await.is_none(), "3 h in the queue is within the pending bound");
+    backdate(7).await;
+    let queued = stalled().await.expect("7 h in the queue is stalled");
+    assert!(queued.body.starts_with("queued since "), "{}", queued.body);
+
+    // Execution starts: the running clock starts now, not when it was queued.
+    h.pipeline_receipt(g.id, JobStatus::Running, Vec::new()).await.unwrap();
+    assert!(stalled().await.is_none(), "a run that just started is not stalled");
+    backdate(3).await;
+    let running = stalled().await.expect("3 h of execution is stalled");
+    assert!(running.body.starts_with("running since "), "{}", running.body);
 }
