@@ -8,11 +8,11 @@
 //! popups alone carry the state.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use contracts::client::HubClient;
-use contracts::{AckNotificationsIn, Notification, NotificationPage, Severity};
+use contracts::{AckNotificationsIn, Notification, NotificationPage, Severity, SyncNotificationItem, SyncNotificationsIn};
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{ToolTip, Tray, TrayMethods};
 use tokio::sync::mpsc;
@@ -28,6 +28,108 @@ const BACKOFF_MAX: u64 = 60;
 const MENU_ROWS: usize = 5;
 /// More new rows than this arrive as one summary popup.
 const POPUP_LIMIT: usize = 3;
+
+fn failed_units(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let first = fields.next()?;
+            let unit = if first == "●" { fields.next()? } else { first };
+            let _load = fields.next()?;
+            (fields.next()? == "failed").then_some(unit)
+        })
+        .collect()
+}
+
+fn remember_failed(last: &mut HashMap<String, Instant>, units: Vec<&str>, now: Instant) {
+    for unit in units {
+        last.insert(unit.to_string(), now);
+    }
+    last.retain(|_, seen| now.duration_since(*seen) < Duration::from_secs(3600));
+}
+
+fn key_safe(key: &str) -> String {
+    key.chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, ':' | '.' | '_' | '-') { c } else { '-' })
+        .take(128)
+        .collect()
+}
+
+async fn report_units(client: HubClient) {
+    let mut last = HashMap::new();
+    let mut interval = tokio::time::interval(Duration::from_secs(300));
+    loop {
+        interval.tick().await;
+        let result = async {
+            let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")?;
+            let output = tokio::time::timeout(
+                Duration::from_secs(15),
+                tokio::process::Command::new("systemctl")
+                    .args(["--user", "list-units", "--state=failed", "--plain", "--no-legend"])
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await??;
+            anyhow::ensure!(output.status.success(), "systemctl exited with {}", output.status);
+            let text = std::str::from_utf8(&output.stdout)?;
+            remember_failed(&mut last, failed_units(text), Instant::now());
+            let items = last
+                .keys()
+                .map(|unit| SyncNotificationItem {
+                    dedupe_key: key_safe(&format!("unit:{}:{unit}", hostname.trim())),
+                    severity: Severity::Warning,
+                    title: format!("{unit} failed on {}", hostname.trim()),
+                    body: "A user unit has failed.".into(),
+                    subject_type: None,
+                    subject_id: None,
+                    url: None,
+                })
+                .collect();
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                client.sync_notifications(&SyncNotificationsIn { source: "units".into(), items }),
+            )
+            .await??;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            eprintln!("fleetix-hub-tray: unit report: {error:#}");
+        }
+    }
+}
+
+fn quiet_transition(held: &mut usize, active: bool, count: usize) -> Option<usize> {
+    if active {
+        *held += count;
+        None
+    } else if *held > 0 {
+        Some(std::mem::take(held))
+    } else {
+        None
+    }
+}
+
+async fn gaming() -> bool {
+    matches!(tokio::time::timeout(Duration::from_secs(2), tokio::process::Command::new("gamemoded").arg("-s").kill_on_drop(true).output()).await,
+        Ok(Ok(output)) if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("is active"))
+}
+
+async fn release_held(notifier: Option<&Notifier>, held: &mut usize, active: bool, count: usize) {
+    if let Some(count) = quiet_transition(held, active, count)
+        && let Some(notifier) = notifier
+    {
+        notifier
+            .popup(&Popup {
+                title: "Fleetix Hub".into(),
+                body: format!("{count} hub notifications while you were playing"),
+                critical: false,
+            })
+            .await;
+    }
+}
 
 #[derive(Default)]
 struct State {
@@ -270,6 +372,12 @@ async fn main() -> Result<()> {
         std::env::var("HUB_TOKEN").context("set HUB_TOKEN to a hub operator token")?,
     );
     let desktop_command = std::env::var("HUB_DESKTOP_COMMAND").unwrap_or_else(|_| "fleetix-hub-desktop".into());
+    if std::env::var("HUB_REPORT_UNITS").as_deref() == Ok("1") {
+        tokio::spawn(report_units(client.clone()));
+    }
+    let quiet = std::env::var("HUB_QUIET_WHILE_GAMING").as_deref() == Ok("1");
+    let mut held = 0;
+    let mut gaming_check = tokio::time::interval(Duration::from_secs(10));
 
     let (sender, mut actions) = mpsc::unbounded_channel();
     let tray = HubTray { view: view(&State::default()), actions: sender };
@@ -291,6 +399,10 @@ async fn main() -> Result<()> {
                 if act(action, &client, &mut desktop).await {
                     break;
                 }
+                continue;
+            }
+            _ = gaming_check.tick(), if quiet && held > 0 => {
+                release_held(notifier.as_ref(), &mut held, gaming().await, 0).await;
                 continue;
             }
         };
@@ -315,9 +427,17 @@ async fn main() -> Result<()> {
         };
         backoff = BACKOFF_START;
         state.offline = false;
+        let count = if snapshot { page.open.max(0) as usize } else { page.items.iter().filter(|item| item.open).count() };
         let popups = apply(&mut state, page);
+        let _ = handle.update(|tray| tray.view = view(&state)).await;
+        let active = quiet && (count > 0 || held > 0) && gaming().await;
+        if quiet {
+            release_held(notifier.as_ref(), &mut held, active, count).await;
+        }
         if let Some(notifier) = &notifier {
-            if snapshot {
+            if active {
+                continue;
+            } else if snapshot {
                 if state.open > 0 {
                     let summary = Popup {
                         title: "Fleetix Hub".into(),
@@ -332,7 +452,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        let _ = handle.update(|tray| tray.view = view(&state)).await;
     }
 
     handle.shutdown().await;
@@ -343,6 +462,39 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn parses_failed_unit_lines() {
+        assert_eq!(
+            failed_units("  foo.service loaded failed failed Foo\n● bar.timer loaded failed failed Bar\n\n"),
+            vec!["foo.service", "bar.timer"]
+        );
+        assert!(failed_units("").is_empty());
+    }
+
+    #[test]
+    fn failed_units_remain_for_one_hour_after_last_sighting() {
+        let now = Instant::now();
+        let mut last = HashMap::new();
+        remember_failed(&mut last, vec!["foo.service"], now);
+        remember_failed(&mut last, vec![], now + Duration::from_secs(3599));
+        assert!(last.contains_key("foo.service"));
+        remember_failed(&mut last, vec!["foo.service"], now + Duration::from_secs(3600));
+        remember_failed(&mut last, vec![], now + Duration::from_secs(7199));
+        assert!(last.contains_key("foo.service"));
+        remember_failed(&mut last, vec![], now + Duration::from_secs(7200));
+        assert!(last.is_empty());
+    }
+
+    #[test]
+    fn quiet_mode_counts_notifications_and_summarizes_once() {
+        let mut held = 0;
+        assert_eq!(quiet_transition(&mut held, true, 4), None);
+        assert_eq!(quiet_transition(&mut held, true, 2), None);
+        assert_eq!(held, 6);
+        assert_eq!(quiet_transition(&mut held, false, 0), Some(6));
+        assert_eq!(quiet_transition(&mut held, false, 0), None);
+    }
 
     fn note(id: u128, seq: i64, title: &str, severity: Severity, open: bool) -> Notification {
         Notification {
