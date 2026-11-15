@@ -2403,6 +2403,40 @@ async fn notifications_dedupe_ack_resolve_and_wake() {
     assert!(rows.items.iter().find(|n| n.id == reopened.id).unwrap().read_at.is_none(), "ack all skips a snoozed row");
 }
 
+/// The `hub_post_summary` path: one row per day, replaced in place on a re-run.
+#[tokio::test]
+async fn summary_notification_replaces_its_day() {
+    let Some(h) = harness().await else { return };
+
+    let first = fleetix_hubd::mcp::summary_input("2026-11-15", "headline\nNeeds you: nothing", Severity::Info).unwrap();
+    let posted = h.op.raise_notification(&first).await.unwrap();
+    assert_eq!(posted.source, "summary", "the summary source is not reserved");
+    assert_eq!(posted.dedupe_key, "summary:2026-11-15");
+    assert_eq!(posted.title, "Daily summary 2026-11-15");
+
+    // Same day, same text: one row, no seq bump, so no second popup.
+    let unchanged = h.op.raise_notification(&first).await.unwrap();
+    assert_eq!((unchanged.id, unchanged.seq), (posted.id, posted.seq), "an unchanged summary touches nothing");
+
+    // A corrected re-run keeps the row and the key, moves the body and the seq.
+    let second = fleetix_hubd::mcp::summary_input("2026-11-15", "headline changed", Severity::Warning).unwrap();
+    let replaced = h.op.raise_notification(&second).await.unwrap();
+    assert_eq!(replaced.id, posted.id);
+    assert_eq!(replaced.dedupe_key, "summary:2026-11-15");
+    assert_eq!(replaced.body, "headline changed");
+    assert_eq!(replaced.severity, Severity::Warning);
+    assert!(replaced.seq > posted.seq, "a changed summary is announced once");
+
+    let rows = h.op.notifications(None, 0, true).await.unwrap().items;
+    assert_eq!(rows.iter().filter(|row| row.dedupe_key.starts_with("summary:")).count(), 1);
+
+    // The next day is a new row, and a malformed day never becomes a key.
+    h.op.raise_notification(&fleetix_hubd::mcp::summary_input("2026-11-16", "next day", Severity::Info).unwrap()).await.unwrap();
+    assert_eq!(h.op.notifications(None, 0, true).await.unwrap().items.len(), 2);
+    assert!(fleetix_hubd::mcp::summary_input("2026-13-01", "bad", Severity::Info).is_err());
+    assert!(fleetix_hubd::mcp::summary_input("2026-11-15x", "bad", Severity::Info).is_err());
+}
+
 #[tokio::test]
 async fn notification_feed_never_skips_a_truncated_change() {
     let Some(h) = harness().await else { return };

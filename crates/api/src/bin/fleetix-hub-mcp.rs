@@ -1,4 +1,4 @@
-//! `fleetix-hub-mcp`: read-only hub tools over stdio, with no packs.
+//! `fleetix-hub-mcp`: hub tools over stdio, with no packs.
 //!
 //! The hub token still decides what the API accepts; this process holds no
 //! database or service secret.
@@ -15,7 +15,7 @@ struct Cli {
     token: String,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let ctx = ClientContext { hub: contracts::client::HubClient::new(cli.url, cli.token), config: serde_json::json!({}) };

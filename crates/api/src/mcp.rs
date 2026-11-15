@@ -13,6 +13,7 @@
 use std::future::Future;
 
 use contracts::client::{ClientError, HubClient};
+use contracts::{RaiseNotificationIn, Severity};
 use fleetix::mcp_server::{Effect, Server};
 use rmcp::handler::server::common::schema_for_input;
 use rmcp::handler::server::router::tool::ToolRoute;
@@ -32,8 +33,9 @@ macro_rules! json_text {
     };
 }
 
-/// Serve the MCP catalog on stdin/stdout until EOF.
-pub async fn serve(ctx: ClientContext, packs: Vec<Box<dyn Pack>>) -> anyhow::Result<()> {
+/// The catalog with its authorizer installed, ready to serve or to inspect
+/// without stdio.
+pub fn catalog(ctx: ClientContext, packs: Vec<Box<dyn Pack>>) -> anyhow::Result<Server> {
     validate_packs(&packs)?;
     let mut server = Server::new("fleetix-hub-mcp", env!("CARGO_PKG_VERSION"));
     for (effect, route) in routes(&ctx) {
@@ -50,8 +52,12 @@ pub async fn serve(ctx: ClientContext, packs: Vec<Box<dyn Pack>>) -> anyhow::Res
     }
     // The hub token decides what the API accepts; this gate only keeps
     // Destructive tools off a server that never registers one.
-    let server = server.with_authorizer(|invocation| matches!(invocation.effect, Effect::Read | Effect::Write));
-    server.serve_stdio().await.map_err(|e| anyhow::anyhow!("serving MCP over stdio: {e}"))?;
+    Ok(server.with_authorizer(|invocation| matches!(invocation.effect, Effect::Read | Effect::Write)))
+}
+
+/// Serve the catalog on stdin/stdout until EOF.
+pub async fn serve(ctx: ClientContext, packs: Vec<Box<dyn Pack>>) -> anyhow::Result<()> {
+    catalog(ctx, packs)?.serve_stdio().await.map_err(|e| anyhow::anyhow!("serving MCP over stdio: {e}"))?;
     Ok(())
 }
 
@@ -99,10 +105,13 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
         ),
         (Effect::Read, opportunities_tool(hub.clone())),
         (Effect::Read, opportunity_tool(hub.clone())),
+        (Effect::Read, notifications_tool(hub.clone())),
         (Effect::Write, create_brief_tool(hub.clone())),
         (Effect::Write, draft_reply_tool(hub.clone())),
         (Effect::Write, assistant_draft_tool(hub.clone())),
-        (Effect::Write, ingest_opportunity_tool(hub)),
+        (Effect::Write, ingest_opportunity_tool(hub.clone())),
+        (Effect::Write, notify_tool(hub.clone())),
+        (Effect::Write, summary_tool(hub)),
     ]
 }
 
@@ -387,6 +396,143 @@ fn assistant_draft_tool(hub: HubClient) -> ToolRoute<()> {
     )
 }
 
+/// The operator's notification set: open rows by default, everything with
+/// `all`. Snapshot only; the feed cursor belongs to the desktop and the tray.
+fn notifications_tool(hub: HubClient) -> ToolRoute<()> {
+    ToolRoute::new(
+        Tool::new(
+            "hub_notifications",
+            "Notifications for the operator: severity, title, body, source, dedupe key and whether each row is still open. `all` includes acknowledged and resolved rows.",
+            schema(json!({ "all": { "type": "boolean", "description": "Include acknowledged and resolved rows." } }), &[]),
+        ),
+        move |Parameters(args): Parameters<Value>| {
+            let hub = hub.clone();
+            async move {
+                let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+                match hub.notifications(None, 0, all).await {
+                    Ok(page) => render(json_text!(page)),
+                    Err(error) => failed(error.to_string()),
+                }
+            }
+        },
+    )
+}
+
+/// An agent or procedure raises one row. `source` stays server-side (`agent`):
+/// a caller that could name a producer source would fake and then resolve it.
+fn notify_tool(hub: HubClient) -> ToolRoute<()> {
+    ToolRoute::new(
+        Tool::new(
+            "hub_notify",
+            "Raise a notification for the operator. `dedupe_key` is its stable identity: the same key and text again touches nothing, changed text replaces the row. No tool acknowledges or snoozes.",
+            schema(
+                json!({
+                    "dedupe_key": { "type": "string", "description": "Stable identity, e.g. `agent:nightly:atlas`." },
+                    "severity": { "type": "string", "enum": ["info", "warning", "critical"] },
+                    "title": { "type": "string" },
+                    "body": { "type": "string" },
+                }),
+                &["dedupe_key", "severity", "title"],
+            ),
+        ),
+        move |Parameters(args): Parameters<Value>| {
+            let hub = hub.clone();
+            async move {
+                let Some(dedupe_key) = args.get("dedupe_key").and_then(Value::as_str) else {
+                    return failed("dedupe_key is required and must be a string");
+                };
+                let Some(severity) = args.get("severity").and_then(Value::as_str).and_then(Severity::parse) else {
+                    return failed("severity must be one of info, warning or critical");
+                };
+                let Some(title) = args.get("title").and_then(Value::as_str) else {
+                    return failed("title is required and must be a string");
+                };
+                let input = RaiseNotificationIn {
+                    source: None,
+                    dedupe_key: dedupe_key.to_owned(),
+                    severity,
+                    title: title.to_owned(),
+                    body: args.get("body").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                    subject_type: None,
+                    subject_id: None,
+                    url: None,
+                };
+                match hub.raise_notification(&input).await {
+                    Ok(notification) => render(json_text!(notification)),
+                    Err(error) => failed(error.to_string()),
+                }
+            }
+        },
+    )
+}
+
+/// The daily summary is a notification keyed `summary:<day>`: a re-run of the
+/// same day replaces its body, and only a changed body is announced again.
+fn summary_tool(hub: HubClient) -> ToolRoute<()> {
+    ToolRoute::new(
+        Tool::new(
+            "hub_post_summary",
+            "Write the day's summary as one notification, keyed `summary:<day>`. Re-posting the same day replaces its body; only a changed one is announced again.",
+            schema(
+                json!({
+                    "day": { "type": "string", "description": "The day the summary covers, `YYYY-MM-DD` in Europe/Berlin." },
+                    "body": { "type": "string", "description": "At most 25 lines of plain text." },
+                    "severity": { "type": "string", "enum": ["info", "warning", "critical"], "default": "info" },
+                }),
+                &["day", "body"],
+            ),
+        ),
+        move |Parameters(args): Parameters<Value>| {
+            let hub = hub.clone();
+            async move {
+                let Some(day) = args.get("day").and_then(Value::as_str) else {
+                    return failed("day is required and must be a string");
+                };
+                let Some(body) = args.get("body").and_then(Value::as_str) else {
+                    return failed("body is required and must be a string");
+                };
+                let severity = match args.get("severity").and_then(Value::as_str) {
+                    None => Severity::Info,
+                    Some(raw) => match Severity::parse(raw) {
+                        Some(severity) => severity,
+                        None => return failed("severity must be one of info, warning or critical"),
+                    },
+                };
+                let input = match summary_input(day, body, severity) {
+                    Ok(input) => input,
+                    Err(error) => return failed(error),
+                };
+                match hub.raise_notification(&input).await {
+                    Ok(notification) => render(json_text!(notification)),
+                    Err(error) => failed(error.to_string()),
+                }
+            }
+        },
+    )
+}
+
+/// The `hub_post_summary` request for one day. `day` becomes part of a dedupe
+/// key, so it is shape-checked here and a bad one never reaches the API.
+pub fn summary_input(day: &str, body: &str, severity: Severity) -> Result<RaiseNotificationIn, String> {
+    let bytes = day.as_bytes();
+    // Ten bytes with dashes in place, then a real calendar date: `2026-13-01`
+    // and `2026-11-15x` must not name a summary row.
+    let shaped = bytes.len() == 10 && bytes[4] == b'-' && bytes[7] == b'-';
+    if !shaped || chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_err() {
+        return Err(format!("day must be a calendar date `YYYY-MM-DD`, got {day:?}"));
+    }
+    Ok(RaiseNotificationIn {
+        source: Some("summary".into()),
+        dedupe_key: format!("summary:{day}"),
+        severity,
+        title: format!("Daily summary {day}"),
+        body: body.to_owned(),
+        subject_type: None,
+        subject_id: None,
+        url: None,
+    })
+}
+
 pub(crate) fn render(text: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(text)])
 }
@@ -442,10 +588,13 @@ mod tests {
                 ("hub_renewals", Effect::Read),
                 ("hub_opportunities", Effect::Read),
                 ("hub_opportunity", Effect::Read),
+                ("hub_notifications", Effect::Read),
                 ("hub_create_brief", Effect::Write),
                 ("hub_draft_reply", Effect::Write),
                 ("hub_assistant_draft_reply", Effect::Write),
                 ("hub_ingest_opportunity", Effect::Write),
+                ("hub_notify", Effect::Write),
+                ("hub_post_summary", Effect::Write),
             ]
         );
         let mut names: Vec<&str> = actual.iter().map(|(name, _)| *name).collect();
@@ -463,5 +612,18 @@ mod tests {
         assert!(uuid_text("3f2504e0-4f89-11d3-9a0c-0305e82c3301", "id").is_ok());
         assert!(uuid_text("../../status", "id").is_err());
         assert!(uuid_text("3f2504e0-4f89-11d3-9a0c-0305e82c330", "id").is_err());
+    }
+
+    #[test]
+    fn summary_days_are_calendar_dates_and_name_their_row() {
+        let input = summary_input("2026-11-15", "headline\nFleet: nothing", Severity::Warning).unwrap();
+        assert_eq!(input.source.as_deref(), Some("summary"));
+        assert_eq!(input.dedupe_key, "summary:2026-11-15");
+        assert_eq!(input.title, "Daily summary 2026-11-15");
+        assert_eq!(input.severity, Severity::Warning);
+
+        for bad in ["2026-13-01", "2026-11-15x", "2026-02-30", "26-11-15", "2026-1-15", ""] {
+            assert!(summary_input(bad, "body", Severity::Info).is_err(), "{bad:?} must not be a summary day");
+        }
     }
 }
