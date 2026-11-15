@@ -1,0 +1,21 @@
+[package]
+name = "fleetix-hub-tray"
+description = "Desktop tray daemon: one hub long-poll, a status notifier icon and freedesktop popups."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+contracts = { workspace = true, features = ["client"] }
+# 0.3.7 is the version the COSMIC 1.11 spike proved; its `tokio` backend shares
+# the runtime with the long-poll.
+ksni = { version = "0.3", features = ["tokio"] }
+tokio = { workspace = true, features = ["process"] }
+# zbus at the major version ksni resolves; only `Notify` needs it directly.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+# Test fixtures build `Notification` rows, whose ids must be distinct.
+uuid.workspace = true

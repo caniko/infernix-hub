@@ -26,6 +26,7 @@ jobs:
         installable:
           - ".#packages.x86_64-linux.fleetix-hubd"
           - ".#packages.x86_64-linux.hubctl"
+          - ".#packages.x86_64-linux.fleetix-hub-tray"
     env:
       NIX_CONFIG: "experimental-features = nix-command flakes"
     steps:
