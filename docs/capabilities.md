@@ -192,7 +192,7 @@ That renders `packs.json` and a `<id>-<name>` systemd credential; the pack reads
 the token from `$CREDENTIALS_DIRECTORY`. Because it is a pack channel, it posts
 for real and therefore requires live Paperclip approvals. State: the pack
 contract and the module options are tested; the Plinth channel itself lives in
-the `canix-hub` repository; its live channel is not qualified here.
+the `canix-hub` crate in the canix repository; its live channel is not qualified here.
 
 ## Live adapters: evidence
 
