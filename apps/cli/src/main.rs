@@ -115,6 +115,26 @@ enum Cmd {
     Handoff {
         id: Uuid,
     },
+    /// Funding calls: `--state` and `--due-within` filter the list.
+    Opportunities {
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        due_within: Option<i32>,
+    },
+    Opportunity {
+        #[command(subcommand)]
+        cmd: OpportunityCmd,
+    },
+    /// Approve the release's native Paperclip approval with the operator's own
+    /// board key, then link it. `--reject` records a rejection instead.
+    Approve {
+        release: Uuid,
+        #[arg(long)]
+        reject: bool,
+        #[arg(long)]
+        note: Option<String>,
+    },
     Pause {
         #[arg(long)]
         reason: Option<String>,
@@ -126,6 +146,23 @@ enum Cmd {
 enum FleetCmd {
     /// The snapshot written by `canix fleet status --write`.
     Status,
+}
+
+#[derive(Subcommand)]
+enum OpportunityCmd {
+    /// One opportunity by id.
+    Show { id: Uuid },
+    /// Operator-only decision: new|shortlisted|drafting|submitted|awarded|rejected|declined.
+    Decide {
+        id: Uuid,
+        state: String,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        issue: Option<String>,
+    },
+    /// File a call from a JSON `OpportunityIn` document.
+    Ingest { file: std::path::PathBuf },
 }
 
 fn print(v: impl serde::Serialize) {
@@ -180,6 +217,37 @@ async fn main() -> Result<()> {
         Cmd::ApproveDraft { id } => print(c.decide_draft(id, &DraftDecisionIn::Approve).await?),
         Cmd::Takeover { id } => print(c.takeover(id).await?),
         Cmd::Handoff { id } => print(c.handoff(id).await?),
+        Cmd::Opportunities { state, due_within } => print(c.opportunities(state.as_deref(), due_within).await?),
+        Cmd::Opportunity { cmd } => match cmd {
+            OpportunityCmd::Show { id } => print(c.opportunity(id).await?),
+            OpportunityCmd::Decide { id, state, note, issue } => {
+                let state = OpportunityState::parse(&state).ok_or_else(|| anyhow::anyhow!("unknown opportunity state {state:?}"))?;
+                print(c.decide_opportunity(id, &OpportunityDecisionIn { state, note, paperclip_issue_id: issue }).await?)
+            }
+            OpportunityCmd::Ingest { file } => {
+                let body: OpportunityIn = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
+                print(c.ingest_opportunity(&body).await?)
+            }
+        },
+        Cmd::Approve { release, reject, note } => {
+            let revision = c.release(release).await?;
+            // Show exactly what the approval authorizes before deciding.
+            print(json!({
+                "release": revision.revision,
+                "state": revision.state,
+                "payload_hash": revision.payload_hash,
+                "text": revision.actions.iter().map(|a| a.text.clone()).collect::<Vec<_>>(),
+                "platform_settings": revision.actions.iter().map(|a| a.platform_settings.clone()).collect::<Vec<_>>(),
+            }));
+            let approval_id = revision
+                .paperclip_approval_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("release {release} has no Paperclip approval; request review first"))?;
+            // The operator's key stays local; the hub never sees it.
+            let board = contracts::client::PaperclipBoard::from_env()?;
+            board.decide(&approval_id, !reject, note.as_deref()).await?;
+            print(c.link_approval(release, &LinkApprovalIn { approval_id }).await?);
+        }
         Cmd::Pause { reason } => print(c.set_pause(&PauseIn { paused: true, reason }).await?),
         Cmd::Resume => print(c.set_pause(&PauseIn { paused: false, reason: None }).await?),
     }

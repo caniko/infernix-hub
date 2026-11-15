@@ -146,6 +146,14 @@ pub async fn freeze(hub: &Hub, actor: &Actor, content_id: Uuid, input: FreezeRel
     Ok(rel)
 }
 
+/// Read one release revision (the CLI and desktop show the frozen payload
+/// before the operator decides its approval).
+pub async fn show(hub: &Hub, actor: &Actor, id: Uuid) -> DResult<ReleaseRevision> {
+    actor.require(crate::ANY_READER)?;
+    let mut conn = hub.db.acquire().await?;
+    get_release(&mut conn, id, false).await
+}
+
 /// Ask Paperclip for a native approval of this exact revision.
 pub async fn request_review(hub: &Hub, actor: &Actor, release_id: Uuid) -> DResult<ReleaseRevision> {
     actor.require(OPERATOR)?;
@@ -226,6 +234,13 @@ pub async fn link_approval(hub: &Hub, actor: &Actor, release_id: Uuid, input: Li
     let mut tx = hub.db.begin().await?;
     let rel = get_release(&mut tx, release_id, true).await?;
     approval_matches(&rel, &view)?;
+    // The worker may have applied this same decision first; linking it again
+    // returns the already-verified result instead of failing.
+    if matches!(rel.state, ReleaseState::Approved | ReleaseState::Rejected)
+        && rel.paperclip_approval_id.as_deref() == Some(input.approval_id.as_str())
+    {
+        return Ok(rel);
+    }
     if !matches!(rel.state, ReleaseState::Draft | ReleaseState::InReview) {
         return Err(conflict("release_not_reviewable", format!("release is {}", rel.state)));
     }

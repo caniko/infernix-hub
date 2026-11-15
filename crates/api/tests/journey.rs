@@ -1995,3 +1995,109 @@ async fn open_procedures_are_polled_least_recently_first_so_none_starves() {
     domain::production::reconcile_procedures(&h.hub).await.unwrap();
     assert_eq!(unpolled().await, 0, "the next pass takes the ones never polled before any repeat");
 }
+
+// ── Opportunities (stream H1) ───────────────────────────────────────────────
+
+fn opportunity_in(external_id: &str, deadline: Option<chrono::DateTime<Utc>>) -> OpportunityIn {
+    OpportunityIn {
+        persona_id: None,
+        source: "n8n:funder-feed".into(),
+        external_id: external_id.into(),
+        kind: OpportunityKind::Grant,
+        title: format!("Call {external_id}"),
+        funder: "Example Fund".into(),
+        url: format!("https://fund.example/{external_id}"),
+        deadline,
+        amount: Some("10k".into()),
+        eligibility: "early career".into(),
+        fit: "spike sorting".into(),
+        evidence: vec![Evidence { url: format!("https://fund.example/{external_id}"), quote: "a call".into() }],
+    }
+}
+
+async fn decide(h: &H, id: Uuid, state: OpportunityState) -> Opportunity {
+    h.op.decide_opportunity(id, &OpportunityDecisionIn { state, note: None, paperclip_issue_id: None }).await.unwrap()
+}
+
+#[tokio::test]
+async fn opportunity_ingest_replay_keeps_state_and_updates_facts() {
+    let Some(h) = harness().await else { return };
+    let first = h.ingest.ingest_opportunity(&opportunity_in("call-1", Some(Utc::now() + chrono::Duration::days(3)))).await.unwrap();
+    h.op.decide_opportunity(
+        first.id,
+        &OpportunityDecisionIn { state: OpportunityState::Shortlisted, note: Some("apply".into()), paperclip_issue_id: None },
+    )
+    .await
+    .unwrap();
+
+    let mut replay = opportunity_in("call-1", Some(Utc::now() + chrono::Duration::days(9)));
+    replay.title = "Call 1, extended".into();
+    replay.amount = Some("20k".into());
+    replay.fit = "a better fit".into();
+    let again = h.ingest.ingest_opportunity(&replay).await.unwrap();
+    assert_eq!(again.id, first.id, "a replay converges on one row");
+    assert_eq!(again.title, "Call 1, extended");
+    assert_eq!(again.amount.as_deref(), Some("20k"));
+    assert_eq!(again.fit, "a better fit");
+    assert_eq!(again.state, OpportunityState::Shortlisted, "ingest never overwrites the decision");
+    assert_eq!(again.note.as_deref(), Some("apply"));
+    assert_eq!(h.op.opportunities(None, None).await.unwrap().len(), 1);
+    let history = h.op.get::<Vec<HistoryEntry>>(&format!("/history/opportunity/{}", first.id)).await.unwrap();
+    assert!(history.iter().any(|entry| entry.action == "opportunity.decided"));
+    assert!(history.iter().any(|entry| entry.action == "opportunity.reingested"));
+}
+
+#[tokio::test]
+async fn opportunity_expired_is_derived_while_the_call_is_open() {
+    let Some(h) = harness().await else { return };
+    let past = h.ingest.ingest_opportunity(&opportunity_in("past", Some(Utc::now() - chrono::Duration::days(1)))).await.unwrap();
+    assert!(past.expired);
+    assert!(decide(&h, past.id, OpportunityState::Drafting).await.expired, "drafting is still open");
+    assert!(!decide(&h, past.id, OpportunityState::Submitted).await.expired, "a submitted call is never expired");
+    let rolling = h.ingest.ingest_opportunity(&opportunity_in("rolling", None)).await.unwrap();
+    assert!(!rolling.expired, "a null deadline is rolling, not expired");
+}
+
+#[tokio::test]
+async fn an_agent_may_file_opportunities_but_never_decide_them() {
+    let Some(h) = harness().await else { return };
+    let filed = h.agent.ingest_opportunity(&opportunity_in("agent-call", None)).await.unwrap();
+    let refused = h
+        .agent
+        .decide_opportunity(filed.id, &OpportunityDecisionIn { state: OpportunityState::Shortlisted, note: None, paperclip_issue_id: None })
+        .await
+        .unwrap_err();
+    assert_eq!(code(refused), "forbidden");
+    assert_eq!(h.op.opportunity(filed.id).await.unwrap().state, OpportunityState::New);
+}
+
+#[tokio::test]
+async fn today_lists_open_calls_due_within_two_weeks() {
+    let Some(h) = harness().await else { return };
+    let soon = h.ingest.ingest_opportunity(&opportunity_in("soon", Some(Utc::now() + chrono::Duration::days(3)))).await.unwrap();
+    let soon = decide(&h, soon.id, OpportunityState::Shortlisted).await;
+    let drafting = h.ingest.ingest_opportunity(&opportunity_in("drafting", Some(Utc::now() + chrono::Duration::days(10)))).await.unwrap();
+    let drafting = decide(&h, drafting.id, OpportunityState::Drafting).await;
+    let later = h.ingest.ingest_opportunity(&opportunity_in("later", Some(Utc::now() + chrono::Duration::days(30)))).await.unwrap();
+    let later = decide(&h, later.id, OpportunityState::Shortlisted).await;
+    let undecided = h.ingest.ingest_opportunity(&opportunity_in("undecided", Some(Utc::now() + chrono::Duration::days(2)))).await.unwrap();
+    let missed = h.ingest.ingest_opportunity(&opportunity_in("missed", Some(Utc::now() - chrono::Duration::days(1)))).await.unwrap();
+    let missed = decide(&h, missed.id, OpportunityState::Drafting).await;
+
+    let today = h.op.today().await.unwrap();
+    let ids: Vec<Uuid> = today.opportunities.iter().map(|item| item.subject_id).collect();
+    assert!(ids.contains(&soon.id), "shortlisted and due in three days");
+    assert!(ids.contains(&drafting.id), "drafting and due in ten days");
+    let status = |id: Uuid| today.opportunities.iter().find(|item| item.subject_id == id).map(|item| item.status.clone());
+    assert_eq!(status(missed.id).as_deref(), Some("expired"), "a passed deadline shows as expired");
+    assert_eq!(status(drafting.id).as_deref(), Some("drafting"));
+    assert_eq!(h.op.opportunity(missed.id).await.unwrap().state, OpportunityState::Drafting, "the stored state is kept");
+    assert!(!ids.contains(&later.id), "thirty days is outside the window");
+    assert!(!ids.contains(&undecided.id), "a new call is not on the decision queue");
+    assert!(today.opportunities.iter().all(|item| item.subject_type == "opportunity"));
+
+    let due = h.op.opportunities(None, Some(7)).await.unwrap();
+    let ids: Vec<Uuid> = due.iter().map(|item| item.id).collect();
+    assert!(ids.contains(&soon.id) && ids.contains(&undecided.id));
+    assert!(!ids.contains(&drafting.id) && !ids.contains(&later.id));
+}

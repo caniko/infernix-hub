@@ -121,6 +121,18 @@
         "description": "See hub_contracts::NewsItem",
         "type": "object"
       },
+      "Opportunity": {
+        "description": "See hub_contracts::Opportunity",
+        "type": "object"
+      },
+      "OpportunityDecisionIn": {
+        "description": "See hub_contracts::OpportunityDecisionIn",
+        "type": "object"
+      },
+      "OpportunityIn": {
+        "description": "See hub_contracts::OpportunityIn",
+        "type": "object"
+      },
       "PauseIn": {
         "description": "See hub_contracts::PauseIn",
         "type": "object"
@@ -1257,6 +1269,49 @@
         "x-roles": "ingest|procedure|operator"
       }
     },
+    "/v1/ingest/opportunities": {
+      "post": {
+        "operationId": "ingest_opportunity",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpportunityIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Opportunity"
+                }
+              }
+            },
+            "description": "Opportunity"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "ingest|procedure|operator|agent"
+      }
+    },
     "/v1/intents": {
       "get": {
         "operationId": "intents",
@@ -1519,6 +1574,138 @@
           }
         ],
         "x-roles": "see domain command"
+      }
+    },
+    "/v1/opportunities": {
+      "get": {
+        "operationId": "opportunity_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Opportunity"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Opportunity[]"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "see domain command"
+      }
+    },
+    "/v1/opportunities/{id}": {
+      "get": {
+        "operationId": "opportunity_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Opportunity"
+                }
+              }
+            },
+            "description": "Opportunity"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "see domain command"
+      }
+    },
+    "/v1/opportunities/{id}/decision": {
+      "post": {
+        "operationId": "opportunity_decide",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpportunityDecisionIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Opportunity"
+                }
+              }
+            },
+            "description": "Opportunity"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "operator"
       }
     },
     "/v1/personas": {
@@ -1974,6 +2161,49 @@
               }
             },
             "description": "Relationship"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "see domain command"
+      }
+    },
+    "/v1/releases/{id}": {
+      "get": {
+        "operationId": "release_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseRevision"
+                }
+              }
+            },
+            "description": "ReleaseRevision"
           },
           "4XX": {
             "content": {

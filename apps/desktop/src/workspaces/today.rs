@@ -11,13 +11,14 @@ use crate::{
     state::Store,
 };
 
-fn buckets(today: &Today) -> [(&'static str, &'static str, &Vec<TodayItem>); 5] {
+fn buckets(today: &Today) -> [(&'static str, &'static str, &Vec<TodayItem>); 6] {
     [
         ("pending_reviews", "Pending reviews", &today.pending_reviews),
         ("active_production", "Active production", &today.active_production),
         ("due_releases", "Due releases", &today.due_releases),
         ("failed_operations", "Failed operations", &today.failed_operations),
         ("overdue_interactions", "Overdue interactions", &today.overdue_interactions),
+        ("opportunities", "Opportunity deadlines", &today.opportunities),
     ]
 }
 
@@ -68,6 +69,7 @@ pub fn TodayView() -> Element {
                         StatCard { label: "Due releases".to_string(), value: data.due_releases.len().to_string(), tone: None, detail: Some("next 24h".to_string()) }
                         StatCard { label: "Failed operations".to_string(), value: data.failed_operations.len().to_string(), tone: Some("bad".to_string()), detail: Some("needs attention".to_string()) }
                         StatCard { label: "Overdue interactions".to_string(), value: data.overdue_interactions.len().to_string(), tone: Some("warn".to_string()), detail: Some("replies owed".to_string()) }
+                        StatCard { label: "Opportunity deadlines".to_string(), value: data.opportunities.len().to_string(), tone: Some("warn".to_string()), detail: Some("two weeks".to_string()) }
                     }
                     for (key, label, items) in buckets(&data) {
                         if selected.is_none() || selected == Some(key) {
@@ -90,6 +92,7 @@ pub fn TodayView() -> Element {
                     if data.pending_reviews.is_empty() && data.active_production.is_empty()
                         && data.due_releases.is_empty() && data.failed_operations.is_empty()
                         && data.overdue_interactions.is_empty()
+                        && data.opportunities.is_empty()
                     {
                         EmptyState { title: "Nothing needs the operator right now.".to_string(), hint: Some("The poll refreshes this view every 1.5s.".to_string()) }
                     }
@@ -119,10 +122,13 @@ fn TodayRow(item: TodayItem) -> Element {
                     span { class: "label-tech", "{format::rel_time(at.timestamp_millis().max(0) as u64)}" }
                 }
                 div { class: "spacer" }
-                button {
-                    class: "btn btn-glass btn-xs",
-                    onclick: move |_| actions::open_subject(store, &subject_type, item.subject_id),
-                    "Open"
+                // Opportunities have no workspace; `hubctl opportunity show` opens them.
+                if item.subject_type != "opportunity" {
+                    button {
+                        class: "btn btn-glass btn-xs",
+                        onclick: move |_| actions::open_subject(store, &subject_type, item.subject_id),
+                        "Open"
+                    }
                 }
             }
         }

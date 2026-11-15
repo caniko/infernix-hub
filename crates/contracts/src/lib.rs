@@ -250,6 +250,83 @@ pub struct NewsItem {
     pub content_item_id: Option<Uuid>,
 }
 
+// ── Opportunities ───────────────────────────────────────────────────────────
+
+wire_enum!(OpportunityKind {
+    Grant = "grant",
+    Fellowship = "fellowship",
+    Prize = "prize",
+    Venue = "venue",
+    Program = "program",
+    Other = "other"
+});
+
+wire_enum!(OpportunityState {
+    New = "new",
+    Shortlisted = "shortlisted",
+    Drafting = "drafting",
+    Submitted = "submitted",
+    Awarded = "awarded",
+    Rejected = "rejected",
+    Declined = "declined"
+});
+
+/// One funding call, fellowship, prize, venue or programme filed by a feed or
+/// a scout. The identity is `(company_id, source, external_id)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpportunityIn {
+    pub persona_id: Option<Uuid>,
+    pub source: String,
+    /// The sender's stable id; a replay updates facts instead of duplicating.
+    pub external_id: String,
+    pub kind: OpportunityKind,
+    pub title: String,
+    pub funder: String,
+    pub url: String,
+    /// Null means rolling or unknown.
+    pub deadline: Option<DateTime<Utc>>,
+    pub amount: Option<String>,
+    #[serde(default)]
+    pub eligibility: String,
+    #[serde(default)]
+    pub fit: String,
+    /// At least one entry; findings without a source are refused.
+    pub evidence: Vec<Evidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Opportunity {
+    pub id: Uuid,
+    pub company_id: String,
+    pub persona_id: Option<Uuid>,
+    pub source: String,
+    pub external_id: String,
+    pub kind: OpportunityKind,
+    pub title: String,
+    pub funder: String,
+    pub url: String,
+    pub deadline: Option<DateTime<Utc>>,
+    pub amount: Option<String>,
+    pub eligibility: String,
+    pub fit: String,
+    pub evidence: Vec<Evidence>,
+    pub state: OpportunityState,
+    pub note: Option<String>,
+    pub paperclip_issue_id: Option<String>,
+    /// A deadline in the past while the state is still open. Derived on read;
+    /// the stored state is untouched.
+    pub expired: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpportunityDecisionIn {
+    pub state: OpportunityState,
+    pub note: Option<String>,
+    pub paperclip_issue_id: Option<String>,
+}
+
 // ── Content & briefs ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -655,6 +732,9 @@ pub struct Today {
     pub due_releases: Vec<TodayItem>,
     pub failed_operations: Vec<TodayItem>,
     pub overdue_interactions: Vec<TodayItem>,
+    /// Shortlisted or drafting calls due within 14 days (additive field).
+    #[serde(default)]
+    pub opportunities: Vec<TodayItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
