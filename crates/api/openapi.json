@@ -1626,7 +1626,7 @@
             "name": "after",
             "required": false,
             "schema": {
-              "default": 0,
+              "description": "Absent: a snapshot of the newest open (or all) rows, cursor = high-water mark. Present: the feed of the oldest changes past this cursor; echo the returned cursor to continue without skipping a change.",
               "format": "int64",
               "type": "integer"
             }
