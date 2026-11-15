@@ -30,6 +30,8 @@ const HUMAN: &[Role] = &[Role::Operator, Role::Member];
 
 const MAX_TITLE: usize = 200;
 const MAX_BODY: usize = 16 * 1024;
+/// Sync copies the source into every item, so it is bounded before that.
+const MAX_SOURCE: usize = 64;
 pub const MAX_LIMIT: i64 = 200;
 /// Cap for one long-poll request; the client re-polls after this.
 pub const MAX_WAIT_SECS: u64 = 55;
@@ -645,8 +647,8 @@ fn stored_key(owner: Option<&str>, key: &str) -> DResult<String> {
 
 fn api_raise(owner: Option<&str>, input: RaiseNotificationIn) -> DResult<Raise> {
     let source = input.source.as_deref().unwrap_or("agent").trim().to_string();
-    if source.is_empty() {
-        return Err(invalid("invalid_source", "source must not be empty"));
+    if source.is_empty() || source.len() > MAX_SOURCE {
+        return Err(invalid("invalid_source", format!("source must be 1..={MAX_SOURCE} bytes")));
     }
     if RESERVED_SOURCES.contains(&source.as_str())
         || (owner.is_none() && (source.starts_with("member:") || input.dedupe_key.starts_with("member:")))
@@ -677,8 +679,8 @@ pub async fn sync_api(hub: &Hub, actor: &Actor, input: SyncNotificationsIn) -> D
     actor.require(RAISERS)?;
     let owner = (actor.principal.role == Role::Member).then_some(actor.principal.name.as_str());
     let source = input.source.trim();
-    if source.is_empty() {
-        return Err(invalid("invalid_source", "source must not be empty"));
+    if source.is_empty() || source.len() > MAX_SOURCE {
+        return Err(invalid("invalid_source", format!("source must be 1..={MAX_SOURCE} bytes")));
     }
     if RESERVED_SOURCES.contains(&source) || (owner.is_none() && source.starts_with("member:")) {
         return Err(invalid("reserved_key", "reserved source"));

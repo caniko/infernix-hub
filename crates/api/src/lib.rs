@@ -460,7 +460,10 @@ async fn search(State(s): State<AppState>, Caller(a): Caller, Query(q): Query<Se
     call!(a, domain::content::search(&s.hub, &a, &q.q))
 }
 async fn history(State(s): State<AppState>, Caller(a): Caller, Path((t, id)): Path<(String, String)>) -> R<Vec<HistoryEntry>> {
-    a.require(domain::ANY_READER).map_err(err(&a))?;
+    // Notification audit rows name members and what they dismissed; only the
+    // operator may see them.
+    let readers = if t == "notification" { domain::OPERATOR } else { domain::ANY_READER };
+    a.require(readers).map_err(err(&a))?;
     call!(a, domain::history(&s.hub.db, &t, &id))
 }
 

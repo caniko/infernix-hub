@@ -2468,6 +2468,11 @@ async fn member_notifications_are_isolated() {
     assert!(other.notifications(None, 0, true).await.unwrap().items[0].read_at.is_some());
     member.ack_notifications(&ack(own.id)).await.unwrap();
     assert!(member.notifications(None, 0, true).await.unwrap().items[0].read_at.is_some());
+    let history = format!("/history/notification/{}", own.id);
+    assert_eq!(code(h.agent.get::<Vec<HistoryEntry>>(&history).await.unwrap_err()), "forbidden");
+    assert!(!h.op.get::<Vec<HistoryEntry>>(&history).await.unwrap().is_empty());
+    let long_source = RaiseNotificationIn { source: Some("s".repeat(65)), ..notification_in("long", "") };
+    assert_eq!(code(member.raise_notification(&long_source).await.unwrap_err()), "invalid_source");
     for client in [&h.op, &h.agent, &h.procedure] {
         assert_eq!(code(client.raise_notification(&notification_in("member:dejana:x", "")).await.unwrap_err()), "reserved_key");
         assert_eq!(
