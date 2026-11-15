@@ -1,7 +1,7 @@
 //! Notifications: what the hub's producers and agents raised. The feed is the
 //! server-held long poll from `api::watch_notifications`, so this view never
 //! polls on its own; `Acknowledge`, `Snooze` and `Mark renewed` are the only
-//! writes and they all re-read the set afterwards.
+//! writes, and their effect arrives through that same feed.
 
 use std::collections::HashMap;
 
@@ -25,17 +25,33 @@ pub enum Filter {
 /// Rows in display order for one filter.
 ///
 /// The newest summary is pinned: it is the day's digest, not a condition, and
-/// it must stay readable while the conditions below it come and go. Everything
+/// it must stay readable while the conditions below it come and go. "Newest"
+/// is the summary's day (`summary:YYYY-MM-DD` sorts by date), not its `seq`:
+/// acknowledging yesterday's summary bumps its `seq`. Everything
 /// else is open before acknowledged/resolved, then most recently changed first
 /// (`seq` is the hub's change order, the same order the feed delivers).
 pub fn rows(items: &HashMap<Uuid, Notification>, filter: Filter) -> Vec<Notification> {
     let mut rows: Vec<Notification> = items.values().filter(|n| filter == Filter::All || n.open).cloned().collect();
-    let pinned = rows.iter().filter(|n| n.source == "summary").max_by_key(|n| n.seq).map(|n| n.id);
+    let pinned = rows.iter().filter(|n| n.source == "summary").max_by_key(|n| (&n.dedupe_key, n.created_at)).map(|n| n.id);
     rows.sort_by(|a, b| {
         let (a_pinned, b_pinned) = (Some(a.id) == pinned, Some(b.id) == pinned);
         b_pinned.cmp(&a_pinned).then(b.open.cmp(&a.open)).then(b.seq.cmp(&a.seq))
     });
     rows
+}
+
+/// Why a row is not open, for the All view. `open` alone conflates an
+/// acknowledged row with a resolved or snoozed one that is still unread.
+pub fn closed_label(n: &Notification, now: chrono::DateTime<chrono::Utc>) -> Option<&'static str> {
+    if n.resolved_at.is_some() {
+        Some("resolved")
+    } else if n.read_at.is_some() {
+        Some("acknowledged")
+    } else if n.snoozed_until.is_some_and(|until| until > now) {
+        Some("snoozed")
+    } else {
+        None
+    }
 }
 
 /// The renewal a notification points at. The producer may carry the renewal's
@@ -187,8 +203,8 @@ fn NotificationRow(notification: Notification) -> Element {
                 div { class: "row",
                     Chip { label: severity_label.to_string(), tone: Some(severity_tone.to_string()) }
                     span { class: "notification-title", "{notification.title}" }
-                    if !notification.open {
-                        Chip { label: "acknowledged".to_string(), tone: Some("muted".to_string()) }
+                    if let Some(label) = closed_label(&notification, chrono::Utc::now()) {
+                        Chip { label: label.to_string(), tone: Some("muted".to_string()) }
                     }
                 }
                 span { class: "label-tech", "{age}" }
@@ -321,6 +337,29 @@ mod tests {
         assert!(open.iter().all(|row| row.open));
         assert_eq!(open[0].id, summary_id);
         assert_eq!(open[1].id, open_id);
+    }
+
+    #[test]
+    fn pinning_follows_the_summary_day_and_labels_name_the_reason() {
+        let today = Uuid::new_v4();
+        let yesterday = Uuid::new_v4();
+        let mut new = notification(today, "summary", 10, true);
+        new.dedupe_key = "summary:2026-11-15".into();
+        // Yesterday's summary was acknowledged after today's arrived.
+        let mut old = notification(yesterday, "summary", 99, false);
+        old.dedupe_key = "summary:2026-11-14".into();
+        assert_eq!(rows(&set(vec![new, old]), Filter::All)[0].id, today);
+
+        let now = Utc.with_ymd_and_hms(2026, 11, 15, 9, 0, 0).unwrap();
+        let mut row = notification(Uuid::new_v4(), "today", 1, false);
+        assert_eq!(closed_label(&row, now), Some("acknowledged"));
+        row.resolved_at = Some(now);
+        assert_eq!(closed_label(&row, now), Some("resolved"));
+        let mut snoozed = notification(Uuid::new_v4(), "today", 2, true);
+        snoozed.open = false;
+        snoozed.snoozed_until = Some(now + chrono::Duration::days(1));
+        assert_eq!(closed_label(&snoozed, now), Some("snoozed"), "unread but snoozed is not acknowledged");
+        assert_eq!(closed_label(&notification(Uuid::new_v4(), "today", 3, true), now), None);
     }
 
     #[test]

@@ -259,20 +259,15 @@ pub async fn watch_notifications(store: Store, client: HubClient) {
     }
 }
 
-/// Re-read every row after a write of our own. A feed only carries changed
-/// rows, so the row we just acknowledged is not in an open-only page; the
-/// `all` snapshot is what moves it out of the open set.
-pub async fn reload_notifications(store: Store, client: HubClient) {
-    match timed(client.notifications(None, 0, true)).await {
-        Ok(page) => store.set_notification_snapshot(page),
-        Err(error) => store.fail_notifications(error),
-    }
-}
+// Writes do not re-read the set: the watcher's feed reads every state
+// (`all = true`) and the server wakes it on our own write, so the change
+// arrives in cursor order. A separate snapshot could land after a newer feed
+// page and erase it while the cursor has already moved past.
 
 pub async fn ack_notification(store: Store, client: HubClient, id: Uuid) {
     let input = AckNotificationsIn { ids: vec![id], all: false };
     match timed(client.ack_notifications(&input)).await {
-        Ok(_) => reload_notifications(store, client).await,
+        Ok(_) => {}
         Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
     }
 }
@@ -282,7 +277,6 @@ pub async fn ack_all_notifications(store: Store, client: HubClient) {
     match timed(client.ack_notifications(&input)).await {
         Ok(page) => {
             store.notify(true, format!("Acknowledged all; {} still open.", page.open));
-            reload_notifications(store, client).await;
         }
         Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
     }
@@ -291,7 +285,7 @@ pub async fn ack_all_notifications(store: Store, client: HubClient) {
 pub async fn snooze_notification(store: Store, client: HubClient, id: Uuid, days: i64) {
     let until = Utc::now() + chrono::Duration::days(days);
     match timed(client.snooze_notification(id, &SnoozeNotificationIn { until })).await {
-        Ok(_) => reload_notifications(store, client).await,
+        Ok(_) => {}
         Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
     }
 }
@@ -312,8 +306,7 @@ pub async fn mark_renewed(store: Store, client: HubClient, key: String, due: Opt
         Ok(renewal) => {
             let due = renewal.due_at.map(format::fmt_dt).unwrap_or_else(|| "no due date".into());
             store.notify(true, format!("Renewed {}; due {due}.", renewal.key));
-            refresh_renewals(store, client.clone()).await;
-            reload_notifications(store, client).await;
+            refresh_renewals(store, client).await;
         }
         Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
     }
