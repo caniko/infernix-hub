@@ -1,8 +1,7 @@
 # Handoff
 
-State on 2026-11-13, branch `feat/fleetix-hub`, open as
-[PR #1](https://github.com/caniko/infernix-hub/pull/1) against `trunk`. Nothing
-in this tree is deployed. Read `VISION.md` for the product, `docs/capabilities.md`
+The hub is deployed on Atlas as `fleetix-hub.service` using `canix-hub`, with
+most integrations in fixture mode. Read `VISION.md` for the product, `docs/capabilities.md`
 for per-integration evidence, and `docs/nix.md` for the flake and NixOS module.
 
 ## What the product is today
@@ -24,8 +23,16 @@ for per-integration evidence, and `docs/nix.md` for the flake and NixOS module.
   pack-provided one such as `plinth`. No fallback; an unknown transport stops
   the intent for an operator. Every real channel requires live Paperclip
   approvals.
-- **Clients.** Dioxus desktop (`apps/desktop`), `hubctl`, and an MCP server
-  (`fleetix-hub-mcp`, read-only `hub_status`, plus pack Write tools).
+- **Notifications.** A PostgreSQL table stores deduplicated conditions and their
+  acknowledgement, resolution and snooze state. `GET /v1/notifications` returns
+  a snapshot without `after`, or a cursor feed with `after` and optional `wait`.
+  Producers sync Today and fleet conditions and summary staleness. MCP
+  `hub_post_summary` writes a daily notification keyed `summary:<YYYY-MM-DD>`.
+- **Renewals.** Seeded renewal records include procedures and HTTPS provider URLs;
+  the operator can mark a renewal complete and set its next due date.
+- **Clients.** The Dioxus console has a Notifications workspace; `hubctl` and
+  the MCP server expose notification operations. `fleetix-hub-tray` is a desktop
+  daemon with a tray icon, long-poll feed and desktop notifications.
 
 ## Run it
 
@@ -63,13 +70,6 @@ HUB_TEST_DATABASE_URL="$DATABASE_URL" cargo test --workspace   # DB tests skip w
 treefmt <files>
 ```
 
-Last run on this branch (2026-11-13, private PostgreSQL 16 under
-`/tmp/hubpg-h1`): `cargo check --workspace --all-targets` clean; `cargo test
---workspace` 151 passed, 1 ignored — desktop 27, `fleetix-hubd` lib 9, journey
-45, contracts 3, domain 7, integrations 59 (+1 ignored live ComfyUI probe),
-worker 1, MCP/`fleetix-hubd`/`hubctl` binaries 0. No test reported skipping, so
-the database-backed tests really ran.
-
 The journey tests cover: changed content cannot reuse an approval, stale and
 duplicate timers, early timer / pause / unverifiable approval fail closed,
 partial multi-account failure, lost publish response reconciled (never
@@ -89,7 +89,7 @@ integration, and the CI workflow another stream added under `.github/workflows`.
 | Area | Built | Fixture-tested | Contract-verified | Live-verified |
 | --- | --- | --- | --- | --- |
 | Hub API, domain, worker, outbox, audit | yes | yes (journey) | — | — |
-| Packs (channels, pipelines, topics, routes, workflows, MCP) | yes | yes | — | no pack deployed |
+| Packs (channels, pipelines, topics, routes, workflows, MCP) | yes | yes | — | see deployment configuration |
 | Pipelines (at-most-once, adoption, artifacts, cancel) | yes | yes | Windmill job API | — |
 | Publication channels | yes | yes (fixture publisher) | — | — |
 | n8n contract v1 channels | yes | yes (recording server) | no (exports unverified) | no |
@@ -101,38 +101,32 @@ integration, and the CI workflow another stream added under `.github/workflows`.
 | n8n news ingest | adapter + `/v1/ingest/news` | ingest route yes | no | `/healthz` |
 | Local LLM assistant | yes | fixture assistant | OpenAI-compatible shape | — |
 | Desktop (Dioxus 0.8.0-alpha.3) | yes | fixture server, 1440/760 px screenshots | — | — |
-| NixOS module + pack options | yes | eval checks | — | not activated |
+| NixOS module + pack options | yes | eval checks | — | Atlas service activated |
 
-## Live blockers (exact)
+## Live integration blockers observed in the 2026-11-13 assessment
 
-1. **Hub service:** no host imports the module; no database, token, DNS record,
-   `packs.json` or systemd unit exists. Activation is an operator step through
-   the Canix pin train and rops switch.
-2. **Packs:** the `plinth` and `animation` packs live in the `canix-hub` crate in
-   the Canix repository. They are not built, installed or enabled anywhere yet.
-3. **ComfyUI has no checkpoints.** The atlas instance is the TRELLIS workbench;
+1. **ComfyUI has no checkpoints.** The atlas instance is the TRELLIS workbench;
    `poster-txt2img` needs a checkpoint. `registry/comfyui/swatch.v1.json` is
    model-free and is the only workflow that could run today.
-4. **Paperclip:** no authenticated call made; the board key
+2. **Paperclip:** no authenticated call made; the board key
    (`paperclip-operations-operator-key`) was not read. Company id unknown — set
    `HUB_COMPANY_ID`. Approval create has no idempotency key in 0.3.1: an
    ambiguous create is dead-lettered and the operator links the approval with
    `link-approval` (hash-checked).
-5. **Windmill:** procedures not deployed (`wmill sync push` not run); secret
+3. **Windmill:** procedures not deployed (`wmill sync push` not run); secret
    variable `f/fleetix_hub/hub_token` not created; workspace token not read.
-6. **n8n:** no `X-N8N-API-KEY`; the `X-Studio-Token` webhook secret was not read;
+4. **n8n:** no `X-N8N-API-KEY`; the `X-Studio-Token` webhook secret was not read;
    no workflow is imported and none points at `/v1/ingest/news` or the publish
    contract.
-7. **Postiz:** not deployed. When it is, the adapter refuses media that carries
+5. **Postiz:** not deployed. When it is, the adapter refuses media that carries
    alt text (the documented API has no alt field) — confirm an alt-text field
    before enabling image posts. Lookup is unsupported, so accepted/ambiguous
    posts are resolved by an operator (`POST /v1/intents/{id}/resolve`).
 
-## Not deployed
+## Deployment qualification
 
-Windmill procedures, n8n workflows, packs, the hub service and Postiz. No
-schedule was activated, nothing was published, no engagement message was sent,
-and no live mutating request was made.
+Atlas runs the hub; this does not establish live qualification of its external
+integrations. The integration observations above describe the earlier review.
 
 ## Review
 
@@ -177,5 +171,3 @@ selecting stage, which is unchanged. 390 px was not captured from the app
 - Postiz vs another transport for publishing; whether the n8n free-platform set
   is worth importing at all.
 - Which ComfyUI checkpoint/workflow to register first.
-- Which host carries the hub, and whether the first deployment is fixture-mode
-  only.

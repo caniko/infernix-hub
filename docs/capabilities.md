@@ -1,7 +1,8 @@
 # Integration and platform capabilities
 
 What the hub can do, what has actually been proven, and what does not exist.
-Nothing in this file is deployed: see [Not deployed](#not-deployed).
+The hub runs on Atlas with most integrations in fixture mode. Deployment does
+not by itself establish live integration qualification.
 
 ## Status terms
 
@@ -12,7 +13,7 @@ Nothing in this file is deployed: see [Not deployed](#not-deployed).
 - **contract-verified** — request/response shapes were checked against a
   downloaded OpenAPI document or the deployed server source.
 - **live-verified** — a request was actually made to the deployed service. No
-  mutating request was made anywhere.
+  mutating request was recorded in the original integration assessment.
 
 A live adapter is never marked fixture-tested by association: the fixture
 adapters are separate code.
@@ -191,7 +192,7 @@ That renders `packs.json` and a `<id>-<name>` systemd credential; the pack reads
 the token from `$CREDENTIALS_DIRECTORY`. Because it is a pack channel, it posts
 for real and therefore requires live Paperclip approvals. State: the pack
 contract and the module options are tested; the Plinth channel itself lives in
-the `canix-hub` repository and is not deployed.
+the `canix-hub` crate in the canix repository; its live channel is not qualified here.
 
 ## Live adapters: evidence
 
@@ -261,6 +262,9 @@ routes. The MCP tools are `hub_notifications` (Read, snapshot, optional `all`),
 `hub_post_summary` (Write, one row per day keyed `summary:<YYYY-MM-DD>` with
 title `Daily summary <day>`); the three producer sources `today`, `fleet` and
 `hub` and their key prefixes stay reserved. No MCP tool acknowledges or snoozes.
+The worker's notification loop syncs Today and fleet conditions and summary
+staleness. The desktop Notifications workspace displays the feed and renewal
+details; `fleetix-hub-tray` uses long-polling for its tray and desktop popups.
 
 ### Windmill
 
@@ -307,17 +311,13 @@ pack registration. It says nothing about a live service.
 The desktop shows a `FIXTURE MODE` banner whenever any adapter is simulated,
 and `GET /v1/status` reports the mode and verification level per integration.
 
-## Not deployed
+## Earlier integration assessment
 
-- `fleetix-hubd` / `canix-hub` services: no host imports the NixOS module. No
-  database, token, DNS record or systemd unit exists for the hub.
 - Windmill procedures `registry/windmill/*.ts`: `wmill sync push` was not run and
   no schedule was created.
-- Packs (including `plinth` and `animation`): compiled in a downstream binary
-  that is not deployed; no `packs.json` is installed on any host.
 - n8n workflows: not imported, no API key, no webhook pointed at the hub.
 - Paperclip approvals: never created against the live board.
 - Postiz: no module, package, secret, endpoint or DNS record.
 
-No release was published, no engagement message was sent, and no live mutating
-request was made anywhere.
+These observations date from the original assessment and are not a current
+inventory of all external activity.

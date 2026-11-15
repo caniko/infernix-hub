@@ -42,7 +42,10 @@ leave no audit trail from an operator action to its external effect.
 - `crates/worker`: integration worker
 - `crates/contracts`: shared wire types
 - `apps/desktop`: Dioxus operator console with workspace navigation and
-  inspector
+  inspector, including Notifications and renewal details
+- `apps/tray`: tray daemon consuming the notification feed
+- Notifications include producer-raised conditions and daily summaries posted
+  through `hub_post_summary`, keyed `summary:<YYYY-MM-DD>`
 - `crates/domain/migrations/` and `registry/` for persistence and external-service catalogues
 
 ## Direction
@@ -54,5 +57,4 @@ turning contract-verified adapters into live-verified ones.
 
 ## Place in the fleet
 
-No consumer was found in canix or the other owned repositories; the project is
-currently developed as a standalone hub.
+Canix deploys `canix-hub` on Atlas, with most integrations in fixture mode.
