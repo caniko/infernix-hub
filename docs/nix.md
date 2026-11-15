@@ -207,15 +207,16 @@ When `seedFile` is null the module renders `HUB_SEED_FILE` from `engines`,
   "engines": [ { "id": "...", "base_url": "...", "capabilities": { } } ],
   "personas": [ { "name": "...", "voice": "...", "rules": [], "avoid": [], "world": [] } ],
   "accounts": [ { "id": "...", "platform": "...", "handle": "...", "transport": "...", "persona": "...", "capabilities": { "publish": true, "comments": true, "mentions": true, "replies": true, "dms": false, "analytics": false } } ],
-  "renewals": [ { "key": "linkedin-personal-token", "title": "LinkedIn access token", "procedure": "Re-authorize the app and update the credential.", "account": null, "cadence_days": 60, "warn_days": 14, "due_at": null } ]
+  "renewals": [ { "key": "linkedin-personal-token", "title": "LinkedIn access token", "procedure": "Re-authorize the app and update the credential.", "urls": ["https://www.linkedin.com/developers/apps"], "account": null, "cadence_days": 60, "warn_days": 14, "due_at": null } ]
 }
 ```
 
 `renewals` rows are upserted by `(company_id, key)`: a new row starts from the
-seed's `due_at`, while a re-seed refreshes only `title`, `procedure`,
+seed's `due_at`, while a re-seed refreshes only `title`, `procedure`, `urls`,
 `account`, `cadence_days`, and `warn_days`. The due date and the last renewal
 belong to the operator's renewals, so restarting or rebuilding never moves
-them.
+them. `urls` are opened in a browser, so the hub refuses a seed whose URLs do
+not start with `https://`.
 
 `company_id` stays out of the generated seed; live deployments pass
 `companyId`. With every integration in `fixture`/`disabled`, the module falls

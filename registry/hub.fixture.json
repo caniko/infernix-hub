@@ -10,6 +10,6 @@
   ],
   "renewals": [
     { "key": "mastodon-personal-token", "title": "Mastodon access token", "procedure": "Re-authorize the app in Mastodon preferences, then update the transport credential.",
-      "account": "fixture-mastodon", "cadence_days": 60, "warn_days": 14 }
+      "urls": ["https://mastodon.social/oauth/authorized_applications"], "account": "fixture-mastodon", "cadence_days": 60, "warn_days": 14 }
   ]
 }

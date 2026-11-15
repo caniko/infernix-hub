@@ -1,6 +1,6 @@
 //! Renewals: credential and account deadlines. The seed owns the facts
-//! (title, procedure, cadence, warn window) and the operator owns the clock:
-//! a re-seed never moves `due_at` or `renewed_at`.
+//! (title, procedure, guide URLs, cadence, warn window) and the operator owns
+//! the clock: a re-seed never moves `due_at` or `renewed_at`.
 
 use contracts::{Renewal, RenewalRenewedIn};
 use serde_json::{Value, json};
@@ -9,8 +9,8 @@ use uuid::Uuid;
 use crate::{Actor, DResult, DomainError, Hub, OPERATOR, audit, decode, decode_one, invalid};
 
 const SELECT: &str = "select to_jsonb(t) from (
-    select r.id, r.company_id, r.key, r.account_id, r.title, r.procedure, r.cadence_days, r.warn_days,
-      r.due_at, r.renewed_at, r.created_at, r.updated_at
+    select r.id, r.company_id, r.key, r.account_id, r.title, r.procedure, r.urls,
+      r.cadence_days, r.warn_days, r.due_at, r.renewed_at, r.created_at, r.updated_at
     from renewals r";
 
 pub async fn list(hub: &Hub, actor: &Actor) -> DResult<Vec<Renewal>> {
