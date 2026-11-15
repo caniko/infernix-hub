@@ -99,7 +99,25 @@ in {
       // {
         cargoArtifacts = cacheRust {package = craneLib.buildDepsOnly desktopArgs;};
         doCheck = false;
-        nativeBuildInputs = [pkgs.pkg-config pkgs.wrapGAppsHook3];
+        nativeBuildInputs = [pkgs.pkg-config pkgs.wrapGAppsHook3 pkgs.copyDesktopItems];
+        desktopItems = [
+          (pkgs.makeDesktopItem {
+            name = "fleetix-hub-desktop";
+            desktopName = "Fleetix Hub";
+            genericName = "Fleet operations console";
+            comment = "Notifications, fleet health and content operations";
+            exec = "fleetix-hub-desktop";
+            icon = "fleetix-hub-desktop";
+            terminal = false;
+            categories = ["Utility" "Monitor"];
+          })
+        ];
+        # The launcher icon reuses the console's own nav asset; the tray starts
+        # this same binary with `--workspace notifications`.
+        postInstall = ''
+          install -Dm644 apps/desktop/assets/icons/command-center.svg \
+            "$out/share/icons/hicolor/scalable/apps/fleetix-hub-desktop.svg"
+        '';
         meta = {
           description = "fleetix-hub operator console";
           mainProgram = "fleetix-hub-desktop";

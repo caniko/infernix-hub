@@ -10,17 +10,18 @@ use crate::{Workspace, fleet, icons, state::Store};
 pub fn Sidebar(workspace: Signal<Workspace>, nav_open: Signal<bool>) -> Element {
     let store = use_context::<Store>();
     let snapshot = (store.fleet).cloned().data;
+    let open = (store.notifications).cloned().open.max(0) as usize;
     let badge = move |target: Workspace| -> usize {
-        let Some(status) = snapshot.as_ref() else { return 0 };
         match target {
-            Workspace::Hosts => fleet::hosts_needing_attention(status),
-            Workspace::Alerts => fleet::alert_count(status),
-            Workspace::Approvals => status.pending_ops.len(),
+            Workspace::Notifications => open,
+            Workspace::Hosts => snapshot.as_ref().map(fleet::hosts_needing_attention).unwrap_or_default(),
+            Workspace::Alerts => snapshot.as_ref().map(fleet::alert_count).unwrap_or_default(),
+            Workspace::Approvals => snapshot.as_ref().map(|status| status.pending_ops.len()).unwrap_or_default(),
             _ => 0,
         }
     };
-    let groups: [(&str, Vec<(usize, Workspace)>); 2] = ["FLEET", "STUDIO"].map(|section| {
-        let items = Workspace::ALL.iter().copied().enumerate().filter(|(_, w)| w.section() == section).collect();
+    let groups: [(&str, Vec<Workspace>); 2] = ["FLEET", "STUDIO"].map(|section| {
+        let items = Workspace::ALL.iter().copied().filter(|w| w.section() == section).collect();
         (section, items)
     });
 
@@ -37,32 +38,30 @@ pub fn Sidebar(workspace: Signal<Workspace>, nav_open: Signal<bool>) -> Element 
             }
             for (section, items) in groups.iter() {
                 div { class: "nav-section label-tech", key: "section-{section}", "{section}" }
-                for (index, target) in items.iter() {
+                for target in items.iter() {
                     NavItem {
                         key: "{target.label()}",
                         workspace,
                         nav_open,
                         target: *target,
-                        index: *index,
                         badge: badge(*target),
                     }
                 }
             }
             div { class: "sidebar-foot",
                 p { class: "label-tech", "Ctrl+K · commands" }
-                p { class: "label-tech", "1–9, 0 · workspaces" }
+                p { class: "label-tech", "1–9, 0, n · workspaces" }
             }
         }
     }
 }
 
 #[component]
-fn NavItem(workspace: Signal<Workspace>, nav_open: Signal<bool>, target: Workspace, index: usize, badge: usize) -> Element {
+fn NavItem(workspace: Signal<Workspace>, nav_open: Signal<bool>, target: Workspace, badge: usize) -> Element {
     let active = workspace.cloned() == target;
     let mut workspace = workspace;
     let mut nav_open = nav_open;
-    // The tenth workspace has no single-digit key; `0` follows `9`.
-    let key = if index == 9 { "0".to_string() } else { (index + 1).to_string() };
+    let key = target.key();
     rsx! {
         button {
             class: if active { "nav-item active" } else { "nav-item" },

@@ -35,10 +35,21 @@ fn main() {
 #[component]
 fn App() -> Element {
     let client = use_hook(api::make_client);
+    // `--workspace NAME` picks the start workspace (the tray passes
+    // `notifications`); an unknown name keeps the default and says so.
+    let start = use_hook(|| {
+        let (workspace, unknown) = state::start_workspace(&std::env::args().collect::<Vec<_>>());
+        if let Some(name) = unknown {
+            eprintln!("--workspace {name:?} is not a workspace; starting at {}.", workspace.label());
+        }
+        workspace
+    });
     let store = Store {
-        workspace: use_signal(|| Workspace::Command),
+        workspace: use_signal(|| start),
         status: use_signal(Loaded::default),
         fleet: use_signal(Loaded::default),
+        notifications: use_signal(Default::default),
+        renewals: use_signal(Loaded::default),
         today: use_signal(Loaded::default),
         news: use_signal(Loaded::default),
         personas: use_signal(Loaded::default),
@@ -106,6 +117,14 @@ fn App() -> Element {
         }
     });
 
+    // Notifications are a server-held long poll, not a timer: one snapshot,
+    // then the change feed as it happens (the tray consumes the same feed).
+    let notification_client = client.clone();
+    use_future(move || {
+        let client = notification_client.clone();
+        async move { api::watch_notifications(store, client).await }
+    });
+
     // Detail loads follow the selections.
     let content_client = client.clone();
     use_effect(move || {
@@ -161,8 +180,8 @@ fn App() -> Element {
                     dioxus.send('escape');
                     return;
                 }
-                if (!editing && !event.ctrlKey && !event.metaKey && !event.altKey && /^[0-9]$/.test(event.key)) {
-                    dioxus.send('ws:' + event.key);
+                if (!editing && !event.ctrlKey && !event.metaKey && !event.altKey && /^[0-9n]$/.test(event.key.toLowerCase())) {
+                    dioxus.send('ws:' + event.key.toLowerCase());
                 }
             });
             "#,
@@ -179,17 +198,12 @@ fn App() -> Element {
                         store.set_nav_open(false);
                     }
                 }
-                "ws:1" => store.set_workspace(Workspace::Command),
-                "ws:2" => store.set_workspace(Workspace::Hosts),
-                "ws:3" => store.set_workspace(Workspace::Alerts),
-                "ws:4" => store.set_workspace(Workspace::Approvals),
-                "ws:5" => store.set_workspace(Workspace::Today),
-                "ws:6" => store.set_workspace(Workspace::News),
-                "ws:7" => store.set_workspace(Workspace::Studio),
-                "ws:8" => store.set_workspace(Workspace::Calendar),
-                "ws:9" => store.set_workspace(Workspace::Relationships),
-                // `0` is the tenth workspace, after `9`.
-                "ws:0" => store.set_workspace(Workspace::Library),
+                // Workspace keys are `Workspace`'s own: 1–9, 0 and `n`.
+                message if message.starts_with("ws:") => {
+                    if let Some(workspace) = Workspace::from_key(&message[3..]) {
+                        store.set_workspace(workspace);
+                    }
+                }
                 _ => {}
             }
         }
@@ -352,6 +366,7 @@ fn App() -> Element {
                 }
                 div { class: "{stage_class}",
                     match (store.workspace).cloned() {
+                        Workspace::Notifications => rsx! { workspaces::notifications::NotificationsView {} },
                         Workspace::Command => rsx! { workspaces::fleet::CommandView {} },
                         Workspace::Hosts => rsx! { workspaces::fleet::HostsView {} },
                         Workspace::Alerts => rsx! { workspaces::fleet::AlertsView {} },

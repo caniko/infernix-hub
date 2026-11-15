@@ -545,6 +545,16 @@ input[type="checkbox"] { accent-color: var(--honey); }
 .today-row { display: flex; flex-direction: column; gap: 6px; padding: 11px 13px; }
 .today-title { font-size: 13.5px; color: var(--text); }
 
+/* Notification feed: the row body is pre-wrapped plain text, and a renewal
+   expands in place under its buttons. */
+.notification-row { display: flex; flex-direction: column; gap: 6px; padding: 11px 13px; }
+.notification-title { font-size: 13.5px; color: var(--text); }
+.renewal-detail {
+  display: flex; flex-direction: column; gap: 8px;
+  padding-top: 8px; border-top: 1px dashed var(--border);
+}
+.renewal-detail .input { max-width: 220px; }
+
 .facet { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
 .facet-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; }
 .facet-list li { font-size: 12.5px; color: var(--text); }
