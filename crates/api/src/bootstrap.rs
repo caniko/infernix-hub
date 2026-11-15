@@ -512,6 +512,16 @@ pub async fn apply_seed(hub: &Hub, seed: &Seed, company_id: &str) -> anyhow::Res
         for url in &r.urls {
             anyhow::ensure!(url.starts_with("https://"), "renewal {:?}: url {url:?} must start with https://", r.key);
         }
+        // Moving a key between owners would leave its earlier notifications in the
+        // old owner's view, so ownership is fixed once a renewal exists.
+        let existing: Option<Option<String>> = domain::sqlx::query_scalar("select owner from renewals where company_id = $1 and key = $2")
+            .bind(company_id)
+            .bind(&r.key)
+            .fetch_optional(&hub.db)
+            .await?;
+        if let Some(owner) = existing {
+            anyhow::ensure!(owner == r.owner, "renewal {:?}: owner cannot change from {owner:?} to {:?}", r.key, r.owner);
+        }
         // Facts come from the seed; `due_at` and `renewed_at` belong to the
         // operator's renewals and are only written on insert. Observation
         // columns are the collector's and are never touched here.

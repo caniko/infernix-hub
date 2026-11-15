@@ -2954,7 +2954,7 @@ async fn member_renewals_are_private_and_produced() {
     h.procedure.observe_renewal("private-provider", &observation).await.unwrap();
     assert_eq!(code(h.op.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{id}")).await.unwrap_err()), "not_found");
     assert_eq!(code(h.agent.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{id}")).await.unwrap_err()), "not_found");
-    assert_eq!(code(member.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{id}")).await.unwrap_err()), "not_found");
+    assert_eq!(code(member.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{id}")).await.unwrap_err()), "forbidden");
     fleetix_hubd::notify_pass(&h.hub, None, None).await;
     let notes = member.notifications(None, 0, true).await.unwrap();
     assert!(notes.items.iter().any(|n| n.dedupe_key == "member:dejana:renewal:private:overdue" && n.severity == Severity::Critical));
@@ -3014,9 +3014,17 @@ async fn member_renewals_are_private_and_produced() {
             .iter()
             .any(|n| n.dedupe_key == "member:other:renewal:last:overdue" && n.resolved_at.is_some())
     );
-    seed_renewals(&h, json!([private])).await;
-    assert!(member.renewals().await.unwrap().iter().all(|r| r.key != "private"));
-    assert!(h.op.renewals().await.unwrap().iter().any(|r| r.key == "private"));
+    // Ownership is fixed once a renewal exists: a re-seed cannot publish it.
+    let seed: bootstrap::Seed = serde_json::from_value(json!({ "renewals": [private] })).unwrap();
+    assert!(bootstrap::apply_seed(&h.hub, &seed, "fixture-company").await.is_err());
+    assert!(h.op.renewals().await.unwrap().iter().all(|r| r.key != "private"));
+    // Her acknowledgements never reach the operator's notification history.
+    member.ack_notifications(&AckNotificationsIn { ids: vec![], all: true }).await.unwrap();
+    let history: Vec<HistoryEntry> = h.op.get("/history/notification/*").await.unwrap();
+    assert!(history.iter().all(|e| !e.actor.starts_with("member:")), "{history:?}");
+    // A deleted member renewal keeps its history hidden.
+    domain::sqlx::query("delete from renewals where key = 'private'").execute(&h.hub.db).await.unwrap();
+    assert_eq!(code(h.op.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{id}")).await.unwrap_err()), "not_found");
 }
 
 #[tokio::test]
