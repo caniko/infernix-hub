@@ -2639,16 +2639,39 @@ async fn stale_observations_and_quiet_rows_never_hide_a_crossed_deadline() {
         .unwrap();
     assert_eq!(expired.status, "overdue");
 
-    // An older answer (replayed or delayed) is refused and changes nothing.
-    for observed_at in [now, now - chrono::Duration::hours(49), now - chrono::Duration::hours(1)] {
+    // An older answer (replayed or delayed) is refused and changes nothing;
+    // one already past the 48 h window is refused as stale.
+    for (observed_at, expected) in [
+        (now, "observation_out_of_order"),
+        (now - chrono::Duration::hours(1), "observation_out_of_order"),
+        (now - chrono::Duration::hours(49), "observation_stale"),
+    ] {
         let stale = h
             .procedure
             .observe_renewal("crossed-token", &ObserveRenewalIn { outcome: Observation::Never, expires_at: None, observed_at })
             .await
             .unwrap_err();
-        assert_eq!(code(stale), "observation_out_of_order");
+        assert_eq!(code(stale), expected);
     }
     assert_eq!(renewal(&h, "crossed-token").await.status, "overdue");
+
+    // Newer-but-stale successes cannot rebuild evidence either: an expired
+    // date seen 96 h ago and a `never` seen 72 h ago are both refused, so a
+    // fresh row keeps no good evidence and stays unverifiable.
+    let mut fresh = renewal_seed("stale-token", None, None);
+    fresh["expiry_kind"] = json!("provider");
+    seed_renewals(&h, json!([fresh])).await;
+    for (outcome, expires_at, hours) in [(Observation::Date, Some(now - chrono::Duration::days(1)), 96), (Observation::Never, None, 72)] {
+        let refused = h
+            .procedure
+            .observe_renewal("stale-token", &ObserveRenewalIn { outcome, expires_at, observed_at: now - chrono::Duration::hours(hours) })
+            .await
+            .unwrap_err();
+        assert_eq!(code(refused), "observation_stale");
+    }
+    let row = renewal(&h, "stale-token").await;
+    assert_eq!(row.status, "unverifiable");
+    assert!(row.last_good_at.is_none() && row.observed_at.is_none());
 
     // More than 200 quiet rows never push the overdue renewal out of Today.
     let today = h.op.today().await.unwrap();

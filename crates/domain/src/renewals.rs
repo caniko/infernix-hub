@@ -253,6 +253,13 @@ pub async fn observe(hub: &Hub, actor: &Actor, key: &str, input: ObserveRenewalI
     if input.observed_at > Utc::now() + CLOCK_SKEW {
         return Err(invalid("observed_in_future", "observed_at is more than 60 s in the future"));
     }
+    // A collector reports what it just saw. An answer already past the
+    // freshness window is not evidence (status() would call it stale anyway),
+    // and accepting it could replace retained good evidence and hide a crossed
+    // deadline, so it is refused before it can touch the row.
+    if Utc::now() - input.observed_at > OBSERVATION_FRESH {
+        return Err(invalid("observation_stale", "observed_at is older than the 48 h freshness window"));
+    }
     // Under the row lock: an older (or replayed) answer must not replace newer
     // evidence, or it could erase a crossed deadline. PostgreSQL keeps
     // microseconds, so compare (and store) at that precision or a replay of the
