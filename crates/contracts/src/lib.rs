@@ -339,6 +339,9 @@ pub struct Renewal {
     pub title: String,
     /// How to renew; shown to the operator.
     pub procedure: String,
+    /// Provider pages the operator opens to mint the new value; https only.
+    #[serde(default)]
+    pub urls: Vec<String>,
     /// Null means the next due date is not known; a renewal asks for one.
     pub cadence_days: Option<i32>,
     pub warn_days: i32,

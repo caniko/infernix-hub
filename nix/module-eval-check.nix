@@ -46,6 +46,13 @@
       services.fleetix-hub = {
         enable = true;
         fleetStatusFile = "/var/lib/fleet-status/fleet.json";
+        renewals = [
+          {
+            key = "eval-token";
+            title = "Eval token";
+            urls = ["https://example.org/oauth/apps"];
+          }
+        ];
       };
     })
   ];
@@ -129,7 +136,10 @@ in {
         "llm_running_url": "http://127.0.0.1:8013/running",
         "defer_on_unknown_work": true
       }' ${liveSeed}
-      jq -e '.personas == [] and .accounts == [] and .renewals == []' ${liveSeed}
+      jq -e '.personas == [] and .accounts == []' ${liveSeed}
+      jq -e '.renewals | length == 1' ${liveSeed}
+      jq -e '.renewals[0].key == "eval-token"' ${liveSeed}
+      jq -e '.renewals[0].urls == ["https://example.org/oauth/apps"]' ${liveSeed}
       manifest=$(sed -n 's/.*--manifest //p' ${liveCheck.serviceConfig.ExecStart})
       test -f "$manifest"
       grep -F '"migrate","--check"' "$manifest"

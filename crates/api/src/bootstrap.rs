@@ -432,6 +432,9 @@ pub struct SeedRenewal {
     pub title: String,
     #[serde(default)]
     pub procedure: String,
+    /// Provider pages to open; a browser opens them, so they must be https.
+    #[serde(default)]
+    pub urls: Vec<String>,
     pub account: Option<String>,
     pub cadence_days: Option<i32>,
     pub warn_days: Option<i32>,
@@ -488,14 +491,20 @@ pub async fn apply_seed(hub: &Hub, seed: &Seed, company_id: &str) -> anyhow::Res
         .await?;
     }
     for r in &seed.renewals {
+        // The operator's browser opens these, so anything but https is a trust
+        // boundary failure. Check before the upsert: a bad seed writes nothing.
+        for url in &r.urls {
+            anyhow::ensure!(url.starts_with("https://"), "renewal {:?}: url {url:?} must start with https://", r.key);
+        }
         // Facts come from the seed; `due_at` and `renewed_at` belong to the
         // operator's renewals and are only written on insert.
         domain::sqlx::query(
-            "insert into renewals (id, company_id, key, account_id, title, procedure, cadence_days, warn_days, due_at)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "insert into renewals (id, company_id, key, account_id, title, procedure, urls, cadence_days, warn_days, due_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              on conflict (company_id, key) do update set
                account_id = excluded.account_id, title = excluded.title, procedure = excluded.procedure,
-               cadence_days = excluded.cadence_days, warn_days = excluded.warn_days, updated_at = now()",
+               urls = excluded.urls, cadence_days = excluded.cadence_days, warn_days = excluded.warn_days,
+               updated_at = now()",
         )
         .bind(uuid::Uuid::new_v4())
         .bind(company_id)
@@ -503,6 +512,7 @@ pub async fn apply_seed(hub: &Hub, seed: &Seed, company_id: &str) -> anyhow::Res
         .bind(r.account.as_deref())
         .bind(&r.title)
         .bind(&r.procedure)
+        .bind(&r.urls)
         .bind(r.cadence_days)
         .bind(r.warn_days.unwrap_or(14))
         .bind(r.due_at)

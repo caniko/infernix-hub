@@ -118,7 +118,7 @@
 
   renewalRecords =
     map (r: {
-      inherit (r) key title procedure account;
+      inherit (r) key title procedure account urls;
       cadence_days = r.cadenceDays;
       warn_days = r.warnDays;
       due_at = r.dueAt;
@@ -549,6 +549,11 @@ in {
             type = types.str;
             default = "";
           };
+          urls = mkOption {
+            type = types.listOf types.str;
+            default = [];
+            description = "Provider pages to open while renewing; must start with https://.";
+          };
           account = mkOption {
             type = types.nullOr types.str;
             default = null;
@@ -571,8 +576,8 @@ in {
       default = [];
       description = ''
         Credential and account renewal deadlines keyed stably by `key`. A
-        re-seed refreshes title, procedure, cadence and account, but never
-        moves the due date or the last renewal.
+        re-seed refreshes title, procedure, URLs, cadence and account, but
+        never moves the due date or the last renewal.
       '';
     };
 

@@ -234,8 +234,9 @@ decision. No live board call was made.
 
 `renewals` rows carry what the operator must re-authorize before a channel
 dies, keyed stably by `(company_id, key)`. The seed supplies `title`,
-`procedure`, an optional `account`, `cadence_days` and `warn_days`; a re-seed
-refreshes those facts and never moves `due_at` or `renewed_at`. `GET
+`procedure`, `urls` (the provider pages to open; https only), an optional
+`account`, `cadence_days` and `warn_days`; a re-seed refreshes those facts and
+never moves `due_at` or `renewed_at`. `GET
 /v1/renewals` lists every row with unknown deadlines first. `POST
 /v1/renewals/{key}/renewed` is operator-only: an explicit `due_at` wins,
 otherwise `now + cadence_days`, and a row with neither answers `due_required`;

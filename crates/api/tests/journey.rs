@@ -2134,10 +2134,13 @@ async fn renewal(h: &H, key: &str) -> Renewal {
 async fn re_seeding_refreshes_facts_but_never_moves_the_clock() {
     let Some(h) = harness().await else { return };
     let seeded_due = Utc::now() + chrono::Duration::days(5);
-    seed_renewals(&h, json!([renewal_seed("seed-a", Some(60), Some(seeded_due))])).await;
+    let mut seeded = renewal_seed("seed-a", Some(60), Some(seeded_due));
+    seeded["urls"] = json!(["https://mastodon.social/oauth/authorized_applications"]);
+    seed_renewals(&h, json!([seeded])).await;
     let row = renewal(&h, "seed-a").await;
     assert_eq!(row.cadence_days, Some(60));
     assert_eq!(row.warn_days, 14, "the seed default");
+    assert_eq!(row.urls, ["https://mastodon.social/oauth/authorized_applications"], "guide URLs round-trip");
     assert!(within(row.due_at.unwrap(), seeded_due));
     assert!(row.renewed_at.is_none());
 
@@ -2152,10 +2155,12 @@ async fn re_seeding_refreshes_facts_but_never_moves_the_clock() {
     again["title"] = json!("Token seed-a, rotated");
     again["procedure"] = json!("Rotate in the provider console.");
     again["warn_days"] = json!(21);
+    again["urls"] = json!(["https://example.org/tokens", "https://example.org/docs"]);
     seed_renewals(&h, json!([again])).await;
     let after = renewal(&h, "seed-a").await;
     assert_eq!(after.title, "Token seed-a, rotated");
     assert_eq!(after.procedure, "Rotate in the provider console.");
+    assert_eq!(after.urls, ["https://example.org/tokens", "https://example.org/docs"], "a re-seed refreshes the URLs");
     assert_eq!(after.cadence_days, Some(30));
     assert_eq!(after.warn_days, 21);
     assert!(within(after.due_at.unwrap(), renewed_due), "the seed never moves a renewed due date");
@@ -2167,6 +2172,18 @@ async fn re_seeding_refreshes_facts_but_never_moves_the_clock() {
     let fresh = renewal(&h, "seed-b").await;
     assert!(within(fresh.due_at.unwrap(), fresh_due));
     assert!(fresh.renewed_at.is_none());
+}
+
+#[tokio::test]
+async fn a_seeded_renewal_url_must_be_https() {
+    let Some(h) = harness().await else { return };
+    let mut insecure = renewal_seed("insecure", Some(30), None);
+    insecure["urls"] = json!(["http://example.org/token"]);
+    let seed: bootstrap::Seed = serde_json::from_value(json!({ "renewals": [insecure] })).unwrap();
+
+    let err = format!("{:#}", bootstrap::apply_seed(&h.hub, &seed, "fixture-company").await.unwrap_err());
+    assert!(err.contains("insecure") && err.contains("https://"), "the error names the key and the rule: {err}");
+    assert!(h.op.renewals().await.unwrap().iter().all(|row| row.key != "insecure"), "a refused seed writes nothing");
 }
 
 #[tokio::test]
