@@ -232,6 +232,10 @@ impl HubClient {
     pub async fn renewal_renewed(&self, key: &str, body: &RenewalRenewedIn) -> Result<Renewal, ClientError> {
         self.post(&format!("/renewals/{key}/renewed"), body).await
     }
+    /// Operator or procedure: record one provider answer. Never a rotation.
+    pub async fn observe_renewal(&self, key: &str, body: &ObserveRenewalIn) -> Result<Renewal, ClientError> {
+        self.post(&format!("/renewals/{key}/observe"), body).await
+    }
     // ── Notifications ───────────────────────────────────────────────────
     /// Rows newer than `after`; `wait` seconds holds the request open on the
     /// server until something changes. `all` includes acknowledged and resolved

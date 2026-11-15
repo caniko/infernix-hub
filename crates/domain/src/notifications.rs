@@ -176,9 +176,14 @@ pub fn today_raises(today: &Today) -> Vec<Raise> {
         push(Severity::Warning, format!("today:overdue:{}", item.subject_id), item);
     }
     for item in &today.renewals {
+        // `never` is a console fact, not a to-do; it must not reach Today, but
+        // a stray one still never notifies.
+        if item.status == "never" {
+            continue;
+        }
         let severity = match item.status.as_str() {
-            "overdue" => Severity::Critical,
-            "due" => Severity::Warning,
+            "overdue" | "invalid" => Severity::Critical,
+            "due" | "unverifiable" => Severity::Warning,
             _ => Severity::Info,
         };
         push(severity, format!("today:renewal:{}:{}", item.subject_id, item.status), item);
@@ -628,6 +633,11 @@ mod tests {
                 today_item("renewal", "renewal", id(6), "overdue"),
                 today_item("renewal", "renewal", id(7), "due"),
                 today_item("renewal", "renewal", id(10), "unknown"),
+                today_item("renewal", "renewal", id(11), "unverifiable"),
+                today_item("renewal", "renewal", id(12), "invalid"),
+                // `never` never reaches Today; if one does, it still notifies
+                // about nothing.
+                today_item("renewal", "renewal", id(13), "never"),
             ],
         };
         let status: FleetStatus = serde_json::from_str(FLEET_SNAPSHOT).unwrap();
@@ -654,11 +664,13 @@ mod tests {
                 "today:renewal:00000000-0000-0000-0000-000000000006:overdue",
                 "today:renewal:00000000-0000-0000-0000-000000000007:due",
                 "today:renewal:00000000-0000-0000-0000-00000000000a:unknown",
+                "today:renewal:00000000-0000-0000-0000-00000000000b:unverifiable",
+                "today:renewal:00000000-0000-0000-0000-00000000000c:invalid",
                 "today:review:release_review:00000000-0000-0000-0000-000000000001",
             ]
         );
-        for quiet in ["000000000008", "000000000009"] {
-            assert!(!keys.iter().any(|key| key.contains(quiet)), "due releases and active production never notify");
+        for quiet in ["000000000008", "000000000009", "00000000000d"] {
+            assert!(!keys.iter().any(|key| key.contains(quiet)), "due releases, active production and never renewals never notify");
         }
 
         let severity = |key: &str| from_today.iter().find(|r| r.dedupe_key == key).unwrap().severity;
@@ -669,6 +681,8 @@ mod tests {
         assert_eq!(severity("today:renewal:00000000-0000-0000-0000-000000000006:overdue"), Severity::Critical);
         assert_eq!(severity("today:renewal:00000000-0000-0000-0000-000000000007:due"), Severity::Warning);
         assert_eq!(severity("today:renewal:00000000-0000-0000-0000-00000000000a:unknown"), Severity::Info);
+        assert_eq!(severity("today:renewal:00000000-0000-0000-0000-00000000000b:unverifiable"), Severity::Warning);
+        assert_eq!(severity("today:renewal:00000000-0000-0000-0000-00000000000c:invalid"), Severity::Critical);
         assert_eq!(severity("today:opportunity:00000000-0000-0000-0000-000000000005:shortlisted"), Severity::Info);
         assert!(from_fleet.iter().all(|r| r.severity == Severity::Warning && r.source == "fleet"));
 

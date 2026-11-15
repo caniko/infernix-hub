@@ -327,6 +327,26 @@ pub struct OpportunityDecisionIn {
     pub paperclip_issue_id: Option<String>,
 }
 
+wire_enum!(
+    /// Where a renewal's expiry comes from (D14). `never` is a kind of its own,
+    /// never a missing date or a far-future sentinel.
+    ExpiryKind { Cadence = "cadence", Never = "never", Provider = "provider" }
+);
+
+// `wire_enum!` owns the derive list, so the default cannot be `#[default]`.
+#[allow(clippy::derivable_impls)]
+impl Default for ExpiryKind {
+    fn default() -> Self {
+        Self::Cadence
+    }
+}
+
+wire_enum!(
+    /// A provider's answer about a credential, reduced to fixed codes before
+    /// it reaches the hub. Provider error text never travels here.
+    Observation { Date = "date", Never = "never", Unverifiable = "unverifiable", Inactive = "inactive", NotYetValid = "not_yet_valid" }
+);
+
 /// One credential or account deadline: `(company_id, key)` is the seed's
 /// stable identity, and only the operator renews it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -348,6 +368,26 @@ pub struct Renewal {
     /// Null means unknown; the row shows on Today until the first renewal.
     pub due_at: Option<DateTime<Utc>>,
     pub renewed_at: Option<DateTime<Utc>>,
+    /// How this renewal's expiry is governed; seeds refresh it, the clock does
+    /// not.
+    #[serde(default)]
+    pub expiry_kind: ExpiryKind,
+    /// The last provider answer, null until the first observation.
+    #[serde(default)]
+    pub observation: Option<Observation>,
+    /// When that answer was observed.
+    #[serde(default)]
+    pub observed_at: Option<DateTime<Utc>>,
+    /// When the last successful (`date` or `never`) answer was observed.
+    #[serde(default)]
+    pub last_good_at: Option<DateTime<Utc>>,
+    /// The deadline the last successful answer reported; null for `never`.
+    #[serde(default)]
+    pub last_good_expires_at: Option<DateTime<Utc>>,
+    /// Derived on read by the hub's judgement, never stored: `ok`, `due`,
+    /// `overdue`, `unknown`, `never`, `unverifiable` or `invalid`.
+    #[serde(default)]
+    pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -356,6 +396,18 @@ pub struct Renewal {
 pub struct RenewalRenewedIn {
     /// RFC 3339; absent means `now + cadence_days`.
     pub due_at: Option<DateTime<Utc>>,
+}
+
+/// `POST /v1/renewals/{key}/observe`: one provider answer about a credential.
+/// An observation is not a rotation and never moves `due_at` or `renewed_at`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObserveRenewalIn {
+    pub outcome: Observation,
+    /// Required with `date`, refused with every other outcome.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// RFC 3339; refused when more than 60 s in the future.
+    pub observed_at: DateTime<Utc>,
 }
 
 // ── Notifications ───────────────────────────────────────────────────────────

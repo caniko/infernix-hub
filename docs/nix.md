@@ -207,16 +207,24 @@ When `seedFile` is null the module renders `HUB_SEED_FILE` from `engines`,
   "engines": [ { "id": "...", "base_url": "...", "capabilities": { } } ],
   "personas": [ { "name": "...", "voice": "...", "rules": [], "avoid": [], "world": [] } ],
   "accounts": [ { "id": "...", "platform": "...", "handle": "...", "transport": "...", "persona": "...", "capabilities": { "publish": true, "comments": true, "mentions": true, "replies": true, "dms": false, "analytics": false } } ],
-  "renewals": [ { "key": "linkedin-personal-token", "title": "LinkedIn access token", "procedure": "Re-authorize the app and update the credential.", "urls": ["https://www.linkedin.com/developers/apps"], "account": null, "cadence_days": 60, "warn_days": 14, "due_at": null } ]
+  "renewals": [ { "key": "linkedin-personal-token", "title": "LinkedIn access token", "procedure": "Re-authorize the app and update the credential.", "urls": ["https://www.linkedin.com/developers/apps"], "account": null, "cadence_days": 60, "warn_days": 14, "due_at": null, "expiry_kind": "cadence" } ]
 }
 ```
 
 `renewals` rows are upserted by `(company_id, key)`: a new row starts from the
 seed's `due_at`, while a re-seed refreshes only `title`, `procedure`, `urls`,
-`account`, `cadence_days`, and `warn_days`. The due date and the last renewal
-belong to the operator's renewals, so restarting or rebuilding never moves
-them. `urls` are opened in a browser, so the hub refuses a seed whose URLs do
-not start with `https://`.
+`account`, `cadence_days`, `warn_days`, and `expiry_kind`. The due date and the
+last renewal belong to the operator's renewals, so restarting or rebuilding
+never moves them. `urls` are opened in a browser, so the hub refuses a seed
+whose URLs do not start with `https://`.
+
+`expiryKind` (`cadence`, `never` or `provider`, default `cadence`) says where a
+renewal's expiry comes from. `never` is listed but never a to-do. `provider`
+is judged by the hub from the collector's observations: a fresh answer (48 h)
+becomes due or overdue inside `warnDays`, a missing or stale one is
+`unverifiable`, and a provider-confirmed inactive credential is `invalid`.
+Observations arrive through `POST /v1/renewals/{key}/observe` (operator or
+procedure); a re-seed never touches them.
 
 `company_id` stays out of the generated seed; live deployments pass
 `companyId`. With every integration in `fixture`/`disabled`, the module falls

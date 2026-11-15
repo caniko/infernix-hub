@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
-use contracts::{AccountCapabilities, AdapterMode, IntegrationStatus, Verification};
+use contracts::{AccountCapabilities, AdapterMode, ExpiryKind, IntegrationStatus, Verification};
 use domain::ports;
 use domain::{Hub, HubConfig};
 use integrations::fixture::{FixtureAssistant, FixtureComfy, FixtureGpuPeer, FixturePaperclip, FixturePublisher, FixtureWindmill};
@@ -448,6 +448,9 @@ pub struct SeedRenewal {
     pub cadence_days: Option<i32>,
     pub warn_days: Option<i32>,
     pub due_at: Option<DateTime<Utc>>,
+    /// `cadence` (default), `never` or `provider`; refreshed by every re-seed.
+    #[serde(default)]
+    pub expiry_kind: ExpiryKind,
 }
 
 /// Idempotent seed: engines, personas (with accepted canon r1), accounts and
@@ -506,13 +509,15 @@ pub async fn apply_seed(hub: &Hub, seed: &Seed, company_id: &str) -> anyhow::Res
             anyhow::ensure!(url.starts_with("https://"), "renewal {:?}: url {url:?} must start with https://", r.key);
         }
         // Facts come from the seed; `due_at` and `renewed_at` belong to the
-        // operator's renewals and are only written on insert.
+        // operator's renewals and are only written on insert. Observation
+        // columns are the collector's and are never touched here.
         domain::sqlx::query(
-            "insert into renewals (id, company_id, key, account_id, title, procedure, urls, cadence_days, warn_days, due_at)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "insert into renewals (id, company_id, key, account_id, title, procedure, urls, cadence_days, warn_days, due_at, expiry_kind)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              on conflict (company_id, key) do update set
                account_id = excluded.account_id, title = excluded.title, procedure = excluded.procedure,
                urls = excluded.urls, cadence_days = excluded.cadence_days, warn_days = excluded.warn_days,
+               expiry_kind = excluded.expiry_kind,
                updated_at = now()",
         )
         .bind(uuid::Uuid::new_v4())
@@ -525,6 +530,7 @@ pub async fn apply_seed(hub: &Hub, seed: &Seed, company_id: &str) -> anyhow::Res
         .bind(r.cadence_days)
         .bind(r.warn_days.unwrap_or(14))
         .bind(r.due_at)
+        .bind(r.expiry_kind.as_str())
         .execute(&hub.db)
         .await?;
     }

@@ -122,6 +122,7 @@
       cadence_days = r.cadenceDays;
       warn_days = r.warnDays;
       due_at = r.dueAt;
+      expiry_kind = r.expiryKind;
     })
     cfg.renewals;
 
@@ -571,13 +572,22 @@ in {
             default = null;
             description = "RFC 3339; null means unknown until the first renewal.";
           };
+          expiryKind = mkOption {
+            type = types.enum ["cadence" "never" "provider"];
+            default = "cadence";
+            description = ''
+              Where the expiry comes from: the operator's cadence clock, an
+              explicit never, or provider observations. A re-seed refreshes it;
+              observations are never touched.
+            '';
+          };
         };
       });
       default = [];
       description = ''
         Credential and account renewal deadlines keyed stably by `key`. A
-        re-seed refreshes title, procedure, URLs, cadence and account, but
-        never moves the due date or the last renewal.
+        re-seed refreshes title, procedure, URLs, cadence, account and expiry
+        kind, but never moves the due date or the last renewal.
       '';
     };
 

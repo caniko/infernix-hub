@@ -133,6 +133,9 @@ impl Actor {
 pub const ANY_READER: &[Role] = &[Role::Operator, Role::Agent];
 pub const OPERATOR: &[Role] = &[Role::Operator];
 pub const OPERATOR_OR_AGENT: &[Role] = &[Role::Operator, Role::Agent];
+/// The procedure role is a machine caller; observations are its only renewal
+/// write, and never a rotation.
+pub const OPERATOR_OR_PROCEDURE: &[Role] = &[Role::Operator, Role::Procedure];
 
 /// Decode rows produced by `select to_jsonb(t) from (...) t` into contract
 /// types. Column names are the contract field names.
