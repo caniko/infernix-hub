@@ -3,8 +3,12 @@
 -- every writer, because a trigger sets it.
 alter table generation_requests add column state_since timestamptz not null default now();
 alter table execution_attempts add column state_since timestamptz not null default now();
-update generation_requests set state_since = updated_at;
-update execution_attempts set state_since = updated_at;
+-- Rows that exist before this migration have no recorded transition time.
+-- `updated_at` is refreshed by every poll and would hide a row that is already
+-- stalled, so backfill from `created_at`: the earliest the row could have
+-- entered its state. This errs toward raising a stall, never toward hiding one.
+update generation_requests set state_since = created_at;
+update execution_attempts set state_since = created_at;
 
 create function stamp_state_since() returns trigger language plpgsql as $$
 begin
