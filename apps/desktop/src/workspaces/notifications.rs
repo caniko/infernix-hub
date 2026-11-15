@@ -376,6 +376,12 @@ mod tests {
             warn_days: 14,
             due_at: None,
             renewed_at: None,
+            expiry_kind: contracts::ExpiryKind::Cadence,
+            observation: None,
+            observed_at: None,
+            last_good_at: None,
+            last_good_expires_at: None,
+            status: String::new(),
             created_at: Utc.with_ymd_and_hms(2026, 11, 15, 7, 0, 0).unwrap(),
             updated_at: Utc.with_ymd_and_hms(2026, 11, 15, 7, 0, 0).unwrap(),
         };
