@@ -21,6 +21,7 @@ pub mod outbox;
 pub mod ports;
 pub mod production;
 pub mod release;
+pub mod renewals;
 pub mod system;
 
 pub use sqlx;

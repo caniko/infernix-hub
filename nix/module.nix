@@ -116,16 +116,26 @@
     })
     allEngines;
 
+  renewalRecords =
+    map (r: {
+      inherit (r) key title procedure account;
+      cadence_days = r.cadenceDays;
+      warn_days = r.warnDays;
+      due_at = r.dueAt;
+    })
+    cfg.renewals;
+
   seedContent = {
     engines = engineRecords;
     personas = cfg.personas;
     accounts = cfg.accounts;
+    renewals = renewalRecords;
   };
 
   seedFile =
     if cfg.seedFile != null
     then cfg.seedFile
-    else if engineRecords != [] || cfg.personas != [] || cfg.accounts != []
+    else if engineRecords != [] || cfg.personas != [] || cfg.accounts != [] || cfg.renewals != []
     then (pkgs.formats.json {}).generate "fleetix-hub-seed.json" seedContent
     else null;
 
@@ -528,6 +538,42 @@ in {
       });
       default = [];
       description = "Seed accounts referencing a persona by name.";
+    };
+
+    renewals = mkOption {
+      type = types.listOf (types.submodule {
+        options = {
+          key = mkOption {type = types.str;};
+          title = mkOption {type = types.str;};
+          procedure = mkOption {
+            type = types.str;
+            default = "";
+          };
+          account = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+          };
+          cadenceDays = mkOption {
+            type = types.nullOr types.ints.positive;
+            default = null;
+          };
+          warnDays = mkOption {
+            type = types.nullOr types.ints.unsigned;
+            default = null;
+          };
+          dueAt = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = "RFC 3339; null means unknown until the first renewal.";
+          };
+        };
+      });
+      default = [];
+      description = ''
+        Credential and account renewal deadlines keyed stably by `key`. A
+        re-seed refreshes title, procedure, cadence and account, but never
+        moves the due date or the last renewal.
+      '';
     };
 
     gpuAdmission = {

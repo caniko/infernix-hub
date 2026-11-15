@@ -88,6 +88,15 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
                 |hub| async move { hub.intents().await.map(|value| json_text!(value)) },
             ),
         ),
+        (
+            Effect::Read,
+            read_tool(
+                "hub_renewals",
+                "Credential and account renewal deadlines: cadence, warn window, due time and the procedure to renew.",
+                hub.clone(),
+                |hub| async move { hub.renewals().await.map(|value| json_text!(value)) },
+            ),
+        ),
         (Effect::Read, opportunities_tool(hub.clone())),
         (Effect::Read, opportunity_tool(hub.clone())),
         (Effect::Write, create_brief_tool(hub.clone())),
@@ -430,6 +439,7 @@ mod tests {
                 ("hub_content", Effect::Read),
                 ("hub_relationships", Effect::Read),
                 ("hub_intents", Effect::Read),
+                ("hub_renewals", Effect::Read),
                 ("hub_opportunities", Effect::Read),
                 ("hub_opportunity", Effect::Read),
                 ("hub_create_brief", Effect::Write),

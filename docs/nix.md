@@ -196,18 +196,26 @@ channel may take a name that only exists as a fixture alias (`plinth` next to a
 seeded `transport = "plinth"`); a collision with a live built-in or another
 pack fails startup.
 
-### Seed, personas, accounts
+### Seed, personas, accounts, renewals
 
 When `seedFile` is null the module renders `HUB_SEED_FILE` from `engines`,
-`personas`, and `accounts` in the same shape as `registry/hub.atlas.json`:
+`personas`, `accounts`, and `renewals` in the same shape as
+`registry/hub.atlas.json`:
 
 ```json
 {
   "engines": [ { "id": "...", "base_url": "...", "capabilities": { } } ],
   "personas": [ { "name": "...", "voice": "...", "rules": [], "avoid": [], "world": [] } ],
-  "accounts": [ { "id": "...", "platform": "...", "handle": "...", "transport": "...", "persona": "...", "capabilities": { "publish": true, "comments": true, "mentions": true, "replies": true, "dms": false, "analytics": false } } ]
+  "accounts": [ { "id": "...", "platform": "...", "handle": "...", "transport": "...", "persona": "...", "capabilities": { "publish": true, "comments": true, "mentions": true, "replies": true, "dms": false, "analytics": false } } ],
+  "renewals": [ { "key": "linkedin-personal-token", "title": "LinkedIn access token", "procedure": "Re-authorize the app and update the credential.", "account": null, "cadence_days": 60, "warn_days": 14, "due_at": null } ]
 }
 ```
+
+`renewals` rows are upserted by `(company_id, key)`: a new row starts from the
+seed's `due_at`, while a re-seed refreshes only `title`, `procedure`,
+`account`, `cadence_days`, and `warn_days`. The due date and the last renewal
+belong to the operator's renewals, so restarting or rebuilding never moves
+them.
 
 `company_id` stays out of the generated seed; live deployments pass
 `companyId`. With every integration in `fixture`/`disabled`, the module falls

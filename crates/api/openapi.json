@@ -161,6 +161,14 @@
         "description": "See hub_contracts::ReleaseRevision",
         "type": "object"
       },
+      "Renewal": {
+        "description": "See hub_contracts::Renewal",
+        "type": "object"
+      },
+      "RenewalRenewedIn": {
+        "description": "See hub_contracts::RenewalRenewedIn",
+        "type": "object"
+      },
       "ReplyDraft": {
         "description": "See hub_contracts::ReplyDraft",
         "type": "object"
@@ -2374,6 +2382,95 @@
           }
         ],
         "x-roles": "see domain command"
+      }
+    },
+    "/v1/renewals": {
+      "get": {
+        "operationId": "renewal_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Renewal"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Renewal[]"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "see domain command"
+      }
+    },
+    "/v1/renewals/{key}/renewed": {
+      "post": {
+        "operationId": "renewal_renewed",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenewalRenewedIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Renewal"
+                }
+              }
+            },
+            "description": "Renewal"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "ApiError"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-roles": "operator"
       }
     },
     "/v1/search": {
