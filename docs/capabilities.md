@@ -230,6 +230,21 @@ hash-checked `link-approval`; the key never reaches the hub. Fixture-tested
 against a mock Paperclip HTTP server, including a changed payload after the
 decision. No live board call was made.
 
+### Renewals
+
+`renewals` rows carry what the operator must re-authorize before a channel
+dies, keyed stably by `(company_id, key)`. The seed supplies `title`,
+`procedure`, an optional `account`, `cadence_days` and `warn_days`; a re-seed
+refreshes those facts and never moves `due_at` or `renewed_at`. `GET
+/v1/renewals` lists every row with unknown deadlines first. `POST
+/v1/renewals/{key}/renewed` is operator-only: an explicit `due_at` wins,
+otherwise `now + cadence_days`, and a row with neither answers `due_required`;
+the change writes a `renewal.renewed` audit row. `/v1/today` adds rows that are
+unknown or inside their warn window as `unknown`, `due` or `overdue`, shown in
+the desktop as "Renewals due". `hubctl renewals list|renewed KEY [--due
+RFC3339]` and the read-only MCP tool `hub_renewals` read the same rows; no MCP
+tool can mark a renewal.
+
 ### Windmill
 
 `CE v1.839.0`, workspace `studio`. Adapter `live/windmill.rs`: `run_generation`,

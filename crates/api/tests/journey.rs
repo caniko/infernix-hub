@@ -2101,3 +2101,165 @@ async fn today_lists_open_calls_due_within_two_weeks() {
     assert!(ids.contains(&soon.id) && ids.contains(&undecided.id));
     assert!(!ids.contains(&drafting.id) && !ids.contains(&later.id));
 }
+
+// ── Renewals (stream H3) ────────────────────────────────────────────────────
+
+/// Apply only renewals through the real seed path, as a restart would.
+async fn seed_renewals(h: &H, renewals: serde_json::Value) {
+    let seed: bootstrap::Seed = serde_json::from_value(json!({ "renewals": renewals })).unwrap();
+    bootstrap::apply_seed(&h.hub, &seed, "fixture-company").await.unwrap();
+}
+
+fn renewal_seed(key: &str, cadence_days: Option<i32>, due_at: Option<chrono::DateTime<Utc>>) -> serde_json::Value {
+    json!({
+        "key": key,
+        "title": format!("Token {key}"),
+        "procedure": "Re-authorize and update the credential.",
+        "cadence_days": cadence_days,
+        "due_at": due_at,
+    })
+}
+
+/// PostgreSQL keeps microseconds and the request takes a moment, so compare
+/// clock assertions to the second.
+fn within(actual: chrono::DateTime<Utc>, expected: chrono::DateTime<Utc>) -> bool {
+    (actual - expected).num_seconds().abs() <= 2
+}
+
+async fn renewal(h: &H, key: &str) -> Renewal {
+    h.op.renewals().await.unwrap().into_iter().find(|row| row.key == key).unwrap()
+}
+
+#[tokio::test]
+async fn re_seeding_refreshes_facts_but_never_moves_the_clock() {
+    let Some(h) = harness().await else { return };
+    let seeded_due = Utc::now() + chrono::Duration::days(5);
+    seed_renewals(&h, json!([renewal_seed("seed-a", Some(60), Some(seeded_due))])).await;
+    let row = renewal(&h, "seed-a").await;
+    assert_eq!(row.cadence_days, Some(60));
+    assert_eq!(row.warn_days, 14, "the seed default");
+    assert!(within(row.due_at.unwrap(), seeded_due));
+    assert!(row.renewed_at.is_none());
+
+    // The operator renews, then a restart re-seeds the same key.
+    let renewed_due = Utc::now() + chrono::Duration::days(9);
+    let renewed = h.op.renewal_renewed("seed-a", &RenewalRenewedIn { due_at: Some(renewed_due) }).await.unwrap();
+    assert!(renewed.renewed_at.is_some());
+    let history = h.op.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{}", renewed.id)).await.unwrap();
+    assert!(history.iter().any(|entry| entry.action == "renewal.renewed"));
+
+    let mut again = renewal_seed("seed-a", Some(30), Some(Utc::now() + chrono::Duration::days(90)));
+    again["title"] = json!("Token seed-a, rotated");
+    again["procedure"] = json!("Rotate in the provider console.");
+    again["warn_days"] = json!(21);
+    seed_renewals(&h, json!([again])).await;
+    let after = renewal(&h, "seed-a").await;
+    assert_eq!(after.title, "Token seed-a, rotated");
+    assert_eq!(after.procedure, "Rotate in the provider console.");
+    assert_eq!(after.cadence_days, Some(30));
+    assert_eq!(after.warn_days, 21);
+    assert!(within(after.due_at.unwrap(), renewed_due), "the seed never moves a renewed due date");
+    assert_eq!(after.renewed_at, renewed.renewed_at, "the seed never clears renewed_at");
+
+    // A key seen for the first time takes the seed's due date.
+    let fresh_due = Utc::now() + chrono::Duration::days(4);
+    seed_renewals(&h, json!([renewal_seed("seed-b", Some(7), Some(fresh_due))])).await;
+    let fresh = renewal(&h, "seed-b").await;
+    assert!(within(fresh.due_at.unwrap(), fresh_due));
+    assert!(fresh.renewed_at.is_none());
+}
+
+#[tokio::test]
+async fn renewing_advances_by_cadence_unless_an_explicit_due_wins() {
+    let Some(h) = harness().await else { return };
+    seed_renewals(&h, json!([renewal_seed("cadence", Some(60), None)])).await;
+    assert!(renewal(&h, "cadence").await.due_at.is_none(), "unknown until the first renewal");
+
+    let renewed = h.op.renewal_renewed("cadence", &RenewalRenewedIn { due_at: None }).await.unwrap();
+    assert!(renewed.renewed_at.is_some());
+    assert!(within(renewed.due_at.unwrap(), Utc::now() + chrono::Duration::days(60)), "the cadence starts the clock");
+
+    let explicit = Utc::now() + chrono::Duration::days(3);
+    let again = h.op.renewal_renewed("cadence", &RenewalRenewedIn { due_at: Some(explicit) }).await.unwrap();
+    assert!(within(again.due_at.unwrap(), explicit), "an explicit due date wins over the cadence");
+}
+
+#[tokio::test]
+async fn a_renewal_without_cadence_needs_an_explicit_due_date() {
+    let Some(h) = harness().await else { return };
+    seed_renewals(&h, json!([renewal_seed("no-cadence", None, None)])).await;
+
+    let refused = h.op.renewal_renewed("no-cadence", &RenewalRenewedIn { due_at: None }).await.unwrap_err();
+    assert_eq!(code(refused), "due_required");
+    let row = renewal(&h, "no-cadence").await;
+    assert!(row.due_at.is_none() && row.renewed_at.is_none(), "a refused renewal changes nothing");
+
+    let due = Utc::now() + chrono::Duration::days(11);
+    let renewed = h.op.renewal_renewed("no-cadence", &RenewalRenewedIn { due_at: Some(due) }).await.unwrap();
+    assert!(within(renewed.due_at.unwrap(), due));
+
+    let missing = h.op.renewal_renewed("nope", &RenewalRenewedIn { due_at: None }).await.unwrap_err();
+    assert_eq!(code(missing), "not_found");
+}
+
+#[tokio::test]
+async fn agents_can_read_renewals_but_never_mark_them() {
+    let Some(h) = harness().await else { return };
+    seed_renewals(&h, json!([renewal_seed("operator-only", Some(30), None)])).await;
+    assert!(h.agent.renewals().await.unwrap().iter().any(|row| row.key == "operator-only"));
+    let refused = h.agent.renewal_renewed("operator-only", &RenewalRenewedIn { due_at: None }).await.unwrap_err();
+    assert_eq!(code(refused), "forbidden");
+    assert!(renewal(&h, "operator-only").await.renewed_at.is_none());
+}
+
+#[tokio::test]
+async fn today_lists_unknown_overdue_and_near_renewals_only() {
+    let Some(h) = harness().await else { return };
+    seed_renewals(
+        &h,
+        json!([
+            renewal_seed("overdue", Some(60), Some(Utc::now() - chrono::Duration::days(2))),
+            renewal_seed("unknown", Some(60), None),
+            renewal_seed("within", Some(60), Some(Utc::now() + chrono::Duration::days(3))),
+            renewal_seed("beyond", Some(60), Some(Utc::now() + chrono::Duration::days(30))),
+        ]),
+    )
+    .await;
+
+    let rows = h.op.renewals().await.unwrap();
+    let id = |key: &str| rows.iter().find(|row| row.key == key).unwrap().id;
+    let today = h.op.today().await.unwrap();
+    let ids: Vec<Uuid> = today.renewals.iter().map(|item| item.subject_id).collect();
+    assert!(ids.contains(&id("overdue")) && ids.contains(&id("unknown")) && ids.contains(&id("within")));
+    assert!(!ids.contains(&id("beyond")), "thirty days is outside the warn window");
+    let status = |key: &str| today.renewals.iter().find(|item| item.subject_id == id(key)).map(|item| item.status.clone());
+    assert_eq!(status("overdue").as_deref(), Some("overdue"));
+    assert_eq!(status("unknown").as_deref(), Some("unknown"));
+    assert_eq!(status("within").as_deref(), Some("due"));
+    let item = today.renewals.iter().find(|item| item.subject_id == id("within")).unwrap();
+    assert_eq!(item.kind, "renewal");
+    assert_eq!(item.subject_type, "renewal");
+    assert!(within(item.at.unwrap(), rows.iter().find(|row| row.key == "within").unwrap().due_at.unwrap()));
+}
+
+#[tokio::test]
+async fn renewals_stay_inside_the_hubs_company_and_keys_are_slugs() {
+    let Some(h) = harness().await else { return };
+    let seed = |renewals| serde_json::from_value::<bootstrap::Seed>(json!({ "renewals": renewals })).unwrap();
+    let elsewhere = seed(json!([renewal_seed("other-company-token", Some(60), None)]));
+    bootstrap::apply_seed(&h.hub, &elsewhere, "other-company").await.unwrap();
+    seed_renewals(&h, json!([renewal_seed("own-token", Some(60), None)])).await;
+
+    let keys: Vec<String> = h.op.renewals().await.unwrap().into_iter().map(|row| row.key).collect();
+    assert!(keys.contains(&"own-token".to_string()));
+    assert!(!keys.contains(&"other-company-token".to_string()), "another company's renewal leaked: {keys:?}");
+    let titles: Vec<String> = h.op.today().await.unwrap().renewals.into_iter().map(|item| item.title).collect();
+    assert!(!titles.contains(&"Token other-company-token".to_string()), "another company's renewal in Today");
+    let missing = h.op.renewal_renewed("other-company-token", &RenewalRenewedIn { due_at: None }).await.unwrap_err();
+    assert_eq!(code(missing), "not_found");
+
+    for bad in ["linkedin/personal", "linkedin#personal", "Upper", ""] {
+        let refused = bootstrap::apply_seed(&h.hub, &seed(json!([renewal_seed(bad, Some(60), None)])), "fixture-company").await;
+        assert!(refused.is_err(), "{bad:?} must not be a renewal key");
+    }
+}

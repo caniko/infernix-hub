@@ -327,6 +327,34 @@ pub struct OpportunityDecisionIn {
     pub paperclip_issue_id: Option<String>,
 }
 
+/// One credential or account deadline: `(company_id, key)` is the seed's
+/// stable identity, and only the operator renews it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Renewal {
+    pub id: Uuid,
+    pub company_id: String,
+    pub key: String,
+    /// The channel account this credential unlocks, when it maps to one.
+    pub account_id: Option<String>,
+    pub title: String,
+    /// How to renew; shown to the operator.
+    pub procedure: String,
+    /// Null means the next due date is not known; a renewal asks for one.
+    pub cadence_days: Option<i32>,
+    pub warn_days: i32,
+    /// Null means unknown; the row shows on Today until the first renewal.
+    pub due_at: Option<DateTime<Utc>>,
+    pub renewed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RenewalRenewedIn {
+    /// RFC 3339; absent means `now + cadence_days`.
+    pub due_at: Option<DateTime<Utc>>,
+}
+
 // ── Content & briefs ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -735,6 +763,9 @@ pub struct Today {
     /// Shortlisted or drafting calls due within 14 days (additive field).
     #[serde(default)]
     pub opportunities: Vec<TodayItem>,
+    /// Renewals that are unknown or inside their warn window (additive field).
+    #[serde(default)]
+    pub renewals: Vec<TodayItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

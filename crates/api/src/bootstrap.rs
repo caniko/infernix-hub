@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
+use chrono::{DateTime, Utc};
 use contracts::{AccountCapabilities, AdapterMode, IntegrationStatus, Verification};
 use domain::ports;
 use domain::{Hub, HubConfig};
@@ -390,6 +391,8 @@ pub struct Seed {
     pub personas: Vec<SeedPersona>,
     #[serde(default)]
     pub accounts: Vec<SeedAccount>,
+    #[serde(default)]
+    pub renewals: Vec<SeedRenewal>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,7 +425,21 @@ pub struct SeedAccount {
     pub capabilities: AccountCapabilities,
 }
 
-/// Idempotent seed: engines, personas (with accepted canon r1) and accounts.
+/// One credential deadline; `key` is stable across re-seeds.
+#[derive(Debug, Deserialize)]
+pub struct SeedRenewal {
+    pub key: String,
+    pub title: String,
+    #[serde(default)]
+    pub procedure: String,
+    pub account: Option<String>,
+    pub cadence_days: Option<i32>,
+    pub warn_days: Option<i32>,
+    pub due_at: Option<DateTime<Utc>>,
+}
+
+/// Idempotent seed: engines, personas (with accepted canon r1), accounts and
+/// renewal deadlines.
 pub async fn apply_seed(hub: &Hub, seed: &Seed, company_id: &str) -> anyhow::Result<()> {
     for e in &seed.engines {
         domain::production::register_engine(hub, &e.id, &e.base_url, e.capabilities.clone()).await?;
@@ -468,6 +485,28 @@ pub async fn apply_seed(hub: &Hub, seed: &Seed, company_id: &str) -> anyhow::Res
                 capabilities: a.capabilities.clone(),
             },
         )
+        .await?;
+    }
+    for r in &seed.renewals {
+        // Facts come from the seed; `due_at` and `renewed_at` belong to the
+        // operator's renewals and are only written on insert.
+        domain::sqlx::query(
+            "insert into renewals (id, company_id, key, account_id, title, procedure, cadence_days, warn_days, due_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             on conflict (company_id, key) do update set
+               account_id = excluded.account_id, title = excluded.title, procedure = excluded.procedure,
+               cadence_days = excluded.cadence_days, warn_days = excluded.warn_days, updated_at = now()",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(company_id)
+        .bind(&r.key)
+        .bind(r.account.as_deref())
+        .bind(&r.title)
+        .bind(&r.procedure)
+        .bind(r.cadence_days)
+        .bind(r.warn_days.unwrap_or(14))
+        .bind(r.due_at)
+        .execute(&hub.db)
         .await?;
     }
     Ok(())

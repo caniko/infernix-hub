@@ -141,6 +141,8 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/opportunities", get(opportunity_list))
         .route("/opportunities/{id}", get(opportunity_get))
         .route("/opportunities/{id}/decision", post(opportunity_decide))
+        .route("/renewals", get(renewal_list))
+        .route("/renewals/{key}/renewed", post(renewal_renewed))
         .route("/personas", get(personas).post(create_persona))
         .route("/personas/{id}/canon", get(canon_list).post(canon_propose))
         .route("/canon/{id}/decision", post(canon_decide))
@@ -443,6 +445,17 @@ async fn opportunity_decide(
     Json(b): Json<OpportunityDecisionIn>,
 ) -> R<Opportunity> {
     call!(a, domain::opportunities::decide(&s.hub, &a, id, b))
+}
+async fn renewal_list(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Renewal>> {
+    call!(a, domain::renewals::list(&s.hub, &a))
+}
+async fn renewal_renewed(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(key): Path<String>,
+    Json(b): Json<RenewalRenewedIn>,
+) -> R<Renewal> {
+    call!(a, domain::renewals::renewed(&s.hub, &a, &key, b))
 }
 async fn personas(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Persona>> {
     call!(a, domain::canon::list_personas(&s.hub, &a))

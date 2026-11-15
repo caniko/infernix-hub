@@ -258,6 +258,13 @@ async fn today_items(hub: &Hub, sql: &str) -> DResult<Vec<TodayItem>> {
     decode(rows)
 }
 
+/// Like `today_items`, with the hub's company bound as `$1`.
+async fn company_today_items(hub: &Hub, sql: &str) -> DResult<Vec<TodayItem>> {
+    let rows: Vec<Value> =
+        sqlx::query_scalar(&format!("select to_jsonb(t) from ({sql} limit 50) t")).bind(&hub.config.company_id).fetch_all(&hub.db).await?;
+    decode(rows)
+}
+
 pub async fn today(hub: &Hub, actor: &Actor) -> DResult<Today> {
     actor.require(crate::ANY_READER)?;
     Ok(Today {
@@ -323,6 +330,15 @@ pub async fn today(hub: &Hub, actor: &Actor) -> DResult<Today> {
              from opportunities o
              where o.state in ('shortlisted', 'drafting') and o.deadline is not null and o.deadline < now() + interval '14 days'
              order by o.deadline",
+        )
+        .await?,
+        renewals: company_today_items(
+            hub,
+            "select 'renewal' as kind, r.title, 'renewal' as subject_type, r.id as subject_id,
+               case when r.due_at is null then 'unknown' when r.due_at < now() then 'overdue' else 'due' end as status, r.due_at as at
+             from renewals r
+             where r.company_id = $1 and (r.due_at is null or r.due_at < now() + make_interval(days => r.warn_days))
+             order by r.due_at nulls first",
         )
         .await?,
     })

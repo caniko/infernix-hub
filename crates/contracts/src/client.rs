@@ -224,6 +224,14 @@ impl HubClient {
     pub async fn decide_opportunity(&self, id: Uuid, body: &OpportunityDecisionIn) -> Result<Opportunity, ClientError> {
         self.post(&format!("/opportunities/{id}/decision"), body).await
     }
+    // ── Renewals (H3) ───────────────────────────────────────────────────
+    pub async fn renewals(&self) -> Result<Vec<Renewal>, ClientError> {
+        self.get("/renewals").await
+    }
+    /// Operator-only: record a renewal; `due_at` wins over the stored cadence.
+    pub async fn renewal_renewed(&self, key: &str, body: &RenewalRenewedIn) -> Result<Renewal, ClientError> {
+        self.post(&format!("/renewals/{key}/renewed"), body).await
+    }
     // ── Release approval (H2) ───────────────────────────────────────────
     pub async fn release(&self, id: Uuid) -> Result<ReleaseRevision, ClientError> {
         self.get(&format!("/releases/{id}")).await

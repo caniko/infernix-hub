@@ -126,6 +126,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OpportunityCmd,
     },
+    /// Credential renewals: what must be re-authorized before a channel dies.
+    Renewals {
+        #[command(subcommand)]
+        cmd: RenewalCmd,
+    },
     /// Approve the release's native Paperclip approval with the operator's own
     /// board key, then link it. `--reject` records a rejection instead.
     Approve {
@@ -163,6 +168,18 @@ enum OpportunityCmd {
     },
     /// File a call from a JSON `OpportunityIn` document.
     Ingest { file: std::path::PathBuf },
+}
+
+#[derive(Subcommand)]
+enum RenewalCmd {
+    /// Every renewal with its cadence, warn window, due time and procedure.
+    List,
+    /// Operator-only: mark renewed; `--due` wins over the stored cadence.
+    Renewed {
+        key: String,
+        #[arg(long)]
+        due: Option<DateTime<Utc>>,
+    },
 }
 
 fn print(v: impl serde::Serialize) {
@@ -228,6 +245,10 @@ async fn main() -> Result<()> {
                 let body: OpportunityIn = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
                 print(c.ingest_opportunity(&body).await?)
             }
+        },
+        Cmd::Renewals { cmd } => match cmd {
+            RenewalCmd::List => print(c.renewals().await?),
+            RenewalCmd::Renewed { key, due } => print(c.renewal_renewed(&key, &RenewalRenewedIn { due_at: due }).await?),
         },
         Cmd::Approve { release, reject, note } => {
             let revision = c.release(release).await?;

@@ -129,7 +129,7 @@ in {
         "llm_running_url": "http://127.0.0.1:8013/running",
         "defer_on_unknown_work": true
       }' ${liveSeed}
-      jq -e '.personas == [] and .accounts == []' ${liveSeed}
+      jq -e '.personas == [] and .accounts == [] and .renewals == []' ${liveSeed}
       manifest=$(sed -n 's/.*--manifest //p' ${liveCheck.serviceConfig.ExecStart})
       test -f "$manifest"
       grep -F '"migrate","--check"' "$manifest"
