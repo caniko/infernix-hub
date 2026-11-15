@@ -21,6 +21,7 @@ use zbus::zvariant::Value;
 /// The server holds a feed request for this long; the client waits longer.
 const FEED_WAIT: u64 = 50;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(70);
+const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKOFF_START: u64 = 5;
 const BACKOFF_MAX: u64 = 60;
 /// Newest open rows kept for the menu.
@@ -233,7 +234,9 @@ impl Desktop {
 }
 
 async fn fetch(client: &HubClient, after: Option<i64>, wait: u64) -> Result<NotificationPage, String> {
-    match tokio::time::timeout(FETCH_TIMEOUT, client.notifications(after, wait, false)).await {
+    // The feed must include closed rows (acknowledged, snoozed, resolved) or a
+    // cached menu entry would never leave; the startup snapshot wants open rows.
+    match tokio::time::timeout(FETCH_TIMEOUT, client.notifications(after, wait, after.is_some())).await {
         Ok(Ok(page)) => Ok(page),
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err(format!("no answer within {} s", FETCH_TIMEOUT.as_secs())),
@@ -247,8 +250,12 @@ async fn act(action: Action, client: &HubClient, desktop: &mut Desktop) -> bool 
         // Nothing is applied here: the acknowledgement bumps `seq`, so the feed
         // reports the rows as closed and the in-flight poll wakes at once.
         Action::AckAll => {
-            if let Err(error) = client.ack_notifications(&AckNotificationsIn { ids: Vec::new(), all: true }).await {
-                eprintln!("fleetix-hub-tray: acknowledge all: {error}");
+            // Bounded: a stalled hub must not stop the poll loop or Quit.
+            let all = AckNotificationsIn { ids: Vec::new(), all: true };
+            match tokio::time::timeout(ACK_TIMEOUT, client.ack_notifications(&all)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("fleetix-hub-tray: acknowledge all: {error}"),
+                Err(_) => eprintln!("fleetix-hub-tray: acknowledge all: no answer within {} s", ACK_TIMEOUT.as_secs()),
             }
         }
         Action::Quit => return true,
@@ -290,10 +297,10 @@ async fn main() -> Result<()> {
         let page = match fetched {
             Ok(page) => page,
             Err(error) => {
-                // Offline: no popup, and recovery takes a fresh snapshot so no
-                // backlog is announced.
+                // Offline: no popup. The cursor is kept, so recovery resumes the
+                // feed and announces what changed meanwhile; only daemon startup
+                // takes the silent snapshot.
                 state.offline = true;
-                state.cursor = None;
                 let _ = handle.update(|tray| tray.view = view(&state)).await;
                 eprintln!("fleetix-hub-tray: {error}; retrying in {backoff}s");
                 tokio::select! {
