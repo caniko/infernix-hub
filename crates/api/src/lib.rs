@@ -305,6 +305,9 @@ pub async fn notify_pass(hub: &Hub, fleet_status_file: Option<&FsPath>, summary_
         Ok(raises) => notify_sync(hub, "today", raises).await,
         Err(error) => tracing::warn!(%error, "notifications: today source skipped"),
     }
+    if let Err(error) = domain::notifications::sync_member_renewals(hub).await {
+        tracing::warn!(%error, "notifications: member renewals source skipped");
+    }
     if let Some(path) = fleet_status_file {
         let raises = match read_fleet_status(Some(path)).await {
             Ok(status) => domain::notifications::fleet_raises(&status, chrono::Utc::now()),
@@ -460,6 +463,11 @@ async fn search(State(s): State<AppState>, Caller(a): Caller, Query(q): Query<Se
     call!(a, domain::content::search(&s.hub, &a, &q.q))
 }
 async fn history(State(s): State<AppState>, Caller(a): Caller, Path((t, id)): Path<(String, String)>) -> R<Vec<HistoryEntry>> {
+    if t == "renewal" {
+        let entries = domain::history(&s.hub.db, &t, &id).await.map_err(err(&a))?;
+        a.require(domain::ANY_READER).map_err(err(&a))?;
+        return Ok(axum::Json(entries));
+    }
     // Notification audit rows name members and what they dismissed; only the
     // operator may see them.
     let readers = if t == "notification" { domain::OPERATOR } else { domain::ANY_READER };

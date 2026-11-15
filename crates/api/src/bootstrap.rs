@@ -438,6 +438,7 @@ pub struct SeedAccount {
 #[derive(Debug, Deserialize)]
 pub struct SeedRenewal {
     pub key: String,
+    pub owner: Option<String>,
     pub title: String,
     #[serde(default)]
     pub procedure: String,
@@ -503,6 +504,9 @@ pub async fn apply_seed(hub: &Hub, seed: &Seed, company_id: &str) -> anyhow::Res
         .await?;
     }
     for r in &seed.renewals {
+        if let Some(owner) = &r.owner {
+            domain::notifications::validate_member_renewal_key(owner, &r.key)?;
+        }
         // The operator's browser opens these, so anything but https is a trust
         // boundary failure. Check before the upsert: a bad seed writes nothing.
         for url in &r.urls {
@@ -512,12 +516,12 @@ pub async fn apply_seed(hub: &Hub, seed: &Seed, company_id: &str) -> anyhow::Res
         // operator's renewals and are only written on insert. Observation
         // columns are the collector's and are never touched here.
         domain::sqlx::query(
-            "insert into renewals (id, company_id, key, account_id, title, procedure, urls, cadence_days, warn_days, due_at, expiry_kind)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "insert into renewals (id, company_id, key, account_id, title, procedure, urls, cadence_days, warn_days, due_at, expiry_kind, owner)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              on conflict (company_id, key) do update set
                account_id = excluded.account_id, title = excluded.title, procedure = excluded.procedure,
                urls = excluded.urls, cadence_days = excluded.cadence_days, warn_days = excluded.warn_days,
-               expiry_kind = excluded.expiry_kind,
+               expiry_kind = excluded.expiry_kind, owner = excluded.owner,
                updated_at = now()",
         )
         .bind(uuid::Uuid::new_v4())
@@ -531,6 +535,7 @@ pub async fn apply_seed(hub: &Hub, seed: &Seed, company_id: &str) -> anyhow::Res
         .bind(r.warn_days.unwrap_or(14))
         .bind(r.due_at)
         .bind(r.expiry_kind.as_str())
+        .bind(&r.owner)
         .execute(&hub.db)
         .await?;
     }

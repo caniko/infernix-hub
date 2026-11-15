@@ -123,6 +123,7 @@
       warn_days = r.warnDays;
       due_at = r.dueAt;
       expiry_kind = r.expiryKind;
+      owner = r.owner;
     })
     cfg.renewals;
 
@@ -545,6 +546,10 @@ in {
       type = types.listOf (types.submodule {
         options = {
           key = mkOption {type = types.str;};
+          owner = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+          };
           title = mkOption {type = types.str;};
           procedure = mkOption {
             type = types.str;

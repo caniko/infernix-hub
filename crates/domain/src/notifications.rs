@@ -131,15 +131,17 @@ async fn sync_owned(hub: &Hub, owner: Option<&str>, source: &str, current: Vec<R
     let mut changed = 0;
     for raise in &current {
         let collision: bool = sqlx::query_scalar(
-            "select exists(select 1 from notifications where company_id = $1 and dedupe_key = $2 and owner is distinct from $3)",
+            "select exists(select 1 from notifications where company_id = $1 and dedupe_key = $2
+                and (owner is distinct from $3 or ($3 is not null and $4 = 'member:' || $3 || ':renewals' and source <> $4)))",
         )
         .bind(&hub.config.company_id)
         .bind(&raise.dedupe_key)
         .bind(owner)
+        .bind(source)
         .fetch_one(&mut *tx)
         .await?;
         if collision {
-            return Err(invalid("invalid_dedupe_key", "key belongs to another notification owner"));
+            return Err(invalid("invalid_dedupe_key", "key belongs to another notification owner or source"));
         }
         changed += usize::from(upsert(&mut *tx, &hub.config.company_id, owner, raise).await?);
     }
@@ -246,20 +248,54 @@ pub fn today_raises(today: &Today) -> Vec<Raise> {
     for item in &today.renewals {
         // `never` is a console fact, not a to-do; it must not reach Today, but
         // a stray one still never notifies.
-        if item.status == "never" {
-            continue;
+        if let Some(severity) = renewal_severity(&item.status) {
+            push(severity, format!("today:renewal:{}:{}", item.subject_id, item.status), item);
         }
-        let severity = match item.status.as_str() {
-            "overdue" | "invalid" => Severity::Critical,
-            "due" | "unverifiable" => Severity::Warning,
-            _ => Severity::Info,
-        };
-        push(severity, format!("today:renewal:{}:{}", item.subject_id, item.status), item);
     }
     for item in &today.opportunities {
         push(Severity::Info, format!("today:opportunity:{}:{}", item.subject_id, item.status), item);
     }
     merge_same_key(raises)
+}
+
+fn renewal_severity(status: &str) -> Option<Severity> {
+    match status {
+        "ok" | "never" => None,
+        "overdue" | "invalid" => Some(Severity::Critical),
+        "due" | "unverifiable" => Some(Severity::Warning),
+        _ => Some(Severity::Info),
+    }
+}
+
+pub async fn sync_member_renewals(hub: &Hub) -> DResult<()> {
+    let owners: Vec<String> = sqlx::query_scalar(
+        "select owner from renewals where company_id = $1 and owner is not null
+         union select owner from notifications where company_id = $1 and owner is not null
+           and source = 'member:' || owner || ':renewals' and resolved_at is null",
+    )
+    .bind(&hub.config.company_id)
+    .fetch_all(&hub.db)
+    .await?;
+    for owner in owners {
+        let source = format!("member:{owner}:renewals");
+        let mut raises = Vec::new();
+        for row in crate::renewals::all(hub, Some(&owner)).await? {
+            if let Some(severity) = renewal_severity(&row.status) {
+                raises.push(Raise {
+                    source: source.clone(),
+                    dedupe_key: stored_key(Some(&owner), &format!("renewal:{}:{}", row.key, row.status))?,
+                    severity,
+                    title: row.title,
+                    body: row.status,
+                    subject_type: Some("renewal".into()),
+                    subject_id: Some(row.id.to_string()),
+                    url: None,
+                });
+            }
+        }
+        sync_owned(hub, Some(&owner), &source, raises).await?;
+    }
+    Ok(())
 }
 
 /// Producer keys embed external text (host names, alert keys, timestamps such
@@ -475,6 +511,8 @@ fn view_owner<'a>(actor: &'a Actor, requested: Option<&'a str>) -> DResult<Optio
 
 pub async fn page(hub: &Hub, actor: &Actor, owner: Option<&str>, after: Option<i64>, all: bool, limit: i64) -> DResult<NotificationPage> {
     let owner = view_owner(actor, owner)?;
+    let visible =
+        if actor.principal.role == Role::Operator { "and (owner is null or source <> 'member:' || owner || ':renewals')" } else { "" };
     let limit = limit.clamp(1, MAX_LIMIT);
     // One snapshot for items, cursor and counts.
     let mut tx = hub.db.begin().await?;
@@ -483,7 +521,7 @@ pub async fn page(hub: &Hub, actor: &Actor, owner: Option<&str>, after: Option<i
     let (items, cursor) = match after {
         None => {
             let rows: Vec<Value> = sqlx::query_scalar(&select(&format!(
-                "company_id = $1 and ($2 or ({OPEN})) and owner is not distinct from $4 order by seq desc limit $3"
+                "company_id = $1 and ($2 or ({OPEN})) and owner is not distinct from $4 {visible} order by seq desc limit $3"
             )))
             .bind(company)
             .bind(all)
@@ -493,9 +531,9 @@ pub async fn page(hub: &Hub, actor: &Actor, owner: Option<&str>, after: Option<i
             .await?;
             let mut items: Vec<Notification> = decode(rows)?;
             items.sort_by_key(|n| std::cmp::Reverse(n.seq));
-            let cursor: i64 = sqlx::query_scalar(
-                "select coalesce(max(seq), 0) from notifications where company_id = $1 and owner is not distinct from $2",
-            )
+            let cursor: i64 = sqlx::query_scalar(&format!(
+                "select coalesce(max(seq), 0) from notifications where company_id = $1 and owner is not distinct from $2 {visible}"
+            ))
             .bind(company)
             .bind(owner)
             .fetch_one(&mut *tx)
@@ -503,14 +541,15 @@ pub async fn page(hub: &Hub, actor: &Actor, owner: Option<&str>, after: Option<i
             (items, cursor)
         }
         Some(after) => {
-            let rows: Vec<Value> =
-                sqlx::query_scalar(&select("company_id = $1 and seq > $2 and owner is not distinct from $4 order by seq limit $3"))
-                    .bind(company)
-                    .bind(after)
-                    .bind(limit)
-                    .bind(owner)
-                    .fetch_all(&mut *tx)
-                    .await?;
+            let rows: Vec<Value> = sqlx::query_scalar(&select(&format!(
+                "company_id = $1 and seq > $2 and owner is not distinct from $4 {visible} order by seq limit $3"
+            )))
+            .bind(company)
+            .bind(after)
+            .bind(limit)
+            .bind(owner)
+            .fetch_all(&mut *tx)
+            .await?;
             let window: Vec<Notification> = decode(rows)?;
             let cursor = window.iter().map(|n| n.seq).max().unwrap_or(after);
             let mut items: Vec<Notification> = window.into_iter().filter(|n| all || n.open).collect();
@@ -520,8 +559,8 @@ pub async fn page(hub: &Hub, actor: &Actor, owner: Option<&str>, after: Option<i
     };
     let (open, critical): (i64, i64) = sqlx::query_as(&format!(
         "select
-           (select count(*) from notifications where company_id = $1 and owner is not distinct from $2 and ({OPEN})),
-           (select count(*) from notifications where company_id = $1 and owner is not distinct from $2 and ({OPEN}) and severity = 'critical')"
+           (select count(*) from notifications where company_id = $1 and owner is not distinct from $2 {visible} and ({OPEN})),
+           (select count(*) from notifications where company_id = $1 and owner is not distinct from $2 {visible} and ({OPEN}) and severity = 'critical')"
     ))
     .bind(company)
     .bind(owner)
@@ -534,6 +573,8 @@ pub async fn page(hub: &Hub, actor: &Actor, owner: Option<&str>, after: Option<i
 /// Acknowledges the given ids, or every open row in the selected view.
 pub async fn ack(hub: &Hub, actor: &Actor, owner: Option<&str>, input: AckNotificationsIn) -> DResult<NotificationPage> {
     actor.require(HUMAN)?;
+    let visible =
+        if actor.principal.role == Role::Operator { "and (owner is null or source <> 'member:' || owner || ':renewals')" } else { "" };
     let owner = view_owner(actor, owner)?;
     if !input.all && input.ids.is_empty() {
         return Err(invalid("nothing_selected", "pass ids or all"));
@@ -541,9 +582,9 @@ pub async fn ack(hub: &Hub, actor: &Actor, owner: Option<&str>, input: AckNotifi
     let mut tx = hub.db.begin().await?;
     lock_writers(&mut tx).await?;
     if !input.all && !input.ids.is_empty() {
-        let found: i64 = sqlx::query_scalar(
-            "select count(distinct id) from notifications where company_id = $1 and owner is not distinct from $2 and id = any($3)",
-        )
+        let found: i64 = sqlx::query_scalar(&format!(
+            "select count(distinct id) from notifications where company_id = $1 and owner is not distinct from $2 and id = any($3) {visible}"
+        ))
         .bind(&hub.config.company_id)
         .bind(owner)
         .bind(&input.ids)
@@ -558,7 +599,7 @@ pub async fn ack(hub: &Hub, actor: &Actor, owner: Option<&str>, input: AckNotifi
     let ids: Vec<Uuid> = sqlx::query_scalar(&format!(
         "update notifications
          set read_at = now(), seq = nextval('notifications_seq'), updated_at = now()
-         where company_id = $1 and owner is not distinct from $4 and read_at is null and (($2 and ({OPEN})) or (not $2 and id = any($3)))
+         where company_id = $1 and owner is not distinct from $4 {visible} and read_at is null and (($2 and ({OPEN})) or (not $2 and id = any($3)))
          returning id"
     ))
     .bind(&hub.config.company_id)
@@ -582,17 +623,19 @@ pub async fn ack(hub: &Hub, actor: &Actor, owner: Option<&str>, input: AckNotifi
 /// lapsed snooze on its next pass.
 pub async fn snooze(hub: &Hub, actor: &Actor, owner: Option<&str>, id: Uuid, input: SnoozeNotificationIn) -> DResult<Notification> {
     actor.require(HUMAN)?;
+    let visible =
+        if actor.principal.role == Role::Operator { "and (owner is null or source <> 'member:' || owner || ':renewals')" } else { "" };
     let owner = view_owner(actor, owner)?;
     if input.until <= Utc::now() {
         return Err(invalid("past_until", "snooze until must be in the future"));
     }
     let mut tx = hub.db.begin().await?;
     lock_writers(&mut tx).await?;
-    let changed = sqlx::query(
+    let changed = sqlx::query(&format!(
         "update notifications
          set snoozed_until = $3, seq = nextval('notifications_seq'), updated_at = now()
-         where company_id = $1 and id = $2 and owner is not distinct from $4",
-    )
+         where company_id = $1 and id = $2 and owner is not distinct from $4 {visible}"
+    ))
     .bind(&hub.config.company_id)
     .bind(id)
     .bind(input.until)
@@ -645,12 +688,18 @@ fn stored_key(owner: Option<&str>, key: &str) -> DResult<String> {
     Ok(stored)
 }
 
+pub fn validate_member_renewal_key(owner: &str, key: &str) -> DResult<()> {
+    stored_key(Some(owner), &format!("renewal:{key}:unverifiable"))?;
+    Ok(())
+}
+
 fn api_raise(owner: Option<&str>, input: RaiseNotificationIn) -> DResult<Raise> {
     let source = input.source.as_deref().unwrap_or("agent").trim().to_string();
     if source.is_empty() || source.len() > MAX_SOURCE {
         return Err(invalid("invalid_source", format!("source must be 1..={MAX_SOURCE} bytes")));
     }
     if RESERVED_SOURCES.contains(&source.as_str())
+        || (owner.is_some() && (source == "renewals" || input.dedupe_key.starts_with("renewal:")))
         || (owner.is_none() && (source.starts_with("member:") || input.dedupe_key.starts_with("member:")))
         || RESERVED_PREFIXES.iter().any(|p| input.dedupe_key.starts_with(p))
     {
@@ -682,7 +731,8 @@ pub async fn sync_api(hub: &Hub, actor: &Actor, input: SyncNotificationsIn) -> D
     if source.is_empty() || source.len() > MAX_SOURCE {
         return Err(invalid("invalid_source", format!("source must be 1..={MAX_SOURCE} bytes")));
     }
-    if RESERVED_SOURCES.contains(&source) || (owner.is_none() && source.starts_with("member:")) {
+    if RESERVED_SOURCES.contains(&source) || (owner.is_some() && source == "renewals") || (owner.is_none() && source.starts_with("member:"))
+    {
         return Err(invalid("reserved_key", "reserved source"));
     }
     let current = input

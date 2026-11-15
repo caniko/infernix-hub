@@ -2915,3 +2915,123 @@ async fn a_queued_pipeline_run_gets_the_pending_bound_until_it_really_runs() {
     let running = stalled().await.expect("3 h of execution is stalled");
     assert!(running.body.starts_with("running since "), "{}", running.body);
 }
+
+#[tokio::test]
+async fn member_renewals_are_private_and_produced() {
+    let Some(h) = harness().await else { return };
+    domain::system::issue_token(&h.hub.db, "dejana", Role::Member, Some("member-renewals".into())).await.unwrap();
+    domain::system::issue_token(&h.hub.db, "other", Role::Member, Some("other-renewals".into())).await.unwrap();
+    let member = HubClient::new(&h.url, "member-renewals");
+    let other = HubClient::new(&h.url, "other-renewals");
+    assert_eq!(
+        code(member.sync_notifications(&SyncNotificationsIn { source: "renewals".into(), items: vec![] }).await.unwrap_err()),
+        "reserved_key"
+    );
+    assert_eq!(code(member.raise_notification(&notification_in("renewal:private:overdue", "fake")).await.unwrap_err()), "reserved_key");
+    let mut private = renewal_seed("private", Some(30), Some(Utc::now() - chrono::Duration::days(1)));
+    private["owner"] = json!("dejana");
+    let mut provider = renewal_seed("private-provider", None, None);
+    provider["owner"] = json!("dejana");
+    provider["expiry_kind"] = json!("provider");
+    let mut removed = renewal_seed("removed", Some(30), Some(Utc::now() - chrono::Duration::days(1)));
+    removed["owner"] = json!("dejana");
+    let mut last = renewal_seed("last", Some(30), Some(Utc::now() - chrono::Duration::days(1)));
+    last["owner"] = json!("other");
+    seed_renewals(&h, json!([private.clone(), provider, removed, last, renewal_seed("public", Some(30), None)])).await;
+    let own = member.renewals().await.unwrap();
+    assert_eq!(own.len(), 3);
+    assert_eq!(other.renewals().await.unwrap().len(), 1);
+    assert!(h.op.renewals().await.unwrap().iter().all(|r| r.key != "private"));
+    assert!(h.agent.renewals().await.unwrap().iter().all(|r| r.key != "private"));
+    let id = own.iter().find(|r| r.key == "private").unwrap().id;
+    assert!(!h.op.today().await.unwrap().renewals.iter().any(|r| r.subject_id == id));
+    assert_eq!(code(h.op.renewal_renewed("private", &RenewalRenewedIn { due_at: None }).await.unwrap_err()), "not_found");
+    assert_eq!(code(member.renewal_renewed("public", &RenewalRenewedIn { due_at: None }).await.unwrap_err()), "not_found");
+    assert_eq!(code(other.renewal_renewed("private", &RenewalRenewedIn { due_at: None }).await.unwrap_err()), "not_found");
+    let observation = ObserveRenewalIn { outcome: Observation::Never, expires_at: None, observed_at: Utc::now() };
+    assert_eq!(code(h.op.observe_renewal("private-provider", &observation).await.unwrap_err()), "not_found");
+    assert_eq!(code(member.observe_renewal("private-provider", &observation).await.unwrap_err()), "forbidden");
+    h.procedure.observe_renewal("private-provider", &observation).await.unwrap();
+    assert_eq!(code(h.op.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{id}")).await.unwrap_err()), "not_found");
+    assert_eq!(code(h.agent.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{id}")).await.unwrap_err()), "not_found");
+    assert_eq!(code(member.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{id}")).await.unwrap_err()), "not_found");
+    fleetix_hubd::notify_pass(&h.hub, None, None).await;
+    let notes = member.notifications(None, 0, true).await.unwrap();
+    assert!(notes.items.iter().any(|n| n.dedupe_key == "member:dejana:renewal:private:overdue" && n.severity == Severity::Critical));
+    assert!(h.op.notifications(None, 0, true).await.unwrap().items.iter().all(|n| !n.dedupe_key.contains("private")));
+    let inspected: NotificationPage = h.op.get("/notifications?owner=dejana&state=all").await.unwrap();
+    assert_eq!((inspected.open, inspected.critical), (0, 0));
+    assert!(inspected.items.is_empty());
+    let private_note = notes.items.iter().find(|n| n.dedupe_key == "member:dejana:renewal:private:overdue").unwrap();
+    let ack = AckNotificationsIn { ids: vec![private_note.id], all: false };
+    assert_eq!(code(h.op.post::<_, NotificationPage>("/notifications/ack?owner=dejana", &ack).await.unwrap_err()), "not_found");
+    let until = SnoozeNotificationIn { until: Utc::now() + chrono::Duration::hours(1) };
+    assert_eq!(
+        code(h.op.post::<_, Notification>(&format!("/notifications/{}/snooze?owner=dejana", private_note.id), &until).await.unwrap_err()),
+        "not_found"
+    );
+    let _: NotificationPage = h.op.post("/notifications/ack?owner=dejana", &AckNotificationsIn { ids: vec![], all: true }).await.unwrap();
+    assert!(member.notifications(None, 0, true).await.unwrap().items.iter().all(|n| n.read_at.is_none()));
+    assert!(notes.items.iter().any(|n| n.dedupe_key == "member:dejana:renewal:removed:overdue" && n.resolved_at.is_none()));
+    domain::sqlx::query("delete from renewals where key = 'removed'").execute(&h.hub.db).await.unwrap();
+    assert!(
+        other
+            .notifications(None, 0, true)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|n| n.dedupe_key == "member:other:renewal:last:overdue" && n.resolved_at.is_none())
+    );
+    domain::sqlx::query("delete from renewals where key = 'last'").execute(&h.hub.db).await.unwrap();
+    member.renewal_renewed("private", &RenewalRenewedIn { due_at: None }).await.unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, None).await;
+    assert!(
+        member
+            .notifications(None, 0, true)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|n| n.dedupe_key == "member:dejana:renewal:private:overdue" && n.resolved_at.is_some())
+    );
+    assert!(
+        member
+            .notifications(None, 0, true)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|n| n.dedupe_key == "member:dejana:renewal:removed:overdue" && n.resolved_at.is_some())
+    );
+    private["owner"] = serde_json::Value::Null;
+    assert!(
+        other
+            .notifications(None, 0, true)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|n| n.dedupe_key == "member:other:renewal:last:overdue" && n.resolved_at.is_some())
+    );
+    seed_renewals(&h, json!([private])).await;
+    assert!(member.renewals().await.unwrap().iter().all(|r| r.key != "private"));
+    assert!(h.op.renewals().await.unwrap().iter().any(|r| r.key == "private"));
+}
+
+#[tokio::test]
+async fn member_renewal_producer_rejects_legacy_key_collision() {
+    let Some(h) = harness().await else { return };
+    let mut private = renewal_seed("collision", Some(30), None);
+    private["owner"] = json!("dejana");
+    seed_renewals(&h, json!([private])).await;
+    domain::sqlx::query("insert into notifications (id, company_id, source, dedupe_key, severity, title, owner) values ($1, $2, 'member:dejana:agent', 'member:dejana:renewal:collision:unknown', 'info', 'old', 'dejana')")
+        .bind(Uuid::new_v4()).bind(&h.hub.config.company_id).execute(&h.hub.db).await.unwrap();
+    assert!(domain::notifications::sync_member_renewals(&h.hub).await.is_err());
+    let title: String =
+        domain::sqlx::query_scalar("select title from notifications where dedupe_key = 'member:dejana:renewal:collision:unknown'")
+            .fetch_one(&h.hub.db)
+            .await
+            .unwrap();
+    assert_eq!(title, "old");
+}

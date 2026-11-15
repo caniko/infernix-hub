@@ -172,6 +172,15 @@ pub(crate) async fn audit(
 }
 
 pub async fn history(db: &PgPool, subject_type: &str, subject_id: &str) -> DResult<Vec<contracts::HistoryEntry>> {
+    if subject_type == "renewal" {
+        let private: bool = sqlx::query_scalar("select exists(select 1 from renewals where id::text = $1 and owner is not null)")
+            .bind(subject_id)
+            .fetch_one(db)
+            .await?;
+        if private {
+            return Err(DomainError::NotFound("renewal"));
+        }
+    }
     let rows: Vec<Value> = sqlx::query_scalar(
         "select to_jsonb(a) from (select id, at, actor, action, subject_type, subject_id, correlation_id, detail
          from audit_log where subject_type = $1 and subject_id = $2 order by id desc limit 200) a",
