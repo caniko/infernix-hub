@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "apps/cli",
     "apps/desktop",
+    "apps/tray",
     "crates/api",
     "crates/contracts",
     "crates/domain",
@@ -12,6 +13,7 @@ members = [
 # The desktop app pulls the webkit stack; native checks build without it.
 default-members = [
     "apps/cli",
+    "apps/tray",
     "crates/api",
     "crates/contracts",
     "crates/domain",

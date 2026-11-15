@@ -91,6 +91,9 @@ in {
 
   hubctl = mkBin "hubctl";
 
+  # ksni and zbus only; no webkit, so it stays in the native graph above.
+  fleetix-hub-tray = mkBin "fleetix-hub-tray";
+
   fleetix-hub-desktop = cacheRust {
     package = craneLib.buildPackage (desktopArgs
       // {
