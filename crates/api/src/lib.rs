@@ -268,6 +268,7 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
 
     if !settings.no_worker {
         tokio::spawn(worker::run(state.hub.clone(), Duration::from_secs(2)));
+        tokio::spawn(notify_loop(state.hub.clone(), state.fleet_status_file.clone(), settings.summary_stale_hours));
     }
     let listener = tokio::net::TcpListener::bind(&settings.bind).await.with_context(|| format!("binding {}", settings.bind))?;
     tracing::info!(bind = %settings.bind, "listening");
@@ -277,6 +278,51 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
         })
         .await?;
     Ok(())
+}
+
+/// Producers ride one in-process loop next to the worker: no scheduler, no
+/// second process. `--no-worker` starts neither.
+pub async fn notify_loop(hub: Hub, fleet_status_file: Option<std::path::PathBuf>, summary_stale_hours: Option<u32>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        notify_pass(&hub, fleet_status_file.as_deref(), summary_stale_hours).await;
+    }
+}
+
+/// One pass: each source syncs the set it currently sees, then lapsed snoozes
+/// are announced and old rows pruned. A failed step is logged and the others
+/// still run; nothing here is fatal.
+pub async fn notify_pass(hub: &Hub, fleet_status_file: Option<&FsPath>, summary_stale_hours: Option<u32>) {
+    match domain::content::system_today(hub).await {
+        Ok(today) => notify_sync(hub, "today", domain::notifications::today_raises(&today)).await,
+        Err(error) => tracing::warn!(%error, "notifications: today source skipped"),
+    }
+    if let Some(path) = fleet_status_file {
+        let raises = match read_fleet_status(Some(path)).await {
+            Ok(status) => domain::notifications::fleet_raises(&status, chrono::Utc::now()),
+            Err(error) => vec![domain::notifications::fleet_unreadable(&error.to_string())],
+        };
+        notify_sync(hub, "fleet", raises).await;
+    }
+    match domain::notifications::summary_raises(hub, summary_stale_hours).await {
+        Ok(raises) => notify_sync(hub, "hub", raises).await,
+        Err(error) => tracing::warn!(%error, "notifications: hub source skipped"),
+    }
+    if let Err(error) = domain::notifications::expire_snoozes(hub).await {
+        tracing::warn!(%error, "notifications: snooze expiry failed");
+    }
+    if let Err(error) = domain::notifications::prune(hub).await {
+        tracing::warn!(%error, "notifications: prune failed");
+    }
+}
+
+async fn notify_sync(hub: &Hub, source: &str, raises: Vec<domain::notifications::Raise>) {
+    match domain::notifications::sync(hub, source, raises).await {
+        Ok(0) => {}
+        Ok(changed) => tracing::debug!(source, changed, "notifications: producer pass"),
+        Err(error) => tracing::warn!(%error, source, "notifications: producer pass failed"),
+    }
 }
 
 /// Merge one pack's channels into the registry.
@@ -347,6 +393,15 @@ pub enum FleetStatusError {
     Unavailable(String),
     /// Not a snapshot, or a schema version this hub does not know.
     Invalid(String),
+}
+
+impl std::fmt::Display for FleetStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unconfigured => f.write_str("no fleet snapshot is configured"),
+            Self::Unavailable(message) | Self::Invalid(message) => f.write_str(message),
+        }
+    }
 }
 
 /// Read the snapshot another tool rewrites atomically every few minutes.

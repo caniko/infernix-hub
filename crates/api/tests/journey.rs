@@ -2459,3 +2459,39 @@ async fn notification_feed_never_skips_a_truncated_change() {
     let done = domain::notifications::page(&h.hub, &op, Some(cursor), true, 1).await.unwrap();
     assert!(done.items.is_empty() && done.cursor == cursor);
 }
+
+#[tokio::test]
+async fn producer_pass_reopens_a_lapsed_snooze_and_tracks_summary_staleness() {
+    let Some(h) = harness().await else { return };
+
+    // A snoozed row is hidden; the producer pass announces it once the snooze lapses.
+    let row = h.op.raise_notification(&notification_in("agent:snoozed", "wait")).await.unwrap();
+    let snoozed = h.op.snooze_notification(row.id, &SnoozeNotificationIn { until: Utc::now() + chrono::Duration::hours(1) }).await.unwrap();
+    assert!(!snoozed.open, "a snoozed row is not open");
+    domain::sqlx::query("update notifications set snoozed_until = now() - interval '1 minute' where id = $1")
+        .bind(row.id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+
+    // No summary has ever been written, so the hub source raises staleness.
+    fleetix_hubd::notify_pass(&h.hub, None, Some(26)).await;
+    let rows = h.op.notifications(None, 0, true).await.unwrap();
+    let reopened = rows.items.iter().find(|n| n.id == row.id).expect("the snoozed row survives");
+    assert!(reopened.snoozed_until.is_none() && reopened.open, "a lapsed snooze reopens");
+    assert!(reopened.seq > snoozed.seq, "the reopen moves the feed cursor");
+    let stale = rows.items.iter().find(|n| n.dedupe_key == "hub:summary-stale").expect("summary staleness is raised");
+    assert!(stale.open && stale.severity == Severity::Warning && stale.source == "hub");
+
+    // The day's summary resolves it on the next pass.
+    domain::notifications::raise(&h.hub, &notification_raise("summary", "summary:2026-11-15")).await.unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, Some(26)).await;
+    let rows = h.op.notifications(None, 0, true).await.unwrap();
+    let stale = rows.items.iter().find(|n| n.dedupe_key == "hub:summary-stale").unwrap();
+    assert!(stale.resolved_at.is_some() && !stale.open, "a fresh summary resolves the raise");
+
+    // With the rule unset the source syncs empty, so nothing stale can survive.
+    fleetix_hubd::notify_pass(&h.hub, None, None).await;
+    let rows = h.op.notifications(None, 0, true).await.unwrap();
+    assert!(rows.items.iter().find(|n| n.dedupe_key == "hub:summary-stale").unwrap().resolved_at.is_some());
+}

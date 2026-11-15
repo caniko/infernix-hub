@@ -30,6 +30,9 @@ pub struct Settings {
     /// Fleet snapshot written by `canix fleet status --write`; absent when the
     /// hub has no fleet configured.
     pub fleet_status_file: Option<PathBuf>,
+    /// Raise `hub:summary-stale` when no daily summary has been written for
+    /// this many hours; unset disables the rule.
+    pub summary_stale_hours: Option<u32>,
     pub company_id: Option<String>,
     pub paperclip: AdapterMode,
     pub windmill: AdapterMode,
@@ -67,6 +70,10 @@ impl Settings {
             registry_dir: env("HUB_REGISTRY_DIR").map(PathBuf::from).unwrap_or_else(|| "registry".into()),
             seed_file: env("HUB_SEED_FILE").map(PathBuf::from),
             fleet_status_file: env("HUB_FLEET_STATUS_FILE").map(PathBuf::from),
+            summary_stale_hours: match env("HUB_SUMMARY_STALE_HOURS") {
+                None => None,
+                Some(v) => Some(v.parse().with_context(|| format!("HUB_SUMMARY_STALE_HOURS must be a number of hours, got {v}"))?),
+            },
             company_id: env("HUB_COMPANY_ID"),
             paperclip: mode("HUB_PAPERCLIP")?,
             windmill: mode("HUB_WINDMILL")?,
@@ -88,6 +95,7 @@ impl Settings {
             registry_dir: "registry".into(),
             seed_file: Some("registry/hub.fixture.json".into()),
             fleet_status_file: None,
+            summary_stale_hours: None,
             company_id: None,
             paperclip: AdapterMode::Fixture,
             windmill: AdapterMode::Fixture,
