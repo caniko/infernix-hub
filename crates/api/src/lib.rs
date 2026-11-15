@@ -143,6 +143,9 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/opportunities/{id}/decision", post(opportunity_decide))
         .route("/renewals", get(renewal_list))
         .route("/renewals/{key}/renewed", post(renewal_renewed))
+        .route("/notifications", get(notification_list).post(raise_notification))
+        .route("/notifications/ack", post(ack_notifications))
+        .route("/notifications/{id}/snooze", post(snooze_notification))
         .route("/personas", get(personas).post(create_persona))
         .route("/personas/{id}/canon", get(canon_list).post(canon_propose))
         .route("/canon/{id}/decision", post(canon_decide))
@@ -456,6 +459,67 @@ async fn renewal_renewed(
     Json(b): Json<RenewalRenewedIn>,
 ) -> R<Renewal> {
     call!(a, domain::renewals::renewed(&s.hub, &a, &key, b))
+}
+
+#[derive(Deserialize)]
+struct NotificationsQ {
+    /// `open` (default) or `all`.
+    state: Option<String>,
+    after: Option<i64>,
+    wait: Option<u64>,
+    limit: Option<i64>,
+}
+
+/// `GET /v1/notifications`: cursor replay plus a long poll.
+///
+/// The wake future is enabled *before* the query, so a raise that commits while
+/// the query runs is not lost; the connection is back in the pool before the
+/// wait starts.
+// ponytail: in-process wake; a split worker process is seen at the client's next re-poll (<=55 s). LISTEN/NOTIFY if the worker is ever split.
+async fn notification_list(State(s): State<AppState>, Caller(a): Caller, Query(q): Query<NotificationsQ>) -> R<NotificationPage> {
+    let all = match q.state.as_deref() {
+        None | Some("open") => false,
+        Some("all") => true,
+        Some(raw) => {
+            return Err(ApiErr::domain(
+                DomainError::Invalid { code: "invalid_state", message: format!("{raw:?} is not notification state open or all") },
+                a.correlation_id.clone(),
+            ));
+        }
+    };
+    let wait = q.wait.unwrap_or(0).min(domain::notifications::MAX_WAIT_SECS);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+    loop {
+        let notified = s.hub.notified.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let page = domain::notifications::page(&s.hub, &a, q.after, all, q.limit.unwrap_or(domain::notifications::MAX_LIMIT))
+            .await
+            .map_err(err(&a))?;
+        // A feed window of only filtered-out rows still moved the cursor: return
+        // it, or the client would wait on changes it has already passed.
+        let advanced = q.after.is_some_and(|after| page.cursor != after);
+        if !page.items.is_empty() || advanced || wait == 0 || tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return Ok(Json(page));
+        }
+    }
+}
+
+async fn raise_notification(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<RaiseNotificationIn>) -> R<Notification> {
+    call!(a, domain::notifications::post(&s.hub, &a, b))
+}
+
+async fn ack_notifications(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<AckNotificationsIn>) -> R<NotificationPage> {
+    call!(a, domain::notifications::ack(&s.hub, &a, b))
+}
+
+async fn snooze_notification(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<SnoozeNotificationIn>,
+) -> R<Notification> {
+    call!(a, domain::notifications::snooze(&s.hub, &a, id, b))
 }
 async fn personas(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Persona>> {
     call!(a, domain::canon::list_personas(&s.hub, &a))

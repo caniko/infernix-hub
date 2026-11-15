@@ -16,6 +16,7 @@ pub mod content;
 pub mod engagement;
 pub mod hash;
 pub mod news;
+pub mod notifications;
 pub mod opportunities;
 pub mod outbox;
 pub mod ports;
@@ -99,6 +100,8 @@ pub struct Hub {
     pub pipelines: Arc<BTreeMap<String, Arc<dyn ports::Pipeline>>>,
     /// Pack-provided outbox topics. Core topics stay in the worker's match.
     pub topics: Arc<BTreeMap<String, Arc<dyn outbox::OutboxHandler>>>,
+    /// Wakes long-polling notification readers after a committed change.
+    pub notified: Arc<tokio::sync::Notify>,
 }
 
 /// The authenticated caller plus the request's correlation id.

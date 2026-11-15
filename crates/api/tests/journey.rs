@@ -2280,3 +2280,148 @@ async fn renewals_stay_inside_the_hubs_company_and_keys_are_slugs() {
         assert!(refused.is_err(), "{bad:?} must not be a renewal key");
     }
 }
+
+fn notification_in(key: &str, body: &str) -> RaiseNotificationIn {
+    RaiseNotificationIn {
+        source: None,
+        dedupe_key: key.into(),
+        severity: Severity::Warning,
+        title: "Nightly failed".into(),
+        body: body.into(),
+        subject_type: Some("host".into()),
+        subject_id: Some("atlas".into()),
+        url: None,
+    }
+}
+
+fn notification_raise(source: &str, key: &str) -> domain::notifications::Raise {
+    domain::notifications::Raise {
+        source: source.into(),
+        dedupe_key: key.into(),
+        severity: Severity::Warning,
+        title: "Renewal due".into(),
+        body: String::new(),
+        subject_type: Some("renewal".into()),
+        subject_id: Some("abc".into()),
+        url: None,
+    }
+}
+
+#[tokio::test]
+async fn notifications_dedupe_ack_resolve_and_wake() {
+    let Some(h) = harness().await else { return };
+
+    // Raising the same condition twice is one row and one seq.
+    let first = h.op.raise_notification(&notification_in("agent:nightly", "step failed")).await.unwrap();
+    let again = h.op.raise_notification(&notification_in("agent:nightly", "step failed")).await.unwrap();
+    assert_eq!(again.id, first.id);
+    assert_eq!(again.seq, first.seq, "an unchanged condition touches nothing");
+    assert_eq!(first.source, "agent", "source defaults to agent");
+    let page = h.op.notifications(None, 0, true).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!((page.open, page.critical), (1, 0));
+    assert_eq!(page.cursor, first.seq);
+    assert!(page.items[0].open);
+    assert_eq!(h.op.notifications(None, 0, false).await.unwrap().items.len(), 1, "open is the default state");
+
+    // Acknowledging closes the row, moves the cursor and audits once.
+    let after_ack = h.op.ack_notifications(&AckNotificationsIn { ids: vec![first.id], all: false }).await.unwrap();
+    assert_eq!(after_ack.open, 0);
+    assert!(after_ack.items.is_empty(), "an acknowledged row is not open");
+    let acked = h.op.notifications(None, 0, true).await.unwrap().items.remove(0);
+    assert!(acked.read_at.is_some() && !acked.open);
+    assert!(acked.seq > first.seq, "the ack moves the cursor");
+    let history = h.op.get::<Vec<HistoryEntry>>(&format!("/history/notification/{}", first.id)).await.unwrap();
+    assert_eq!(history.iter().filter(|e| e.action == "notification.acked").count(), 1);
+    assert_eq!(
+        code(h.agent.ack_notifications(&AckNotificationsIn { ids: vec![], all: true }).await.unwrap_err()),
+        "forbidden",
+        "ack stays with the operator"
+    );
+
+    // A producer pass resolves what it no longer reports, and only its source.
+    domain::notifications::raise(&h.hub, &notification_raise("today", "today:renewal:abc:due")).await.unwrap();
+    assert_eq!(h.op.notifications(None, 0, false).await.unwrap().open, 1);
+    assert_eq!(domain::notifications::sync(&h.hub, "today", vec![]).await.unwrap(), 1);
+    let rows = h.op.notifications(None, 0, true).await.unwrap();
+    let today = rows.items.iter().find(|n| n.dedupe_key == "today:renewal:abc:due").unwrap();
+    assert!(today.resolved_at.is_some() && !today.open);
+    let kept = rows.items.iter().find(|n| n.id == first.id).unwrap();
+    assert!(kept.read_at.is_some() && kept.resolved_at.is_none(), "sync leaves other sources alone");
+
+    // A changed condition reopens unread.
+    let reopened = h.op.raise_notification(&notification_in("agent:nightly", "step failed again")).await.unwrap();
+    assert_eq!(reopened.id, first.id);
+    assert!(reopened.read_at.is_none() && reopened.resolved_at.is_none() && reopened.open);
+    assert!(reopened.seq > kept.seq);
+
+    // Snooze hides it from the open page, and only into the future.
+    let snoozed =
+        h.op.snooze_notification(reopened.id, &SnoozeNotificationIn { until: Utc::now() + chrono::Duration::hours(1) }).await.unwrap();
+    assert!(snoozed.snoozed_until.is_some() && !snoozed.open);
+    assert!(h.op.notifications(None, 0, false).await.unwrap().items.is_empty());
+    let past =
+        h.op.snooze_notification(reopened.id, &SnoozeNotificationIn { until: Utc::now() - chrono::Duration::hours(1) }).await.unwrap_err();
+    assert_eq!(code(past), "past_until");
+    let history = h.op.get::<Vec<HistoryEntry>>(&format!("/history/notification/{}", reopened.id)).await.unwrap();
+    assert!(history.iter().any(|e| e.action == "notification.snoozed"));
+
+    // The long poll: a request started first returns at once when a raise lands.
+    let after = h.op.notifications(None, 0, true).await.unwrap().cursor;
+    let wake = h.op.clone();
+    let started = std::time::Instant::now();
+    let waiter = tokio::spawn(async move { wake.notifications(Some(after), 5, true).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    h.op.raise_notification(&notification_in("agent:wake", "woke")).await.unwrap();
+    let woke = waiter.await.unwrap().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2), "the long poll woke in {:?}", started.elapsed());
+    assert!(woke.items.iter().any(|n| n.dedupe_key == "agent:wake"));
+    assert!(woke.cursor > after);
+
+    // Reserved keys and size limits are refusals, not 500s.
+    for key in ["today:renewal:abc:due", "fleet:host:atlas", "hub:summary-stale"] {
+        assert_eq!(code(h.op.raise_notification(&notification_in(key, "")).await.unwrap_err()), "reserved_key", "{key}");
+    }
+    let reserved_source = RaiseNotificationIn { source: Some("fleet".into()), ..notification_in("agent:x", "") };
+    assert_eq!(code(h.op.raise_notification(&reserved_source).await.unwrap_err()), "reserved_key");
+    let long_title = RaiseNotificationIn { title: "x".repeat(201), ..notification_in("agent:long", "") };
+    assert_eq!(code(h.op.raise_notification(&long_title).await.unwrap_err()), "invalid_title");
+    let big_body = RaiseNotificationIn { body: "x".repeat(16 * 1024 + 1), ..notification_in("agent:big", "") };
+    assert_eq!(code(h.op.raise_notification(&big_body).await.unwrap_err()), "body_too_large");
+
+    // Procedure tokens raise their own rows; ingest tokens do not.
+    h.procedure.raise_notification(&notification_in("agent:procedure", "")).await.unwrap();
+    assert_eq!(code(h.ingest.raise_notification(&notification_in("agent:ingest", "")).await.unwrap_err()), "forbidden");
+
+    // Acknowledge all clears whatever is still open, but not a row snoozed into
+    // the future: that one must resurface when its snooze lapses.
+    let cleared = h.op.ack_notifications(&AckNotificationsIn { ids: vec![], all: true }).await.unwrap();
+    assert_eq!(cleared.open, 0);
+    assert!(cleared.items.is_empty());
+    let rows = h.op.notifications(None, 0, true).await.unwrap();
+    assert_eq!(rows.items.iter().filter(|n| n.open).count(), 0);
+    assert!(rows.items.iter().find(|n| n.id == reopened.id).unwrap().read_at.is_none(), "ack all skips a snoozed row");
+}
+
+#[tokio::test]
+async fn notification_feed_never_skips_a_truncated_change() {
+    let Some(h) = harness().await else { return };
+    let op = actor(Role::Operator, "operator");
+    let start = domain::notifications::page(&h.hub, &op, None, true, 200).await.unwrap().cursor;
+    for key in ["agent:feed-a", "agent:feed-b", "agent:feed-c"] {
+        h.op.raise_notification(&notification_in(key, "")).await.unwrap();
+    }
+    // A one-row window walks the changes oldest first and never jumps past one.
+    let mut cursor = start;
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let page = domain::notifications::page(&h.hub, &op, Some(cursor), true, 1).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.cursor, page.items[0].seq, "the cursor stops at the last row delivered");
+        seen.push(page.items[0].dedupe_key.clone());
+        cursor = page.cursor;
+    }
+    assert_eq!(seen, ["agent:feed-a", "agent:feed-b", "agent:feed-c"]);
+    let done = domain::notifications::page(&h.hub, &op, Some(cursor), true, 1).await.unwrap();
+    assert!(done.items.is_empty() && done.cursor == cursor);
+}

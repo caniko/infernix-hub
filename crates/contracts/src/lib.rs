@@ -358,6 +358,76 @@ pub struct RenewalRenewedIn {
     pub due_at: Option<DateTime<Utc>>,
 }
 
+// ── Notifications ───────────────────────────────────────────────────────────
+
+wire_enum!(Severity { Info = "info", Warning = "warning", Critical = "critical" });
+
+/// One condition the operator should see. `seq` is the long-poll cursor and
+/// moves on every change; `open` is derived server-side from the three
+/// timestamps (unresolved, unacknowledged, not snoozed into the future).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Notification {
+    pub id: Uuid,
+    pub seq: i64,
+    pub source: String,
+    pub dedupe_key: String,
+    pub severity: Severity,
+    pub title: String,
+    pub body: String,
+    pub subject_type: Option<String>,
+    pub subject_id: Option<String>,
+    pub url: Option<String>,
+    pub read_at: Option<DateTime<Utc>>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub snoozed_until: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub open: bool,
+}
+
+/// `POST /v1/notifications`; `source` defaults to `agent`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RaiseNotificationIn {
+    #[serde(default)]
+    pub source: Option<String>,
+    pub dedupe_key: String,
+    pub severity: Severity,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub subject_type: Option<String>,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// Rows newer than the caller's cursor, newest first, plus the cursor to send
+/// back. `open` and `critical` always count *all* open rows.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NotificationPage {
+    pub items: Vec<Notification>,
+    pub cursor: i64,
+    pub open: i64,
+    pub critical: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AckNotificationsIn {
+    #[serde(default)]
+    pub ids: Vec<Uuid>,
+    /// Acknowledge every open row instead of `ids`.
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnoozeNotificationIn {
+    /// RFC 3339; must be in the future.
+    pub until: DateTime<Utc>,
+}
+
 // ── Content & briefs ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -372,6 +372,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         channels: Arc::new(channels),
         pipelines: Arc::new(pipelines),
         topics: Arc::new(BTreeMap::new()),
+        notified: Arc::new(tokio::sync::Notify::new()),
     };
     if let Some(seed) = &seed {
         apply_seed(&hub, seed, &hub.config.company_id).await?;
