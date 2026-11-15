@@ -7,11 +7,11 @@
 //! the daily summary all read the same status.
 
 use chrono::{DateTime, Duration, Utc};
-use contracts::{ExpiryKind, Observation, ObserveRenewalIn, Renewal, RenewalRenewedIn, TodayItem};
+use contracts::{ExpiryKind, Observation, ObserveRenewalIn, Renewal, RenewalRenewedIn, Role, TodayItem};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{Actor, DResult, DomainError, Hub, OPERATOR, OPERATOR_OR_PROCEDURE, audit, decode, decode_one, invalid};
+use crate::{Actor, DResult, DomainError, Hub, OPERATOR_OR_PROCEDURE, audit, decode, decode_one, invalid};
 
 /// A provider answer is trusted for this long. Older evidence is unverifiable,
 /// not healthy (D17).
@@ -152,11 +152,12 @@ fn deadline_of(row: &Renewal) -> Option<DateTime<Utc>> {
     }
 }
 
-async fn all(hub: &Hub) -> DResult<Vec<Renewal>> {
+pub(crate) async fn all(hub: &Hub, owner: Option<&str>) -> DResult<Vec<Renewal>> {
     let rows: Vec<Value> =
         // ponytail: unbounded read; renewals are a hand-written catalogue (tens of rows). Paginate if that changes.
-        sqlx::query_scalar(&format!("{SELECT} where r.company_id = $1 order by r.due_at nulls first, r.title) t"))
+        sqlx::query_scalar(&format!("{SELECT} where r.company_id = $1 and r.owner is not distinct from $2 order by r.due_at nulls first, r.title) t"))
             .bind(&hub.config.company_id)
+            .bind(owner)
             .fetch_all(&hub.db)
             .await?;
     let now = Utc::now();
@@ -164,15 +165,15 @@ async fn all(hub: &Hub) -> DResult<Vec<Renewal>> {
 }
 
 pub async fn list(hub: &Hub, actor: &Actor) -> DResult<Vec<Renewal>> {
-    actor.require(crate::ANY_READER)?;
-    all(hub).await
+    actor.require(&[Role::Operator, Role::Agent, Role::Member])?;
+    all(hub, (actor.principal.role == Role::Member).then_some(actor.principal.name.as_str())).await
 }
 
 /// The Today bucket: every renewal the operator must act on. `never` is a
 /// console fact, not a to-do, so it never enters Today and never notifies
 /// (D15).
 pub(crate) async fn today(hub: &Hub) -> DResult<Vec<TodayItem>> {
-    let mut items: Vec<TodayItem> = all(hub)
+    let mut items: Vec<TodayItem> = all(hub, None)
         .await?
         .into_iter()
         .filter(|row| !matches!(row.status.as_str(), "ok" | "never"))
@@ -196,17 +197,19 @@ pub(crate) async fn today(hub: &Hub) -> DResult<Vec<TodayItem>> {
     Ok(items)
 }
 
-/// Operator-only. An explicit due date wins; otherwise the stored cadence
-/// starts the next clock. Neither is an error: the operator must say when.
+/// A human may renew their own row. An explicit due date wins; otherwise the
+/// stored cadence starts the next clock.
 pub async fn renewed(hub: &Hub, actor: &Actor, key: &str, input: RenewalRenewedIn) -> DResult<Renewal> {
-    actor.require(OPERATOR)?;
+    actor.require(&[Role::Operator, Role::Member])?;
     let mut tx = hub.db.begin().await?;
-    let cadence: Option<Option<i32>> =
-        sqlx::query_scalar("select cadence_days from renewals where company_id = $1 and key = $2 for update")
-            .bind(&hub.config.company_id)
-            .bind(key)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let cadence: Option<Option<i32>> = sqlx::query_scalar(
+        "select cadence_days from renewals where company_id = $1 and key = $2 and owner is not distinct from $3 for update",
+    )
+    .bind(&hub.config.company_id)
+    .bind(key)
+    .bind((actor.principal.role == Role::Member).then_some(actor.principal.name.as_str()))
+    .fetch_optional(&mut *tx)
+    .await?;
     let cadence = cadence.ok_or(DomainError::NotFound("renewal"))?;
     if input.due_at.is_none() && cadence.is_none() {
         return Err(invalid("due_required", "renewal has no cadence_days; pass due_at"));
@@ -234,12 +237,14 @@ pub async fn renewed(hub: &Hub, actor: &Actor, key: &str, input: RenewalRenewedI
 pub async fn observe(hub: &Hub, actor: &Actor, key: &str, input: ObserveRenewalIn) -> DResult<Renewal> {
     actor.require(OPERATOR_OR_PROCEDURE)?;
     let mut tx = hub.db.begin().await?;
-    let current: Option<(String, Option<DateTime<Utc>>)> =
-        sqlx::query_as("select expiry_kind, observed_at from renewals where company_id = $1 and key = $2 for update")
-            .bind(&hub.config.company_id)
-            .bind(key)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let current: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "select expiry_kind, observed_at from renewals where company_id = $1 and key = $2 and ($3 or owner is null) for update",
+    )
+    .bind(&hub.config.company_id)
+    .bind(key)
+    .bind(actor.principal.role == Role::Procedure)
+    .fetch_optional(&mut *tx)
+    .await?;
     let (kind, last_observed) = current.ok_or(DomainError::NotFound("renewal"))?;
     if kind != ExpiryKind::Provider.as_str() {
         return Err(invalid("not_provider", "only a provider expiry kind accepts observations"));

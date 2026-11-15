@@ -305,6 +305,9 @@ pub async fn notify_pass(hub: &Hub, fleet_status_file: Option<&FsPath>, summary_
         Ok(raises) => notify_sync(hub, "today", raises).await,
         Err(error) => tracing::warn!(%error, "notifications: today source skipped"),
     }
+    if let Err(error) = domain::notifications::sync_member_renewals(hub).await {
+        tracing::warn!(%error, "notifications: member renewals source skipped");
+    }
     if let Some(path) = fleet_status_file {
         let raises = match read_fleet_status(Some(path)).await {
             Ok(status) => domain::notifications::fleet_raises(&status, chrono::Utc::now()),

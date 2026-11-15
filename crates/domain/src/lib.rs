@@ -172,9 +172,24 @@ pub(crate) async fn audit(
 }
 
 pub async fn history(db: &PgPool, subject_type: &str, subject_id: &str) -> DResult<Vec<contracts::HistoryEntry>> {
+    // Fail closed: only an existing ownerless renewal has readable history, so a
+    // member's renewal stays hidden even after its row is gone.
+    if subject_type == "renewal" {
+        let public: bool = sqlx::query_scalar("select exists(select 1 from renewals where id::text = $1 and owner is null)")
+            .bind(subject_id)
+            .fetch_one(db)
+            .await?;
+        if !public {
+            return Err(DomainError::NotFound("renewal"));
+        }
+    }
+    // A member's own acknowledgements and snoozes name rows the operator may not
+    // see (its renewal notifications), so notification history omits them.
     let rows: Vec<Value> = sqlx::query_scalar(
         "select to_jsonb(a) from (select id, at, actor, action, subject_type, subject_id, correlation_id, detail
-         from audit_log where subject_type = $1 and subject_id = $2 order by id desc limit 200) a",
+         from audit_log where subject_type = $1 and subject_id = $2
+           and not ($1 = 'notification' and actor like 'member:%')
+         order by id desc limit 200) a",
     )
     .bind(subject_type)
     .bind(subject_id)
