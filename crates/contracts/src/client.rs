@@ -232,6 +232,28 @@ impl HubClient {
     pub async fn renewal_renewed(&self, key: &str, body: &RenewalRenewedIn) -> Result<Renewal, ClientError> {
         self.post(&format!("/renewals/{key}/renewed"), body).await
     }
+    // ── Notifications ───────────────────────────────────────────────────
+    /// Rows newer than `after`; `wait` seconds holds the request open on the
+    /// server until something changes. `all` includes acknowledged and resolved
+    /// rows.
+    pub async fn notifications(&self, after: i64, wait: u64, all: bool) -> Result<NotificationPage, ClientError> {
+        let mut query: Vec<(&str, String)> = vec![("after", after.to_string()), ("state", if all { "all".into() } else { "open".into() })];
+        if wait > 0 {
+            query.push(("wait", wait.to_string()));
+        }
+        self.send(self.http.get(self.url("/notifications")).query(&query)).await
+    }
+    pub async fn raise_notification(&self, body: &RaiseNotificationIn) -> Result<Notification, ClientError> {
+        self.post("/notifications", body).await
+    }
+    /// Operator-only: `ids` or `all`; returns the remaining open page.
+    pub async fn ack_notifications(&self, body: &AckNotificationsIn) -> Result<NotificationPage, ClientError> {
+        self.post("/notifications/ack", body).await
+    }
+    /// Operator-only: hide one row until `until`.
+    pub async fn snooze_notification(&self, id: Uuid, body: &SnoozeNotificationIn) -> Result<Notification, ClientError> {
+        self.post(&format!("/notifications/{id}/snooze"), body).await
+    }
     // ── Release approval (H2) ───────────────────────────────────────────
     pub async fn release(&self, id: Uuid) -> Result<ReleaseRevision, ClientError> {
         self.get(&format!("/releases/{id}")).await
