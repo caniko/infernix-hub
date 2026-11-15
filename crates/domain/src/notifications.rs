@@ -147,6 +147,35 @@ pub async fn sync(hub: &Hub, source: &str, current: Vec<Raise>) -> DResult<usize
 const FLEET_STALE_AFTER_SECS: i64 = 15 * 60;
 /// Clock difference tolerated between the snapshot's writer and the hub.
 const FLEET_CLOCK_SKEW_SECS: i64 = 60;
+// ponytail: fixed bounds; make configurable if a pipeline legitimately runs longer.
+const STALLED_RUNNING_HOURS: i32 = 2;
+const STALLED_PENDING_HOURS: i32 = 6;
+
+/// Include every stalled generation, not the capped informational Today list.
+pub async fn today_with_stalled(hub: &Hub, today: &Today) -> DResult<Vec<Raise>> {
+    let rows: Vec<(Uuid, Uuid, String, String, DateTime<Utc>)> = sqlx::query_as(
+        "select g.id, c.id, c.title, g.state, g.updated_at
+         from generation_requests g join content_items c on c.id = g.content_item_id
+         where (g.state = 'running' and g.updated_at < now() - make_interval(hours => $1))
+            or (g.state in ('requested', 'dispatched') and g.updated_at < now() - make_interval(hours => $2))",
+    )
+    .bind(STALLED_RUNNING_HOURS)
+    .bind(STALLED_PENDING_HOURS)
+    .fetch_all(&hub.db)
+    .await?;
+    let mut raises = today_raises(today);
+    raises.extend(rows.into_iter().map(|(id, content_id, title, state, since)| Raise {
+        source: "today".into(),
+        dedupe_key: format!("today:stalled:{id}"),
+        severity: Severity::Warning,
+        title: format!("{title}: {state}"),
+        body: format!("{state} since {}", since.to_rfc3339()),
+        subject_type: Some("content".into()),
+        subject_id: Some(content_id.to_string()),
+        url: None,
+    }));
+    Ok(merge_same_key(raises))
+}
 
 /// One raise per Today row the operator must act on: reviews, failed
 /// operations, overdue interactions, renewals and opportunities.

@@ -2576,6 +2576,44 @@ async fn notification_feed_never_skips_a_truncated_change() {
 }
 
 #[tokio::test]
+async fn stalled_generation_notifies_and_resolves() {
+    let Some(h) = harness().await else { return };
+    let item = h.brief(None).await;
+    let wf = h.workflow("poster-txt2img").await;
+    let input = GenerateIn { workflow_id: wf.id, inputs: json!({ "prompt": "test" }), variants: 1 };
+    let old = h.op.generate(item.id, &input).await.unwrap();
+    let fresh = h.op.generate(item.id, &input).await.unwrap();
+    domain::sqlx::query("update generation_requests set state = 'dispatched', updated_at = now() - interval '7 hours' where id = $1")
+        .bind(old.id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    domain::sqlx::query("update generation_requests set state = 'running', updated_at = now() where id = $1")
+        .bind(fresh.id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, None).await;
+    let rows = h.op.notifications(None, 0, true).await.unwrap().items;
+    let key = format!("today:stalled:{}", old.id);
+    let stalled = rows.iter().find(|n| n.dedupe_key == key).expect("old dispatched generation raises");
+    assert!(stalled.open && stalled.severity == Severity::Warning);
+    assert!(stalled.title.contains("Kiln story") && stalled.title.contains("dispatched"));
+    assert!(stalled.body.starts_with("dispatched since "));
+    assert_eq!(stalled.subject_type.as_deref(), Some("content"));
+    assert_eq!(stalled.subject_id.as_deref(), Some(item.id.to_string().as_str()));
+    assert!(!rows.iter().any(|n| n.dedupe_key == format!("today:stalled:{}", fresh.id)));
+    domain::sqlx::query("update generation_requests set state = 'succeeded', updated_at = now() where id = $1")
+        .bind(old.id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, None).await;
+    let rows = h.op.notifications(None, 0, true).await.unwrap().items;
+    assert!(rows.iter().find(|n| n.dedupe_key == key).unwrap().resolved_at.is_some());
+}
+
+#[tokio::test]
 async fn producer_pass_reopens_a_lapsed_snooze_and_tracks_summary_staleness() {
     let Some(h) = harness().await else { return };
 
