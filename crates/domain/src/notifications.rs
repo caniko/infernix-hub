@@ -7,7 +7,7 @@
 //! resolving the rows a source no longer reports. `seq` is the long-poll cursor,
 //! so every change here wakes the waiters after its transaction commits.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use contracts::fleet::{FleetStatus, Health, NightlyOutcome};
 use contracts::{
     AckNotificationsIn, Notification, NotificationPage, RaiseNotificationIn, Role, Severity, SnoozeNotificationIn, Today, TodayItem,
@@ -36,7 +36,7 @@ const OPEN: &str = "resolved_at is null and read_at is null and (snoozed_until i
 
 /// One condition a producer wants the operator to see. Producers build these;
 /// `post` builds the same shape from an API request after its checks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Raise {
     pub source: String,
     pub dedupe_key: String,
@@ -186,7 +186,47 @@ pub fn today_raises(today: &Today) -> Vec<Raise> {
     for item in &today.opportunities {
         push(Severity::Info, format!("today:opportunity:{}:{}", item.subject_id, item.status), item);
     }
-    raises
+    merge_same_key(raises)
+}
+
+/// Producer keys embed external text (host names, alert keys, timestamps such
+/// as `2026-11-15T02:00:00.7+00:00`). One key that breaks the table's check
+/// would roll back a whole `sync`, so every producer key is folded into the
+/// allowed alphabet: lowercase, anything else becomes `-`, at most 128 bytes.
+fn key_safe(key: &str) -> String {
+    let mut out: String = key
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, ':' | '.' | '_' | '-') { c } else { '-' })
+        .collect();
+    out.truncate(128);
+    out
+}
+
+/// Several Today rows can share one key (two failed destinations of the same
+/// content). Syncing them separately would overwrite one row every pass and
+/// clear its acknowledgement, so rows with the same key become one raise with
+/// a deterministic title and body.
+fn merge_same_key(raises: Vec<Raise>) -> Vec<Raise> {
+    let mut groups: std::collections::BTreeMap<String, Vec<Raise>> = std::collections::BTreeMap::new();
+    for raise in raises {
+        groups.entry(key_safe(&raise.dedupe_key)).or_default().push(raise);
+    }
+    groups
+        .into_iter()
+        .map(|(key, mut group)| {
+            group.sort_by(|a, b| (&a.title, &a.body).cmp(&(&b.title, &b.body)));
+            let mut first = group.remove(0);
+            first.dedupe_key = key;
+            if !group.is_empty() {
+                let mut lines = vec![format!("{}: {}", first.title, first.body)];
+                lines.extend(group.iter().map(|r| format!("{}: {}", r.title, r.body)));
+                first.title = format!("{} (+{} more)", first.title, group.len());
+                first.body = lines.join("\n");
+            }
+            first
+        })
+        .collect()
 }
 
 /// One raise per operator concern in a snapshot. A host is named only when its
@@ -241,19 +281,20 @@ pub fn fleet_raises(status: &FleetStatus, now: DateTime<Utc>) -> Vec<Raise> {
             let failed: Vec<&str> = nightly.hosts.iter().filter(|h| h.outcome == NightlyOutcome::Failed).map(|h| h.host.as_str()).collect();
             if failed.is_empty() { "the run failed".to_string() } else { format!("failed on {}", failed.join(", ")) }
         });
-        // The key constraint is lowercase-only; an RFC 3339 stamp is not.
-        push(format!("fleet:nightly:{}", nightly.started_at.to_ascii_lowercase()), "Nightly update failed".into(), body);
+        push(format!("fleet:nightly:{}", nightly.started_at), "Nightly update failed".into(), body);
     }
     match snapshot_age_secs(status, now) {
+        // The body names the snapshot, not its age: an age changes every pass,
+        // which would reopen an acknowledged outage each minute.
         Some(age) if age > FLEET_STALE_AFTER_SECS => push(
             "fleet:stale".into(),
             "Fleet snapshot is stale".into(),
-            format!("no snapshot for {} minutes; fleet status is not evidence the fleet is healthy", age / 60),
+            format!("last snapshot generated at {}; fleet status is not evidence the fleet is healthy", status.generated_at),
         ),
         Some(_) => {}
         None => push("fleet:stale".into(), "Fleet snapshot is stale".into(), "generatedAt is not a time this hub can compare".into()),
     }
-    raises
+    merge_same_key(raises)
 }
 
 /// The single raise a pass uses when the configured snapshot cannot be read.
@@ -602,7 +643,7 @@ mod tests {
                 "fleet:alert:core_forgejo",
                 "fleet:host:nomad",
                 "fleet:monitoring",
-                // The key constraint is lowercase-only; an RFC 3339 stamp is not.
+                // Folded into the key alphabet: lowercase, no `+`.
                 "fleet:nightly:2026-11-10t02:00:00z",
                 "fleet:op:op-1",
                 "fleet:op:op-2",
@@ -634,7 +675,37 @@ mod tests {
         // Aged-out or unreadable snapshots are the same `fleet:stale` raise.
         let stale = fleet_raises(&status, generated + chrono::Duration::minutes(16));
         assert_eq!(stale.len(), from_fleet.len() + 1);
-        assert_eq!(stale.last().unwrap().dedupe_key, "fleet:stale");
+        assert!(stale.iter().any(|r| r.dedupe_key == "fleet:stale"));
         assert_eq!(fleet_unreadable("gone").dedupe_key, "fleet:stale");
+    }
+
+    #[test]
+    fn producer_raises_are_stable_and_key_safe() {
+        // The production nightly stamp carries fractional seconds and `+00:00`.
+        let mut status: FleetStatus = serde_json::from_str(FLEET_SNAPSHOT).unwrap();
+        status.nightly.as_mut().unwrap().started_at = "2026-11-15T02:00:00.766434605+00:00".into();
+        let generated = DateTime::parse_from_rfc3339("2026-11-10T03:10:00Z").unwrap().with_timezone(&Utc);
+        let pass = |minutes| fleet_raises(&status, generated + chrono::Duration::minutes(minutes));
+        for raise in pass(20) {
+            assert!(valid_key(&raise.dedupe_key), "{} breaks the key check", raise.dedupe_key);
+        }
+        assert!(pass(20).iter().any(|r| r.dedupe_key == "fleet:nightly:2026-11-15t02:00:00.766434605-00:00"));
+
+        // A stale snapshot reads the same on every pass, so an acknowledgement
+        // survives until a new snapshot arrives.
+        let body = |minutes| pass(minutes).into_iter().find(|r| r.dedupe_key == "fleet:stale").unwrap().body;
+        assert_eq!(body(20), body(90));
+
+        // Two failed destinations of one content share a key: one raise, both named.
+        let id = Uuid::from_u128(2);
+        let mut a = today_item("publication", "content", id, "failed");
+        a.title = "Publication to account b failed".into();
+        let mut b = today_item("publication", "content", id, "failed");
+        b.title = "Publication to account a failed".into();
+        let today = |items: Vec<TodayItem>| Today { failed_operations: items, ..Today::default() };
+        let merged = today_raises(&today(vec![a.clone(), b.clone()]));
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged, today_raises(&today(vec![b, a])), "order of Today rows does not change the raise");
+        assert!(merged[0].body.contains("account a") && merged[0].body.contains("account b"));
     }
 }
