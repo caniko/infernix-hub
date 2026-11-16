@@ -76,7 +76,7 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
         (Effect::Read, individual_pass_status_tool(hub.clone())),
         (
             Effect::Read,
-            read_tool("hub_projects", "Projects, their members, accounts and dynamics.", hub.clone(), |hub| async move {
+            read_tool("hub_projects", "Projects, their members, accounts, dynamics and model settings.", hub.clone(), |hub| async move {
                 hub.projects().await.map(|value| json_text!(value))
             }),
         ),

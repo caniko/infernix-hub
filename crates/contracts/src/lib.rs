@@ -144,6 +144,63 @@ pub struct PauseIn {
 
 // ── Personas & canon ────────────────────────────────────────────────────────
 
+pub const MODEL_ROUTES: &[(&str, &str, &[&str])] = &[
+    ("checker", "openai/gpt-6.1-sol", &["low", "medium", "high", "xhigh"]),
+    ("image", "moss-look", &[]),
+    ("assistant", "hub-default", &[]),
+    ("three_d", "trellis2", &[]),
+    ("voice", "kokoro", &[]),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRoute {
+    pub id: String,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectModels {
+    pub checker: ModelRoute,
+    pub image: String,
+    pub assistant: String,
+    pub three_d: String,
+    pub voice: String,
+}
+
+impl Default for ProjectModels {
+    fn default() -> Self {
+        Self {
+            checker: ModelRoute { id: "openai/gpt-6.1-sol".into(), effort: Some("xhigh".into()) },
+            image: "moss-look".into(),
+            assistant: "hub-default".into(),
+            three_d: "trellis2".into(),
+            voice: "kokoro".into(),
+        }
+    }
+}
+
+impl ProjectModels {
+    pub fn validate(&self) -> Result<(), (&'static str, String)> {
+        for (role, id, effort) in [
+            ("checker", self.checker.id.as_str(), self.checker.effort.as_deref()),
+            ("image", self.image.as_str(), None),
+            ("assistant", self.assistant.as_str(), None),
+            ("three_d", self.three_d.as_str(), None),
+            ("voice", self.voice.as_str(), None),
+        ] {
+            let Some((_, _, efforts)) = MODEL_ROUTES.iter().find(|(r, model, _)| *r == role && *model == id) else {
+                return Err(("unknown_model", format!("unknown {role} model: {id}")));
+            };
+            if effort.is_some_and(|value| !efforts.contains(&value)) {
+                return Err(("unknown_effort", format!("unknown effort for {role}: {}", effort.unwrap_or_default())));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub id: Uuid,
@@ -152,6 +209,8 @@ pub struct Project {
     pub kind: ProjectKind,
     pub premise: String,
     pub dynamics: String,
+    #[serde(default)]
+    pub models: ProjectModels,
     pub members: Vec<ProjectMember>,
     pub account_ids: Vec<String>,
     pub created_at: DateTime<Utc>,
@@ -175,6 +234,8 @@ pub struct ProjectIn {
     pub premise: String,
     #[serde(default)]
     pub dynamics: String,
+    #[serde(default)]
+    pub models: Option<ProjectModels>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1143,6 +1204,11 @@ pub struct CancelOut {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn every_default_model_is_in_the_catalog() {
+        assert!(ProjectModels::default().validate().is_ok());
+    }
 
     #[test]
     fn individual_profile_defaults_and_preserves_bio() {

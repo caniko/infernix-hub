@@ -333,3 +333,6 @@ and `GET /v1/status` reports the mode and verification level per integration.
 
 These observations date from the original assessment and are not a current
 inventory of all external activity.
+# Per-project models
+
+Per-project models: stored and validated; the hub acts on `checker` after slice 8 and on `image`; `assistant`, `three_d` and `voice` are served to agents and the pipeline only.

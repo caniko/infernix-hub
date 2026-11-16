@@ -1,11 +1,11 @@
 //! Projects, their members and accounts.
 use crate::{Actor, DResult, DomainError, Hub, OPERATOR, audit, conflict, decode, decode_one, invalid};
-use contracts::{Project, ProjectAccountsIn, ProjectIn, ProjectKind, ProjectMemberIn};
+use contracts::{Project, ProjectAccountsIn, ProjectIn, ProjectKind, ProjectMemberIn, ProjectModels};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 const SELECT: &str = "select to_jsonb(t) from (
-    select i.id, i.company_id, i.name, i.kind, i.premise, i.dynamics, i.created_at,
+    select i.id, i.company_id, i.name, i.kind, i.premise, i.dynamics, i.models, i.created_at,
       coalesce((select jsonb_agg(to_jsonb(m) order by m.added_at, m.persona_id) from (
         select im.persona_id, p.name, im.role, im.added_at,
           (select asset_id from persona_references where persona_id=p.id order by pinned_at desc, id desc limit 1) as reference_asset_id,
@@ -45,19 +45,22 @@ pub async fn create(hub: &Hub, actor: &Actor, input: ProjectIn) -> DResult<Proje
     if input.name.trim().is_empty() {
         return Err(invalid("invalid_project", "name is required"));
     }
+    let models = input.models.clone().unwrap_or_default();
+    models.validate().map_err(|(code, message)| invalid(code, message))?;
     let mut tx = hub.db.begin().await?;
     let id = Uuid::new_v4();
-    sqlx::query("insert into projects (id, company_id, name, kind, premise, dynamics) values ($1,$2,$3,$4,$5,$6)")
+    sqlx::query("insert into projects (id, company_id, name, kind, premise, dynamics, models) values ($1,$2,$3,$4,$5,$6,$7)")
         .bind(id)
         .bind(&hub.config.company_id)
         .bind(&input.name)
         .bind(input.kind.as_str())
         .bind(&input.premise)
         .bind(&input.dynamics)
+        .bind(json!(models))
         .execute(&mut *tx)
         .await
         .map_err(name_error)?;
-    audit(&mut tx, actor, "project.created", "project", id, json!({"name": input.name})).await?;
+    audit(&mut tx, actor, "project.created", "project", id, json!({"name": input.name, "models_changed": input.models.is_some()})).await?;
     let result = get_conn(&mut tx, id).await?;
     tx.commit().await?;
     Ok(result)
@@ -67,6 +70,9 @@ pub async fn update(hub: &Hub, actor: &Actor, id: Uuid, input: ProjectIn) -> DRe
     actor.require(OPERATOR)?;
     if input.name.trim().is_empty() {
         return Err(invalid("invalid_project", "name is required"));
+    }
+    if let Some(models) = &input.models {
+        models.validate().map_err(|(code, message)| invalid(code, message))?;
     }
     let mut tx = hub.db.begin().await?;
     sqlx::query("select id from projects where id = $1 for update")
@@ -78,19 +84,34 @@ pub async fn update(hub: &Hub, actor: &Actor, id: Uuid, input: ProjectIn) -> DRe
     if input.kind == ProjectKind::Solo && count > 1 {
         return Err(conflict("solo_has_one_member", "solo project has more than one member"));
     }
-    sqlx::query("update projects set name=$2, kind=$3, premise=$4, dynamics=$5, updated_at=now() where id=$1")
+    let current = get_conn(&mut tx, id).await?;
+    let models = input.models.unwrap_or_else(|| current.models.clone());
+    let models_changed = models != current.models;
+    sqlx::query("update projects set name=$2, kind=$3, premise=$4, dynamics=$5, models=$6, updated_at=now() where id=$1")
         .bind(id)
         .bind(&input.name)
         .bind(input.kind.as_str())
         .bind(&input.premise)
         .bind(&input.dynamics)
+        .bind(json!(models))
         .execute(&mut *tx)
         .await
         .map_err(name_error)?;
-    audit(&mut tx, actor, "project.updated", "project", id, json!({"name": input.name})).await?;
+    audit(&mut tx, actor, "project.updated", "project", id, json!({"name": input.name, "models_changed": models_changed})).await?;
     let result = get_conn(&mut tx, id).await?;
     tx.commit().await?;
     Ok(result)
+}
+
+pub async fn image_set(conn: &mut sqlx::PgConnection, persona_id: Uuid) -> DResult<String> {
+    // ponytail: one image set exists; add LookPassIn.project_id when a second one does
+    let sets: Vec<String> = sqlx::query_scalar("select distinct coalesce(i.models->>'image', $2) from projects i join project_members m on m.project_id=i.id where m.persona_id=$1")
+        .bind(persona_id).bind(ProjectModels::default().image).fetch_all(conn).await?;
+    match sets.as_slice() {
+        [] => Ok(ProjectModels::default().image),
+        [set] => Ok(set.clone()),
+        _ => Err(conflict("projects_disagree_on_image_model", "projects disagree on image model")),
+    }
 }
 
 pub async fn put_member(hub: &Hub, actor: &Actor, id: Uuid, persona_id: Uuid, input: ProjectMemberIn) -> DResult<Project> {

@@ -671,7 +671,99 @@ async fn a_solo_project_refuses_a_second_member() {
 }
 
 fn project_input(name: &str, kind: ProjectKind) -> ProjectIn {
-    ProjectIn { name: name.into(), kind, premise: "".into(), dynamics: "".into() }
+    ProjectIn { name: name.into(), kind, premise: "".into(), dynamics: "".into(), models: None }
+}
+
+#[tokio::test]
+async fn a_new_project_defaults_to_sol_xhigh_as_its_checker() {
+    let Some(h) = harness().await else { return };
+    let p = h.op.create_project(&project_input("Default", ProjectKind::Solo)).await.unwrap();
+    assert_eq!(p.models, ProjectModels::default());
+}
+
+#[tokio::test]
+async fn a_project_model_outside_the_catalog_is_refused() {
+    let Some(h) = harness().await else { return };
+    let mut input = project_input("Invalid", ProjectKind::Solo);
+    let mut models = ProjectModels::default();
+    models.checker.id = "unknown".into();
+    input.models = Some(models.clone());
+    assert_eq!(code(h.op.create_project(&input).await.unwrap_err()), "unknown_model");
+    models.checker.id = ProjectModels::default().checker.id;
+    models.checker.effort = Some("max".into());
+    input.models = Some(models);
+    assert_eq!(code(h.op.create_project(&input).await.unwrap_err()), "unknown_effort");
+    assert!(!h.op.projects().await.unwrap().iter().any(|p| p.name == "Invalid"));
+}
+
+#[tokio::test]
+async fn saving_premise_keeps_the_project_models() {
+    let Some(h) = harness().await else { return };
+    let mut input = project_input("Preserve", ProjectKind::Solo);
+    let p = h.op.create_project(&input).await.unwrap();
+    let mut models = p.models;
+    models.checker.effort = Some("high".into());
+    input.models = Some(models.clone());
+    h.op.update_project(p.id, &input).await.unwrap();
+    input.models = None;
+    input.premise = "new premise".into();
+    assert_eq!(h.op.update_project(p.id, &input).await.unwrap().models, models);
+}
+
+#[tokio::test]
+async fn projects_stored_before_models_decode_with_defaults() {
+    let Some(h) = harness().await else { return };
+    let p = h.op.create_project(&project_input("Legacy", ProjectKind::Solo)).await.unwrap();
+    for (raw, effort) in [(json!({}), Some("xhigh")), (json!({"checker":{"id":"openai/gpt-6.1-sol"}}), None)] {
+        domain::sqlx::query("update projects set models=$2 where id=$1").bind(p.id).bind(raw).execute(&h.hub.db).await.unwrap();
+        let models = h.op.project(p.id).await.unwrap().models;
+        assert_eq!(models.checker.effort.as_deref(), effort);
+        assert_eq!(models.image, "moss-look");
+    }
+}
+
+#[tokio::test]
+async fn only_the_operator_changes_project_models() {
+    let Some(h) = harness().await else { return };
+    let mut input = project_input("Access", ProjectKind::Solo);
+    let p = h.op.create_project(&input).await.unwrap();
+    input.models = Some(ProjectModels::default());
+    assert_eq!(code(h.agent.update_project(p.id, &input).await.unwrap_err()), "forbidden");
+    assert_eq!(h.agent.project(p.id).await.unwrap().models, p.models);
+}
+
+#[tokio::test]
+async fn a_look_pass_uses_the_projects_image_workflow_set() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let p = h.op.create_project(&project_input("Set", ProjectKind::Solo)).await.unwrap();
+    h.op.put_project_member(p.id, persona, &ProjectMemberIn { role: "".into() }).await.unwrap();
+    domain::sqlx::query("update projects set models=jsonb_set(models, '{image}', '\"other-look\"') where id=$1")
+        .bind(p.id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    let id = Uuid::new_v4();
+    domain::sqlx::query("insert into workflows (id,name,version,engine_instance_id,api_graph,graph_sha256,bindings,windmill_path) select $1,'other-look-txt2img',version,engine_instance_id,api_graph,graph_sha256,bindings,windmill_path from workflows where name='moss-look-txt2img' order by version desc limit 1").bind(id).execute(&h.hub.db).await.unwrap();
+    assert_eq!(h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap().generation.workflow_id, id);
+}
+
+#[tokio::test]
+async fn projects_that_disagree_on_the_image_model_refuse_a_pass() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    for name in ["First", "Second"] {
+        let p = h.op.create_project(&project_input(name, ProjectKind::Solo)).await.unwrap();
+        h.op.put_project_member(p.id, persona, &ProjectMemberIn { role: "".into() }).await.unwrap();
+        if name == "Second" {
+            domain::sqlx::query("update projects set models=jsonb_set(models, '{image}', '\"other-look\"') where id=$1")
+                .bind(p.id)
+                .execute(&h.hub.db)
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(code(h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap_err()), "projects_disagree_on_image_model");
 }
 
 #[tokio::test]

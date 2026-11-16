@@ -172,6 +172,21 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ProjectCmd {
+    Models {
+        id: Uuid,
+        #[arg(long)]
+        checker: Option<String>,
+        #[arg(long)]
+        checker_effort: Option<String>,
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        assistant: Option<String>,
+        #[arg(long)]
+        three_d: Option<String>,
+        #[arg(long)]
+        voice: Option<String>,
+    },
     Create {
         #[arg(long)]
         name: String,
@@ -277,7 +292,47 @@ async fn main() -> Result<()> {
         Cmd::Projects => print(c.projects().await?),
         Cmd::Project { cmd: ProjectCmd::Create { name, kind, premise, dynamics } } => {
             let kind = ProjectKind::parse(&kind).ok_or_else(|| anyhow::anyhow!("kind must be solo or group"))?;
-            print(c.create_project(&ProjectIn { name, kind, premise, dynamics }).await?)
+            print(c.create_project(&ProjectIn { name, kind, premise, dynamics, models: None }).await?)
+        }
+        Cmd::Project { cmd: ProjectCmd::Models { id, checker, checker_effort, image, assistant, three_d, voice } } => {
+            let project = c.project(id).await?;
+            let changed = checker.is_some()
+                || checker_effort.is_some()
+                || image.is_some()
+                || assistant.is_some()
+                || three_d.is_some()
+                || voice.is_some();
+            let mut models = project.models;
+            if let Some(v) = checker {
+                models.checker.id = v;
+            }
+            if let Some(v) = checker_effort {
+                models.checker.effort = Some(v);
+            }
+            if let Some(v) = image {
+                models.image = v;
+            }
+            if let Some(v) = assistant {
+                models.assistant = v;
+            }
+            if let Some(v) = three_d {
+                models.three_d = v;
+            }
+            if let Some(v) = voice {
+                models.voice = v;
+            }
+            if changed {
+                let input = ProjectIn {
+                    name: project.name,
+                    kind: project.kind,
+                    premise: project.premise,
+                    dynamics: project.dynamics,
+                    models: Some(models),
+                };
+                print(c.update_project(id, &input).await?.models);
+            } else {
+                print(models);
+            }
         }
         Cmd::Project { cmd: ProjectCmd::AddMember { id, persona, role } } => {
             print(c.put_project_member(id, persona, &ProjectMemberIn { role }).await?)

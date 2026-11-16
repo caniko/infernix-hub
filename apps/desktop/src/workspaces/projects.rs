@@ -34,6 +34,7 @@ pub fn ProjectsView() -> Element {
     let project = projects.data.as_ref().and_then(|items| items.iter().find(|item| Some(item.id) == selected_project_id).cloned());
     let mut premise = use_signal(String::new);
     let mut dynamics = use_signal(String::new);
+    let mut models = use_signal(contracts::ProjectModels::default);
     let mut project_form_for = use_signal(|| Option::<Uuid>::None);
     let mut save_error = use_signal(|| Option::<crate::state::UiError>::None);
     use_effect(move || {
@@ -44,6 +45,7 @@ pub fn ProjectsView() -> Element {
         if let Some(item) = (store.projects).cloned().data.and_then(|items| items.into_iter().find(|item| Some(item.id) == id)) {
             premise.set(item.premise);
             dynamics.set(item.dynamics);
+            models.set(item.models);
             project_form_for.set(id);
             save_error.set(None);
         }
@@ -522,7 +524,9 @@ pub fn ProjectsView() -> Element {
                         Some(item) => {
                             let (status, tone) = project_status(&item);
                             let client_save = client.clone();
+                            let client_models = client.clone();
                             let input_name = item.name.clone();
+                            let models_name = item.name.clone();
                             let kind = item.kind;
                             let id = item.id;
                             rsx! {
@@ -532,7 +536,7 @@ pub fn ProjectsView() -> Element {
                                         div { class: "field-row", label { class: "label-tech", r#for: "project-premise", "Premise" } textarea { id: "project-premise", class: "input", value: "{premise}", oninput: move |e| premise.set(e.value()) } }
                                         div { class: "field-row", label { class: "label-tech", r#for: "project-dynamics", "Dynamics" } textarea { id: "project-dynamics", class: "input", value: "{dynamics}", oninput: move |e| dynamics.set(e.value()) } }
                                         div { class: "form-actions", button { class: "btn btn-primary", onclick: move |_| {
-                                            let input = ProjectIn { name: input_name.clone(), kind, premise: premise.cloned(), dynamics: dynamics.cloned() };
+                                            let input = ProjectIn { name: input_name.clone(), kind, premise: premise.cloned(), dynamics: dynamics.cloned(), models: None };
                                             let client = client_save.clone();
                                             spawn(async move { match api::timed(client.update_project(id, &input)).await {
                                                 Ok(_) => { save_error.set(None); api::refresh_projects(store, &client).await; },
@@ -540,6 +544,69 @@ pub fn ProjectsView() -> Element {
                                             } });
                                         }, "Save" } }
                                         p { "Accounts: {item.account_ids.join(\", \")}" }
+                                    }
+                                }
+                                Panel { title: "Models".to_string(), caption: None,
+                                    div { class: "form-grid",
+                                        for (role, label) in [("checker", "Checker"), ("image", "Image"), ("assistant", "Assistant"), ("three_d", "3D"), ("voice", "Voice")] {
+                                            {
+                                                let selected = match role {
+                                                    "checker" => models().checker.id,
+                                                    "image" => models().image,
+                                                    "assistant" => models().assistant,
+                                                    "three_d" => models().three_d,
+                                                    _ => models().voice,
+                                                };
+                                                rsx! {
+                                                    div { class: "field-row", key: "{role}",
+                                                        label { class: "label-tech", r#for: "model-{role}", "{label}" }
+                                                        select { id: "model-{role}", class: "input", value: "{selected}", onchange: move |e| {
+                                                            let value = e.value();
+                                                            let mut current = models.write();
+                                                            match role {
+                                                                "checker" => {
+                                                                    current.checker.id = value;
+                                                                    let efforts = model_options("checker").into_iter().find(|(id, _)| *id == current.checker.id).map(|(_, efforts)| efforts).unwrap_or_default();
+                                                                    if current.checker.effort.as_deref().is_some_and(|effort| !efforts.contains(&effort)) {
+                                                                        current.checker.effort = None;
+                                                                    }
+                                                                },
+                                                                "image" => current.image = value,
+                                                                "assistant" => current.assistant = value,
+                                                                "three_d" => current.three_d = value,
+                                                                _ => current.voice = value,
+                                                            }
+                                                        },
+                                                            for (id, _) in model_options(role) { option { value: "{id}", "{id}" } }
+                                                        }
+                                                        if role == "checker" {
+                                                            p { "Runs when you keep an image, once the automated checker ships (slice 8). Until then you attest." }
+                                                            label { class: "label-tech", r#for: "model-checker-effort", "Checker effort" }
+                                                            select { id: "model-checker-effort", class: "input", value: models().checker.effort.unwrap_or_default(), onchange: move |e| {
+                                                                let value = e.value();
+                                                                models.write().checker.effort = if value.is_empty() { None } else { Some(value) };
+                                                            },
+                                                                option { value: "", "Default" }
+                                                                for effort in model_options("checker").into_iter().find(|(id, _)| *id == models().checker.id).map(|(_, efforts)| efforts).unwrap_or_default().iter() {
+                                                                    option { value: "{effort}", "{effort}" }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        div { class: "form-actions", button { class: "btn btn-primary", onclick: move |_| {
+                                            let input = ProjectIn { name: models_name.clone(), kind, premise: premise.cloned(), dynamics: dynamics.cloned(), models: Some(models.cloned()) };
+                                            let client = client_models.clone();
+                                            spawn(async move { match api::timed(client.update_project(id, &input)).await {
+                                                Ok(project) => {
+                                                    if (store.selected_project).cloned() == Some(id) { save_error.set(None); models.set(project.models); }
+                                                    api::refresh_projects(store, &client).await;
+                                                },
+                                                Err(error) => { if (store.selected_project).cloned() == Some(id) { save_error.set(Some(error)); } },
+                                            } });
+                                        }, "Save models" } }
                                     }
                                 }
                                 Panel { title: "Members".to_string(), caption: None,
@@ -583,6 +650,10 @@ pub fn ProjectsView() -> Element {
         }
         if let Some((persona_id, project_id)) = wizard() { super::individual::IndividualWizard { persona_id, project_id, on_close: move |_| wizard.set(None) } }
     }
+}
+
+fn model_options(role: &str) -> Vec<(&'static str, &'static [&'static str])> {
+    contracts::MODEL_ROUTES.iter().filter(|(candidate, _, _)| *candidate == role).map(|(_, id, efforts)| (*id, *efforts)).collect()
 }
 
 fn remaining_members(selected: &[(Uuid, String)], added: &[Uuid]) -> Vec<(Uuid, String)> {
@@ -656,7 +727,7 @@ fn NewProjectDialog(on_close: EventHandler<()>) -> Element {
                             busy.set(true);
                             error.set(None);
                             let client = client.clone();
-                            let input = ProjectIn { name: name().trim().to_string(), kind: kind(), premise: premise(), dynamics: dynamics() };
+                            let input = ProjectIn { name: name().trim().to_string(), kind: kind(), premise: premise(), dynamics: dynamics(), models: None };
                             let members = remaining_members(&selected(), &added());
                             spawn(async move {
                                 let id = if let Some(id) = created() { id } else {
@@ -730,6 +801,11 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn model_options_come_from_the_catalog() {
+        assert_eq!(super::model_options("checker"), vec![("openai/gpt-6.1-sol", &["low", "medium", "high", "xhigh"][..])]);
+    }
+
+    #[test]
     fn review_chip_waits_until_an_agent_comments() {
         use contracts::{CanonBody, CanonComment, CanonRevision, CanonSource, CanonState, Role};
         let mut rev = CanonRevision {
@@ -789,6 +865,7 @@ mod tests {
             kind: ProjectKind::Group,
             premise: String::new(),
             dynamics: String::new(),
+            models: Default::default(),
             members: Vec::new(),
             account_ids: Vec::new(),
             created_at: chrono::Utc::now(),

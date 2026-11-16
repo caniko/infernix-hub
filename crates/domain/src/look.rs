@@ -120,15 +120,16 @@ pub async fn request_pass(hub: &Hub, actor: &Actor, persona_id: Uuid, input: Loo
             return Err(invalid("bad_seed_source", "seed source must belong to this persona"));
         }
     }
-    let (name, inputs) = match source {
-        None => ("moss-look-txt2img", json!({"prompt":input.prompt})),
+    let set = crate::projects::image_set(&mut *hub.db.acquire().await?, persona_id).await?;
+    let (suffix, inputs) = match source {
+        None => ("txt2img", json!({"prompt":input.prompt})),
         Some((sha, mime)) => (
-            if input.size == LookSize::Final { "moss-look-img2img-final" } else { "moss-look-img2img" },
+            if input.size == LookSize::Final { "img2img-final" } else { "img2img" },
             json!({"prompt":input.prompt, "image":production::source_filename(&sha, &mime), "denoise":input.strength}),
         ),
     };
     let workflow_id: Uuid = sqlx::query_scalar("select id from workflows where name=$1 order by version desc limit 1")
-        .bind(name)
+        .bind(format!("{set}-{suffix}"))
         .fetch_optional(&hub.db)
         .await?
         .ok_or(DomainError::NotFound("workflow"))?;
