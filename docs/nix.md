@@ -434,3 +434,11 @@ Notes for the example:
   secret names; wire them through `age.secrets` on the host before enabling.
 - No Postiz deployment exists, so the publisher is `disabled` (a `fixture`
   publisher would silently simulate publishing).
+# Secret inventory
+
+Set `services.fleetix-hub.secretInventoryFile` to the absolute inventory JSON
+path, outside `/home`, `/root`, and `/run/user`. Its directory is mounted
+read-only so atomic replacements remain visible. The service user must be able
+to read the file. An unreadable inventory preserves previous secret alerts and
+raises `secrets:inventory-stale`; readable snapshots older than 25 hours retain
+their secret alerts and also raise staleness.

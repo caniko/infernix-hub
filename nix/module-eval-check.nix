@@ -46,6 +46,7 @@
       services.fleetix-hub = {
         enable = true;
         fleetStatusFile = "/var/lib/fleet-status/fleet.json";
+        secretInventoryFile = "/var/lib/secret-inventory/inventory.json";
         renewals = [
           {
             key = "eval-token";
@@ -74,6 +75,7 @@ in {
   assert !(fixtureHub.environment ? HUB_SEED_FILE);
   assert !(fixtureHub.environment ? LLM_URL);
   assert !(fixtureHub.environment ? HUB_FLEET_STATUS_FILE);
+  assert !(fixtureHub.environment ? HUB_SECRET_INVENTORY_FILE);
   assert !(fixtureHub.serviceConfig ? BindReadOnlyPaths);
   assert fixture.config.services.harbor-db.projects."fleetix-hub".enable;
   assert lib.elem "fleetix-hub.service" fixtureMigration.requiredBy;
@@ -107,8 +109,10 @@ in {
   assert liveHub.environment.LLM_MODEL == "qwen3.8-27b";
   assert liveHub.environment.HUB_MIGRATE_ON_START == "0";
   assert liveHub.environment.HUB_FLEET_STATUS_FILE == "/var/lib/fleet-status/fleet.json";
+  assert liveHub.environment.HUB_SECRET_INVENTORY_FILE == "/var/lib/secret-inventory/inventory.json";
   # The directory, not the file: atomic replacements must stay visible.
   assert lib.elem "/var/lib/fleet-status" liveHub.serviceConfig.BindReadOnlyPaths;
+  assert lib.elem "/var/lib/secret-inventory" liveHub.serviceConfig.BindReadOnlyPaths;
   assert lib.elem "comfyui.service" liveHub.after;
   assert lib.elem "llama-swap.service" liveHub.after;
   assert lib.elem "comfyui.service" liveHub.wants;
