@@ -308,6 +308,9 @@ pipeline submission/status/cancel paths including the crash-window adoption,
 release freezing, channel dispatch, engagement replies, MCP, the desktop and
 pack registration. It says nothing about a live service.
 
+Influencers: fixture-tested against PostgreSQL, including member and account
+rules and delegated brief dynamics. No live adapter is changed by this feature.
+
 The desktop shows a `FIXTURE MODE` banner whenever any adapter is simulated,
 and `GET /v1/status` reports the mode and verification level per integration.
 

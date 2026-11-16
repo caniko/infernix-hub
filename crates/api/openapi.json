@@ -248,6 +248,24 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/v1/influencers": {
+      "get": { "operationId": "influencers", "responses": { "200": { "description": "Influencer list" } }, "security": [{ "bearer": [] }] },
+      "post": { "operationId": "create_influencer", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] }
+    },
+    "/v1/influencers/{id}": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+      "get": { "operationId": "influencer", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] },
+      "put": { "operationId": "update_influencer", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] }
+    },
+    "/v1/influencers/{id}/members/{persona_id}": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }, { "in": "path", "name": "persona_id", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+      "put": { "operationId": "put_influencer_member", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] },
+      "delete": { "operationId": "remove_influencer_member", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] }
+    },
+    "/v1/influencers/{id}/accounts": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+      "put": { "operationId": "set_influencer_accounts", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] }
+    },
     "/healthz": {
       "get": {
         "operationId": "healthz",

@@ -32,6 +32,11 @@ enum Cmd {
     Today,
     News,
     Personas,
+    Influencers,
+    Influencer {
+        #[command(subcommand)]
+        cmd: InfluencerCmd,
+    },
     Workflows,
     Accounts,
     Content,
@@ -166,6 +171,27 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum InfluencerCmd {
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long, default_value = "")]
+        premise: String,
+        #[arg(long, default_value = "")]
+        dynamics: String,
+    },
+    AddMember {
+        id: Uuid,
+        #[arg(long)]
+        persona: Uuid,
+        #[arg(long, default_value = "")]
+        role: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum FleetCmd {
     /// The snapshot written by `canix fleet status --write`.
     Status,
@@ -248,6 +274,14 @@ async fn main() -> Result<()> {
         Cmd::Today => print(c.today().await?),
         Cmd::News => print(c.news().await?),
         Cmd::Personas => print(c.personas().await?),
+        Cmd::Influencers => print(c.influencers().await?),
+        Cmd::Influencer { cmd: InfluencerCmd::Create { name, kind, premise, dynamics } } => {
+            let kind = InfluencerKind::parse(&kind).ok_or_else(|| anyhow::anyhow!("kind must be solo or group"))?;
+            print(c.create_influencer(&InfluencerIn { name, kind, premise, dynamics }).await?)
+        }
+        Cmd::Influencer { cmd: InfluencerCmd::AddMember { id, persona, role } } => {
+            print(c.put_influencer_member(id, persona, &InfluencerMemberIn { role }).await?)
+        }
         Cmd::Workflows => print(c.workflows().await?),
         Cmd::Accounts => print(c.accounts().await?),
         Cmd::Content => print(c.content().await?),

@@ -149,6 +149,10 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/notifications/sync", post(sync_notifications))
         .route("/notifications/{id}/snooze", post(snooze_notification))
         .route("/personas", get(personas).post(create_persona))
+        .route("/influencers", get(influencers).post(create_influencer))
+        .route("/influencers/{id}", get(influencer).put(update_influencer))
+        .route("/influencers/{id}/members/{persona_id}", axum::routing::put(put_influencer_member).delete(remove_influencer_member))
+        .route("/influencers/{id}/accounts", axum::routing::put(set_influencer_accounts))
         .route("/personas/{id}/canon", get(canon_list).post(canon_propose))
         .route("/canon/{id}/decision", post(canon_decide))
         .route("/workflows", get(workflows))
@@ -612,6 +616,43 @@ async fn snooze_notification(
 }
 async fn personas(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Persona>> {
     call!(a, domain::canon::list_personas(&s.hub, &a))
+}
+
+async fn influencers(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Influencer>> {
+    call!(a, domain::influencers::list(&s.hub, &a))
+}
+async fn influencer(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<Influencer> {
+    call!(a, domain::influencers::get(&s.hub, &a, id))
+}
+async fn create_influencer(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<InfluencerIn>) -> R<Influencer> {
+    call!(a, domain::influencers::create(&s.hub, &a, b))
+}
+async fn update_influencer(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<InfluencerIn>,
+) -> R<Influencer> {
+    call!(a, domain::influencers::update(&s.hub, &a, id, b))
+}
+async fn put_influencer_member(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path((id, persona)): Path<(Uuid, Uuid)>,
+    Json(b): Json<InfluencerMemberIn>,
+) -> R<Influencer> {
+    call!(a, domain::influencers::put_member(&s.hub, &a, id, persona, b))
+}
+async fn remove_influencer_member(State(s): State<AppState>, Caller(a): Caller, Path((id, persona)): Path<(Uuid, Uuid)>) -> R<Influencer> {
+    call!(a, domain::influencers::remove_member(&s.hub, &a, id, persona))
+}
+async fn set_influencer_accounts(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<InfluencerAccountsIn>,
+) -> R<Influencer> {
+    call!(a, domain::influencers::set_accounts(&s.hub, &a, id, b))
 }
 #[derive(Deserialize)]
 struct NewPersona {

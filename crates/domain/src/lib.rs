@@ -15,6 +15,7 @@ pub mod canon;
 pub mod content;
 pub mod engagement;
 pub mod hash;
+pub mod influencers;
 pub mod news;
 pub mod notifications;
 pub mod opportunities;

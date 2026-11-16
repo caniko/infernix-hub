@@ -78,6 +78,14 @@ impl HubClient {
         self.send(self.http.post(self.url(path)).json(body)).await
     }
 
+    pub async fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T, ClientError> {
+        self.send(self.http.put(self.url(path)).json(body)).await
+    }
+
+    pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
+        self.send(self.http.delete(self.url(path))).await
+    }
+
     /// Raw bytes (asset content) — returns `(mime, bytes)`.
     pub async fn get_bytes(&self, path: &str) -> Result<(String, Vec<u8>), ClientError> {
         let resp =
@@ -115,6 +123,27 @@ impl HubClient {
     }
     pub async fn personas(&self) -> Result<Vec<Persona>, ClientError> {
         self.get("/personas").await
+    }
+    pub async fn influencers(&self) -> Result<Vec<Influencer>, ClientError> {
+        self.get("/influencers").await
+    }
+    pub async fn influencer(&self, id: Uuid) -> Result<Influencer, ClientError> {
+        self.get(&format!("/influencers/{id}")).await
+    }
+    pub async fn create_influencer(&self, body: &InfluencerIn) -> Result<Influencer, ClientError> {
+        self.post("/influencers", body).await
+    }
+    pub async fn update_influencer(&self, id: Uuid, body: &InfluencerIn) -> Result<Influencer, ClientError> {
+        self.put(&format!("/influencers/{id}"), body).await
+    }
+    pub async fn put_influencer_member(&self, id: Uuid, persona: Uuid, body: &InfluencerMemberIn) -> Result<Influencer, ClientError> {
+        self.put(&format!("/influencers/{id}/members/{persona}"), body).await
+    }
+    pub async fn remove_influencer_member(&self, id: Uuid, persona: Uuid) -> Result<Influencer, ClientError> {
+        self.delete(&format!("/influencers/{id}/members/{persona}")).await
+    }
+    pub async fn set_influencer_accounts(&self, id: Uuid, body: &InfluencerAccountsIn) -> Result<Influencer, ClientError> {
+        self.put(&format!("/influencers/{id}/accounts"), body).await
     }
     pub async fn workflows(&self) -> Result<Vec<Workflow>, ClientError> {
         self.get("/workflows").await

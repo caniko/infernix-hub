@@ -88,6 +88,130 @@ fn code(e: ClientError) -> String {
     }
 }
 
+#[tokio::test]
+async fn a_solo_influencer_refuses_a_second_member() {
+    let Some(h) = harness().await else { return };
+    let influencer: serde_json::Value = h.op.post("/influencers", &json!({"name":"Solo", "kind":"solo"})).await.unwrap();
+    let id = influencer["id"].as_str().unwrap();
+    let first = h.persona().await;
+    let second: serde_json::Value = h.op.post("/personas", &json!({"name":"Second"})).await.unwrap();
+    let _: serde_json::Value = h.op.put(&format!("/influencers/{id}/members/{}", first.id), &json!({})).await.unwrap();
+    let result: Result<serde_json::Value, _> =
+        h.op.put(&format!("/influencers/{id}/members/{}", second["id"].as_str().unwrap()), &json!({})).await;
+    assert_eq!(code(result.unwrap_err()), "solo_has_one_member");
+    let group = h.op.create_influencer(&influencer_input("Group", InfluencerKind::Group)).await.unwrap();
+    h.op.put_influencer_member(group.id, first.id, &InfluencerMemberIn { role: "".into() }).await.unwrap();
+    h.op.put_influencer_member(group.id, Uuid::parse_str(second["id"].as_str().unwrap()).unwrap(), &InfluencerMemberIn { role: "".into() })
+        .await
+        .unwrap();
+    assert_eq!(
+        code(h.op.update_influencer(group.id, &influencer_input("Group", InfluencerKind::Solo)).await.unwrap_err()),
+        "solo_has_one_member"
+    );
+    let race = h.op.create_influencer(&influencer_input("Race", InfluencerKind::Solo)).await.unwrap();
+    let second_id = Uuid::parse_str(second["id"].as_str().unwrap()).unwrap();
+    let member = InfluencerMemberIn { role: "".into() };
+    let (a, b) =
+        tokio::join!(h.op.put_influencer_member(race.id, first.id, &member), h.op.put_influencer_member(race.id, second_id, &member));
+    assert_ne!(a.is_ok(), b.is_ok());
+    assert_eq!(h.op.influencer(race.id).await.unwrap().members.len(), 1);
+}
+
+fn influencer_input(name: &str, kind: InfluencerKind) -> InfluencerIn {
+    InfluencerIn { name: name.into(), kind, premise: "".into(), dynamics: "".into() }
+}
+
+#[tokio::test]
+async fn a_character_performs_in_a_solo_and_a_group_influencer() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await;
+    let solo = h.op.create_influencer(&influencer_input("Solo", InfluencerKind::Solo)).await.unwrap();
+    let group = h.op.create_influencer(&influencer_input("Group", InfluencerKind::Group)).await.unwrap();
+    for id in [solo.id, group.id] {
+        let result = h.op.put_influencer_member(id, persona.id, &InfluencerMemberIn { role: "lead".into() }).await.unwrap();
+        assert_eq!(result.members[0].persona_id, persona.id);
+        assert_eq!(result.members[0].has_accepted_canon, persona.canon.is_some());
+    }
+    let other: Persona = h.op.post("/personas", &json!({"name": "No canon"})).await.unwrap();
+    let result = h.op.put_influencer_member(group.id, other.id, &InfluencerMemberIn { role: "".into() }).await.unwrap();
+    assert!(!result.members.iter().find(|m| m.persona_id == other.id).unwrap().has_accepted_canon);
+    assert_eq!(h.op.influencers().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn an_influencer_member_must_share_its_company() {
+    let Some(h) = harness().await else { return };
+    let id = Uuid::new_v4();
+    domain::sqlx::query("insert into personas (id, company_id, name) values ($1, 'other', 'Other')")
+        .bind(id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    let group = h.op.create_influencer(&influencer_input("Group", InfluencerKind::Group)).await.unwrap();
+    assert_eq!(code(h.op.put_influencer_member(group.id, id, &InfluencerMemberIn { role: "".into() }).await.unwrap_err()), "other_company");
+    assert!(h.op.influencer(group.id).await.unwrap().members.is_empty());
+}
+
+#[tokio::test]
+async fn an_account_belongs_to_the_last_influencer_that_claimed_it() {
+    let Some(h) = harness().await else { return };
+    let a = h.op.create_influencer(&influencer_input("A", InfluencerKind::Solo)).await.unwrap();
+    let b = h.op.create_influencer(&influencer_input("B", InfluencerKind::Solo)).await.unwrap();
+    let accounts = InfluencerAccountsIn { account_ids: vec!["fixture-mastodon".into()] };
+    h.op.set_influencer_accounts(a.id, &accounts).await.unwrap();
+    h.op.set_influencer_accounts(b.id, &accounts).await.unwrap();
+    assert!(h.op.influencer(a.id).await.unwrap().account_ids.is_empty());
+    assert_eq!(h.op.influencer(b.id).await.unwrap().account_ids, accounts.account_ids);
+    assert_eq!(
+        code(h.op.set_influencer_accounts(b.id, &InfluencerAccountsIn { account_ids: vec!["missing".into()] }).await.unwrap_err()),
+        "not_found"
+    );
+    assert_eq!(h.op.influencer(b.id).await.unwrap().account_ids, accounts.account_ids);
+}
+
+#[tokio::test]
+async fn only_the_operator_changes_influencers() {
+    let Some(h) = harness().await else { return };
+    let input = influencer_input("Group", InfluencerKind::Group);
+    let group = h.op.create_influencer(&input).await.unwrap();
+    let persona = h.persona().await;
+    let before: i64 = domain::sqlx::query_scalar("select count(*) from audit_log").fetch_one(&h.hub.db).await.unwrap();
+    assert_eq!(code(h.agent.create_influencer(&input).await.unwrap_err()), "forbidden");
+    assert_eq!(code(h.agent.update_influencer(group.id, &input).await.unwrap_err()), "forbidden");
+    assert_eq!(
+        code(h.agent.put_influencer_member(group.id, persona.id, &InfluencerMemberIn { role: "".into() }).await.unwrap_err()),
+        "forbidden"
+    );
+    assert_eq!(code(h.agent.remove_influencer_member(group.id, persona.id).await.unwrap_err()), "forbidden");
+    assert_eq!(
+        code(h.agent.set_influencer_accounts(group.id, &InfluencerAccountsIn { account_ids: vec![] }).await.unwrap_err()),
+        "forbidden"
+    );
+    assert_eq!(h.agent.influencer(group.id).await.unwrap().id, group.id);
+    assert_eq!(h.agent.influencers().await.unwrap().len(), 1);
+    let after: i64 = domain::sqlx::query_scalar("select count(*) from audit_log").fetch_one(&h.hub.db).await.unwrap();
+    assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn a_delegated_brief_carries_the_influencer_dynamics() {
+    let Some(h) = harness().await else { return };
+    domain::sqlx::query(
+        "insert into settings (key, value) values ('paperclip_studio', $1) on conflict (key) do update set value = excluded.value",
+    )
+    .bind(json!({"project_id":"project_studio_content", "assignee_agent_id":"agent_studio_showrunner"}))
+    .execute(&h.hub.db)
+    .await
+    .unwrap();
+    let mut input = influencer_input("Group", InfluencerKind::Group);
+    input.dynamics = "They finish each other's sentences".into();
+    let group = h.op.create_influencer(&input).await.unwrap();
+    h.op.put_influencer_member(group.id, h.persona().await.id, &InfluencerMemberIn { role: "lead".into() }).await.unwrap();
+    h.brief(None).await;
+    h.tick().await;
+    assert!(h.fx.paperclip.as_ref().unwrap().issue_requests().last().unwrap().description.contains(&input.dynamics));
+}
+
 impl H {
     async fn tick(&self) {
         worker::tick(&self.hub).await.unwrap();

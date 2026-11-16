@@ -57,6 +57,7 @@ wire_enum!(
 );
 
 wire_enum!(CanonState { Proposed = "proposed", Accepted = "accepted", Rejected = "rejected", Superseded = "superseded" });
+wire_enum!(InfluencerKind { Solo = "solo", Group = "group" });
 wire_enum!(CanonSource { Operator = "operator", Chat = "chat", News = "news", Agent = "agent" });
 wire_enum!(ContentState { Idea = "idea", Brief = "brief", Producing = "producing", Selecting = "selecting", Review = "review", Approved = "approved", Scheduled = "scheduled", Published = "published", Archived = "archived" });
 wire_enum!(GenerationState { Requested = "requested", Dispatched = "dispatched", Running = "running", Succeeded = "succeeded", Failed = "failed", Cancelling = "cancelling", Cancelled = "cancelled", OutcomeUnknown = "outcome_unknown" });
@@ -142,6 +143,48 @@ pub struct PauseIn {
 }
 
 // ── Personas & canon ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Influencer {
+    pub id: Uuid,
+    pub company_id: String,
+    pub name: String,
+    pub kind: InfluencerKind,
+    pub premise: String,
+    pub dynamics: String,
+    pub members: Vec<InfluencerMember>,
+    pub account_ids: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InfluencerMember {
+    pub persona_id: Uuid,
+    pub name: String,
+    pub role: String,
+    pub has_accepted_canon: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InfluencerIn {
+    pub name: String,
+    pub kind: InfluencerKind,
+    #[serde(default)]
+    pub premise: String,
+    #[serde(default)]
+    pub dynamics: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InfluencerMemberIn {
+    #[serde(default)]
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InfluencerAccountsIn {
+    pub account_ids: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Persona {
