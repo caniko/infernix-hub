@@ -58,8 +58,8 @@ pub async fn create_brief(hub: &Hub, actor: &Actor, input: CreateBriefIn) -> DRe
     if let Some((title, url)) = &news {
         description.push_str(&format!("\nSource: {title} — {url}"));
     }
-    for (name, _, dynamics, role) in crate::influencers::for_persona(&mut tx, input.persona_id).await? {
-        description.push_str(&format!("\nInfluencer: {name} ({role}). Dynamics: {dynamics}"));
+    for (name, _, dynamics, role) in crate::projects::for_persona(&mut tx, input.persona_id).await? {
+        description.push_str(&format!("\nProject: {name} ({role}). Dynamics: {dynamics}"));
     }
     // The producer decides who starts the work. `delegated` files the issue
     // with the studio org (project and assignee from the `paperclip_studio`
@@ -177,12 +177,12 @@ async fn chat_context(hub: &Hub, actor: &Actor, subject_type: &str, subject_id: 
     };
     let persona = crate::canon::get_persona(hub, actor, persona_id).await?;
     let mut conn = hub.db.acquire().await?;
-    let influencers = crate::influencers::for_persona(&mut conn, persona_id).await?;
+    let projects = crate::projects::for_persona(&mut conn, persona_id).await?;
     Ok((
         persona_id,
         json!({
             "persona": { "name": persona.name, "canon": persona.canon },
-            "influencers": influencers.into_iter().map(|(name, premise, dynamics, role)| json!({"name": name, "premise": premise, "dynamics": dynamics, "role": role})).collect::<Vec<_>>(),
+            "projects": projects.into_iter().map(|(name, premise, dynamics, role)| json!({"name": name, "premise": premise, "dynamics": dynamics, "role": role})).collect::<Vec<_>>(),
             "content": item.as_ref().map(|i| json!({ "title": i.title, "brief": i.brief, "state": i.state, "paperclip_issue_id": i.paperclip_issue_id })),
         }),
     ))

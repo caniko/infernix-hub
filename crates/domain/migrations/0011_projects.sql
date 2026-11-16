@@ -1,4 +1,4 @@
-create table influencers (
+create table projects (
     id uuid primary key,
     company_id text not null,
     name text not null check (length(trim(name)) > 0),
@@ -9,12 +9,12 @@ create table influencers (
     updated_at timestamptz not null default now(),
     unique (company_id, name)
 );
-create table influencer_members (
-    influencer_id uuid not null references influencers (id),
+create table project_members (
+    project_id uuid not null references projects (id),
     persona_id uuid not null references personas (id),
     role text not null default '',
     added_at timestamptz not null default now(),
-    primary key (influencer_id, persona_id)
+    primary key (project_id, persona_id)
 );
-create index influencer_members_persona on influencer_members (persona_id);
-alter table accounts add column influencer_id uuid references influencers (id);
+create index project_members_persona on project_members (persona_id);
+alter table accounts add column project_id uuid references projects (id);

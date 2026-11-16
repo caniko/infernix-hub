@@ -2,7 +2,7 @@
 //! propose; an operator decision is the only path to `accepted`.
 
 use contracts::{
-    CanonBody, CanonCommentIn, CanonDecisionIn, CanonDraftIn, CanonProposalIn, CanonRevision, CanonSource, CanonState, CharacterProfile,
+    CanonBody, CanonCommentIn, CanonDecisionIn, CanonDraftIn, CanonProposalIn, CanonRevision, CanonSource, CanonState, IndividualProfile,
     Persona, Role, Severity,
 };
 use serde_json::{Value, json};
@@ -68,7 +68,7 @@ async fn get(conn: &mut sqlx::PgConnection, id: Uuid) -> DResult<CanonRevision> 
     decode_one(row.ok_or(DomainError::NotFound("canon revision"))?)
 }
 
-pub async fn set_profile(hub: &Hub, actor: &Actor, persona_id: Uuid, profile: CharacterProfile) -> DResult<Persona> {
+pub async fn set_profile(hub: &Hub, actor: &Actor, persona_id: Uuid, profile: IndividualProfile) -> DResult<Persona> {
     actor.require(OPERATOR)?;
     let mut tx = hub.db.begin().await?;
     let changed = sqlx::query("update personas set profile = $2 where id = $1")

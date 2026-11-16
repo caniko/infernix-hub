@@ -57,7 +57,7 @@ wire_enum!(
 );
 
 wire_enum!(CanonState { Proposed = "proposed", Accepted = "accepted", Rejected = "rejected", Superseded = "superseded" });
-wire_enum!(InfluencerKind { Solo = "solo", Group = "group" });
+wire_enum!(ProjectKind { Solo = "solo", Group = "group" });
 wire_enum!(CanonSource { Operator = "operator", Chat = "chat", News = "news", Agent = "agent" });
 wire_enum!(ContentState { Idea = "idea", Brief = "brief", Producing = "producing", Selecting = "selecting", Review = "review", Approved = "approved", Scheduled = "scheduled", Published = "published", Archived = "archived" });
 wire_enum!(GenerationState { Requested = "requested", Dispatched = "dispatched", Running = "running", Succeeded = "succeeded", Failed = "failed", Cancelling = "cancelling", Cancelled = "cancelled", OutcomeUnknown = "outcome_unknown" });
@@ -145,20 +145,20 @@ pub struct PauseIn {
 // ── Personas & canon ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Influencer {
+pub struct Project {
     pub id: Uuid,
     pub company_id: String,
     pub name: String,
-    pub kind: InfluencerKind,
+    pub kind: ProjectKind,
     pub premise: String,
     pub dynamics: String,
-    pub members: Vec<InfluencerMember>,
+    pub members: Vec<ProjectMember>,
     pub account_ids: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InfluencerMember {
+pub struct ProjectMember {
     pub persona_id: Uuid,
     pub name: String,
     pub role: String,
@@ -168,9 +168,9 @@ pub struct InfluencerMember {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InfluencerIn {
+pub struct ProjectIn {
     pub name: String,
-    pub kind: InfluencerKind,
+    pub kind: ProjectKind,
     #[serde(default)]
     pub premise: String,
     #[serde(default)]
@@ -178,13 +178,13 @@ pub struct InfluencerIn {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InfluencerMemberIn {
+pub struct ProjectMemberIn {
     #[serde(default)]
     pub role: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InfluencerAccountsIn {
+pub struct ProjectAccountsIn {
     pub account_ids: Vec<String>,
 }
 
@@ -194,7 +194,7 @@ pub struct Persona {
     pub company_id: String,
     pub name: String,
     #[serde(default)]
-    pub profile: CharacterProfile,
+    pub profile: IndividualProfile,
     /// The newest accepted canon, if any.
     pub canon: Option<CanonRevision>,
     pub pending_proposals: i64,
@@ -210,7 +210,7 @@ pub enum ReadsAs {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct CharacterProfile {
+pub struct IndividualProfile {
     #[serde(default)]
     pub bio: String,
     #[serde(default)]
@@ -787,7 +787,7 @@ pub struct LookPass {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CharacterLook {
+pub struct IndividualLook {
     pub uploads: Vec<Asset>,
     pub passes: Vec<LookPass>,
     #[serde(default)]
@@ -817,7 +817,7 @@ pub struct PinIn {
 pub struct PinOut {
     pub reference: Reference,
     #[serde(default)]
-    pub affected_influencers: Vec<String>,
+    pub affected_projects: Vec<String>,
     #[serde(default)]
     pub stale_stages: Vec<String>,
 }
@@ -1145,13 +1145,13 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn character_profile_defaults_and_preserves_bio() {
-        let empty: CharacterProfile = serde_json::from_value(json!({})).unwrap();
-        assert_eq!(empty, CharacterProfile::default());
-        let profile: CharacterProfile = serde_json::from_value(json!({"bio": "é  \n\n", "reads_as": "non_human"})).unwrap();
+    fn individual_profile_defaults_and_preserves_bio() {
+        let empty: IndividualProfile = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty, IndividualProfile::default());
+        let profile: IndividualProfile = serde_json::from_value(json!({"bio": "é  \n\n", "reads_as": "non_human"})).unwrap();
         assert_eq!(profile.bio, "é  \n\n");
         assert_eq!(profile.reads_as, Some(ReadsAs::NonHuman));
-        assert_eq!(serde_json::from_value::<CharacterProfile>(serde_json::to_value(&profile).unwrap()).unwrap(), profile);
+        assert_eq!(serde_json::from_value::<IndividualProfile>(serde_json::to_value(&profile).unwrap()).unwrap(), profile);
     }
 
     #[test]

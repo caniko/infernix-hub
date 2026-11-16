@@ -124,7 +124,7 @@ impl HubClient {
     pub async fn personas(&self) -> Result<Vec<Persona>, ClientError> {
         self.get("/personas").await
     }
-    pub async fn character_look(&self, id: Uuid) -> Result<CharacterLook, ClientError> {
+    pub async fn individual_look(&self, id: Uuid) -> Result<IndividualLook, ClientError> {
         self.get(&format!("/personas/{id}/look")).await
     }
     pub async fn pin_look_reference(&self, id: Uuid, body: &PinIn) -> Result<PinOut, ClientError> {
@@ -144,26 +144,26 @@ impl HubClient {
     pub async fn request_look_pass(&self, id: Uuid, body: &LookPassIn) -> Result<LookPass, ClientError> {
         self.post(&format!("/personas/{id}/look/passes"), body).await
     }
-    pub async fn influencers(&self) -> Result<Vec<Influencer>, ClientError> {
-        self.get("/influencers").await
+    pub async fn projects(&self) -> Result<Vec<Project>, ClientError> {
+        self.get("/projects").await
     }
-    pub async fn influencer(&self, id: Uuid) -> Result<Influencer, ClientError> {
-        self.get(&format!("/influencers/{id}")).await
+    pub async fn project(&self, id: Uuid) -> Result<Project, ClientError> {
+        self.get(&format!("/projects/{id}")).await
     }
-    pub async fn create_influencer(&self, body: &InfluencerIn) -> Result<Influencer, ClientError> {
-        self.post("/influencers", body).await
+    pub async fn create_project(&self, body: &ProjectIn) -> Result<Project, ClientError> {
+        self.post("/projects", body).await
     }
-    pub async fn update_influencer(&self, id: Uuid, body: &InfluencerIn) -> Result<Influencer, ClientError> {
-        self.put(&format!("/influencers/{id}"), body).await
+    pub async fn update_project(&self, id: Uuid, body: &ProjectIn) -> Result<Project, ClientError> {
+        self.put(&format!("/projects/{id}"), body).await
     }
-    pub async fn put_influencer_member(&self, id: Uuid, persona: Uuid, body: &InfluencerMemberIn) -> Result<Influencer, ClientError> {
-        self.put(&format!("/influencers/{id}/members/{persona}"), body).await
+    pub async fn put_project_member(&self, id: Uuid, persona: Uuid, body: &ProjectMemberIn) -> Result<Project, ClientError> {
+        self.put(&format!("/projects/{id}/members/{persona}"), body).await
     }
-    pub async fn remove_influencer_member(&self, id: Uuid, persona: Uuid) -> Result<Influencer, ClientError> {
-        self.delete(&format!("/influencers/{id}/members/{persona}")).await
+    pub async fn remove_project_member(&self, id: Uuid, persona: Uuid) -> Result<Project, ClientError> {
+        self.delete(&format!("/projects/{id}/members/{persona}")).await
     }
-    pub async fn set_influencer_accounts(&self, id: Uuid, body: &InfluencerAccountsIn) -> Result<Influencer, ClientError> {
-        self.put(&format!("/influencers/{id}/accounts"), body).await
+    pub async fn set_project_accounts(&self, id: Uuid, body: &ProjectAccountsIn) -> Result<Project, ClientError> {
+        self.put(&format!("/projects/{id}/accounts"), body).await
     }
     pub async fn workflows(&self) -> Result<Vec<Workflow>, ClientError> {
         self.get("/workflows").await
@@ -238,7 +238,7 @@ impl HubClient {
     pub async fn canon(&self, persona: Uuid) -> Result<Vec<CanonRevision>, ClientError> {
         self.get(&format!("/personas/{persona}/canon")).await
     }
-    pub async fn set_profile(&self, persona: Uuid, body: &CharacterProfile) -> Result<Persona, ClientError> {
+    pub async fn set_profile(&self, persona: Uuid, body: &IndividualProfile) -> Result<Persona, ClientError> {
         self.put(&format!("/personas/{persona}/profile"), body).await
     }
     pub async fn draft_canon(&self, persona: Uuid, body: &CanonDraftIn) -> Result<CanonBody, ClientError> {

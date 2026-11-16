@@ -81,7 +81,7 @@ pub fn open_subject(store: Store, subject_type: &str, id: Uuid) {
             store.set_selected_news(Some(id));
         }
         "persona" => {
-            store.set_workspace(Workspace::Influencers);
+            store.set_workspace(Workspace::Projects);
             store.set_selected_persona(Some(id));
         }
         "relationship" => {

@@ -1,10 +1,10 @@
-//! Influencers, characters and proposal-only canon review.
+//! Projects, individuals and proposal-only canon review.
 //!
 //! Canon is proposal-only: the rules editor submits `CanonProposalIn`; accepting
 //! a proposal is the only path that changes accepted canon.
 
 use contracts::{
-    CanonBody, CanonDecisionIn, CanonProposalIn, CanonRevision, CanonSource, CanonState, ChatMessageIn, InfluencerIn, client::HubClient,
+    CanonBody, CanonDecisionIn, CanonProposalIn, CanonRevision, CanonSource, CanonState, ChatMessageIn, ProjectIn, client::HubClient,
 };
 use dioxus::prelude::*;
 use uuid::Uuid;
@@ -22,29 +22,29 @@ use crate::{
 };
 
 #[component]
-pub fn InfluencersView() -> Element {
+pub fn ProjectsView() -> Element {
     let store = use_context::<Store>();
     let client = use_context::<HubClient>();
-    let mut show_character = store.influencers_show_character;
+    let mut show_individual = store.projects_show_individual;
     let mut show_new = use_signal(|| false);
     let mut wizard = use_signal(|| None::<(Option<Uuid>, Option<Uuid>)>);
     let mut pending_accept = use_signal(|| None::<(Uuid, Uuid, CanonDecisionIn)>);
-    let influencers = (store.influencers).cloned();
-    let selected_influencer_id = (store.selected_influencer).cloned();
-    let influencer = influencers.data.as_ref().and_then(|items| items.iter().find(|item| Some(item.id) == selected_influencer_id).cloned());
+    let projects = (store.projects).cloned();
+    let selected_project_id = (store.selected_project).cloned();
+    let project = projects.data.as_ref().and_then(|items| items.iter().find(|item| Some(item.id) == selected_project_id).cloned());
     let mut premise = use_signal(String::new);
     let mut dynamics = use_signal(String::new);
-    let mut influencer_form_for = use_signal(|| Option::<Uuid>::None);
+    let mut project_form_for = use_signal(|| Option::<Uuid>::None);
     let mut save_error = use_signal(|| Option::<crate::state::UiError>::None);
     use_effect(move || {
-        let id = (store.selected_influencer).cloned();
-        if influencer_form_for.cloned() == id {
+        let id = (store.selected_project).cloned();
+        if project_form_for.cloned() == id {
             return;
         }
-        if let Some(item) = (store.influencers).cloned().data.and_then(|items| items.into_iter().find(|item| Some(item.id) == id)) {
+        if let Some(item) = (store.projects).cloned().data.and_then(|items| items.into_iter().find(|item| Some(item.id) == id)) {
             premise.set(item.premise);
             dynamics.set(item.dynamics);
-            influencer_form_for.set(id);
+            project_form_for.set(id);
             save_error.set(None);
         }
     });
@@ -53,8 +53,8 @@ pub fn InfluencersView() -> Element {
     let persona = personas.data.as_ref().and_then(|items| items.iter().find(|p| Some(p.id) == selected_persona_id).cloned());
     let member_client = client.clone();
     use_effect(move || {
-        let selected = (store.selected_influencer).cloned();
-        let members = (store.influencers)
+        let selected = (store.selected_project).cloned();
+        let members = (store.projects)
             .cloned()
             .data
             .unwrap_or_default()
@@ -69,7 +69,7 @@ pub fn InfluencersView() -> Element {
                 if store.asset_images.peek().contains_key(&reference_id) {
                     continue;
                 }
-                if let Ok(look) = api::timed(client.character_look(member.persona_id)).await
+                if let Ok(look) = api::timed(client.individual_look(member.persona_id)).await
                     && let Some(asset) = look
                         .uploads
                         .into_iter()
@@ -92,7 +92,7 @@ pub fn InfluencersView() -> Element {
         let Some(persona) = selected else { return };
         let client = reference_client.clone();
         spawn(async move {
-            match api::timed(client.character_look(persona)).await {
+            match api::timed(client.individual_look(persona)).await {
                 Ok(look) => {
                     let asset = look.reference.and_then(|reference| {
                         look.uploads
@@ -191,33 +191,33 @@ pub fn InfluencersView() -> Element {
     };
 
     rsx! {
-        aside { class: "context", aria_label: "Influencers and characters",
+        aside { class: "context", aria_label: "Projects and individuals",
             div { class: "context-head",
-                h2 { "Influencers" }
-                button { class: "btn btn-glass", onclick: move |_| show_new.set(true), "New influencer" }
-                button { class: "btn btn-glass", onclick: move |_| wizard.set(Some((None, (store.selected_influencer).cloned()))), "New character" }
+                h2 { "Projects" }
+                button { class: "btn btn-glass", onclick: move |_| show_new.set(true), "New project" }
+                button { class: "btn btn-glass", onclick: move |_| wizard.set(Some((None, (store.selected_project).cloned()))), "New individual" }
             }
             div { class: "context-list",
-                match influencers.data.clone() {
-                    Some(items) if items.is_empty() => rsx! { p { class: "ctx-empty", "No influencers yet." } },
+                match projects.data.clone() {
+                    Some(items) if items.is_empty() => rsx! { p { class: "ctx-empty", "No projects yet." } },
                     Some(items) => rsx! {
                         for item in items {
                             {
-                                let (status, _) = influencer_status(&item);
-                                let kind = match item.kind { contracts::InfluencerKind::Solo => "Solo", contracts::InfluencerKind::Group => "Group" };
+                                let (status, _) = project_status(&item);
+                                let kind = match item.kind { contracts::ProjectKind::Solo => "Solo", contracts::ProjectKind::Group => "Group" };
                                 rsx! { ContextItem {
                                     key: "{item.id}", title: item.name.clone(),
-                                    meta: format!("{} · {} characters · {}", kind, item.members.len(), status),
-                                    active: !show_character.cloned() && Some(item.id) == selected_influencer_id,
-                                    on_select: move |_| { let mut selected = store.selected_influencer; selected.set(Some(item.id)); show_character.set(false); },
+                                    meta: format!("{} · {} individuals · {}", kind, item.members.len(), status),
+                                    active: !show_individual.cloned() && Some(item.id) == selected_project_id,
+                                    on_select: move |_| { let mut selected = store.selected_project; selected.set(Some(item.id)); show_individual.set(false); },
                                 } }
                             }
                         }
                     },
-                    None if influencers.error.is_none() => rsx! { p { class: "ctx-empty", "Loading influencers…" } },
+                    None if projects.error.is_none() => rsx! { p { class: "ctx-empty", "Loading projects…" } },
                     None => rsx! {},
                 }
-                h2 { "Characters" }
+                h2 { "Individuals" }
                 match personas.data.clone() {
                     Some(items) if items.is_empty() => rsx! { p { class: "ctx-empty", "No personas yet." } },
                     Some(items) => rsx! {
@@ -230,7 +230,7 @@ pub fn InfluencersView() -> Element {
                                     item.canon.as_ref().map(|c| c.revision.to_string()).unwrap_or_else(|| "—".into()),
                                     item.pending_proposals
                                 ),
-                                active: show_character.cloned() && Some(item.id) == selected_persona_id,
+                                active: show_individual.cloned() && Some(item.id) == selected_persona_id,
                                 on_select: {
                                     move |_| {
                                         store.set_selected_persona(Some(item.id));
@@ -248,15 +248,15 @@ pub fn InfluencersView() -> Element {
         main { class: "work",
             div { class: "work-head",
                 div {
-                    h1 { "Influencers" }
+                    h1 { "Projects" }
                     p { class: "hint", "Persona canon is proposal-only: the assistant proposes, the operator accepts." }
                 }
             }
-            if let Some(error) = influencers.error.clone() { ErrorCard { code: error.code, message: error.message } }
+            if let Some(error) = projects.error.clone() { ErrorCard { code: error.code, message: error.message } }
             if let Some(error) = personas.error.clone() {
                 ErrorCard { code: error.code, message: error.message }
             }
-            match show_character.cloned() {
+            match show_individual.cloned() {
                 true => rsx! {
                     if let Some(error) = canon_load.error.clone() {
                         ErrorCard { code: error.code, message: error.message }
@@ -290,7 +290,7 @@ pub fn InfluencersView() -> Element {
                                         if let Some(asset) = reference() {
                                             div { class: "asset-frame", if let Some(uri) = (store.asset_images).cloned().get(&asset.id) { img { src: "{uri}", alt: "{asset.alt_text}" } } else { span { class: "asset-missing", "{asset.mime}" } } }
                                         } else { p { "No reference pinned yet." } }
-                                        p { "Pinning another image asks first, lists the influencers it affects, and marks 3D and rig for redo. The approved model stays in use until you approve a new one." }
+                                        p { "Pinning another image asks first, lists the projects it affects, and marks 3D and rig for redo. The approved model stays in use until you approve a new one." }
                                     }
                                     Panel { title: "Accepted canon".to_string(), caption: Some("read-only".to_string()),
                                         if let Some(canon) = accepted.clone() {
@@ -516,27 +516,27 @@ pub fn InfluencersView() -> Element {
                 },
                 false => rsx! {
                     if let Some(error) = save_error.cloned() { ErrorCard { code: error.code, message: error.message } }
-                    match influencer {
-                        None if influencers.data.is_none() && influencers.error.is_none() => rsx! { Loading { text: "Loading influencers…".to_string() } },
-                        None => rsx! { EmptyState { title: "Select an influencer.".to_string(), hint: None } },
+                    match project {
+                        None if projects.data.is_none() && projects.error.is_none() => rsx! { Loading { text: "Loading projects…".to_string() } },
+                        None => rsx! { EmptyState { title: "Select an project.".to_string(), hint: None } },
                         Some(item) => {
-                            let (status, tone) = influencer_status(&item);
+                            let (status, tone) = project_status(&item);
                             let client_save = client.clone();
                             let input_name = item.name.clone();
                             let kind = item.kind;
                             let id = item.id;
                             rsx! {
-                                div { class: "work-head", h1 { "{item.name}" } Chip { label: status.to_string(), tone: Some(tone.to_string()) } button { class: "btn btn-glass", onclick: move |_| wizard.set(Some((None, Some(id)))), "New character" } }
-                                Panel { title: "Influencer".to_string(), caption: None,
+                                div { class: "work-head", h1 { "{item.name}" } Chip { label: status.to_string(), tone: Some(tone.to_string()) } button { class: "btn btn-glass", onclick: move |_| wizard.set(Some((None, Some(id)))), "New individual" } }
+                                Panel { title: "Project".to_string(), caption: None,
                                     div { class: "form-grid",
-                                        div { class: "field-row", label { class: "label-tech", r#for: "influencer-premise", "Premise" } textarea { id: "influencer-premise", class: "input", value: "{premise}", oninput: move |e| premise.set(e.value()) } }
-                                        div { class: "field-row", label { class: "label-tech", r#for: "influencer-dynamics", "Dynamics" } textarea { id: "influencer-dynamics", class: "input", value: "{dynamics}", oninput: move |e| dynamics.set(e.value()) } }
+                                        div { class: "field-row", label { class: "label-tech", r#for: "project-premise", "Premise" } textarea { id: "project-premise", class: "input", value: "{premise}", oninput: move |e| premise.set(e.value()) } }
+                                        div { class: "field-row", label { class: "label-tech", r#for: "project-dynamics", "Dynamics" } textarea { id: "project-dynamics", class: "input", value: "{dynamics}", oninput: move |e| dynamics.set(e.value()) } }
                                         div { class: "form-actions", button { class: "btn btn-primary", onclick: move |_| {
-                                            let input = InfluencerIn { name: input_name.clone(), kind, premise: premise.cloned(), dynamics: dynamics.cloned() };
+                                            let input = ProjectIn { name: input_name.clone(), kind, premise: premise.cloned(), dynamics: dynamics.cloned() };
                                             let client = client_save.clone();
-                                            spawn(async move { match api::timed(client.update_influencer(id, &input)).await {
-                                                Ok(_) => { save_error.set(None); api::refresh_influencers(store, &client).await; },
-                                                Err(error) => { if (store.selected_influencer).cloned() == Some(id) { save_error.set(Some(error)); } },
+                                            spawn(async move { match api::timed(client.update_project(id, &input)).await {
+                                                Ok(_) => { save_error.set(None); api::refresh_projects(store, &client).await; },
+                                                Err(error) => { if (store.selected_project).cloned() == Some(id) { save_error.set(Some(error)); } },
                                             } });
                                         }, "Save" } }
                                         p { "Accounts: {item.account_ids.join(\", \")}" }
@@ -545,7 +545,7 @@ pub fn InfluencersView() -> Element {
                                 Panel { title: "Members".to_string(), caption: None,
                                     if item.members.is_empty() { EmptyState { title: "No members yet.".to_string(), hint: None } }
                                     for member in item.members {
-                                        { let bio_done = personas.data.as_ref().and_then(|people| people.iter().find(|p| p.id == member.persona_id)).is_some_and(|p| super::character::bio_stage_done(&p.profile));
+                                        { let bio_done = personas.data.as_ref().and_then(|people| people.iter().find(|p| p.id == member.persona_id)).is_some_and(|p| super::individual::bio_stage_done(&p.profile));
                                         rsx! {
                                         div { class: "glass-card", key: "{member.persona_id}",
                                             h3 { "{member.name}" }
@@ -561,7 +561,7 @@ pub fn InfluencersView() -> Element {
                                         }
                                         } }
                                     }
-                                    p { "Pinning another image asks first, lists the influencers it affects, and marks 3D and rig for redo. The approved model stays in use until you approve a new one." }
+                                    p { "Pinning another image asks first, lists the projects it affects, and marks 3D and rig for redo. The approved model stays in use until you approve a new one." }
                                 }
                             }
                         },
@@ -569,7 +569,7 @@ pub fn InfluencersView() -> Element {
                 },
             }
         }
-        if show_new() { NewInfluencerDialog { on_close: move |_| show_new.set(false) } }
+        if show_new() { NewProjectDialog { on_close: move |_| show_new.set(false) } }
         if let Some((revision_id, persona_id, decision)) = pending_accept() {
             GatePrompt { label: "The CEO has not commented yet. Accept anyway?".to_string(), approve_label: "Accept anyway".to_string(), reject_label: "Cancel".to_string(),
                 on_reject: move |_| pending_accept.set(None),
@@ -581,7 +581,7 @@ pub fn InfluencersView() -> Element {
                 }); } },
             }
         }
-        if let Some((persona_id, influencer_id)) = wizard() { super::character::CharacterWizard { persona_id, influencer_id, on_close: move |_| wizard.set(None) } }
+        if let Some((persona_id, project_id)) = wizard() { super::individual::IndividualWizard { persona_id, project_id, on_close: move |_| wizard.set(None) } }
     }
 }
 
@@ -589,17 +589,17 @@ fn remaining_members(selected: &[(Uuid, String)], added: &[Uuid]) -> Vec<(Uuid, 
     selected.iter().filter(|(id, _)| !added.contains(id)).cloned().collect()
 }
 
-fn solo_allows_one_member(kind: contracts::InfluencerKind, count: usize) -> bool {
-    kind != contracts::InfluencerKind::Solo || count <= 1
+fn solo_allows_one_member(kind: contracts::ProjectKind, count: usize) -> bool {
+    kind != contracts::ProjectKind::Solo || count <= 1
 }
 
 #[component]
-fn NewInfluencerDialog(on_close: EventHandler<()>) -> Element {
-    use contracts::{InfluencerKind, InfluencerMemberIn};
+fn NewProjectDialog(on_close: EventHandler<()>) -> Element {
+    use contracts::{ProjectKind, ProjectMemberIn};
     let store = use_context::<Store>();
     let client = use_context::<HubClient>();
     let mut name = use_signal(String::new);
-    let mut kind = use_signal(|| InfluencerKind::Solo);
+    let mut kind = use_signal(|| ProjectKind::Solo);
     let mut premise = use_signal(String::new);
     let mut dynamics = use_signal(String::new);
     let mut selected = use_signal(Vec::<(Uuid, String)>::new);
@@ -611,24 +611,24 @@ fn NewInfluencerDialog(on_close: EventHandler<()>) -> Element {
     let locked = created().is_some() || busy();
     let valid = !name().trim().is_empty() && solo_allows_one_member(kind(), selected().len());
     rsx! {
-        div { class: "influencer-dialog-backdrop",
-            section { class: "influencer-dialog glass-card", role: "dialog", aria_modal: "true", aria_labelledby: "new-influencer-title",
-                h2 { id: "new-influencer-title", "New influencer" }
-                p { class: "hint", "One premise, one set of accounts, and one or more characters." }
+        div { class: "project-dialog-backdrop",
+            section { class: "project-dialog glass-card", role: "dialog", aria_modal: "true", aria_labelledby: "new-project-title",
+                h2 { id: "new-project-title", "New project" }
+                p { class: "hint", "One premise, one set of accounts, and one or more individuals." }
                 if let Some(err) = error() { ErrorCard { code: err.code, message: err.message } }
                 div { class: "form-grid",
-                    div { class: "field-row", label { class: "label-tech", r#for: "new-influencer-name", "Name" }
-                        input { id: "new-influencer-name", class: "input", required: true, disabled: locked, value: "{name}", oninput: move |e| name.set(e.value()) }
+                    div { class: "field-row", label { class: "label-tech", r#for: "new-project-name", "Name" }
+                        input { id: "new-project-name", class: "input", required: true, disabled: locked, value: "{name}", oninput: move |e| name.set(e.value()) }
                     }
                     fieldset { disabled: locked, legend { class: "label-tech", "Format" }
-                        label { input { r#type: "radio", name: "influencer-kind", checked: kind() == InfluencerKind::Solo, onchange: move |_| kind.set(InfluencerKind::Solo) } " Solo" }
-                        label { input { r#type: "radio", name: "influencer-kind", checked: kind() == InfluencerKind::Group, onchange: move |_| kind.set(InfluencerKind::Group) } " Group" }
+                        label { input { r#type: "radio", name: "project-kind", checked: kind() == ProjectKind::Solo, onchange: move |_| kind.set(ProjectKind::Solo) } " Solo" }
+                        label { input { r#type: "radio", name: "project-kind", checked: kind() == ProjectKind::Group, onchange: move |_| kind.set(ProjectKind::Group) } " Group" }
                     }
-                    div { class: "field-row", label { class: "label-tech", r#for: "new-influencer-premise", "Premise" }
-                        textarea { id: "new-influencer-premise", class: "input", disabled: locked, value: "{premise}", oninput: move |e| premise.set(e.value()) }
+                    div { class: "field-row", label { class: "label-tech", r#for: "new-project-premise", "Premise" }
+                        textarea { id: "new-project-premise", class: "input", disabled: locked, value: "{premise}", oninput: move |e| premise.set(e.value()) }
                     }
-                    div { class: "field-row", label { class: "label-tech", r#for: "new-influencer-dynamics", "How they play together" }
-                        textarea { id: "new-influencer-dynamics", class: "input", disabled: locked, value: "{dynamics}", oninput: move |e| dynamics.set(e.value()) }
+                    div { class: "field-row", label { class: "label-tech", r#for: "new-project-dynamics", "How they play together" }
+                        textarea { id: "new-project-dynamics", class: "input", disabled: locked, value: "{dynamics}", oninput: move |e| dynamics.set(e.value()) }
                     }
                     fieldset { disabled: busy(), legend { class: "label-tech", "Members" }
                         for persona in personas {
@@ -656,32 +656,32 @@ fn NewInfluencerDialog(on_close: EventHandler<()>) -> Element {
                             busy.set(true);
                             error.set(None);
                             let client = client.clone();
-                            let input = InfluencerIn { name: name().trim().to_string(), kind: kind(), premise: premise(), dynamics: dynamics() };
+                            let input = ProjectIn { name: name().trim().to_string(), kind: kind(), premise: premise(), dynamics: dynamics() };
                             let members = remaining_members(&selected(), &added());
                             spawn(async move {
                                 let id = if let Some(id) = created() { id } else {
-                                    match api::timed(client.create_influencer(&input)).await {
-                                        Ok(influencer) => { created.set(Some(influencer.id)); influencer.id },
+                                    match api::timed(client.create_project(&input)).await {
+                                        Ok(project) => { created.set(Some(project.id)); project.id },
                                         Err(err) => { error.set(Some(err)); busy.set(false); return; }
                                     }
                                 };
                                 for (persona, role) in members {
-                                    if let Err(err) = api::timed(client.put_influencer_member(id, persona, &InfluencerMemberIn { role })).await {
+                                    if let Err(err) = api::timed(client.put_project_member(id, persona, &ProjectMemberIn { role })).await {
                                         error.set(Some(err));
-                                        api::refresh_influencers(store, &client).await;
+                                        api::refresh_projects(store, &client).await;
                                         busy.set(false);
                                         return;
                                     }
                                     added.write().push(persona);
                                 }
-                                api::refresh_influencers(store, &client).await;
-                                let mut selection = store.selected_influencer;
+                                api::refresh_projects(store, &client).await;
+                                let mut selection = store.selected_project;
                                 selection.set(Some(id));
-                                let mut show_character = store.influencers_show_character;
-                                show_character.set(false);
+                                let mut show_individual = store.projects_show_individual;
+                                show_individual.set(false);
                                 on_close.call(());
                             });
-                        }, if created().is_some() { "Retry" } else { "Create influencer" } }
+                        }, if created().is_some() { "Retry" } else { "Create project" } }
                     }
                 }
             }
@@ -714,10 +714,10 @@ fn transcript(messages: &[contracts::ChatMessage]) -> Vec<TranscriptLine> {
         .collect()
 }
 
-fn influencer_status(influencer: &contracts::Influencer) -> (&'static str, &'static str) {
-    if influencer.members.is_empty() {
+fn project_status(project: &contracts::Project) -> (&'static str, &'static str) {
+    if project.members.is_empty() {
         ("Empty", "muted")
-    } else if influencer.members.iter().any(|member| !member.has_accepted_canon) {
+    } else if project.members.iter().any(|member| !member.has_accepted_canon) {
         ("Draft", "warn")
     } else {
         ("Ready", "ok")
@@ -726,7 +726,7 @@ fn influencer_status(influencer: &contracts::Influencer) -> (&'static str, &'sta
 
 #[cfg(test)]
 mod tests {
-    use contracts::{Influencer, InfluencerKind, InfluencerMember};
+    use contracts::{Project, ProjectKind, ProjectMember};
     use uuid::Uuid;
 
     #[test]
@@ -775,44 +775,44 @@ mod tests {
 
     #[test]
     fn solo_allows_one_member() {
-        assert!(super::solo_allows_one_member(InfluencerKind::Solo, 1));
-        assert!(!super::solo_allows_one_member(InfluencerKind::Solo, 2));
-        assert!(super::solo_allows_one_member(InfluencerKind::Group, 2));
+        assert!(super::solo_allows_one_member(ProjectKind::Solo, 1));
+        assert!(!super::solo_allows_one_member(ProjectKind::Solo, 2));
+        assert!(super::solo_allows_one_member(ProjectKind::Group, 2));
     }
 
     #[test]
-    fn influencer_status_is_draft_until_every_member_has_accepted_canon() {
-        let mut influencer = Influencer {
+    fn project_status_is_draft_until_every_member_has_accepted_canon() {
+        let mut project = Project {
             id: Uuid::new_v4(),
             company_id: "company".into(),
             name: "Test".into(),
-            kind: InfluencerKind::Group,
+            kind: ProjectKind::Group,
             premise: String::new(),
             dynamics: String::new(),
             members: Vec::new(),
             account_ids: Vec::new(),
             created_at: chrono::Utc::now(),
         };
-        assert_eq!(super::influencer_status(&influencer), ("Empty", "muted"));
-        influencer.members.push(InfluencerMember {
+        assert_eq!(super::project_status(&project), ("Empty", "muted"));
+        project.members.push(ProjectMember {
             persona_id: Uuid::new_v4(),
             name: "One".into(),
             role: String::new(),
             has_accepted_canon: false,
             reference_asset_id: None,
         });
-        assert_eq!(super::influencer_status(&influencer), ("Draft", "warn"));
-        influencer.members[0].has_accepted_canon = true;
-        assert_eq!(super::influencer_status(&influencer), ("Ready", "ok"));
-        influencer.members.push(InfluencerMember {
+        assert_eq!(super::project_status(&project), ("Draft", "warn"));
+        project.members[0].has_accepted_canon = true;
+        assert_eq!(super::project_status(&project), ("Ready", "ok"));
+        project.members.push(ProjectMember {
             persona_id: Uuid::new_v4(),
             name: "Two".into(),
             role: String::new(),
             has_accepted_canon: false,
             reference_asset_id: None,
         });
-        assert_eq!(super::influencer_status(&influencer), ("Draft", "warn"));
-        influencer.members[1].has_accepted_canon = true;
-        assert_eq!(super::influencer_status(&influencer), ("Ready", "ok"));
+        assert_eq!(super::project_status(&project), ("Draft", "warn"));
+        project.members[1].has_accepted_canon = true;
+        assert_eq!(super::project_status(&project), ("Ready", "ok"));
     }
 }

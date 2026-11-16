@@ -32,10 +32,10 @@ enum Cmd {
     Today,
     News,
     Personas,
-    Influencers,
-    Influencer {
+    Projects,
+    Project {
         #[command(subcommand)]
-        cmd: InfluencerCmd,
+        cmd: ProjectCmd,
     },
     Workflows,
     Accounts,
@@ -171,7 +171,7 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
-enum InfluencerCmd {
+enum ProjectCmd {
     Create {
         #[arg(long)]
         name: String,
@@ -274,13 +274,13 @@ async fn main() -> Result<()> {
         Cmd::Today => print(c.today().await?),
         Cmd::News => print(c.news().await?),
         Cmd::Personas => print(c.personas().await?),
-        Cmd::Influencers => print(c.influencers().await?),
-        Cmd::Influencer { cmd: InfluencerCmd::Create { name, kind, premise, dynamics } } => {
-            let kind = InfluencerKind::parse(&kind).ok_or_else(|| anyhow::anyhow!("kind must be solo or group"))?;
-            print(c.create_influencer(&InfluencerIn { name, kind, premise, dynamics }).await?)
+        Cmd::Projects => print(c.projects().await?),
+        Cmd::Project { cmd: ProjectCmd::Create { name, kind, premise, dynamics } } => {
+            let kind = ProjectKind::parse(&kind).ok_or_else(|| anyhow::anyhow!("kind must be solo or group"))?;
+            print(c.create_project(&ProjectIn { name, kind, premise, dynamics }).await?)
         }
-        Cmd::Influencer { cmd: InfluencerCmd::AddMember { id, persona, role } } => {
-            print(c.put_influencer_member(id, persona, &InfluencerMemberIn { role }).await?)
+        Cmd::Project { cmd: ProjectCmd::AddMember { id, persona, role } } => {
+            print(c.put_project_member(id, persona, &ProjectMemberIn { role }).await?)
         }
         Cmd::Workflows => print(c.workflows().await?),
         Cmd::Accounts => print(c.accounts().await?),

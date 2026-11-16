@@ -93,7 +93,7 @@ const LOOK_PNG: &[u8] = b"\x89PNG\r\n\x1a\nfixture";
 fn look_input(source: Option<Uuid>, variants: i32) -> LookPassIn {
     LookPassIn {
         source_asset_id: source,
-        prompt: "a character".into(),
+        prompt: "an individual".into(),
         strength: source.map(|_| 0.5),
         variants,
         size: LookSize::Test,
@@ -114,7 +114,7 @@ impl H {
             comfy.tick();
         }
         self.tick().await;
-        let pass = self.op.character_look(persona).await.unwrap().passes.into_iter().find(|p| p.generation.id == pass).unwrap();
+        let pass = self.op.individual_look(persona).await.unwrap().passes.into_iter().find(|p| p.generation.id == pass).unwrap();
         assert_eq!(pass.generation.state, GenerationState::Succeeded, "{pass:?}");
         pass
     }
@@ -174,7 +174,7 @@ async fn look_passes_form_a_tree_by_source_asset() {
     let child = p1.assets[0].id;
     let p2 = h.op.request_look_pass(persona, &look_input(Some(child), 1)).await.unwrap();
     let p3 = h.op.request_look_pass(persona, &look_input(Some(source.id), 1)).await.unwrap();
-    let look = h.op.character_look(persona).await.unwrap();
+    let look = h.op.individual_look(persona).await.unwrap();
     for (id, source) in [(p1.generation.id, source.id), (p2.generation.id, child), (p3.generation.id, source.id)] {
         assert_eq!(look.passes.iter().find(|p| p.generation.id == id).unwrap().generation.source_asset_id, Some(source));
     }
@@ -192,7 +192,7 @@ async fn a_second_look_pass_waits_for_the_gpu_gate() {
     h.wait_queued(1).await;
     let p2 = h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap();
     h.tick().await;
-    let look = h.op.character_look(persona).await.unwrap();
+    let look = h.op.individual_look(persona).await.unwrap();
     assert_eq!(look.passes.iter().find(|p| p.generation.id == p2.generation.id).unwrap().generation.state, GenerationState::Requested);
     let comfy = h.fx.comfy.as_ref().unwrap();
     for _ in 0..=comfy.steps {
@@ -200,7 +200,7 @@ async fn a_second_look_pass_waits_for_the_gpu_gate() {
     }
     h.tick().await;
     assert_eq!(
-        h.op.character_look(persona).await.unwrap().passes.iter().find(|p| p.generation.id == p1.generation.id).unwrap().generation.state,
+        h.op.individual_look(persona).await.unwrap().passes.iter().find(|p| p.generation.id == p1.generation.id).unwrap().generation.state,
         GenerationState::Succeeded
     );
     h.release_look_outbox().await;
@@ -223,7 +223,7 @@ async fn cancelling_a_queued_look_pass_never_submits_it() {
     let persona = h.persona().await.id;
     let pass = h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap();
     h.tick().await;
-    assert_eq!(h.op.character_look(persona).await.unwrap().passes[0].generation.state, GenerationState::Requested);
+    assert_eq!(h.op.individual_look(persona).await.unwrap().passes[0].generation.state, GenerationState::Requested);
     h.op.cancel_generation(pass.generation.id).await.unwrap();
     peer.loaded.store(false, std::sync::atomic::Ordering::SeqCst);
     h.release_look_outbox().await;
@@ -426,7 +426,7 @@ async fn an_agent_cannot_keep_a_look_image() {
 }
 
 #[tokio::test]
-async fn pin_requires_a_kept_image_of_this_character() {
+async fn pin_requires_a_kept_image_of_this_individual() {
     let Some(h) = harness().await else { return };
     let p = h.persona().await.id;
     let a = h.look_upload(p).await;
@@ -446,12 +446,12 @@ async fn pin_requires_a_kept_image_of_this_character() {
 }
 
 #[tokio::test]
-async fn repinning_asks_first_then_keeps_history_and_names_the_influencers() {
+async fn repinning_asks_first_then_keeps_history_and_names_the_projects() {
     let Some(h) = harness().await else { return };
     let p = h.persona().await.id;
     for name in ["Alpha", "Beta"] {
-        let i: Influencer = h.op.post("/influencers", &json!({"name":name,"kind":"group"})).await.unwrap();
-        let _: Influencer = h.op.put(&format!("/influencers/{}/members/{p}", i.id), &json!({})).await.unwrap();
+        let i: Project = h.op.post("/projects", &json!({"name":name,"kind":"group"})).await.unwrap();
+        let _: Project = h.op.put(&format!("/projects/{}/members/{p}", i.id), &json!({})).await.unwrap();
     }
     let a = h.look_upload(p).await;
     let b = h.op.upload_look_image(p, "image/png", true, b"\x89PNG\r\n\x1a\nsecond".to_vec()).await.unwrap();
@@ -474,7 +474,7 @@ async fn repinning_asks_first_then_keeps_history_and_names_the_influencers() {
         e => panic!("{e}"),
     }
     let result: serde_json::Value = h.op.post(&path, &json!({"asset_id":b.id,"confirm_repin":true})).await.unwrap();
-    assert_eq!(result["affected_influencers"], json!(["Alpha", "Beta"]));
+    assert_eq!(result["affected_projects"], json!(["Alpha", "Beta"]));
     assert_eq!(result["stale_stages"], json!(["3d", "rig"]));
     let look: serde_json::Value = h.op.get(&format!("/personas/{p}/look")).await.unwrap();
     assert_eq!(look["reference_history"].as_array().unwrap().len(), 2);
@@ -482,9 +482,9 @@ async fn repinning_asks_first_then_keeps_history_and_names_the_influencers() {
     assert_eq!(look["reference_history"][1]["asset_id"], json!(a.id));
     let same = h.op.pin_look_reference(p, &PinIn { asset_id: b.id, confirm_repin: false }).await.unwrap();
     assert_eq!(same.reference.asset_id, b.id);
-    assert_eq!(h.op.character_look(p).await.unwrap().reference_history.len(), 2);
+    assert_eq!(h.op.individual_look(p).await.unwrap().reference_history.len(), 2);
     assert_eq!(h.op.personas().await.unwrap().into_iter().find(|v| v.id == p).unwrap().reference_asset_id, Some(b.id));
-    for i in h.op.influencers().await.unwrap() {
+    for i in h.op.projects().await.unwrap() {
         assert_eq!(i.members[0].reference_asset_id, Some(b.id));
     }
 }
@@ -508,7 +508,7 @@ async fn a_pinned_image_cannot_be_unkept() {
 }
 
 async fn canon_test_proposal(h: &H) -> CanonRevision {
-    let p: Persona = h.op.post("/personas", &json!({"name": "Review character"})).await.unwrap();
+    let p: Persona = h.op.post("/personas", &json!({"name": "Review individual"})).await.unwrap();
     h.op.propose_canon(
         p.id,
         &CanonProposalIn {
@@ -640,63 +640,59 @@ async fn the_profile_keeps_the_pasted_bio_verbatim() {
     let Some(h) = harness().await else { return };
     let p = h.persona().await;
     let bio = "  Café  \n\n最後  \n";
-    let profile = CharacterProfile { bio: bio.into(), ..Default::default() };
+    let profile = IndividualProfile { bio: bio.into(), ..Default::default() };
     assert_eq!(h.op.set_profile(p.id, &profile).await.unwrap().profile.bio, bio);
     assert_eq!(h.op.personas().await.unwrap().into_iter().find(|x| x.id == p.id).unwrap().profile.bio, bio);
 }
 
 #[tokio::test]
-async fn a_solo_influencer_refuses_a_second_member() {
+async fn a_solo_project_refuses_a_second_member() {
     let Some(h) = harness().await else { return };
-    let influencer: serde_json::Value = h.op.post("/influencers", &json!({"name":"Solo", "kind":"solo"})).await.unwrap();
-    let id = influencer["id"].as_str().unwrap();
+    let project: serde_json::Value = h.op.post("/projects", &json!({"name":"Solo", "kind":"solo"})).await.unwrap();
+    let id = project["id"].as_str().unwrap();
     let first = h.persona().await;
     let second: serde_json::Value = h.op.post("/personas", &json!({"name":"Second"})).await.unwrap();
-    let _: serde_json::Value = h.op.put(&format!("/influencers/{id}/members/{}", first.id), &json!({})).await.unwrap();
+    let _: serde_json::Value = h.op.put(&format!("/projects/{id}/members/{}", first.id), &json!({})).await.unwrap();
     let result: Result<serde_json::Value, _> =
-        h.op.put(&format!("/influencers/{id}/members/{}", second["id"].as_str().unwrap()), &json!({})).await;
+        h.op.put(&format!("/projects/{id}/members/{}", second["id"].as_str().unwrap()), &json!({})).await;
     assert_eq!(code(result.unwrap_err()), "solo_has_one_member");
-    let group = h.op.create_influencer(&influencer_input("Group", InfluencerKind::Group)).await.unwrap();
-    h.op.put_influencer_member(group.id, first.id, &InfluencerMemberIn { role: "".into() }).await.unwrap();
-    h.op.put_influencer_member(group.id, Uuid::parse_str(second["id"].as_str().unwrap()).unwrap(), &InfluencerMemberIn { role: "".into() })
+    let group = h.op.create_project(&project_input("Group", ProjectKind::Group)).await.unwrap();
+    h.op.put_project_member(group.id, first.id, &ProjectMemberIn { role: "".into() }).await.unwrap();
+    h.op.put_project_member(group.id, Uuid::parse_str(second["id"].as_str().unwrap()).unwrap(), &ProjectMemberIn { role: "".into() })
         .await
         .unwrap();
-    assert_eq!(
-        code(h.op.update_influencer(group.id, &influencer_input("Group", InfluencerKind::Solo)).await.unwrap_err()),
-        "solo_has_one_member"
-    );
-    let race = h.op.create_influencer(&influencer_input("Race", InfluencerKind::Solo)).await.unwrap();
+    assert_eq!(code(h.op.update_project(group.id, &project_input("Group", ProjectKind::Solo)).await.unwrap_err()), "solo_has_one_member");
+    let race = h.op.create_project(&project_input("Race", ProjectKind::Solo)).await.unwrap();
     let second_id = Uuid::parse_str(second["id"].as_str().unwrap()).unwrap();
-    let member = InfluencerMemberIn { role: "".into() };
-    let (a, b) =
-        tokio::join!(h.op.put_influencer_member(race.id, first.id, &member), h.op.put_influencer_member(race.id, second_id, &member));
+    let member = ProjectMemberIn { role: "".into() };
+    let (a, b) = tokio::join!(h.op.put_project_member(race.id, first.id, &member), h.op.put_project_member(race.id, second_id, &member));
     assert_ne!(a.is_ok(), b.is_ok());
-    assert_eq!(h.op.influencer(race.id).await.unwrap().members.len(), 1);
+    assert_eq!(h.op.project(race.id).await.unwrap().members.len(), 1);
 }
 
-fn influencer_input(name: &str, kind: InfluencerKind) -> InfluencerIn {
-    InfluencerIn { name: name.into(), kind, premise: "".into(), dynamics: "".into() }
+fn project_input(name: &str, kind: ProjectKind) -> ProjectIn {
+    ProjectIn { name: name.into(), kind, premise: "".into(), dynamics: "".into() }
 }
 
 #[tokio::test]
-async fn a_character_performs_in_a_solo_and_a_group_influencer() {
+async fn a_individual_performs_in_a_solo_and_a_group_project() {
     let Some(h) = harness().await else { return };
     let persona = h.persona().await;
-    let solo = h.op.create_influencer(&influencer_input("Solo", InfluencerKind::Solo)).await.unwrap();
-    let group = h.op.create_influencer(&influencer_input("Group", InfluencerKind::Group)).await.unwrap();
+    let solo = h.op.create_project(&project_input("Solo", ProjectKind::Solo)).await.unwrap();
+    let group = h.op.create_project(&project_input("Group", ProjectKind::Group)).await.unwrap();
     for id in [solo.id, group.id] {
-        let result = h.op.put_influencer_member(id, persona.id, &InfluencerMemberIn { role: "lead".into() }).await.unwrap();
+        let result = h.op.put_project_member(id, persona.id, &ProjectMemberIn { role: "lead".into() }).await.unwrap();
         assert_eq!(result.members[0].persona_id, persona.id);
         assert_eq!(result.members[0].has_accepted_canon, persona.canon.is_some());
     }
     let other: Persona = h.op.post("/personas", &json!({"name": "No canon"})).await.unwrap();
-    let result = h.op.put_influencer_member(group.id, other.id, &InfluencerMemberIn { role: "".into() }).await.unwrap();
+    let result = h.op.put_project_member(group.id, other.id, &ProjectMemberIn { role: "".into() }).await.unwrap();
     assert!(!result.members.iter().find(|m| m.persona_id == other.id).unwrap().has_accepted_canon);
-    assert_eq!(h.op.influencers().await.unwrap().len(), 2);
+    assert_eq!(h.op.projects().await.unwrap().len(), 2);
 }
 
 #[tokio::test]
-async fn an_influencer_member_must_share_its_company() {
+async fn an_project_member_must_share_its_company() {
     let Some(h) = harness().await else { return };
     let id = Uuid::new_v4();
     domain::sqlx::query("insert into personas (id, company_id, name) values ($1, 'other', 'Other')")
@@ -704,54 +700,51 @@ async fn an_influencer_member_must_share_its_company() {
         .execute(&h.hub.db)
         .await
         .unwrap();
-    let group = h.op.create_influencer(&influencer_input("Group", InfluencerKind::Group)).await.unwrap();
-    assert_eq!(code(h.op.put_influencer_member(group.id, id, &InfluencerMemberIn { role: "".into() }).await.unwrap_err()), "other_company");
-    assert!(h.op.influencer(group.id).await.unwrap().members.is_empty());
+    let group = h.op.create_project(&project_input("Group", ProjectKind::Group)).await.unwrap();
+    assert_eq!(code(h.op.put_project_member(group.id, id, &ProjectMemberIn { role: "".into() }).await.unwrap_err()), "other_company");
+    assert!(h.op.project(group.id).await.unwrap().members.is_empty());
 }
 
 #[tokio::test]
-async fn an_account_belongs_to_the_last_influencer_that_claimed_it() {
+async fn an_account_belongs_to_the_last_project_that_claimed_it() {
     let Some(h) = harness().await else { return };
-    let a = h.op.create_influencer(&influencer_input("A", InfluencerKind::Solo)).await.unwrap();
-    let b = h.op.create_influencer(&influencer_input("B", InfluencerKind::Solo)).await.unwrap();
-    let accounts = InfluencerAccountsIn { account_ids: vec!["fixture-mastodon".into()] };
-    h.op.set_influencer_accounts(a.id, &accounts).await.unwrap();
-    h.op.set_influencer_accounts(b.id, &accounts).await.unwrap();
-    assert!(h.op.influencer(a.id).await.unwrap().account_ids.is_empty());
-    assert_eq!(h.op.influencer(b.id).await.unwrap().account_ids, accounts.account_ids);
+    let a = h.op.create_project(&project_input("A", ProjectKind::Solo)).await.unwrap();
+    let b = h.op.create_project(&project_input("B", ProjectKind::Solo)).await.unwrap();
+    let accounts = ProjectAccountsIn { account_ids: vec!["fixture-mastodon".into()] };
+    h.op.set_project_accounts(a.id, &accounts).await.unwrap();
+    h.op.set_project_accounts(b.id, &accounts).await.unwrap();
+    assert!(h.op.project(a.id).await.unwrap().account_ids.is_empty());
+    assert_eq!(h.op.project(b.id).await.unwrap().account_ids, accounts.account_ids);
     assert_eq!(
-        code(h.op.set_influencer_accounts(b.id, &InfluencerAccountsIn { account_ids: vec!["missing".into()] }).await.unwrap_err()),
+        code(h.op.set_project_accounts(b.id, &ProjectAccountsIn { account_ids: vec!["missing".into()] }).await.unwrap_err()),
         "not_found"
     );
-    assert_eq!(h.op.influencer(b.id).await.unwrap().account_ids, accounts.account_ids);
+    assert_eq!(h.op.project(b.id).await.unwrap().account_ids, accounts.account_ids);
 }
 
 #[tokio::test]
-async fn only_the_operator_changes_influencers() {
+async fn only_the_operator_changes_projects() {
     let Some(h) = harness().await else { return };
-    let input = influencer_input("Group", InfluencerKind::Group);
-    let group = h.op.create_influencer(&input).await.unwrap();
+    let input = project_input("Group", ProjectKind::Group);
+    let group = h.op.create_project(&input).await.unwrap();
     let persona = h.persona().await;
     let before: i64 = domain::sqlx::query_scalar("select count(*) from audit_log").fetch_one(&h.hub.db).await.unwrap();
-    assert_eq!(code(h.agent.create_influencer(&input).await.unwrap_err()), "forbidden");
-    assert_eq!(code(h.agent.update_influencer(group.id, &input).await.unwrap_err()), "forbidden");
+    assert_eq!(code(h.agent.create_project(&input).await.unwrap_err()), "forbidden");
+    assert_eq!(code(h.agent.update_project(group.id, &input).await.unwrap_err()), "forbidden");
     assert_eq!(
-        code(h.agent.put_influencer_member(group.id, persona.id, &InfluencerMemberIn { role: "".into() }).await.unwrap_err()),
+        code(h.agent.put_project_member(group.id, persona.id, &ProjectMemberIn { role: "".into() }).await.unwrap_err()),
         "forbidden"
     );
-    assert_eq!(code(h.agent.remove_influencer_member(group.id, persona.id).await.unwrap_err()), "forbidden");
-    assert_eq!(
-        code(h.agent.set_influencer_accounts(group.id, &InfluencerAccountsIn { account_ids: vec![] }).await.unwrap_err()),
-        "forbidden"
-    );
-    assert_eq!(h.agent.influencer(group.id).await.unwrap().id, group.id);
-    assert_eq!(h.agent.influencers().await.unwrap().len(), 1);
+    assert_eq!(code(h.agent.remove_project_member(group.id, persona.id).await.unwrap_err()), "forbidden");
+    assert_eq!(code(h.agent.set_project_accounts(group.id, &ProjectAccountsIn { account_ids: vec![] }).await.unwrap_err()), "forbidden");
+    assert_eq!(h.agent.project(group.id).await.unwrap().id, group.id);
+    assert_eq!(h.agent.projects().await.unwrap().len(), 1);
     let after: i64 = domain::sqlx::query_scalar("select count(*) from audit_log").fetch_one(&h.hub.db).await.unwrap();
     assert_eq!(before, after);
 }
 
 #[tokio::test]
-async fn a_delegated_brief_carries_the_influencer_dynamics() {
+async fn a_delegated_brief_carries_the_project_dynamics() {
     let Some(h) = harness().await else { return };
     domain::sqlx::query(
         "insert into settings (key, value) values ('paperclip_studio', $1) on conflict (key) do update set value = excluded.value",
@@ -760,10 +753,10 @@ async fn a_delegated_brief_carries_the_influencer_dynamics() {
     .execute(&h.hub.db)
     .await
     .unwrap();
-    let mut input = influencer_input("Group", InfluencerKind::Group);
+    let mut input = project_input("Group", ProjectKind::Group);
     input.dynamics = "They finish each other's sentences".into();
-    let group = h.op.create_influencer(&input).await.unwrap();
-    h.op.put_influencer_member(group.id, h.persona().await.id, &InfluencerMemberIn { role: "lead".into() }).await.unwrap();
+    let group = h.op.create_project(&input).await.unwrap();
+    h.op.put_project_member(group.id, h.persona().await.id, &ProjectMemberIn { role: "lead".into() }).await.unwrap();
     h.brief(None).await;
     h.tick().await;
     assert!(h.fx.paperclip.as_ref().unwrap().issue_requests().last().unwrap().description.contains(&input.dynamics));

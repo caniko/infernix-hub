@@ -73,11 +73,11 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
             }),
         ),
         (Effect::Write, canon_comment_tool(hub.clone())),
-        (Effect::Read, character_pass_status_tool(hub.clone())),
+        (Effect::Read, individual_pass_status_tool(hub.clone())),
         (
             Effect::Read,
-            read_tool("hub_influencers", "Influencers, their members, accounts and dynamics.", hub.clone(), |hub| async move {
-                hub.influencers().await.map(|value| json_text!(value))
+            read_tool("hub_projects", "Projects, their members, accounts and dynamics.", hub.clone(), |hub| async move {
+                hub.projects().await.map(|value| json_text!(value))
             }),
         ),
         (
@@ -129,11 +129,11 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
     ]
 }
 
-fn character_pass_status_tool(hub: HubClient) -> ToolRoute<()> {
+fn individual_pass_status_tool(hub: HubClient) -> ToolRoute<()> {
     ToolRoute::new(
         Tool::new(
-            "hub_character_pass_status",
-            "Generation pass status for a character.",
+            "hub_individual_pass_status",
+            "Generation pass status for an individual.",
             schema(json!({"persona_id": {"type": "string", "description": "Persona UUID."}}), &["persona_id"]),
         ),
         move |Parameters(args): Parameters<Value>| {
@@ -143,7 +143,7 @@ fn character_pass_status_tool(hub: HubClient) -> ToolRoute<()> {
                     Ok(id) => id,
                     Err(error) => return failed(error),
                 };
-                match hub.character_look(id).await {
+                match hub.individual_look(id).await {
                     Ok(look) => {
                         let passes: Vec<Value> = look.passes.into_iter().map(|pass| json!({
                             "generation_id": pass.generation.id,
@@ -665,8 +665,8 @@ mod tests {
                 ("hub_status", Effect::Read),
                 ("hub_canon_review", Effect::Read),
                 ("hub_canon_comment", Effect::Write),
-                ("hub_character_pass_status", Effect::Read),
-                ("hub_influencers", Effect::Read),
+                ("hub_individual_pass_status", Effect::Read),
+                ("hub_projects", Effect::Read),
                 ("hub_today", Effect::Read),
                 ("hub_content", Effect::Read),
                 ("hub_relationships", Effect::Read),

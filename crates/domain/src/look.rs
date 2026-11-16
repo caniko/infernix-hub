@@ -1,7 +1,7 @@
 //! Persona-owned look images and generation passes.
 
 use contracts::{
-    Asset, CharacterLook, GenerateIn, GenerationRequest, LookPass, LookPassIn, LookSize, LookSourceIn, PinIn, PinOut, Reference, Severity,
+    Asset, GenerateIn, GenerationRequest, IndividualLook, LookPass, LookPassIn, LookSize, LookSourceIn, PinIn, PinOut, Reference, Severity,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -160,18 +160,18 @@ pub async fn pin(hub: &Hub, actor: &Actor, persona_id: Uuid, input: PinIn) -> DR
             .bind(persona_id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or_else(|| invalid("pin_needs_a_kept_image", "pin needs a kept image of this character"))?;
+            .ok_or_else(|| invalid("pin_needs_a_kept_image", "pin needs a kept image of this individual"))?;
     let history: Vec<Reference> = decode(sqlx::query_scalar(REFERENCES).bind(persona_id).fetch_all(&mut *tx).await?)?;
     let previous = history.first();
     let names: Vec<String> = sqlx::query_scalar(
-        "select i.name from influencers i join influencer_members m on m.influencer_id=i.id where m.persona_id=$1 order by i.name, i.id",
+        "select i.name from projects i join project_members m on m.project_id=i.id where m.persona_id=$1 order by i.name, i.id",
     )
     .bind(persona_id)
     .fetch_all(&mut *tx)
     .await?;
     if let Some(current) = previous {
         if current.asset_id == input.asset_id {
-            return Ok(PinOut { reference: current.clone(), affected_influencers: names, stale_stages: vec![] });
+            return Ok(PinOut { reference: current.clone(), affected_projects: names, stale_stages: vec![] });
         }
         if !input.confirm_repin {
             return Err(conflict(
@@ -200,10 +200,10 @@ pub async fn pin(hub: &Hub, actor: &Actor, persona_id: Uuid, input: PinIn) -> DR
     .await?;
     let reference: Reference = decode_one(sqlx::query_scalar(REFERENCES).bind(persona_id).fetch_one(&mut *tx).await?)?;
     tx.commit().await?;
-    Ok(PinOut { reference, affected_influencers: names, stale_stages })
+    Ok(PinOut { reference, affected_projects: names, stale_stages })
 }
 
-pub async fn get(hub: &Hub, actor: &Actor, persona_id: Uuid) -> DResult<CharacterLook> {
+pub async fn get(hub: &Hub, actor: &Actor, persona_id: Uuid) -> DResult<IndividualLook> {
     actor.require(crate::ANY_READER)?;
     let mut conn = hub.db.acquire().await?;
     persona(&mut conn, persona_id).await?;
@@ -232,7 +232,7 @@ pub async fn get(hub: &Hub, actor: &Actor, persona_id: Uuid) -> DResult<Characte
         .collect();
     let reference_history: Vec<Reference> = decode(sqlx::query_scalar(REFERENCES).bind(persona_id).fetch_all(&mut *conn).await?)?;
     let reference = reference_history.first().cloned();
-    Ok(CharacterLook { uploads, passes, reference, reference_history })
+    Ok(IndividualLook { uploads, passes, reference, reference_history })
 }
 
 pub async fn notify_finished(hub: &Hub) -> DResult<()> {

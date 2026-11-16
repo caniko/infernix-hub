@@ -31,7 +31,7 @@
       },
       "CanonCommentIn": {"description": "See hub_contracts::CanonCommentIn", "type": "object"},
       "CanonDraftIn": {"description": "See hub_contracts::CanonDraftIn", "type": "object"},
-      "CharacterProfile": {"description": "See hub_contracts::CharacterProfile", "type": "object"},
+      "IndividualProfile": {"description": "See hub_contracts::IndividualProfile", "type": "object"},
       "CanonDecisionIn": {
         "description": "See hub_contracts::CanonDecisionIn",
         "type": "object"
@@ -251,23 +251,23 @@
   },
   "openapi": "3.1.0",
   "paths": {
-    "/v1/influencers": {
-      "get": { "operationId": "influencers", "responses": { "200": { "description": "Influencer list" } }, "security": [{ "bearer": [] }] },
-      "post": { "operationId": "create_influencer", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] }
+    "/v1/projects": {
+      "get": { "operationId": "projects", "responses": { "200": { "description": "Project list" } }, "security": [{ "bearer": [] }] },
+      "post": { "operationId": "create_project", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] }
     },
-    "/v1/influencers/{id}": {
+    "/v1/projects/{id}": {
       "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-      "get": { "operationId": "influencer", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] },
-      "put": { "operationId": "update_influencer", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] }
+      "get": { "operationId": "project", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] },
+      "put": { "operationId": "update_project", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] }
     },
-    "/v1/influencers/{id}/members/{persona_id}": {
+    "/v1/projects/{id}/members/{persona_id}": {
       "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }, { "in": "path", "name": "persona_id", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-      "put": { "operationId": "put_influencer_member", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] },
-      "delete": { "operationId": "remove_influencer_member", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] }
+      "put": { "operationId": "put_project_member", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] },
+      "delete": { "operationId": "remove_project_member", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] }
     },
-    "/v1/influencers/{id}/accounts": {
+    "/v1/projects/{id}/accounts": {
       "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-      "put": { "operationId": "set_influencer_accounts", "responses": { "200": { "description": "Influencer" } }, "security": [{ "bearer": [] }] }
+      "put": { "operationId": "set_project_accounts", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] }
     },
     "/healthz": {
       "get": {
@@ -463,13 +463,13 @@
       "post": {"operationId": "canon_comment", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CanonCommentIn"}}}}, "responses": {"200": {"description": "CanonRevision"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
     },
     "/v1/personas/{id}/profile": {
-      "put": {"operationId": "set_profile", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CharacterProfile"}}}}, "responses": {"200": {"description": "Persona"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+      "put": {"operationId": "set_profile", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IndividualProfile"}}}}, "responses": {"200": {"description": "Persona"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
     },
     "/v1/personas/{id}/canon-draft": {
       "post": {"operationId": "draft_canon", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CanonDraftIn"}}}}, "responses": {"200": {"description": "CanonBody"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
     },
     "/v1/personas/{id}/look": {
-      "get": {"operationId": "character_look", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "CharacterLook"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+      "get": {"operationId": "individual_look", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "IndividualLook"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
     },
     "/v1/personas/{id}/look/uploads": {
       "post": {"operationId": "upload_look_image", "description": "Raw image bytes (maximum 32 MiB); content-type identifies the image.", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}, {"in": "header", "name": "x-attest-not-real-person", "required": true, "schema": {"type": "string", "enum": ["true"]}}], "requestBody": {"required": true, "content": {"image/png": {"schema": {"type": "string", "format": "binary"}}, "image/jpeg": {"schema": {"type": "string", "format": "binary"}}, "image/webp": {"schema": {"type": "string", "format": "binary"}}}}, "responses": {"200": {"description": "Asset"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}

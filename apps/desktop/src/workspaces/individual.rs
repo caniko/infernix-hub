@@ -1,6 +1,6 @@
 use contracts::{
-    Asset, AssetState, CanonBody, CanonDraftIn, CanonProposalIn, CanonSource, CharacterLook, CharacterProfile, ImageCheck,
-    InfluencerMemberIn, LookPassIn, LookSize, LookSourceIn, Persona, PinIn, ReadsAs, SelectAssetIn, client::HubClient,
+    Asset, AssetState, CanonBody, CanonDraftIn, CanonProposalIn, CanonSource, ImageCheck, IndividualLook, IndividualProfile, LookPassIn,
+    LookSize, LookSourceIn, Persona, PinIn, ProjectMemberIn, ReadsAs, SelectAssetIn, client::HubClient,
 };
 use dioxus::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,7 +22,7 @@ fn mime_for(file_name: &str) -> Option<&'static str> {
     }
 }
 
-pub fn bio_stage_done(profile: &CharacterProfile) -> bool {
+pub fn bio_stage_done(profile: &IndividualProfile) -> bool {
     !profile.bio.is_empty() && profile.reads_as.is_some()
 }
 
@@ -39,7 +39,7 @@ struct PassNode {
     parent: Option<Uuid>,
 }
 
-fn pass_tree(look: &CharacterLook) -> Vec<PassNode> {
+fn pass_tree(look: &IndividualLook) -> Vec<PassNode> {
     let mut nodes: Vec<PassNode> = Vec::new();
     for (index, pass) in look.passes.iter().enumerate() {
         let parent = pass.generation.source_asset_id.and_then(|source| {
@@ -60,7 +60,7 @@ fn pass_tree(look: &CharacterLook) -> Vec<PassNode> {
     nodes
 }
 
-fn lineage(look: &CharacterLook, asset_id: Uuid) -> Vec<String> {
+fn lineage(look: &IndividualLook, asset_id: Uuid) -> Vec<String> {
     let mut labels = Vec::new();
     let mut current = Some(asset_id);
     let mut seen = BTreeSet::new();
@@ -97,8 +97,8 @@ fn PinButton(persona: Uuid, asset_id: Uuid, on_reload: EventHandler<()>) -> Elem
             match api::timed(client.pin_look_reference(persona, &PinIn { asset_id, confirm_repin })).await {
                 Ok(out) => {
                     let mut details = Vec::new();
-                    if !out.affected_influencers.is_empty() {
-                        details.push(format!("Affected influencers: {}", out.affected_influencers.join(", ")));
+                    if !out.affected_projects.is_empty() {
+                        details.push(format!("Affected projects: {}", out.affected_projects.join(", ")));
                     }
                     if !out.stale_stages.is_empty() {
                         details.push(format!("Stages to redo: {}", out.stale_stages.join(", ")));
@@ -204,8 +204,8 @@ fn KeepDialog(asset: Asset, on_close: EventHandler<()>, on_reload: EventHandler<
     let mut busy = use_signal(|| false);
     let valid = REQUIRED_CHECKS.iter().all(|(key, _)| ticked().contains(*key));
     rsx! {
-        div { class: "influencer-dialog-backdrop",
-            section { class: "influencer-dialog glass-card", role: "dialog", aria_modal: "true", aria_labelledby: "keep-image-title",
+        div { class: "project-dialog-backdrop",
+            section { class: "project-dialog glass-card", role: "dialog", aria_modal: "true", aria_labelledby: "keep-image-title",
                 h2 { id: "keep-image-title", "Keep image" }
                 if let Some(err) = error() { ErrorCard { code: err.code, message: err.message } }
                 fieldset { class: "form-grid", disabled: busy(), legend { "Required checks" }
@@ -269,7 +269,7 @@ fn should_publish(ticket: u64, latest: u64) -> bool {
 }
 
 #[component]
-pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on_close: EventHandler<()>) -> Element {
+pub fn IndividualWizard(persona_id: Option<Uuid>, project_id: Option<Uuid>, on_close: EventHandler<()>) -> Element {
     let store = use_context::<Store>();
     let client = use_context::<HubClient>();
     let existing = (store.personas).cloned().data.unwrap_or_default().into_iter().find(|p| Some(p.id) == persona_id);
@@ -286,7 +286,7 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
     let mut rules = use_signal(|| draft.rules.clone());
     let mut avoid = use_signal(|| draft.avoid.clone());
     let mut world = use_signal(|| draft.world.clone());
-    let mut selected = use_signal(|| influencer_id);
+    let mut selected = use_signal(|| project_id);
     let mut role = use_signal(String::new);
     let mut step = use_signal(|| 0usize);
     let mut busy = use_signal(|| false);
@@ -305,7 +305,7 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
     });
     let mut prompt_initialized = use_signal(|| false);
     let mut variants = use_signal(|| 2i32);
-    let mut character_look = use_signal(|| None::<CharacterLook>);
+    let mut individual_look = use_signal(|| None::<IndividualLook>);
     let mut library = use_signal(Vec::<Asset>::new);
     let mut refine_pass = use_signal(|| None::<Uuid>);
     let mut refine_source = use_signal(|| None::<Uuid>);
@@ -323,8 +323,8 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
         look_ticket.set(ticket);
         let client = refresh_client.clone();
         spawn(async move {
-            match api::timed(client.character_look(persona)).await {
-                Ok(look) if should_publish(ticket, *look_ticket.peek()) => character_look.set(Some(look)),
+            match api::timed(client.individual_look(persona)).await {
+                Ok(look) if should_publish(ticket, *look_ticket.peek()) => individual_look.set(Some(look)),
                 Err(err) if should_publish(ticket, *look_ticket.peek()) => error.set(Some(err)),
                 _ => {}
             }
@@ -355,7 +355,7 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
     });
     let thumbnails_client = client.clone();
     use_effect(move || {
-        let Some(look) = character_look() else { return };
+        let Some(look) = individual_look() else { return };
         let selected = refine_pass();
         let mut assets = look.uploads.clone();
         if let Some(pass) = look.passes.iter().find(|pass| Some(pass.generation.id) == selected) {
@@ -390,7 +390,7 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 if *step.peek() != 2
-                    || !character_look.peek().as_ref().is_some_and(|look| look.passes.iter().any(|pass| !terminal(pass.generation.state)))
+                    || !individual_look.peek().as_ref().is_some_and(|look| look.passes.iter().any(|pass| !terminal(pass.generation.state)))
                 {
                     continue;
                 }
@@ -399,15 +399,15 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
                 // explicit refreshes still take a newer ticket and win.
                 let ticket = *look_ticket.peek() + 1;
                 look_ticket.set(ticket);
-                match api::timed(client.character_look(persona)).await {
-                    Ok(look) if should_publish(ticket, *look_ticket.peek()) => character_look.set(Some(look)),
+                match api::timed(client.individual_look(persona)).await {
+                    Ok(look) if should_publish(ticket, *look_ticket.peek()) => individual_look.set(Some(look)),
                     Err(err) if should_publish(ticket, *look_ticket.peek()) => error.set(Some(err)),
                     _ => {}
                 }
             }
         }
     });
-    let influencers = (store.influencers).cloned().data.unwrap_or_default();
+    let projects = (store.projects).cloned().data.unwrap_or_default();
     let client_save = client.clone();
     let client_send = client.clone();
     let mut save = move |_: MouseEvent| {
@@ -417,7 +417,7 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
         busy.set(true);
         error.set(None);
         let client = client_save.clone();
-        let profile = CharacterProfile {
+        let profile = IndividualProfile {
             bio: bio(),
             reads_as: reads(),
             look: look(),
@@ -430,7 +430,7 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
             },
         };
         let name = name();
-        let influencer = selected();
+        let project = selected();
         let role = role();
         spawn(async move {
             let persona = if let Some(id) = id() {
@@ -459,9 +459,9 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
             }
             if persona_id.is_none()
                 && !member_added()
-                && let Some(influencer) = influencer
+                && let Some(project) = project
             {
-                if let Err(err) = api::timed(client.put_influencer_member(influencer, persona, &InfluencerMemberIn { role })).await {
+                if let Err(err) = api::timed(client.put_project_member(project, persona, &ProjectMemberIn { role })).await {
                     error.set(Some(err));
                     busy.set(false);
                     return;
@@ -473,9 +473,9 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
         });
     };
     rsx! {
-        div { class: "influencer-dialog-backdrop",
-            section { class: "influencer-dialog glass-card", role: "dialog", aria_modal: "true", aria_label: "Character wizard",
-                div { class: "work-head", h2 { if persona_id.is_some() { "Edit character" } else { "New character" } }
+        div { class: "project-dialog-backdrop",
+            section { class: "project-dialog glass-card", role: "dialog", aria_modal: "true", aria_label: "Individual wizard",
+                div { class: "work-head", h2 { if persona_id.is_some() { "Edit individual" } else { "New individual" } }
                     button { class: "btn btn-glass", disabled: busy(), onclick: move |_| on_close.call(()), "Close" }
                 }
                 div { class: "row", for (index, label) in ["Bio", "Image", "Refine", "Review"].iter().enumerate() {
@@ -485,16 +485,16 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
                 if step() == 0 {
                     Panel { title: "Bio".to_string(), caption: None,
                         fieldset { class: "form-grid", disabled: busy(),
-                            div { class: "field-row", label { r#for: "character-name", "Name" } input { id: "character-name", class: "input", disabled: persona_id.is_some() || id().is_some() || busy(), value: "{name}", oninput: move |e| name.set(e.value()) } }
+                            div { class: "field-row", label { r#for: "individual-name", "Name" } input { id: "individual-name", class: "input", disabled: persona_id.is_some() || id().is_some() || busy(), value: "{name}", oninput: move |e| name.set(e.value()) } }
                             if persona_id.is_none() {
-                                div { class: "field-row", label { r#for: "character-influencer", "Influencer" } select { id: "character-influencer", class: "input", disabled: busy() || member_added(), value: selected().map(|v| v.to_string()).unwrap_or_default(), onchange: move |e| selected.set(Uuid::parse_str(&e.value()).ok()), option { value: "", "No influencer yet" } for item in influencers.clone() { option { value: "{item.id}", "{item.name}" } } } }
-                                div { class: "field-row", label { r#for: "character-role", "Role" } input { id: "character-role", class: "input", disabled: busy() || member_added(), value: "{role}", oninput: move |e| role.set(e.value()) } }
+                                div { class: "field-row", label { r#for: "individual-project", "Project" } select { id: "individual-project", class: "input", disabled: busy() || member_added(), value: selected().map(|v| v.to_string()).unwrap_or_default(), onchange: move |e| selected.set(Uuid::parse_str(&e.value()).ok()), option { value: "", "No project yet" } for item in projects.clone() { option { value: "{item.id}", "{item.name}" } } } }
+                                div { class: "field-row", label { r#for: "individual-role", "Role" } input { id: "individual-role", class: "input", disabled: busy() || member_added(), value: "{role}", oninput: move |e| role.set(e.value()) } }
                             }
-                            div { class: "field-row", label { r#for: "character-reads", "Reads as" } select { id: "character-reads", class: "input", value: match reads() { Some(ReadsAs::Adult) => "adult", Some(ReadsAs::NonHuman) => "non_human", None => "" }, onchange: move |e| reads.set(match e.value().as_str() { "adult" => Some(ReadsAs::Adult), "non_human" => Some(ReadsAs::NonHuman), _ => None }), option { value: "", "Select…" } option { value: "adult", "Adult" } option { value: "non_human", "Non-human" } } }
-                            div { class: "field-row", label { r#for: "character-bio", "Bio (kept verbatim)" } textarea { id: "character-bio", class: "input", value: "{bio}", oninput: move |e| bio.set(e.value()) } }
-                            div { class: "field-row", label { r#for: "character-look", "Look description" } textarea { id: "character-look", class: "input", value: "{look}", oninput: move |e| look.set(e.value()) } }
+                            div { class: "field-row", label { r#for: "individual-reads", "Reads as" } select { id: "individual-reads", class: "input", value: match reads() { Some(ReadsAs::Adult) => "adult", Some(ReadsAs::NonHuman) => "non_human", None => "" }, onchange: move |e| reads.set(match e.value().as_str() { "adult" => Some(ReadsAs::Adult), "non_human" => Some(ReadsAs::NonHuman), _ => None }), option { value: "", "Select…" } option { value: "adult", "Adult" } option { value: "non_human", "Non-human" } } }
+                            div { class: "field-row", label { r#for: "individual-bio", "Bio (kept verbatim)" } textarea { id: "individual-bio", class: "input", value: "{bio}", oninput: move |e| bio.set(e.value()) } }
+                            div { class: "field-row", label { r#for: "individual-look", "Look description" } textarea { id: "individual-look", class: "input", value: "{look}", oninput: move |e| look.set(e.value()) } }
                             ListEditor { title: "Palette".to_string(), hint: "Hex colours".to_string(), items: palette, placeholder: "#ffffff".to_string() }
-                            div { class: "field-row", label { r#for: "character-voice", "Kokoro voice id" } input { id: "character-voice", class: "input", value: "{voice}", oninput: move |e| voice.set(e.value()) } }
+                            div { class: "field-row", label { r#for: "individual-voice", "Kokoro voice id" } input { id: "individual-voice", class: "input", value: "{voice}", oninput: move |e| voice.set(e.value()) } }
                             button { class: "btn btn-glass", disabled: busy() || id().is_none(), onclick: move |_| {
                                 let Some(persona) = id() else { return }; busy.set(true); error.set(None); let client = client.clone(); let input = CanonDraftIn { bio: bio() };
                                 spawn(async move { match api::draft_canon(&client, persona, &input).await {
@@ -502,9 +502,9 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
                                     Err(err) => error.set(Some(err)),
                                 } busy.set(false); });
                             }, "Draft canon from my bio" }
-                            if id().is_none() { p { class: "hint", "Save the character before drafting canon." } }
+                            if id().is_none() { p { class: "hint", "Save the individual before drafting canon." } }
                             if has_draft() {
-                                div { class: "field-row", label { r#for: "character-canon-voice", "Canon voice" } textarea { id: "character-canon-voice", class: "input", value: "{canon_voice}", oninput: move |e| canon_voice.set(e.value()) } }
+                                div { class: "field-row", label { r#for: "individual-canon-voice", "Canon voice" } textarea { id: "individual-canon-voice", class: "input", value: "{canon_voice}", oninput: move |e| canon_voice.set(e.value()) } }
                                 ListEditor { title: "Rules".to_string(), hint: "".to_string(), items: rules, placeholder: "Add a rule".to_string() }
                                 ListEditor { title: "Avoid".to_string(), hint: "".to_string(), items: avoid, placeholder: "Add an item".to_string() }
                                 ListEditor { title: "World".to_string(), hint: "".to_string(), items: world, placeholder: "Add a fact".to_string() }
@@ -581,7 +581,7 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
                                 } }
                             }
                         }
-                        if let Some(look) = character_look() {
+                        if let Some(look) = individual_look() {
                             div { class: "asset-grid four", for asset in look.uploads {
                                 LookAsset { key: "{asset.id}", pinned: look.reference.as_ref().is_some_and(|reference| reference.asset_id == asset.id), asset, persona, on_source: move |id| refine_source.set(Some(id)), on_keep: move |asset| keep_asset.set(Some(asset)), on_reload: move |_| refresh_look.call(persona) }
                             } }
@@ -590,9 +590,9 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
                             p { "You confirm the required checks when you keep an image. No automated checker runs yet." }
                             ul { class: "facet-list", li { "Required · Reads as an adult, or is non-human" } li { "Required · Not sexualised" } li { "Required · Not a real person or modelled on one" } li { "Advice · Stylized rather than photoreal" } li { "Advice · Whole body in frame, plain background, even light, A-pose" } }
                         }
-                    } else { p { "Save the character first." } }
+                    } else { p { "Save the individual first." } }
                 } else if step() == 2 {
-                    if let Some(look) = character_look() {
+                    if let Some(look) = individual_look() {
                         div { style: "display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-start",
                         div { style: "flex: 2 1 18rem; min-width: 0",
                         Panel { title: "Passes".to_string(), caption: None,
@@ -665,18 +665,18 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
                             }
                         }
                         }
-                    } else { p { "Open Image to load this character's look." } }
+                    } else { p { "Open Image to load this individual's look." } }
                 } else if step() == 3 {
                     { let body = CanonBody { voice: canon_voice(), rules: rules(), avoid: avoid(), world: world() };
                       let empty = body.voice.trim().is_empty() && body.rules.iter().chain(&body.avoid).chain(&body.world).all(|s| s.trim().is_empty());
-                      let membership = influencers.iter().find_map(|i| i.members.iter().find(|m| Some(m.persona_id) == id()).map(|m| format!("{} · {}", i.name, m.role)))
-                          .or_else(|| influencers.iter().find(|i| Some(i.id) == selected()).map(|i| format!("{} · {}", i.name, role()))).unwrap_or_else(|| "None".into());
+                      let membership = projects.iter().find_map(|i| i.members.iter().find(|m| Some(m.persona_id) == id()).map(|m| format!("{} · {}", i.name, m.role)))
+                          .or_else(|| projects.iter().find(|i| Some(i.id) == selected()).map(|i| format!("{} · {}", i.name, role()))).unwrap_or_else(|| "None".into());
                       let revision = existing.as_ref().and_then(|p| p.canon.as_ref()).map(|c| c.revision + 1).unwrap_or(1);
                       let reads_label = match reads() { Some(ReadsAs::Adult) => "Adult", Some(ReadsAs::NonHuman) => "Non-human", None => "—" };
                       rsx! {
                         Panel { title: "Review".to_string(), caption: Some("Read only".to_string()),
                             h3 { "Pinned reference" }
-                            if let Some(look) = character_look() {
+                            if let Some(look) = individual_look() {
                                 if let Some(reference) = look.reference.as_ref() {
                                     if let Some(asset) = look.uploads.iter().chain(look.passes.iter().flat_map(|pass| pass.assets.iter())).find(|asset| asset.id == reference.asset_id) {
                                         div { class: "asset-frame", if let Some(uri) = (store.asset_images).cloned().get(&asset.id) { img { src: "{uri}", alt: "{asset.alt_text}" } } else { span { class: "asset-missing", "{asset.mime}" } } }
@@ -685,8 +685,8 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
                                     p { "{lineage(&look, reference.asset_id).join(\" → \")}" }
                                 } else { p { "No reference pinned yet." } }
                             } else { p { "No reference pinned yet." } }
-                            p { "3D from the pinned image (TRELLIS.2) is offered on the character page. It does not start by itself." }
-                            p { "Name: {name}" } p { "Influencer · role: {membership}" }
+                            p { "3D from the pinned image (TRELLIS.2) is offered on the individual page. It does not start by itself." }
+                            p { "Name: {name}" } p { "Project · role: {membership}" }
                             p { "Reads as: {reads_label}" }
                             p { "Voice: {voice}" }
                             h3 { "Bio" } p { style: "white-space: pre-wrap", "{bio}" }
@@ -701,21 +701,21 @@ pub fn CharacterWizard(persona_id: Option<Uuid>, influencer_id: Option<Uuid>, on
                                 button { class: "btn btn-primary", disabled: busy() || name().trim().is_empty() || (empty && proposal().is_none()), onclick: move |_| {
                                     if busy() { return; } busy.set(true); error.set(None);
                                     let client = client_send.clone();
-                                    let profile = CharacterProfile { bio: bio(), reads_as: reads(), look: look(), palette: palette(), voice: if voice().is_empty() { None } else { Some(voice()) }, canon_draft: Some(CanonBody { voice: canon_voice(), rules: rules(), avoid: avoid(), world: world() }) };
-                                    let name = name(); let influencer = selected(); let role = role();
+                                    let profile = IndividualProfile { bio: bio(), reads_as: reads(), look: look(), palette: palette(), voice: if voice().is_empty() { None } else { Some(voice()) }, canon_draft: Some(CanonBody { voice: canon_voice(), rules: rules(), avoid: avoid(), world: world() }) };
+                                    let name = name(); let project = selected(); let role = role();
                                     spawn(async move {
                                         let persona = if let Some(persona_id) = id() {
                                             saved_persona().or_else(|| (store.personas).cloned().data.unwrap_or_default().into_iter().find(|p| p.id == persona_id))
                                         } else { match api::create_persona(&client, &name).await { Ok(p) => { id.set(Some(p.id)); saved_persona.set(Some(p.clone())); Some(p) }, Err(e) => { error.set(Some(e)); busy.set(false); return; } } };
                                         let Some(persona) = persona else { error.set(Some(UiError { code: "persona_not_loaded".into(), message: "Reload and try again.".into() })); busy.set(false); return };
                                         if proposal().is_none() && persona.pending_proposals > 0 {
-                                            error.set(Some(UiError { code: "proposal_pending".into(), message: "A canon proposal is already pending. Send it for comments from the character page.".into() }));
+                                            error.set(Some(UiError { code: "proposal_pending".into(), message: "A canon proposal is already pending. Send it for comments from the individual page.".into() }));
                                             busy.set(false); return;
                                         }
                                         if proposal().is_none() {
                                             if let Err(e) = api::set_profile(&client, persona.id, &profile).await { error.set(Some(e)); busy.set(false); return; }
-                                            if persona_id.is_none() && !member_added() && let Some(influencer) = influencer {
-                                                if let Err(e) = api::timed(client.put_influencer_member(influencer, persona.id, &InfluencerMemberIn { role })).await { error.set(Some(e)); busy.set(false); return; }
+                                            if persona_id.is_none() && !member_added() && let Some(project) = project {
+                                                if let Err(e) = api::timed(client.put_project_member(project, persona.id, &ProjectMemberIn { role })).await { error.set(Some(e)); busy.set(false); return; }
                                                 member_added.set(true);
                                             }
                                             match api::timed(client.propose_canon(persona.id, &next_proposal(&persona, profile.canon_draft.clone().unwrap_or_default()))).await {
@@ -760,7 +760,7 @@ mod tests {
         let upload = asset();
         let first = asset();
         let last = asset();
-        let look = CharacterLook {
+        let look = IndividualLook {
             uploads: vec![upload.clone()],
             passes: vec![
                 contracts::LookPass { generation: generation(Some(upload.id)), assets: vec![first.clone()] },
@@ -862,7 +862,7 @@ mod tests {
         let first = generation(Some(upload.id));
         let second = generation(Some(output.id));
         let third = generation(Some(upload.id));
-        let look = CharacterLook {
+        let look = IndividualLook {
             uploads: vec![upload],
             passes: vec![
                 contracts::LookPass { generation: first.clone(), assets: vec![output] },
@@ -880,7 +880,7 @@ mod tests {
     }
     #[test]
     fn a_pass_from_a_library_pick_is_a_root() {
-        let look = CharacterLook {
+        let look = IndividualLook {
             uploads: vec![asset()],
             passes: vec![contracts::LookPass { generation: generation(Some(Uuid::new_v4())), assets: vec![] }],
             reference: None,
@@ -908,7 +908,7 @@ mod tests {
             id: Uuid::new_v4(),
             company_id: String::new(),
             name: String::new(),
-            profile: CharacterProfile::default(),
+            profile: IndividualProfile::default(),
             canon: None,
             pending_proposals: 0,
             reference_asset_id: None,
@@ -934,7 +934,7 @@ mod tests {
     }
     #[test]
     fn bio_stage_chip_needs_a_bio_and_reads_as() {
-        let mut profile = CharacterProfile::default();
+        let mut profile = IndividualProfile::default();
         assert!(!bio_stage_done(&profile));
         profile.bio = "bio".into();
         assert!(!bio_stage_done(&profile));

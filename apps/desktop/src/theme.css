@@ -637,7 +637,7 @@ input[type="checkbox"] { accent-color: var(--honey); }
   .host-row { flex-wrap: wrap; }
   .host-checked { margin-left: 0; }
 }
-.influencer-dialog-backdrop {
+.project-dialog-backdrop {
   position: fixed;
   inset: 0;
   z-index: 1000;
@@ -645,7 +645,7 @@ input[type="checkbox"] { accent-color: var(--honey); }
   place-items: center;
   background: #000b;
 }
-.influencer-dialog {
+.project-dialog {
   width: min(40rem, 95vw);
   max-height: 90vh;
   overflow-y: auto;

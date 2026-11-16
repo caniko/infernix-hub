@@ -50,7 +50,7 @@ pub fn Sidebar(workspace: Signal<Workspace>, nav_open: Signal<bool>) -> Element 
             }
             div { class: "sidebar-foot",
                 p { class: "label-tech", "Ctrl+K · commands" }
-                p { class: "label-tech", "1–9, 0, n, i · workspaces" }
+                p { class: "label-tech", "1–9, 0, n, p · workspaces" }
             }
         }
     }
