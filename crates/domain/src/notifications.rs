@@ -18,10 +18,38 @@ use uuid::Uuid;
 
 use crate::{Actor, DResult, DomainError, Hub, audit, decode, decode_one, invalid};
 
+#[cfg(test)]
+#[test]
+fn secret_raises_follow_the_contract() {
+    let now = DateTime::parse_from_rfc3339("2026-11-16T12:00:00Z").unwrap().with_timezone(&Utc);
+    let mut value = serde_json::json!({"schemaVersion":1,"generatedAt":"2026-11-16T12:00:00Z","secrets":[]});
+    for (id, expiry) in [
+        ("expired", json!({"type":"at","date":"2026-11-16"})),
+        ("warning", json!({"type":"at","date":"2026-12-16"})),
+        ("far", json!({"type":"at","date":"2026-12-17"})),
+        ("never", json!({"type":"never"})),
+        ("unknown", json!({"type":"unknown"})),
+    ] {
+        value["secrets"].as_array_mut().unwrap().push(json!({"id":id,"tree":"home","scope":"can","category":"oauth","project":null,"kind":"external","custodian":"can","expiry":expiry,"rotatedAt":null,"rotation":{"method":"replace","command":"rotate","note":""},"consumers":[]}));
+    }
+    let mut inventory: contracts::SecretInventory = serde_json::from_value(value).unwrap();
+    let raises = secret_raises(&inventory, now);
+    assert_eq!(
+        raises.iter().map(|r| r.dedupe_key.as_str()).collect::<Vec<_>>(),
+        vec!["secrets:expired:expired", "secrets:unknown:unknown", "secrets:warning:expiring"]
+    );
+    assert!(!secret_inventory_stale(&inventory, now));
+    assert!(secret_inventory_stale(&inventory, now + chrono::Duration::hours(26)));
+    inventory.generated_at = (now + chrono::Duration::seconds(61)).to_rfc3339();
+    assert!(secret_inventory_stale(&inventory, now));
+    inventory.generated_at = "invalid".into();
+    assert!(secret_inventory_stale(&inventory, now));
+}
+
 /// Producer keys belong to the loop; an HTTP caller that could write them would
 /// fake a source's state, and the next pass would resolve it away.
-const RESERVED_SOURCES: &[&str] = &["today", "fleet", "hub"];
-const RESERVED_PREFIXES: &[&str] = &["today:", "fleet:", "hub:"];
+const RESERVED_SOURCES: &[&str] = &["today", "fleet", "hub", "secrets"];
+const RESERVED_PREFIXES: &[&str] = &["today:", "fleet:", "hub:", "secrets:"];
 
 /// Agents and procedures raise their own rows; only the operator dismisses.
 const RAISERS: &[Role] = &[Role::Operator, Role::Agent, Role::Procedure, Role::Member];
@@ -175,6 +203,60 @@ const FLEET_CLOCK_SKEW_SECS: i64 = 60;
 // ponytail: fixed bounds; make configurable if a pipeline legitimately runs longer.
 const STALLED_RUNNING_HOURS: i32 = 2;
 const STALLED_PENDING_HOURS: i32 = 6;
+
+// ponytail: fixed warning window; make configurable if different policies are needed.
+const SECRET_WARN_DAYS: i64 = 30;
+
+pub fn secret_state(secret: &contracts::Secret, now: DateTime<Utc>) -> &'static str {
+    match secret.expiry {
+        contracts::SecretExpiry::Never => "never",
+        contracts::SecretExpiry::Unknown => "unknown",
+        contracts::SecretExpiry::At { date } if date <= now.date_naive() => "expired",
+        contracts::SecretExpiry::At { date } if date.signed_duration_since(now.date_naive()).num_days() <= SECRET_WARN_DAYS => "expiring",
+        contracts::SecretExpiry::At { .. } => "ok",
+    }
+}
+
+pub fn secret_inventory_stale(inventory: &contracts::SecretInventory, now: DateTime<Utc>) -> bool {
+    match DateTime::parse_from_rfc3339(&inventory.generated_at) {
+        Ok(generated) => {
+            let age = now.signed_duration_since(generated.with_timezone(&Utc));
+            age > chrono::Duration::hours(25) || age < chrono::Duration::seconds(-60)
+        }
+        Err(_) => true,
+    }
+}
+
+pub fn secret_raises(inventory: &contracts::SecretInventory, now: DateTime<Utc>) -> Vec<Raise> {
+    let mut raises = Vec::new();
+    for secret in &inventory.secrets {
+        let state = secret_state(secret, now);
+        let severity = match state {
+            "expired" => Severity::Critical,
+            "expiring" => Severity::Warning,
+            "unknown" => Severity::Info,
+            _ => continue,
+        };
+        let date = match &secret.expiry {
+            contracts::SecretExpiry::At { date } => date.to_string(),
+            _ => "unknown".into(),
+        };
+        raises.push(Raise {
+            source: "secrets".into(),
+            dedupe_key: format!("secrets:{}:{state}", secret.id),
+            severity,
+            title: format!("Secret {}: {state}", secret.id),
+            body: format!(
+                "{}; date: {date}; custodian: {}; rotation: {} — {}",
+                secret.id, secret.custodian, secret.rotation.method, secret.rotation.command
+            ),
+            subject_type: None,
+            subject_id: None,
+            url: None,
+        });
+    }
+    merge_same_key(raises)
+}
 
 /// Include every stalled generation, not the capped informational Today list.
 pub async fn today_with_stalled(hub: &Hub, today: &Today) -> DResult<Vec<Raise>> {

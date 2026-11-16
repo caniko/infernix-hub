@@ -68,6 +68,12 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
         (Effect::Read, hub_status_route(hub.clone())),
         (
             Effect::Read,
+            read_tool("hub_secrets", "Secret inventory and expiry states.", hub.clone(), |hub| async move {
+                hub.secrets().await.map(|value| json_text!(value))
+            }),
+        ),
+        (
+            Effect::Read,
             read_tool(
                 "hub_today",
                 "Operator queues: pending reviews, active production, due releases, failed operations and overdue interactions.",
@@ -581,6 +587,7 @@ mod tests {
             actual,
             [
                 ("hub_status", Effect::Read),
+                ("hub_secrets", Effect::Read),
                 ("hub_today", Effect::Read),
                 ("hub_content", Effect::Read),
                 ("hub_relationships", Effect::Read),

@@ -312,6 +312,12 @@ in {
       '';
     };
 
+    secretInventoryFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description = "Inventory JSON written by canix. Its directory is mounted read-only and must be outside protected home directories.";
+    };
+
     database = {
       createLocally = mkOption {
         type = types.bool;
@@ -715,6 +721,10 @@ in {
           message = "fleetix-hub: fleetStatusFile must live outside /home, /root and /run/user (the unit runs with ProtectHome).";
         }
         {
+          assertion = cfg.secretInventoryFile == null || !lib.any (home: lib.hasPrefix home (toString cfg.secretInventoryFile)) ["/home/" "/root/" "/run/user/"];
+          message = "fleetix-hub: secretInventoryFile must live outside /home, /root and /run/user (the unit runs with ProtectHome).";
+        }
+        {
           assertion = cfg.integrations.windmill != "fixture" || cfg.integrations.comfy == "fixture";
           message = "fleetix-hub: a fixture Windmill runs procedures in-process and needs a fixture ComfyUI.";
         }
@@ -799,6 +809,7 @@ in {
           }
           // optionalAttrs (seedFile != null) {HUB_SEED_FILE = toString seedFile;}
           // optionalAttrs (cfg.fleetStatusFile != null) {HUB_FLEET_STATUS_FILE = toString cfg.fleetStatusFile;}
+          // optionalAttrs (cfg.secretInventoryFile != null) {HUB_SECRET_INVENTORY_FILE = toString cfg.secretInventoryFile;}
           // optionalAttrs (cfg.database.urlFile == null) {DATABASE_URL = cfg.database.url;}
           // optionalAttrs cfg.migrations.enable {HUB_MIGRATE_ON_START = "0";}
           // optionalAttrs (cfg.integrations.assistant == "live" && llmUrl != null) {
@@ -830,10 +841,10 @@ in {
             SystemCallFilter = ["@system-service" "~@privileged"];
             ReadWritePaths = [(toString cfg.assetDir)];
           }
-          // optionalAttrs (cfg.fleetStatusFile != null) {
+          // optionalAttrs (cfg.fleetStatusFile != null || cfg.secretInventoryFile != null) {
             # Bind the directory, not the file: atomic replacement gives the
             # snapshot a new inode. Read-only is all the hub needs.
-            BindReadOnlyPaths = [(builtins.dirOf (toString cfg.fleetStatusFile))];
+            BindReadOnlyPaths = lib.optional (cfg.fleetStatusFile != null) (builtins.dirOf (toString cfg.fleetStatusFile)) ++ lib.optional (cfg.secretInventoryFile != null) (builtins.dirOf (toString cfg.secretInventoryFile));
           };
       };
     }

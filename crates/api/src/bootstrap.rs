@@ -30,6 +30,7 @@ pub struct Settings {
     /// Fleet snapshot written by `canix fleet status --write`; absent when the
     /// hub has no fleet configured.
     pub fleet_status_file: Option<PathBuf>,
+    pub secret_inventory_file: Option<PathBuf>,
     /// Raise `hub:summary-stale` when no daily summary has been written for
     /// this many hours; unset disables the rule.
     pub summary_stale_hours: Option<u32>,
@@ -70,6 +71,7 @@ impl Settings {
             registry_dir: env("HUB_REGISTRY_DIR").map(PathBuf::from).unwrap_or_else(|| "registry".into()),
             seed_file: env("HUB_SEED_FILE").map(PathBuf::from),
             fleet_status_file: env("HUB_FLEET_STATUS_FILE").map(PathBuf::from),
+            secret_inventory_file: env("HUB_SECRET_INVENTORY_FILE").map(PathBuf::from),
             summary_stale_hours: match env("HUB_SUMMARY_STALE_HOURS") {
                 None => None,
                 Some(v) => Some(v.parse().with_context(|| format!("HUB_SUMMARY_STALE_HOURS must be a number of hours, got {v}"))?),
@@ -95,6 +97,7 @@ impl Settings {
             registry_dir: "registry".into(),
             seed_file: Some("registry/hub.fixture.json".into()),
             fleet_status_file: None,
+            secret_inventory_file: None,
             summary_stale_hours: None,
             company_id: None,
             paperclip: AdapterMode::Fixture,
@@ -387,7 +390,15 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
     }
     load_registry(&hub, &s.registry_dir.join("comfyui")).await?;
     load_registry(&hub, &s.registry_dir.join("pipeline")).await?;
-    Ok((AppState { hub, fixture_paperclip: fx.paperclip.clone(), fleet_status_file: s.fleet_status_file.clone() }, fx))
+    Ok((
+        AppState {
+            hub,
+            fixture_paperclip: fx.paperclip.clone(),
+            fleet_status_file: s.fleet_status_file.clone(),
+            secret_inventory_file: s.secret_inventory_file.clone(),
+        },
+        fx,
+    ))
 }
 
 #[derive(Debug, Deserialize)]

@@ -18,6 +18,67 @@ pub mod client;
 /// desktop and CLI never disagree about its shape.
 pub use fleetix::status as fleet;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretInventory {
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub secrets: Vec<Secret>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretInventoryView {
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub secrets: Vec<SecretView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretView {
+    #[serde(flatten)]
+    pub secret: Secret,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Secret {
+    pub id: String,
+    pub tree: String,
+    pub scope: String,
+    pub category: String,
+    pub project: Option<String>,
+    pub kind: String,
+    pub custodian: String,
+    pub expiry: SecretExpiry,
+    pub rotated_at: Option<String>,
+    pub rotation: SecretRotation,
+    pub consumers: Vec<SecretConsumer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SecretExpiry {
+    At { date: chrono::NaiveDate },
+    Never,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretRotation {
+    pub method: String,
+    pub command: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SecretConsumer {
+    File { path: String },
+    Env { name: String },
+}
+
 /// Contract version carried in the URL prefix and in hashed payloads.
 pub const API_VERSION: &str = "v1";
 /// Request/response header carrying the shared correlation id.

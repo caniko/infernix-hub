@@ -114,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
             let mut s = Settings::fixture(&database_url, &bind);
             // Fixtures simulate integrations; the fleet snapshot is a file either way.
             s.fleet_status_file = std::env::var_os("HUB_FLEET_STATUS_FILE").map(Into::into);
+            s.secret_inventory_file = std::env::var_os("HUB_SECRET_INVENTORY_FILE").map(Into::into);
             let (state, fx) = bootstrap::build(&s).await?;
             for (name, role, token) in DEV_TOKENS {
                 domain::system::issue_token(&state.hub.db, name, *role, Some(token.to_string())).await?;

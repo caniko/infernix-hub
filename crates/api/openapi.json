@@ -961,6 +961,18 @@
         "x-roles": "see domain command"
       }
     },
+    "/v1/secrets": {
+      "get": {
+        "operationId": "secrets",
+        "responses": {
+          "200": { "description": "Secret inventory with computed states", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "4XX": { "description": "ApiError", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+          "5XX": { "description": "Inventory unavailable or invalid" }
+        },
+        "security": [{ "bearer": [] }],
+        "x-roles": "operator, agent, procedure, ingest"
+      }
+    },
     "/v1/fleet/status": {
       "get": {
         "operationId": "fleet_status",
