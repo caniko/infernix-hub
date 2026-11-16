@@ -315,6 +315,8 @@ pack registration. It says nothing about a live service.
 Influencers: fixture-tested against PostgreSQL, including member and account
 rules and delegated brief dynamics. No live adapter is changed by this feature.
 Look image checks: operator attestation; no automated image check exists.
+Desktop character Image step: built; upload, library selection and look generation are not yet fixture-tested through the desktop.
+Desktop Image, Refine and pin screens are built with unit-test coverage only, not verified in a running GUI.
 The desktop Influencers workspace is built and covered by unit tests only; it
 has not been verified in a running GUI.
 

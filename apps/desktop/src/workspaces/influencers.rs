@@ -51,6 +51,66 @@ pub fn InfluencersView() -> Element {
     let personas = (store.personas).cloned();
     let selected_persona_id = (store.selected_persona).cloned();
     let persona = personas.data.as_ref().and_then(|items| items.iter().find(|p| Some(p.id) == selected_persona_id).cloned());
+    let member_client = client.clone();
+    use_effect(move || {
+        let selected = (store.selected_influencer).cloned();
+        let members = (store.influencers)
+            .cloned()
+            .data
+            .unwrap_or_default()
+            .into_iter()
+            .find(|item| Some(item.id) == selected)
+            .map(|item| item.members)
+            .unwrap_or_default();
+        let client = member_client.clone();
+        spawn(async move {
+            for member in members {
+                let Some(reference_id) = member.reference_asset_id else { continue };
+                if store.asset_images.peek().contains_key(&reference_id) {
+                    continue;
+                }
+                if let Ok(look) = api::timed(client.character_look(member.persona_id)).await
+                    && let Some(asset) = look
+                        .uploads
+                        .into_iter()
+                        .chain(look.passes.into_iter().flat_map(|pass| pass.assets))
+                        .find(|asset| asset.id == reference_id)
+                {
+                    api::load_asset_bytes(store, client.clone(), &[asset]).await;
+                }
+            }
+        });
+    });
+    let mut reference = use_signal(|| None::<contracts::Asset>);
+    let reference_client = client.clone();
+    use_effect(move || {
+        let selected = (store.selected_persona).cloned();
+        if wizard().is_some() {
+            return;
+        }
+        reference.set(None);
+        let Some(persona) = selected else { return };
+        let client = reference_client.clone();
+        spawn(async move {
+            match api::timed(client.character_look(persona)).await {
+                Ok(look) => {
+                    let asset = look.reference.and_then(|reference| {
+                        look.uploads
+                            .into_iter()
+                            .chain(look.passes.into_iter().flat_map(|pass| pass.assets))
+                            .find(|asset| asset.id == reference.asset_id)
+                    });
+                    if let Some(asset) = asset.as_ref() {
+                        api::load_asset_bytes(store, client, std::slice::from_ref(asset)).await;
+                    }
+                    if (store.selected_persona).cloned() == Some(persona) {
+                        reference.set(asset);
+                    }
+                }
+                Err(err) => store.notify(false, format!("{} — {}", err.code, err.message)),
+            }
+        });
+    });
     let canon_load = (store.canon).cloned();
     let revisions: Vec<CanonRevision> = canon_load
         .data
@@ -225,6 +285,12 @@ pub fn InfluencersView() -> Element {
                                         if let Some(canon) = accepted.clone() {
                                             Chip { label: format!("Accepted rev {}", canon.revision), tone: Some("ok".to_string()) }
                                         }
+                                    }
+                                    Panel { title: "Pinned reference".to_string(), caption: None,
+                                        if let Some(asset) = reference() {
+                                            div { class: "asset-frame", if let Some(uri) = (store.asset_images).cloned().get(&asset.id) { img { src: "{uri}", alt: "{asset.alt_text}" } } else { span { class: "asset-missing", "{asset.mime}" } } }
+                                        } else { p { "No reference pinned yet." } }
+                                        p { "Pinning another image asks first, lists the influencers it affects, and marks 3D and rig for redo. The approved model stays in use until you approve a new one." }
                                     }
                                     Panel { title: "Accepted canon".to_string(), caption: Some("read-only".to_string()),
                                         if let Some(canon) = accepted.clone() {
@@ -484,13 +550,18 @@ pub fn InfluencersView() -> Element {
                                         div { class: "glass-card", key: "{member.persona_id}",
                                             h3 { "{member.name}" }
                                             p { "{member.role}" }
+                                            if let Some(reference_id) = member.reference_asset_id {
+                                                div { class: "asset-frame", if let Some(uri) = (store.asset_images).cloned().get(&reference_id) { img { src: "{uri}", alt: "Pinned reference for {member.name}" } } else { span { class: "asset-missing", "Reference image unavailable" } } }
+                                            }
                                             div { class: "row", Chip { label: status.to_string(), tone: Some(tone.to_string()) }
                                                 Chip { label: if bio_done { "Bio · done".to_string() } else { "Bio · —".to_string() }, tone: Some(if bio_done { "ok" } else { "muted" }.to_string()) }
-                                                for stage in ["Look", "3D", "Rig", "Voice"] { Chip { label: format!("{stage} · —"), tone: Some("muted".to_string()) } }
+                                                Chip { label: if member.reference_asset_id.is_some() { "Look · done".to_string() } else { "Look · —".to_string() }, tone: Some(if member.reference_asset_id.is_some() { "ok" } else { "muted" }.to_string()) }
+                                                for stage in ["3D", "Rig", "Voice"] { Chip { label: format!("{stage} · —"), tone: Some("muted".to_string()) } }
                                             }
                                         }
                                         } }
                                     }
+                                    p { "Pinning another image asks first, lists the influencers it affects, and marks 3D and rig for redo. The approved model stays in use until you approve a new one." }
                                 }
                             }
                         },
