@@ -218,6 +218,21 @@ impl HubClient {
     pub async fn canon(&self, persona: Uuid) -> Result<Vec<CanonRevision>, ClientError> {
         self.get(&format!("/personas/{persona}/canon")).await
     }
+    pub async fn set_profile(&self, persona: Uuid, body: &CharacterProfile) -> Result<Persona, ClientError> {
+        self.put(&format!("/personas/{persona}/profile"), body).await
+    }
+    pub async fn draft_canon(&self, persona: Uuid, body: &CanonDraftIn) -> Result<CanonBody, ClientError> {
+        self.post(&format!("/personas/{persona}/canon-draft"), body).await
+    }
+    pub async fn request_canon_comments(&self, revision: Uuid) -> Result<CanonRevision, ClientError> {
+        self.post(&format!("/canon/{revision}/request-comments"), &()).await
+    }
+    pub async fn comment_canon(&self, revision: Uuid, body: &CanonCommentIn) -> Result<CanonRevision, ClientError> {
+        self.post(&format!("/canon/{revision}/comments"), body).await
+    }
+    pub async fn canon_reviews(&self) -> Result<Vec<CanonRevision>, ClientError> {
+        self.get("/canon/reviews").await
+    }
     pub async fn propose_canon(&self, persona: Uuid, body: &CanonProposalIn) -> Result<CanonRevision, ClientError> {
         self.post(&format!("/personas/{persona}/canon"), body).await
     }

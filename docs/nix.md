@@ -178,8 +178,8 @@ unit after/wants `llama-swap.service` or `infernix-lb.service` respectively.
 - Paperclip: `PAPERCLIP_URL` defaults to `http://127.0.0.1:3117`. Paperclip is
   a home-manager user service (`paperclip-operations`), so there is no system
   unit ordering. The optional `paperclip_studio` settings row
-  (`{"project_id": …, "assignee_agent_id": …}`) routes delegated briefs to the
-  studio's project and producer agent.
+  (`{"project_id": …, "assignee_agent_id": …, "ceo_agent_id": …}`) routes delegated briefs to the
+  studio's project and producer agent and canon comment requests to the CEO.
 
 ### Publishing channels and approvals
 

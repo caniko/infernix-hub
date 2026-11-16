@@ -272,6 +272,7 @@ mod tests {
             name: "Field Notes".into(),
             canon: None,
             pending_proposals: 1,
+            profile: Default::default(),
         };
         let revision = CanonRevision {
             id: uuid::Uuid::new_v4(),
@@ -285,6 +286,9 @@ mod tests {
             proposed_by: "operator".into(),
             decided_by: Some("operator".into()),
             created_at: Utc.with_ymd_and_hms(2026, 11, 9, 12, 0, 0).unwrap(),
+            review_requested_at: None,
+            review_issue_url: None,
+            comments: Vec::new(),
         };
         let data = from_persona(&persona, std::slice::from_ref(&revision));
         assert!(data.ids.iter().any(|(k, _)| k == "persona id"));

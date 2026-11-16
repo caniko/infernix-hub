@@ -29,6 +29,9 @@
         "description": "See hub_contracts::CancelOut",
         "type": "object"
       },
+      "CanonCommentIn": {"description": "See hub_contracts::CanonCommentIn", "type": "object"},
+      "CanonDraftIn": {"description": "See hub_contracts::CanonDraftIn", "type": "object"},
+      "CharacterProfile": {"description": "See hub_contracts::CharacterProfile", "type": "object"},
       "CanonDecisionIn": {
         "description": "See hub_contracts::CanonDecisionIn",
         "type": "object"
@@ -449,6 +452,21 @@
         ],
         "x-roles": "see domain command"
       }
+    },
+    "/v1/canon/reviews": {
+      "get": {"operationId": "canon_reviews", "responses": {"200": {"description": "Canon revisions"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/canon/{id}/request-comments": {
+      "post": {"operationId": "request_canon_comments", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "CanonRevision"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/canon/{id}/comments": {
+      "post": {"operationId": "canon_comment", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CanonCommentIn"}}}}, "responses": {"200": {"description": "CanonRevision"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/profile": {
+      "put": {"operationId": "set_profile", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CharacterProfile"}}}}, "responses": {"200": {"description": "Persona"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/canon-draft": {
+      "post": {"operationId": "draft_canon", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CanonDraftIn"}}}}, "responses": {"200": {"description": "CanonBody"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
     },
     "/v1/canon/{id}/decision": {
       "post": {

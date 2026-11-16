@@ -191,9 +191,34 @@ pub struct Persona {
     pub id: Uuid,
     pub company_id: String,
     pub name: String,
+    #[serde(default)]
+    pub profile: CharacterProfile,
     /// The newest accepted canon, if any.
     pub canon: Option<CanonRevision>,
     pub pending_proposals: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadsAs {
+    Adult,
+    NonHuman,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CharacterProfile {
+    #[serde(default)]
+    pub bio: String,
+    #[serde(default)]
+    pub reads_as: Option<ReadsAs>,
+    #[serde(default)]
+    pub look: String,
+    #[serde(default)]
+    pub palette: Vec<String>,
+    #[serde(default)]
+    pub voice: Option<String>,
+    #[serde(default)]
+    pub canon_draft: Option<CanonBody>,
 }
 
 /// Persona voice/brand rules plus accepted world canon.
@@ -222,6 +247,32 @@ pub struct CanonRevision {
     pub proposed_by: String,
     pub decided_by: Option<String>,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub review_requested_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub review_issue_url: Option<String>,
+    #[serde(default)]
+    pub comments: Vec<CanonComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonComment {
+    pub id: Uuid,
+    pub revision_id: Uuid,
+    pub author: String,
+    pub author_role: Role,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonCommentIn {
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonDraftIn {
+    pub bio: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1006,6 +1057,16 @@ pub struct CancelOut {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn character_profile_defaults_and_preserves_bio() {
+        let empty: CharacterProfile = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty, CharacterProfile::default());
+        let profile: CharacterProfile = serde_json::from_value(json!({"bio": "é  \n\n", "reads_as": "non_human"})).unwrap();
+        assert_eq!(profile.bio, "é  \n\n");
+        assert_eq!(profile.reads_as, Some(ReadsAs::NonHuman));
+        assert_eq!(serde_json::from_value::<CharacterProfile>(serde_json::to_value(&profile).unwrap()).unwrap(), profile);
+    }
 
     #[test]
     fn wire_names_match_serde() {

@@ -68,6 +68,13 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
         (Effect::Read, hub_status_route(hub.clone())),
         (
             Effect::Read,
+            read_tool("hub_canon_review", "Canon proposals waiting for comments.", hub.clone(), |hub| async move {
+                hub.canon_reviews().await.map(|value| json_text!(value))
+            }),
+        ),
+        (Effect::Write, canon_comment_tool(hub.clone())),
+        (
+            Effect::Read,
             read_tool("hub_influencers", "Influencers, their members, accounts and dynamics.", hub.clone(), |hub| async move {
                 hub.influencers().await.map(|value| json_text!(value))
             }),
@@ -119,6 +126,42 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
         (Effect::Write, notify_tool(hub.clone())),
         (Effect::Write, summary_tool(hub)),
     ]
+}
+
+fn canon_comment_tool(hub: HubClient) -> ToolRoute<()> {
+    ToolRoute::new(
+        Tool::new(
+            "hub_canon_comment",
+            "Comment on a proposed canon revision.",
+            schema(
+                json!({
+                    "revision_id": {"type": "string", "description": "Revision UUID."},
+                    "body": {"type": "string"}
+                }),
+                &["revision_id", "body"],
+            ),
+        ),
+        move |Parameters(args): Parameters<Value>| {
+            let hub = hub.clone();
+            async move {
+                let id = match required_uuid(&args, "revision_id") {
+                    Ok(id) => match uuid::Uuid::parse_str(id) {
+                        Ok(id) => id,
+                        Err(error) => return failed(error.to_string()),
+                    },
+                    Err(error) => return failed(error),
+                };
+                let body: contracts::CanonCommentIn = match serde_json::from_value(args) {
+                    Ok(body) => body,
+                    Err(error) => return failed(error.to_string()),
+                };
+                match hub.comment_canon(id, &body).await {
+                    Ok(value) => render(json_text!(value)),
+                    Err(error) => failed(error.to_string()),
+                }
+            }
+        },
+    )
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -587,6 +630,8 @@ mod tests {
             actual,
             [
                 ("hub_status", Effect::Read),
+                ("hub_canon_review", Effect::Read),
+                ("hub_canon_comment", Effect::Write),
                 ("hub_influencers", Effect::Read),
                 ("hub_today", Effect::Read),
                 ("hub_content", Effect::Read),

@@ -198,6 +198,8 @@ the `canix-hub` crate in the canix repository; its live channel is not qualified
 
 ### Paperclip
 
+Canon comment issues reuse `create_issue`; CEO wake on assignment is not verified; comments arrive through the hub MCP, not the Paperclip API.
+
 Version `0.3.1-unstable-2026-10-23`, commit `6f1bf1754c4862cbae59a58306652ded8a44cd17`.
 Adapter `live/paperclip.rs`. `create_issue`, `create_approval` and
 `get_approval` are contract-verified against `docs/contracts/paperclip-openapi-subset.json`

@@ -88,6 +88,144 @@ fn code(e: ClientError) -> String {
     }
 }
 
+async fn canon_test_proposal(h: &H) -> CanonRevision {
+    let p: Persona = h.op.post("/personas", &json!({"name": "Review character"})).await.unwrap();
+    h.op.propose_canon(
+        p.id,
+        &CanonProposalIn {
+            base_revision: None,
+            body: CanonBody { voice: "distinctive voice".into(), ..Default::default() },
+            source: CanonSource::Operator,
+            rationale: None,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn configure_ceo(h: &H) {
+    domain::sqlx::query(
+        "insert into settings (key, value) values ('paperclip_studio', $1) on conflict (key) do update set value = excluded.value",
+    )
+    .bind(json!({"project_id":"project_studio_content", "ceo_agent_id":"agent_ceo"}))
+    .execute(&h.hub.db)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn canon_r1_goes_to_the_ceo_for_comments_then_the_operator_accepts() {
+    let Some(h) = harness().await else { return };
+    configure_ceo(&h).await;
+    let p = canon_test_proposal(&h).await;
+    h.op.request_canon_comments(p.id).await.unwrap();
+    assert!(h.agent.canon_reviews().await.unwrap().iter().any(|r| r.id == p.id));
+    h.tick().await;
+    let requests = h.fx.paperclip.as_ref().unwrap().issue_requests();
+    let issue = requests.last().unwrap();
+    assert_eq!(issue.assignee_agent_id.as_deref(), Some("agent_ceo"));
+    assert!(issue.description.contains("distinctive voice"));
+    h.agent.comment_canon(p.id, &CanonCommentIn { body: "Looks good".into() }).await.unwrap();
+    assert!(h.op.notifications(None, 0, true).await.unwrap().items.iter().any(|n| n.dedupe_key == format!("canon:comment:{}", p.id)));
+    h.op.decide_canon(p.id, &CanonDecisionIn::Accept).await.unwrap();
+    assert_eq!(h.op.personas().await.unwrap().into_iter().find(|x| x.id == p.persona_id).unwrap().canon.unwrap().id, p.id);
+}
+
+#[tokio::test]
+async fn requesting_comments_twice_files_one_issue() {
+    let Some(h) = harness().await else { return };
+    configure_ceo(&h).await;
+    let p = canon_test_proposal(&h).await;
+    let first = h.op.request_canon_comments(p.id).await.unwrap();
+    assert_eq!(first, h.op.request_canon_comments(p.id).await.unwrap());
+    h.tick().await;
+    assert_eq!(h.fx.paperclip.as_ref().unwrap().issue_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn request_comments_without_a_configured_ceo_fails_closed() {
+    let Some(h) = harness().await else { return };
+    let p = canon_test_proposal(&h).await;
+    assert_eq!(code(h.op.request_canon_comments(p.id).await.unwrap_err()), "ceo_not_configured");
+    let count: i64 = domain::sqlx::query_scalar("select count(*) from outbox where idempotency_key = $1")
+        .bind(format!("issue:canon:{}", p.id))
+        .fetch_one(&h.hub.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn agents_comment_but_cannot_decide_canon() {
+    let Some(h) = harness().await else { return };
+    let p = canon_test_proposal(&h).await;
+    assert_eq!(h.agent.comment_canon(p.id, &CanonCommentIn { body: "Advice".into() }).await.unwrap().comments.len(), 1);
+    assert_eq!(code(h.agent.decide_canon(p.id, &CanonDecisionIn::Accept).await.unwrap_err()), "forbidden");
+}
+
+#[tokio::test]
+async fn a_later_agent_comment_notifies_again_after_acknowledgement() {
+    let Some(h) = harness().await else { return };
+    let p = canon_test_proposal(&h).await;
+    let key = format!("canon:comment:{}", p.id);
+    let open = |items: Vec<contracts::Notification>| items.into_iter().find(|n| n.dedupe_key == key && n.read_at.is_none());
+    h.agent.comment_canon(p.id, &CanonCommentIn { body: "First".into() }).await.unwrap();
+    let first = open(h.op.notifications(None, 0, true).await.unwrap().items).unwrap();
+    h.op.ack_notifications(&AckNotificationsIn { ids: vec![first.id], all: false }).await.unwrap();
+    assert!(open(h.op.notifications(None, 0, true).await.unwrap().items).is_none());
+    h.agent.comment_canon(p.id, &CanonCommentIn { body: "Second".into() }).await.unwrap();
+    assert!(open(h.op.notifications(None, 0, true).await.unwrap().items).unwrap().body.contains("Second"));
+}
+
+#[tokio::test]
+async fn comments_on_a_decided_revision_are_refused() {
+    let Some(h) = harness().await else { return };
+    let p = canon_test_proposal(&h).await;
+    h.op.decide_canon(p.id, &CanonDecisionIn::Accept).await.unwrap();
+    assert_eq!(code(h.agent.comment_canon(p.id, &CanonCommentIn { body: "Late".into() }).await.unwrap_err()), "canon_already_decided");
+}
+
+#[tokio::test]
+async fn agents_read_only_accepted_canon_while_a_proposal_awaits_comments() {
+    let Some(h) = harness().await else { return };
+    configure_ceo(&h).await;
+    let p = canon_test_proposal(&h).await;
+    h.op.decide_canon(p.id, &CanonDecisionIn::Accept).await.unwrap();
+    let next =
+        h.op.propose_canon(
+            p.persona_id,
+            &CanonProposalIn {
+                base_revision: Some(1),
+                body: CanonBody { voice: "new".into(), ..Default::default() },
+                source: CanonSource::Operator,
+                rationale: None,
+            },
+        )
+        .await
+        .unwrap();
+    h.op.request_canon_comments(next.id).await.unwrap();
+    assert_eq!(h.agent.personas().await.unwrap().into_iter().find(|x| x.id == p.persona_id).unwrap().canon.unwrap().id, p.id);
+}
+
+#[tokio::test]
+async fn draft_canon_from_bio_persists_nothing() {
+    let Some(h) = harness().await else { return };
+    let p: Persona = h.op.post("/personas", &json!({"name":"Draft"})).await.unwrap();
+    let draft = h.op.draft_canon(p.id, &CanonDraftIn { bio: "rule: always be kind".into() }).await.unwrap();
+    assert!(draft.rules.iter().any(|r| r.contains("kind")));
+    assert!(h.op.canon(p.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_profile_keeps_the_pasted_bio_verbatim() {
+    let Some(h) = harness().await else { return };
+    let p = h.persona().await;
+    let bio = "  Café  \n\n最後  \n";
+    let profile = CharacterProfile { bio: bio.into(), ..Default::default() };
+    assert_eq!(h.op.set_profile(p.id, &profile).await.unwrap().profile.bio, bio);
+    assert_eq!(h.op.personas().await.unwrap().into_iter().find(|x| x.id == p.id).unwrap().profile.bio, bio);
+}
+
 #[tokio::test]
 async fn a_solo_influencer_refuses_a_second_member() {
     let Some(h) = harness().await else { return };

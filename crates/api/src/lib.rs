@@ -154,6 +154,11 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/influencers/{id}/members/{persona_id}", axum::routing::put(put_influencer_member).delete(remove_influencer_member))
         .route("/influencers/{id}/accounts", axum::routing::put(set_influencer_accounts))
         .route("/personas/{id}/canon", get(canon_list).post(canon_propose))
+        .route("/personas/{id}/profile", axum::routing::put(set_profile))
+        .route("/personas/{id}/canon-draft", post(draft_canon))
+        .route("/canon/reviews", get(canon_reviews))
+        .route("/canon/{id}/request-comments", post(request_canon_comments))
+        .route("/canon/{id}/comments", post(canon_comment))
         .route("/canon/{id}/decision", post(canon_decide))
         .route("/workflows", get(workflows))
         .route("/accounts", get(accounts))
@@ -663,6 +668,26 @@ async fn create_persona(State(s): State<AppState>, Caller(a): Caller, Json(b): J
 }
 async fn canon_list(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<Vec<CanonRevision>> {
     call!(a, domain::canon::list(&s.hub, &a, id))
+}
+async fn set_profile(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<CharacterProfile>) -> R<Persona> {
+    call!(a, domain::canon::set_profile(&s.hub, &a, id, b))
+}
+async fn draft_canon(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<CanonDraftIn>) -> R<CanonBody> {
+    call!(a, domain::canon::draft_canon(&s.hub, &a, id, b))
+}
+async fn canon_reviews(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<CanonRevision>> {
+    call!(a, domain::canon::reviews(&s.hub, &a))
+}
+async fn request_canon_comments(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<CanonRevision> {
+    call!(a, domain::canon::request_comments(&s.hub, &a, id))
+}
+async fn canon_comment(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<CanonCommentIn>,
+) -> R<CanonRevision> {
+    call!(a, domain::canon::comment(&s.hub, &a, id, b))
 }
 async fn canon_propose(
     State(s): State<AppState>,
