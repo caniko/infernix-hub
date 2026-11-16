@@ -272,6 +272,7 @@ mod tests {
             name: "Field Notes".into(),
             canon: None,
             pending_proposals: 1,
+            reference_asset_id: None,
             profile: Default::default(),
         };
         let revision = CanonRevision {

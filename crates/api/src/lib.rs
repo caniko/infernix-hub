@@ -160,6 +160,7 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/personas/{id}/look/uploads", post(upload_look_image).layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)))
         .route("/personas/{id}/look/sources", post(add_look_source))
         .route("/personas/{id}/look/passes", post(request_look_pass))
+        .route("/personas/{id}/look/reference", post(pin_look_reference))
         .route("/canon/reviews", get(canon_reviews))
         .route("/canon/{id}/request-comments", post(request_canon_comments))
         .route("/canon/{id}/comments", post(canon_comment))
@@ -629,6 +630,9 @@ async fn personas(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Persona
 
 async fn character_look(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<CharacterLook> {
     call!(a, domain::look::get(&s.hub, &a, id))
+}
+async fn pin_look_reference(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<PinIn>) -> R<PinOut> {
+    call!(a, domain::look::pin(&s.hub, &a, id, b))
 }
 async fn upload_look_image(
     State(s): State<AppState>,

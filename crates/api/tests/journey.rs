@@ -321,7 +321,7 @@ async fn a_generation_has_exactly_one_owner() {
 }
 
 #[tokio::test]
-async fn a_look_image_cannot_be_kept_before_checks_exist() {
+async fn keeping_a_look_image_needs_the_three_required_attestations() {
     let Some(h) = harness().await else { return };
     let persona = h.persona().await;
     let id = Uuid::new_v4();
@@ -336,12 +336,175 @@ async fn a_look_image_cannot_be_kept_before_checks_exist() {
     .await
     .unwrap();
     assert_eq!(
-        code(h.op.select_asset(id, &SelectAssetIn { selected: true, alt_text: None }).await.unwrap_err()),
-        "keep_arrives_with_checks"
+        code(
+            h.op.select_asset(
+                id,
+                &SelectAssetIn { selected: true, attest: vec!["adult_or_non_human".into(), "not_sexualised".into()], ..Default::default() }
+            )
+            .await
+            .unwrap_err()
+        ),
+        "required_checks_missing"
     );
     let selected: bool =
         domain::sqlx::query_scalar("select selected from assets where id = $1").bind(id).fetch_one(&h.hub.db).await.unwrap();
     assert!(!selected);
+    let count: i64 =
+        domain::sqlx::query_scalar("select count(*) from image_checks where asset_id=$1").bind(id).fetch_one(&h.hub.db).await.unwrap();
+    assert_eq!(count, 0);
+    let kept =
+        h.op.select_asset(
+            id,
+            &SelectAssetIn {
+                selected: true,
+                attest: vec!["adult_or_non_human".into(), "not_sexualised".into(), "not_real_person".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(kept.selected);
+    assert_eq!(kept.checks.len(), 3);
+    assert!(kept.checks.iter().all(|c| c.checker == "operator:operator" && c.verdict == "pass"));
+    assert_eq!(
+        code(
+            h.op.select_asset(id, &SelectAssetIn { selected: true, attest: vec!["bogus".into()], ..Default::default() }).await.unwrap_err()
+        ),
+        "unknown_check"
+    );
+}
+
+#[tokio::test]
+async fn an_uploaded_image_already_carries_the_real_person_attestation() {
+    let Some(h) = harness().await else { return };
+    let asset = h.look_upload(h.persona().await.id).await;
+    assert!(asset.checks.iter().any(|c| c.check_key == "not_real_person" && c.verdict == "pass" && c.checker == "operator:operator"));
+    let kept =
+        h.op.select_asset(
+            asset.id,
+            &SelectAssetIn { selected: true, attest: vec!["adult_or_non_human".into(), "not_sexualised".into()], ..Default::default() },
+        )
+        .await
+        .unwrap();
+    assert!(kept.selected);
+    assert_eq!(kept.checks.len(), 3);
+}
+
+#[tokio::test]
+async fn advice_checks_never_block_keeping() {
+    let Some(h) = harness().await else { return };
+    let asset = h.look_upload(h.persona().await.id).await;
+    let kept =
+        h.op.select_asset(
+            asset.id,
+            &SelectAssetIn {
+                selected: true,
+                attest: vec!["adult_or_non_human".into(), "not_sexualised".into()],
+                advice: [("stylized".into(), false)].into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(kept.selected);
+    assert!(kept.checks.iter().any(|c| c.check_key == "stylized" && c.verdict == "fail"));
+}
+
+#[tokio::test]
+async fn an_agent_cannot_keep_a_look_image() {
+    let Some(h) = harness().await else { return };
+    let asset = h.look_upload(h.persona().await.id).await;
+    assert_eq!(
+        code(h.agent.select_asset(asset.id, &SelectAssetIn { selected: true, ..Default::default() }).await.unwrap_err()),
+        "forbidden"
+    );
+    let content = h.brief(None).await;
+    let id = Uuid::new_v4();
+    domain::sqlx::query("insert into assets (id, content_item_id, sha256, storage_key, mime, bytes, state, provenance, source_key) values ($1,$2,'sha','key','image/png',0,'ready','{}',$3)")
+        .bind(id).bind(content.id).bind(id.to_string()).execute(&h.hub.db).await.unwrap();
+    assert!(h.agent.select_asset(id, &SelectAssetIn { selected: true, ..Default::default() }).await.unwrap().selected);
+}
+
+#[tokio::test]
+async fn pin_requires_a_kept_image_of_this_character() {
+    let Some(h) = harness().await else { return };
+    let p = h.persona().await.id;
+    let a = h.look_upload(p).await;
+    let path = format!("/personas/{p}/look/reference");
+    let result: Result<serde_json::Value, _> = h.op.post(&path, &json!({"asset_id": a.id})).await;
+    assert_eq!(code(result.unwrap_err()), "pin_needs_a_kept_image");
+    let other: Persona = h.op.post("/personas", &json!({"name":"Other"})).await.unwrap();
+    h.op.select_asset(
+        a.id,
+        &SelectAssetIn { selected: true, attest: vec!["adult_or_non_human".into(), "not_sexualised".into()], ..Default::default() },
+    )
+    .await
+    .unwrap();
+    let result: Result<serde_json::Value, _> =
+        h.op.post(&format!("/personas/{}/look/reference", other.id), &json!({"asset_id":a.id})).await;
+    assert_eq!(code(result.unwrap_err()), "pin_needs_a_kept_image");
+}
+
+#[tokio::test]
+async fn repinning_asks_first_then_keeps_history_and_names_the_influencers() {
+    let Some(h) = harness().await else { return };
+    let p = h.persona().await.id;
+    for name in ["Alpha", "Beta"] {
+        let i: Influencer = h.op.post("/influencers", &json!({"name":name,"kind":"group"})).await.unwrap();
+        let _: Influencer = h.op.put(&format!("/influencers/{}/members/{p}", i.id), &json!({})).await.unwrap();
+    }
+    let a = h.look_upload(p).await;
+    let b = h.op.upload_look_image(p, "image/png", true, b"\x89PNG\r\n\x1a\nsecond".to_vec()).await.unwrap();
+    for id in [a.id, b.id] {
+        h.op.select_asset(
+            id,
+            &SelectAssetIn { selected: true, attest: vec!["adult_or_non_human".into(), "not_sexualised".into()], ..Default::default() },
+        )
+        .await
+        .unwrap();
+    }
+    let path = format!("/personas/{p}/look/reference");
+    let _: serde_json::Value = h.op.post(&path, &json!({"asset_id":a.id})).await.unwrap();
+    let result: Result<serde_json::Value, _> = h.op.post(&path, &json!({"asset_id":b.id})).await;
+    match result.unwrap_err() {
+        ClientError::Api { error, .. } => {
+            assert_eq!(error.code, "repin_needs_confirmation");
+            assert!(error.message.contains("Alpha") && error.message.contains("Beta"));
+        }
+        e => panic!("{e}"),
+    }
+    let result: serde_json::Value = h.op.post(&path, &json!({"asset_id":b.id,"confirm_repin":true})).await.unwrap();
+    assert_eq!(result["affected_influencers"], json!(["Alpha", "Beta"]));
+    assert_eq!(result["stale_stages"], json!(["3d", "rig"]));
+    let look: serde_json::Value = h.op.get(&format!("/personas/{p}/look")).await.unwrap();
+    assert_eq!(look["reference_history"].as_array().unwrap().len(), 2);
+    assert_eq!(look["reference"]["asset_id"], json!(b.id));
+    assert_eq!(look["reference_history"][1]["asset_id"], json!(a.id));
+    let same = h.op.pin_look_reference(p, &PinIn { asset_id: b.id, confirm_repin: false }).await.unwrap();
+    assert_eq!(same.reference.asset_id, b.id);
+    assert_eq!(h.op.character_look(p).await.unwrap().reference_history.len(), 2);
+    assert_eq!(h.op.personas().await.unwrap().into_iter().find(|v| v.id == p).unwrap().reference_asset_id, Some(b.id));
+    for i in h.op.influencers().await.unwrap() {
+        assert_eq!(i.members[0].reference_asset_id, Some(b.id));
+    }
+}
+
+#[tokio::test]
+async fn a_pinned_image_cannot_be_unkept() {
+    let Some(h) = harness().await else { return };
+    let p = h.persona().await.id;
+    let a = h.look_upload(p).await;
+    h.op.select_asset(
+        a.id,
+        &SelectAssetIn { selected: true, attest: vec!["adult_or_non_human".into(), "not_sexualised".into()], ..Default::default() },
+    )
+    .await
+    .unwrap();
+    let _: serde_json::Value = h.op.post(&format!("/personas/{p}/look/reference"), &json!({"asset_id":a.id})).await.unwrap();
+    assert_eq!(
+        code(h.op.select_asset(a.id, &SelectAssetIn { selected: false, ..Default::default() }).await.unwrap_err()),
+        "asset_is_pinned"
+    );
 }
 
 async fn canon_test_proposal(h: &H) -> CanonRevision {
@@ -692,7 +855,13 @@ impl H {
     /// Select all ready assets with alt text.
     async fn select_all(&self, content: Uuid) {
         for a in self.op.content_detail(content).await.unwrap().assets {
-            self.op.select_asset(a.id, &SelectAssetIn { selected: true, alt_text: Some("A kiln glowing at dusk".into()) }).await.unwrap();
+            self.op
+                .select_asset(
+                    a.id,
+                    &SelectAssetIn { selected: true, alt_text: Some("A kiln glowing at dusk".into()), ..Default::default() },
+                )
+                .await
+                .unwrap();
         }
     }
 
@@ -783,7 +952,7 @@ async fn complete_fixture_journey() {
     assert!(String::from_utf8_lossy(&bytes).contains("FIXTURE"));
 
     // Freeze without alt text is refused; then select, freeze, approve.
-    h.op.select_asset(asset.id, &SelectAssetIn { selected: true, alt_text: None }).await.unwrap();
+    h.op.select_asset(asset.id, &SelectAssetIn { selected: true, ..Default::default() }).await.unwrap();
     let err =
         h.op.freeze_release(
             item.id,

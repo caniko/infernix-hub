@@ -480,6 +480,9 @@
     "/v1/personas/{id}/look/passes": {
       "post": {"operationId": "request_look_pass", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"200": {"description": "LookPass"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
     },
+    "/v1/personas/{id}/look/reference": {
+      "post": {"operationId": "pin_look_reference", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["asset_id"], "properties": {"asset_id": {"type": "string", "format": "uuid"}, "confirm_repin": {"type": "boolean", "default": false}}}}}}, "responses": {"200": {"description": "PinOut"}}, "security": [{"bearer": []}], "x-roles": "operator"}
+    },
     "/v1/canon/{id}/decision": {
       "post": {
         "operationId": "canon_decide",

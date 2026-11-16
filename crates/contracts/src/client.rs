@@ -127,6 +127,9 @@ impl HubClient {
     pub async fn character_look(&self, id: Uuid) -> Result<CharacterLook, ClientError> {
         self.get(&format!("/personas/{id}/look")).await
     }
+    pub async fn pin_look_reference(&self, id: Uuid, body: &PinIn) -> Result<PinOut, ClientError> {
+        self.post(&format!("/personas/{id}/look/reference"), body).await
+    }
     pub async fn upload_look_image(&self, id: Uuid, mime: &str, attested: bool, bytes: Vec<u8>) -> Result<Asset, ClientError> {
         let mut req =
             self.http.post(self.url(&format!("/personas/{id}/look/uploads"))).header(reqwest::header::CONTENT_TYPE, mime).body(bytes);

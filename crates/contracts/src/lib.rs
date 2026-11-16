@@ -163,6 +163,8 @@ pub struct InfluencerMember {
     pub name: String,
     pub role: String,
     pub has_accepted_canon: bool,
+    #[serde(default)]
+    pub reference_asset_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -196,6 +198,8 @@ pub struct Persona {
     /// The newest accepted canon, if any.
     pub canon: Option<CanonRevision>,
     pub pending_proposals: i64,
+    #[serde(default)]
+    pub reference_asset_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -732,6 +736,15 @@ pub struct ArtifactRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageCheck {
+    pub check_key: String,
+    pub verdict: String,
+    pub checker: String,
+    pub detail: String,
+    pub checked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Asset {
     pub id: Uuid,
     pub content_item_id: Option<Uuid>,
@@ -746,6 +759,8 @@ pub struct Asset {
     /// prompt id, engine instance, workflow hash, node id, filename.
     pub provenance: Value,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub checks: Vec<ImageCheck>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -775,6 +790,36 @@ pub struct LookPass {
 pub struct CharacterLook {
     pub uploads: Vec<Asset>,
     pub passes: Vec<LookPass>,
+    #[serde(default)]
+    pub reference: Option<Reference>,
+    #[serde(default)]
+    pub reference_history: Vec<Reference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reference {
+    pub id: Uuid,
+    pub persona_id: Uuid,
+    pub asset_id: Uuid,
+    pub sha256: String,
+    pub pinned_by: String,
+    pub pinned_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PinIn {
+    pub asset_id: Uuid,
+    #[serde(default)]
+    pub confirm_repin: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PinOut {
+    pub reference: Reference,
+    #[serde(default)]
+    pub affected_influencers: Vec<String>,
+    #[serde(default)]
+    pub stale_stages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -782,10 +827,14 @@ pub struct LookSourceIn {
     pub asset_id: Uuid,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SelectAssetIn {
     pub selected: bool,
     pub alt_text: Option<String>,
+    #[serde(default)]
+    pub attest: Vec<String>,
+    #[serde(default)]
+    pub advice: std::collections::BTreeMap<String, bool>,
 }
 
 // ── Releases & publication ──────────────────────────────────────────────────

@@ -230,6 +230,7 @@ mod tests {
             profile: CharacterProfile::default(),
             canon: None,
             pending_proposals: 0,
+            reference_asset_id: None,
         };
         assert_eq!(next_proposal(&persona, CanonBody::default()).base_revision, None);
         persona.canon = Some(contracts::CanonRevision {

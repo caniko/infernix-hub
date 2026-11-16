@@ -8,6 +8,7 @@ const SELECT: &str = "select to_jsonb(t) from (
     select i.id, i.company_id, i.name, i.kind, i.premise, i.dynamics, i.created_at,
       coalesce((select jsonb_agg(to_jsonb(m) order by m.added_at, m.persona_id) from (
         select im.persona_id, p.name, im.role, im.added_at,
+          (select asset_id from persona_references where persona_id=p.id order by pinned_at desc, id desc limit 1) as reference_asset_id,
           exists(select 1 from canon_revisions c where c.persona_id = p.id and c.state = 'accepted') as has_accepted_canon
         from influencer_members im join personas p on p.id = im.persona_id where im.influencer_id = i.id
       ) m), '[]'::jsonb) as members,

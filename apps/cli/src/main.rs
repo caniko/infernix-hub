@@ -295,7 +295,9 @@ async fn main() -> Result<()> {
             print(c.generate(content, &GenerateIn { workflow_id: workflow, inputs: json!({ "prompt": prompt }), variants }).await?)
         }
         Cmd::CancelGeneration { id } => print(c.cancel_generation(id).await?),
-        Cmd::Select { asset, alt } => print(c.select_asset(asset, &SelectAssetIn { selected: true, alt_text: Some(alt) }).await?),
+        Cmd::Select { asset, alt } => {
+            print(c.select_asset(asset, &SelectAssetIn { selected: true, alt_text: Some(alt), ..Default::default() }).await?)
+        }
         Cmd::Freeze { content, account, text, not_before, not_after } => print(
             c.freeze_release(
                 content,

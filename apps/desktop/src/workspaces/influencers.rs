@@ -728,6 +728,7 @@ mod tests {
             name: "One".into(),
             role: String::new(),
             has_accepted_canon: false,
+            reference_asset_id: None,
         });
         assert_eq!(super::influencer_status(&influencer), ("Draft", "warn"));
         influencer.members[0].has_accepted_canon = true;
@@ -737,6 +738,7 @@ mod tests {
             name: "Two".into(),
             role: String::new(),
             has_accepted_canon: false,
+            reference_asset_id: None,
         });
         assert_eq!(super::influencer_status(&influencer), ("Draft", "warn"));
         influencer.members[1].has_accepted_canon = true;

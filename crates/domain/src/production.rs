@@ -2092,8 +2092,7 @@ pub async fn admission(hub: &Hub, generation_id: Uuid) -> DResult<Admission> {
 
 // ── Assets ──────────────────────────────────────────────────────────────────
 
-pub(crate) const ASSET_COLS: &str =
-    "id, content_item_id, persona_id, generation_request_id, sha256, mime, bytes, state, selected, alt_text, provenance, created_at";
+pub(crate) const ASSET_COLS: &str = "id, content_item_id, persona_id, generation_request_id, sha256, mime, bytes, state, selected, alt_text, provenance, created_at, coalesce((select jsonb_agg(to_jsonb(c) - 'asset_id' order by c.check_key, c.checker) from image_checks c where c.asset_id = assets.id), '[]'::jsonb) as checks";
 
 pub async fn assets_for_content(hub: &Hub, content_id: Uuid) -> DResult<Vec<Asset>> {
     let rows: Vec<Value> = sqlx::query_scalar(&format!(
@@ -2118,6 +2117,53 @@ pub async fn all_assets(hub: &Hub, actor: &Actor) -> DResult<Vec<Asset>> {
 pub async fn select_asset(hub: &Hub, actor: &Actor, asset_id: Uuid, input: SelectAssetIn) -> DResult<Asset> {
     actor.require(OPERATOR_OR_AGENT)?;
     let mut tx = hub.db.begin().await?;
+    let persona_id: Option<Uuid> = sqlx::query_scalar("select persona_id from assets where id = $1 and state = 'ready'")
+        .bind(asset_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DomainError::NotFound("ready asset"))?;
+    if let Some(persona_id) = persona_id {
+        actor.require(crate::OPERATOR)?;
+        sqlx::query("select id from personas where id=$1 for update").bind(persona_id).execute(&mut *tx).await?;
+        if !input.selected {
+            let pinned: Option<Uuid> =
+                sqlx::query_scalar("select asset_id from persona_references where persona_id=$1 order by pinned_at desc, id desc limit 1")
+                    .bind(persona_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if pinned == Some(asset_id) {
+                return Err(conflict("asset_is_pinned", "the current reference cannot be unkept"));
+            }
+        }
+        const REQUIRED: [&str; 3] = ["adult_or_non_human", "not_sexualised", "not_real_person"];
+        const KNOWN: [&str; 5] = ["adult_or_non_human", "not_sexualised", "not_real_person", "stylized", "three_d_ready"];
+        for key in input.attest.iter().chain(input.advice.keys()) {
+            if !KNOWN.contains(&key.as_str()) {
+                return Err(invalid("unknown_check", format!("unknown check: {key}")));
+            }
+        }
+        if input.selected {
+            let checker = actor.name();
+            for (key, verdict) in input
+                .attest
+                .iter()
+                .map(|key| (key, "pass"))
+                .chain(input.advice.iter().map(|(key, pass)| (key, if *pass { "pass" } else { "fail" })))
+            {
+                sqlx::query("insert into image_checks (asset_id, check_key, verdict, checker) values ($1,$2,$3,$4) on conflict (asset_id, check_key, checker) do update set verdict=excluded.verdict, detail='', checked_at=now()")
+                    .bind(asset_id).bind(key).bind(verdict).bind(&checker).execute(&mut *tx).await?;
+            }
+            let passed: Vec<String> =
+                sqlx::query_scalar("select distinct check_key from image_checks where asset_id=$1 and verdict='pass'")
+                    .bind(asset_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            let missing: Vec<&str> = REQUIRED.into_iter().filter(|key| !passed.iter().any(|p| p == key)).collect();
+            if !missing.is_empty() {
+                return Err(invalid("required_checks_missing", format!("missing required checks: {}", missing.join(", "))));
+            }
+        }
+    }
     let row: Option<Value> = sqlx::query_scalar(&format!(
         "update assets set selected = $2, alt_text = coalesce($3, alt_text) where id = $1 and state = 'ready'
          returning to_jsonb((select t from (select {ASSET_COLS}) t))"
@@ -2128,9 +2174,6 @@ pub async fn select_asset(hub: &Hub, actor: &Actor, asset_id: Uuid, input: Selec
     .fetch_optional(&mut *tx)
     .await?;
     let asset: Asset = decode_one(row.ok_or(DomainError::NotFound("ready asset"))?)?;
-    if asset.persona_id.is_some() {
-        return Err(invalid("keep_arrives_with_checks", "look images require checks before selection"));
-    }
     let (subject_type, subject_id) = owner_subject(asset.content_item_id, asset.persona_id)?;
     audit(
         &mut tx,

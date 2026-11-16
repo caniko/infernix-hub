@@ -314,6 +314,7 @@ pack registration. It says nothing about a live service.
 
 Influencers: fixture-tested against PostgreSQL, including member and account
 rules and delegated brief dynamics. No live adapter is changed by this feature.
+Look image checks: operator attestation; no automated image check exists.
 The desktop Influencers workspace is built and covered by unit tests only; it
 has not been verified in a running GUI.
 

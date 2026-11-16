@@ -1,10 +1,12 @@
 //! Persona-owned look images and generation passes.
 
-use contracts::{Asset, CharacterLook, GenerateIn, GenerationRequest, LookPass, LookPassIn, LookSize, LookSourceIn, Severity};
+use contracts::{
+    Asset, CharacterLook, GenerateIn, GenerationRequest, LookPass, LookPassIn, LookSize, LookSourceIn, PinIn, PinOut, Reference, Severity,
+};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{Actor, DResult, DomainError, Hub, OPERATOR, audit, decode, decode_one, hash, invalid, production};
+use crate::{Actor, DResult, DomainError, Hub, OPERATOR, audit, conflict, decode, decode_one, hash, invalid, production};
 
 fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -44,6 +46,8 @@ pub async fn upload(hub: &Hub, actor: &Actor, persona_id: Uuid, _mime: &str, att
     sqlx::query("insert into assets (id, persona_id, sha256, storage_key, mime, bytes, state, provenance, source_key) values ($1,$2,$3,$4,$5,$6,'ready',$7,$8) on conflict (source_key) do nothing")
         .bind(Uuid::new_v4()).bind(persona_id).bind(&sha).bind(key).bind(mime).bind(bytes.len() as i64)
         .bind(json!({"source":"operator_upload", "uploaded_by":actor.name(), "attested_not_real_person":true})).bind(&source_key).execute(&mut *tx).await?;
+    sqlx::query("insert into image_checks (asset_id, check_key, verdict, checker) select id, 'not_real_person', 'pass', $2 from assets where source_key=$1 on conflict (asset_id, check_key, checker) do update set verdict='pass', detail='', checked_at=now()")
+        .bind(&source_key).bind(actor.name()).execute(&mut *tx).await?;
     let row: Value =
         sqlx::query_scalar(&format!("select to_jsonb(t) from (select {} from assets where source_key=$1) t", production::ASSET_COLS))
             .bind(&source_key)
@@ -140,6 +144,65 @@ pub async fn request_pass(hub: &Hub, actor: &Actor, persona_id: Uuid, input: Loo
     Ok(LookPass { generation, assets: vec![] })
 }
 
+const REFERENCES: &str = "select to_jsonb(t) from (select r.id, r.persona_id, r.asset_id, a.sha256, r.pinned_by, r.pinned_at from persona_references r join assets a on a.id=r.asset_id where r.persona_id=$1 order by r.pinned_at desc, r.id desc) t";
+
+pub async fn pin(hub: &Hub, actor: &Actor, persona_id: Uuid, input: PinIn) -> DResult<PinOut> {
+    actor.require(OPERATOR)?;
+    let mut tx = hub.db.begin().await?;
+    sqlx::query_scalar::<_, Uuid>("select id from personas where id=$1 for update")
+        .bind(persona_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DomainError::NotFound("persona"))?;
+    let sha: String =
+        sqlx::query_scalar("select sha256 from assets where id=$1 and persona_id=$2 and state='ready' and selected for update")
+            .bind(input.asset_id)
+            .bind(persona_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| invalid("pin_needs_a_kept_image", "pin needs a kept image of this character"))?;
+    let history: Vec<Reference> = decode(sqlx::query_scalar(REFERENCES).bind(persona_id).fetch_all(&mut *tx).await?)?;
+    let previous = history.first();
+    let names: Vec<String> = sqlx::query_scalar(
+        "select i.name from influencers i join influencer_members m on m.influencer_id=i.id where m.persona_id=$1 order by i.name, i.id",
+    )
+    .bind(persona_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    if let Some(current) = previous {
+        if current.asset_id == input.asset_id {
+            return Ok(PinOut { reference: current.clone(), affected_influencers: names, stale_stages: vec![] });
+        }
+        if !input.confirm_repin {
+            return Err(conflict(
+                "repin_needs_confirmation",
+                format!("Re-pinning affects: {}. 3D and rig built from the old reference need redoing.", names.join(", ")),
+            ));
+        }
+    }
+    // ponytail: 3D and rig have no hub data yet, so "needs redo" is the audit entry and the response field; when those stages land they store the reference id they were built from and compare.
+    let stale_stages: Vec<String> = if previous.is_some() { vec!["3d".into(), "rig".into()] } else { vec![] };
+    sqlx::query("insert into persona_references (id, persona_id, asset_id, pinned_by, pinned_at) values ($1,$2,$3,$4,clock_timestamp())")
+        .bind(Uuid::new_v4())
+        .bind(persona_id)
+        .bind(input.asset_id)
+        .bind(actor.name())
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        actor,
+        "look.pinned",
+        "persona",
+        persona_id,
+        json!({"asset_id":input.asset_id, "sha256":sha, "previous_asset_id":previous.map(|r| r.asset_id), "stale_stages":stale_stages}),
+    )
+    .await?;
+    let reference: Reference = decode_one(sqlx::query_scalar(REFERENCES).bind(persona_id).fetch_one(&mut *tx).await?)?;
+    tx.commit().await?;
+    Ok(PinOut { reference, affected_influencers: names, stale_stages })
+}
+
 pub async fn get(hub: &Hub, actor: &Actor, persona_id: Uuid) -> DResult<CharacterLook> {
     actor.require(crate::ANY_READER)?;
     let mut conn = hub.db.acquire().await?;
@@ -167,7 +230,9 @@ pub async fn get(hub: &Hub, actor: &Actor, persona_id: Uuid) -> DResult<Characte
             LookPass { generation, assets }
         })
         .collect();
-    Ok(CharacterLook { uploads, passes })
+    let reference_history: Vec<Reference> = decode(sqlx::query_scalar(REFERENCES).bind(persona_id).fetch_all(&mut *conn).await?)?;
+    let reference = reference_history.first().cloned();
+    Ok(CharacterLook { uploads, passes, reference, reference_history })
 }
 
 pub async fn notify_finished(hub: &Hub) -> DResult<()> {

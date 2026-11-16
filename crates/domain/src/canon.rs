@@ -29,6 +29,7 @@ pub async fn create_persona(hub: &Hub, actor: &Actor, name: &str) -> DResult<Per
 
 const PERSONA_SELECT: &str = "select to_jsonb(t) from (
     select p.id, p.company_id, p.name, p.profile,
+      (select asset_id from persona_references where persona_id=p.id order by pinned_at desc, id desc limit 1) as reference_asset_id,
       (select to_jsonb(c) from (select id, persona_id, revision, base_revision, body, state, source, rationale, proposed_by, decided_by, created_at, review_requested_at, review_issue_url,
           (select coalesce(jsonb_agg(to_jsonb(cc) order by cc.created_at, cc.id), '[]'::jsonb) from canon_comments cc where cc.revision_id = canon_revisions.id) as comments
          from canon_revisions where persona_id = p.id and state = 'accepted') c) as canon,
