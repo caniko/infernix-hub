@@ -42,6 +42,18 @@ pub async fn timed<T>(future: impl Future<Output = Result<T, ClientError>>) -> R
     }
 }
 
+pub async fn create_persona(client: &HubClient, name: &str) -> Result<contracts::Persona, UiError> {
+    timed(client.post("/personas", &serde_json::json!({ "name": name }))).await
+}
+
+pub async fn set_profile(client: &HubClient, id: Uuid, profile: &contracts::CharacterProfile) -> Result<contracts::Persona, UiError> {
+    timed(client.set_profile(id, profile)).await
+}
+
+pub async fn draft_canon(client: &HubClient, id: Uuid, input: &contracts::CanonDraftIn) -> Result<contracts::CanonBody, UiError> {
+    timed(client.draft_canon(id, input)).await
+}
+
 fn keep<T: Clone + 'static>(mut signal: Signal<Loaded<T>>, error: UiError) {
     let mut current = signal.cloned();
     current.failed(error);

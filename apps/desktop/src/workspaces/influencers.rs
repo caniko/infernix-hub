@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::{
     api,
     components::{
-        Chip, EmptyState, ErrorCard, Loading, Panel,
+        Chip, EmptyState, ErrorCard, GatePrompt, Loading, Panel,
         chat::{ChatPanel, TranscriptLine},
         proposal::{DeltaRow, ListEditor, ProposalCard},
     },
@@ -27,6 +27,8 @@ pub fn InfluencersView() -> Element {
     let client = use_context::<HubClient>();
     let mut show_character = store.influencers_show_character;
     let mut show_new = use_signal(|| false);
+    let mut wizard = use_signal(|| None::<(Option<Uuid>, Option<Uuid>)>);
+    let mut pending_accept = use_signal(|| None::<(Uuid, Uuid, CanonDecisionIn)>);
     let influencers = (store.influencers).cloned();
     let selected_influencer_id = (store.selected_influencer).cloned();
     let influencer = influencers.data.as_ref().and_then(|items| items.iter().find(|item| Some(item.id) == selected_influencer_id).cloned());
@@ -133,6 +135,7 @@ pub fn InfluencersView() -> Element {
             div { class: "context-head",
                 h2 { "Influencers" }
                 button { class: "btn btn-glass", onclick: move |_| show_new.set(true), "New influencer" }
+                button { class: "btn btn-glass", onclick: move |_| wizard.set(Some((None, (store.selected_influencer).cloned()))), "New character" }
             }
             div { class: "context-list",
                 match influencers.data.clone() {
@@ -218,6 +221,7 @@ pub fn InfluencersView() -> Element {
                                     div { class: "work-head",
                                         div { h1 { "{persona.name}" } p { class: "hint", "company {persona.company_id} · {persona.pending_proposals} pending proposal(s)" } }
                                         div { class: "spacer" }
+                                        button { class: "btn btn-glass", onclick: move |_| wizard.set(Some((Some(persona.id), None))), "Edit" }
                                         if let Some(canon) = accepted.clone() {
                                             Chip { label: format!("Accepted rev {}", canon.revision), tone: Some("ok".to_string()) }
                                         }
@@ -275,6 +279,24 @@ pub fn InfluencersView() -> Element {
                                                         let editable = revision.body.voice.clone();
                                                         let description = describe_canon(&revision.body);
                                                         rsx! {
+                                                            div {
+                                                            if let Some((label, tone)) = canon_review_chip(&revision) { Chip { label: label.to_string(), tone: Some(tone.to_string()) } }
+                                                            if revision.review_requested_at.is_none() {
+                                                                {
+                                                                    let client = client.clone();
+                                                                    let (revision_id, persona_id) = (revision.id, revision.persona_id);
+                                                                    rsx! { button { class: "btn btn-glass btn-xs", onclick: move |_| {
+                                                                        let client = client.clone();
+                                                                        spawn(async move {
+                                                                            match api::timed(client.request_canon_comments(revision_id)).await {
+                                                                                Ok(_) => store.notify(true, "Sent to the CEO for comments.".to_string()),
+                                                                                Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
+                                                                            }
+                                                                            api::load_canon(store, client, persona_id).await;
+                                                                        });
+                                                                    }, "Send for comments" } }
+                                                                }
+                                                            }
                                                             ProposalCard {
                                                                 key: "{revision.id}",
                                                                 title: format!("revision {} · {}", revision.revision, revision.source),
@@ -291,9 +313,13 @@ pub fn InfluencersView() -> Element {
                                                                         }
                                                                         None => CanonDecisionIn::Accept,
                                                                     };
-                                                                    let client = client_accept.clone();
-                                                                    let revision_id = accept_rev.id;
-                                                                    let persona_id = accept_rev.persona_id;
+                                                                     let client = client_accept.clone();
+                                                                     let revision_id = accept_rev.id;
+                                                                     let persona_id = accept_rev.persona_id;
+                                                                     if canon_review_chip(&accept_rev) == Some(("Waiting for CEO comments", "warn")) {
+                                                                         pending_accept.set(Some((revision_id, persona_id, decision)));
+                                                                         return;
+                                                                     }
                                                                     spawn(async move {
                                                                         match api::timed(client.decide_canon(revision_id, &decision)).await {
                                                                             Ok(revision) => {
@@ -325,6 +351,10 @@ pub fn InfluencersView() -> Element {
                                                                         }
                                                                     });
                                                                 },
+                                                            }
+                                                            for comment in revision.comments.iter() {
+                                                                div { class: "glass-card", p { class: "label-tech", "{comment.author} · {comment.author_role} · {comment.created_at}" } p { style: "white-space: pre-wrap", "{comment.body}" } }
+                                                            }
                                                             }
                                                         }
                                                     }
@@ -430,7 +460,7 @@ pub fn InfluencersView() -> Element {
                             let kind = item.kind;
                             let id = item.id;
                             rsx! {
-                                div { class: "work-head", h1 { "{item.name}" } Chip { label: status.to_string(), tone: Some(tone.to_string()) } }
+                                div { class: "work-head", h1 { "{item.name}" } Chip { label: status.to_string(), tone: Some(tone.to_string()) } button { class: "btn btn-glass", onclick: move |_| wizard.set(Some((None, Some(id)))), "New character" } }
                                 Panel { title: "Influencer".to_string(), caption: None,
                                     div { class: "form-grid",
                                         div { class: "field-row", label { class: "label-tech", r#for: "influencer-premise", "Premise" } textarea { id: "influencer-premise", class: "input", value: "{premise}", oninput: move |e| premise.set(e.value()) } }
@@ -449,13 +479,17 @@ pub fn InfluencersView() -> Element {
                                 Panel { title: "Members".to_string(), caption: None,
                                     if item.members.is_empty() { EmptyState { title: "No members yet.".to_string(), hint: None } }
                                     for member in item.members {
+                                        { let bio_done = personas.data.as_ref().and_then(|people| people.iter().find(|p| p.id == member.persona_id)).is_some_and(|p| super::character::bio_stage_done(&p.profile));
+                                        rsx! {
                                         div { class: "glass-card", key: "{member.persona_id}",
                                             h3 { "{member.name}" }
                                             p { "{member.role}" }
                                             div { class: "row", Chip { label: status.to_string(), tone: Some(tone.to_string()) }
-                                                for stage in ["Bio", "Look", "3D", "Rig", "Voice"] { Chip { label: format!("{stage} · —"), tone: Some("muted".to_string()) } }
+                                                Chip { label: if bio_done { "Bio · done".to_string() } else { "Bio · —".to_string() }, tone: Some(if bio_done { "ok" } else { "muted" }.to_string()) }
+                                                for stage in ["Look", "3D", "Rig", "Voice"] { Chip { label: format!("{stage} · —"), tone: Some("muted".to_string()) } }
                                             }
                                         }
+                                        } }
                                     }
                                 }
                             }
@@ -465,6 +499,18 @@ pub fn InfluencersView() -> Element {
             }
         }
         if show_new() { NewInfluencerDialog { on_close: move |_| show_new.set(false) } }
+        if let Some((revision_id, persona_id, decision)) = pending_accept() {
+            GatePrompt { label: "The CEO has not commented yet. Accept anyway?".to_string(), approve_label: "Accept anyway".to_string(), reject_label: "Cancel".to_string(),
+                on_reject: move |_| pending_accept.set(None),
+                on_approve: { let client = client.clone(); move |_| { let client = client.clone(); let decision = decision.clone(); pending_accept.set(None); spawn(async move {
+                    match api::timed(client.decide_canon(revision_id, &decision)).await {
+                        Ok(revision) => { store.notify(true, format!("Canon revision {} is {}.", revision.revision, revision.state)); api::load_canon(store, client.clone(), persona_id).await; api::refresh_base(store, client).await; form_for.set(None); store.set_focus_proposal(None); },
+                        Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
+                    }
+                }); } },
+            }
+        }
+        if let Some((persona_id, influencer_id)) = wizard() { super::character::CharacterWizard { persona_id, influencer_id, on_close: move |_| wizard.set(None) } }
     }
 }
 
@@ -576,6 +622,16 @@ fn describe_canon(body: &CanonBody) -> String {
     format!("{} · {} rules · {} avoid · {} world", body.voice, body.rules.len(), body.avoid.len(), body.world.len())
 }
 
+fn canon_review_chip(revision: &CanonRevision) -> Option<(&'static str, &'static str)> {
+    if revision.state != CanonState::Proposed || revision.review_requested_at.is_none() {
+        None
+    } else if revision.comments.iter().any(|c| c.author_role == contracts::Role::Agent) {
+        Some(("CEO commented", "ok"))
+    } else {
+        Some(("Waiting for CEO comments", "warn"))
+    }
+}
+
 fn transcript(messages: &[contracts::ChatMessage]) -> Vec<TranscriptLine> {
     messages
         .iter()
@@ -601,6 +657,43 @@ fn influencer_status(influencer: &contracts::Influencer) -> (&'static str, &'sta
 mod tests {
     use contracts::{Influencer, InfluencerKind, InfluencerMember};
     use uuid::Uuid;
+
+    #[test]
+    fn review_chip_waits_until_an_agent_comments() {
+        use contracts::{CanonBody, CanonComment, CanonRevision, CanonSource, CanonState, Role};
+        let mut rev = CanonRevision {
+            id: Uuid::new_v4(),
+            persona_id: Uuid::new_v4(),
+            revision: 1,
+            base_revision: None,
+            body: CanonBody::default(),
+            state: CanonState::Proposed,
+            source: CanonSource::Operator,
+            rationale: None,
+            proposed_by: String::new(),
+            decided_by: None,
+            created_at: chrono::Utc::now(),
+            review_requested_at: None,
+            review_issue_url: None,
+            comments: vec![],
+        };
+        assert_eq!(super::canon_review_chip(&rev), None);
+        rev.review_requested_at = Some(chrono::Utc::now());
+        assert_eq!(super::canon_review_chip(&rev), Some(("Waiting for CEO comments", "warn")));
+        rev.comments.push(CanonComment {
+            id: Uuid::new_v4(),
+            revision_id: rev.id,
+            author: String::new(),
+            author_role: Role::Operator,
+            body: String::new(),
+            created_at: chrono::Utc::now(),
+        });
+        assert_eq!(super::canon_review_chip(&rev), Some(("Waiting for CEO comments", "warn")));
+        rev.comments[0].author_role = Role::Agent;
+        assert_eq!(super::canon_review_chip(&rev), Some(("CEO commented", "ok")));
+        rev.state = CanonState::Accepted;
+        assert_eq!(super::canon_review_chip(&rev), None);
+    }
 
     #[test]
     fn member_retry_skips_members_already_added() {

@@ -2,6 +2,7 @@
 //! central work surface; the inspector is shared chrome in `main.rs`.
 
 pub mod calendar;
+pub mod character;
 pub mod fleet;
 pub mod influencers;
 pub mod library;
