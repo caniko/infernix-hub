@@ -81,7 +81,7 @@ pub fn open_subject(store: Store, subject_type: &str, id: Uuid) {
             store.set_selected_news(Some(id));
         }
         "persona" => {
-            store.set_workspace(Workspace::Library);
+            store.set_workspace(Workspace::Influencers);
             store.set_selected_persona(Some(id));
         }
         "relationship" => {
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn static_entries_cover_navigation_and_commands() {
         let entries = static_entries();
-        assert_eq!(entries.iter().filter(|e| e.kind == "navigate").count(), 11);
+        assert_eq!(entries.iter().filter(|e| e.kind == "navigate").count(), Workspace::ALL.len());
         assert!(entries.iter().any(|e| e.action == Action::ToggleInspector));
         assert!(entries.iter().any(|e| e.action == Action::Refresh));
         assert!(entries.iter().any(|e| e.action == Action::RefreshFleet));

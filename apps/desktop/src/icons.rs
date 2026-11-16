@@ -26,6 +26,7 @@ pub fn workspace(w: Workspace) -> &'static str {
         Workspace::Studio => MISSIONS,
         Workspace::Calendar => CHANNELS,
         Workspace::Relationships => CHAT,
+        Workspace::Influencers => AGENTS,
         Workspace::Library => MEMORY,
     }
 }

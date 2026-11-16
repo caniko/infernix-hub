@@ -62,6 +62,13 @@ pub async fn refresh_fleet(store: Store, client: HubClient) {
     }
 }
 
+pub async fn refresh_influencers(store: Store, client: &HubClient) {
+    match timed(client.influencers()).await {
+        Ok(v) => put(store.influencers, v),
+        Err(e) => keep(store.influencers, e),
+    }
+}
+
 /// Refresh the data every workspace can need, plus status. Runs sequentially so
 /// a slow endpoint cannot stampede the hub; `poll_busy` prevents overlap.
 pub async fn refresh_base(store: Store, client: HubClient) {
@@ -86,6 +93,7 @@ pub async fn refresh_base(store: Store, client: HubClient) {
         Ok(v) => put(store.personas, v),
         Err(e) => keep(store.personas, e),
     }
+    refresh_influencers(store, &client).await;
     match timed(client.workflows()).await {
         Ok(v) => put(store.workflows, v),
         Err(e) => keep(store.workflows, e),
@@ -114,6 +122,7 @@ pub async fn refresh_base(store: Store, client: HubClient) {
     ensure_selection((store.content).cloned(), store.selected_content, |item| item.id);
     ensure_selection((store.news).cloned(), store.selected_news, |item| item.id);
     ensure_selection((store.personas).cloned(), store.selected_persona, |item| item.id);
+    ensure_selection((store.influencers).cloned(), store.selected_influencer, |item| item.id);
     ensure_selection((store.relationships).cloned(), store.selected_relationship, |item| item.id);
 
     store.set_poll_busy(false);

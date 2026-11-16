@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use contracts::{
-    Account, Asset, CanonRevision, ChatMessage, ContentDetail, ContentItem, NewsItem, Notification, NotificationPage, Persona,
+    Account, Asset, CanonRevision, ChatMessage, ContentDetail, ContentItem, Influencer, NewsItem, Notification, NotificationPage, Persona,
     PublicationIntent, Relationship, RelationshipDetail, ReleaseState, Renewal, SearchHit, SystemStatus, Today, Workflow,
 };
 use dioxus::prelude::*;
@@ -26,11 +26,12 @@ pub enum Workspace {
     Studio,
     Calendar,
     Relationships,
+    Influencers,
     Library,
 }
 
 impl Workspace {
-    pub const ALL: [Workspace; 11] = [
+    pub const ALL: [Workspace; 12] = [
         Workspace::Notifications,
         Workspace::Command,
         Workspace::Hosts,
@@ -41,6 +42,7 @@ impl Workspace {
         Workspace::Studio,
         Workspace::Calendar,
         Workspace::Relationships,
+        Workspace::Influencers,
         Workspace::Library,
     ];
 
@@ -56,6 +58,7 @@ impl Workspace {
             Workspace::Studio => "Studio",
             Workspace::Calendar => "Calendar",
             Workspace::Relationships => "Relationships",
+            Workspace::Influencers => "Influencers",
             Workspace::Library => "Library",
         }
     }
@@ -74,6 +77,7 @@ impl Workspace {
             Workspace::Studio => "studio",
             Workspace::Calendar => "calendar",
             Workspace::Relationships => "relationships",
+            Workspace::Influencers => "influencers",
             Workspace::Library => "library",
         }
     }
@@ -96,6 +100,7 @@ impl Workspace {
             Workspace::Studio => "7",
             Workspace::Calendar => "8",
             Workspace::Relationships => "9",
+            Workspace::Influencers => "i",
             Workspace::Library => "0",
         }
     }
@@ -120,7 +125,8 @@ impl Workspace {
             Workspace::Studio => "brief, generation, assets, release freeze and scheduling",
             Workspace::Calendar => "intents by day and account",
             Workspace::Relationships => "threads, ownership, drafts and handoff",
-            Workspace::Library => "personas, canon review, assets",
+            Workspace::Influencers => "influencers, characters and canon review",
+            Workspace::Library => "assets",
         }
     }
 
@@ -135,7 +141,8 @@ impl Workspace {
     /// Fleet workspaces use the whole stage: their lists carry their own
     /// columns, so there is no separate context list to pin beside them.
     pub fn full_width(self) -> bool {
-        self.section() == "FLEET"
+        // Library lost its context list when personas moved to Influencers.
+        self.section() == "FLEET" || self == Workspace::Library
     }
 }
 
@@ -256,6 +263,7 @@ pub struct Store {
     pub today: Signal<Loaded<Today>>,
     pub news: Signal<Loaded<Vec<NewsItem>>>,
     pub personas: Signal<Loaded<Vec<Persona>>>,
+    pub influencers: Signal<Loaded<Vec<Influencer>>>,
     pub workflows: Signal<Loaded<Vec<Workflow>>>,
     pub accounts: Signal<Loaded<Vec<Account>>>,
     pub content: Signal<Loaded<Vec<ContentItem>>>,
@@ -272,6 +280,8 @@ pub struct Store {
     pub selected_content: Signal<Option<Uuid>>,
     pub selected_news: Signal<Option<Uuid>>,
     pub selected_persona: Signal<Option<Uuid>>,
+    pub selected_influencer: Signal<Option<Uuid>>,
+    pub influencers_show_character: Signal<bool>,
     pub selected_relationship: Signal<Option<Uuid>>,
     /// Hosts are identified by name in the snapshot, not by an id.
     pub selected_host: Signal<Option<String>>,
@@ -386,6 +396,8 @@ impl Store {
         signal.set(value);
     }
     pub fn set_selected_persona(&self, value: Option<Uuid>) {
+        let mut show_character = self.influencers_show_character;
+        show_character.set(value.is_some());
         let mut signal = self.selected_persona;
         if signal.cloned() != value {
             // Canon is loaded per persona; never let the next persona read the previous one's.
@@ -494,5 +506,13 @@ mod tests {
         assert_eq!(Workspace::Notifications.key(), "n", "Notifications keeps its letter");
         assert_eq!(Workspace::Command.key(), "1", "the ten original digits do not move");
         assert_eq!(Workspace::Library.key(), "0");
+    }
+
+    #[test]
+    fn influencers_sits_in_the_studio_section() {
+        assert_eq!(Workspace::Influencers.section(), "STUDIO");
+        let position = Workspace::ALL.iter().position(|w| *w == Workspace::Influencers).unwrap();
+        assert_eq!(Workspace::ALL[position + 1], Workspace::Library);
+        assert_eq!(start_workspace(&args(&["app", "--workspace", "influencers"])), (Workspace::Influencers, None));
     }
 }

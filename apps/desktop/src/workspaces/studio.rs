@@ -290,7 +290,7 @@ pub fn StudioView() -> Element {
             store.set_selected_persona(Some(persona));
         }
         store.set_focus_proposal(Some(proposal));
-        store.set_workspace(Workspace::Library);
+        store.set_workspace(Workspace::Influencers);
     };
 
     rsx! {

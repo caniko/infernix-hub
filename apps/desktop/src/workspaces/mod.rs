@@ -3,6 +3,7 @@
 
 pub mod calendar;
 pub mod fleet;
+pub mod influencers;
 pub mod library;
 pub mod news;
 pub mod notifications;
