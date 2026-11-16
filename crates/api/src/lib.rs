@@ -336,15 +336,31 @@ pub async fn notify_pass(
         match read_secret_inventory(Some(path)).await {
             Ok(inventory) => {
                 let now = chrono::Utc::now();
-                let mut raises = domain::notifications::secret_raises(&inventory, now);
-                if domain::notifications::secret_inventory_stale(&inventory, now) {
-                    raises.push(secret_inventory_stale(format!(
-                        "{}: generatedAt {} is stale or invalid",
-                        path.display(),
-                        inventory.generated_at
-                    )));
+                let result: domain::DResult<()> = async {
+                    let members: std::collections::BTreeSet<String> =
+                        domain::sqlx::query_scalar("select name from principals where role = 'member'")
+                            .fetch_all(&hub.db)
+                            .await?
+                            .into_iter()
+                            .collect();
+                    let mut raises = domain::notifications::secret_raises(&inventory, now, &members)?;
+                    if domain::notifications::secret_inventory_stale(&inventory, now) {
+                        raises.push((
+                            None,
+                            secret_inventory_stale(format!(
+                                "{}: generatedAt {} is stale or invalid",
+                                path.display(),
+                                inventory.generated_at
+                            )),
+                        ));
+                    }
+                    domain::notifications::sync_secrets(hub, raises).await?;
+                    Ok(())
                 }
-                notify_sync(hub, "secrets", raises).await;
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!(%error, "notifications: secret source skipped");
+                }
             }
             Err(error) => {
                 let raise = secret_inventory_stale(format!("{}: {}: {error}", path.display(), secret_error_code(&error)));
