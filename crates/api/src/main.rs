@@ -65,7 +65,14 @@ pub const DEV_TOKENS: &[(&str, Role, &str)] = &[
 ];
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("Error: {error:?}");
+        std::process::exit(fleetix_hubd::exit_code(&error));
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,sqlx=warn,tower_http=info".into()))
         .init();
@@ -73,6 +80,13 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Migrate { check } => {
             let s = Settings::from_env()?;
             let db = domain::sqlx::PgPool::connect(&s.database_url).await?;
+            if !check {
+                domain::MIGRATOR.run(&db).await?;
+            }
+            let applied = domain::applied_migrations(&db).await?;
+            let head = applied.last().copied().unwrap_or(0);
+            let bundled = domain::MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0);
+            println!("database head {head}, bundled head {bundled}, applied {applied:?}");
             if check {
                 let pending = domain::pending_migrations(&db).await?;
                 if !pending.is_empty() {
@@ -81,7 +95,6 @@ async fn main() -> anyhow::Result<()> {
                 }
                 println!("schema current");
             } else {
-                domain::MIGRATOR.run(&db).await?;
                 println!("migrations applied");
             }
         }

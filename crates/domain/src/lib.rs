@@ -204,8 +204,16 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
 /// Embedded migrations not yet applied successfully (all of them on an empty database).
 pub async fn pending_migrations(db: &PgPool) -> DResult<Vec<i64>> {
-    let exists: bool = sqlx::query_scalar("select to_regclass('_sqlx_migrations') is not null").fetch_one(db).await?;
-    let applied: Vec<i64> =
-        if exists { sqlx::query_scalar("select version from _sqlx_migrations where success").fetch_all(db).await? } else { vec![] };
+    let applied = applied_migrations(db).await?;
     Ok(MIGRATOR.iter().map(|m| m.version).filter(|v| !applied.contains(v)).collect())
+}
+
+pub async fn applied_migrations(db: &PgPool) -> DResult<Vec<i64>> {
+    let exists: bool = sqlx::query_scalar("select to_regclass('_sqlx_migrations') is not null").fetch_one(db).await?;
+    let applied: Vec<i64> = if exists {
+        sqlx::query_scalar("select version from _sqlx_migrations where success order by version").fetch_all(db).await?
+    } else {
+        vec![]
+    };
+    Ok(applied)
 }

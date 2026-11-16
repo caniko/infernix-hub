@@ -21,6 +21,11 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub mod bootstrap;
+
+/// Exit status for a server startup failure, including errors wrapped in context.
+pub fn exit_code(error: &anyhow::Error) -> i32 {
+    if error.downcast_ref::<bootstrap::PendingMigrations>().is_some() { 78 } else { 1 }
+}
 pub mod mcp;
 pub mod plugin;
 

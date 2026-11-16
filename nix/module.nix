@@ -833,6 +833,7 @@ in {
             LoadCredential = loadCredentials;
             Restart = "on-failure";
             RestartSec = 5;
+            RestartPreventExitStatus = 78;
             UMask = "0027";
             # The Postgres socket and the hub's HTTP listener need these.
             CapabilityBoundingSet = "";

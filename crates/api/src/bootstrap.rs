@@ -19,6 +19,25 @@ use serde_json::Value;
 
 use crate::AppState;
 
+#[derive(Debug)]
+pub struct PendingMigrations {
+    pub database_head: i64,
+    pub bundled_head: i64,
+    pub pending: Vec<i64>,
+}
+
+impl std::fmt::Display for PendingMigrations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "database at {}, binary bundles {}; pending {:?}; run `fleetix-hubd migrate` first",
+            self.database_head, self.bundled_head, self.pending
+        )
+    }
+}
+
+impl std::error::Error for PendingMigrations {}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub database_url: String,
@@ -212,7 +231,13 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
     if env("HUB_MIGRATE_ON_START").as_deref() == Some("0") {
         let pending = domain::pending_migrations(&db).await?;
         if !pending.is_empty() {
-            bail!("database has pending migrations {pending:?}; run `fleetix-hubd migrate` first");
+            let applied = domain::applied_migrations(&db).await?;
+            return Err(PendingMigrations {
+                database_head: applied.last().copied().unwrap_or(0),
+                bundled_head: domain::MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0),
+                pending,
+            }
+            .into());
         }
     } else {
         domain::MIGRATOR.run(&db).await.context("running migrations")?;
@@ -605,6 +630,14 @@ fn read_registry(dir: &Path) -> anyhow::Result<Vec<domain::production::WorkflowS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_migrations_explain_heads_and_map_to_config_exit() {
+        let error = PendingMigrations { database_head: 2, bundled_head: 8, pending: vec![3, 4, 8] };
+        assert_eq!(error.to_string(), "database at 2, binary bundles 8; pending [3, 4, 8]; run `fleetix-hubd migrate` first");
+        assert_eq!(crate::exit_code(&anyhow::Error::new(error).context("startup")), 78);
+        assert_eq!(crate::exit_code(&anyhow::anyhow!("other error")), 1);
+    }
 
     fn channel(name: &'static str) -> Arc<dyn ports::Publisher> {
         Arc::new(Disabled(name))
