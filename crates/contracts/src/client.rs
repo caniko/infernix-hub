@@ -107,6 +107,9 @@ impl HubClient {
     pub async fn fleet_status(&self) -> Result<fleet::FleetStatus, ClientError> {
         self.get("/fleet/status").await
     }
+    pub async fn secrets(&self) -> Result<SecretInventoryView, ClientError> {
+        self.get("/secrets").await
+    }
     pub async fn today(&self) -> Result<Today, ClientError> {
         self.get("/today").await
     }

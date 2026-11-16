@@ -31,6 +31,7 @@ pub struct AppState {
     pub fixture_paperclip: Option<Arc<integrations::fixture::FixturePaperclip>>,
     /// Fleet snapshot path; `None` means the hub serves no fleet section.
     pub fleet_status_file: Option<std::path::PathBuf>,
+    pub secret_inventory_file: Option<std::path::PathBuf>,
 }
 
 /// An API failure in the wire error shape. Domain outcomes keep their stable
@@ -129,6 +130,7 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
     let mut v1 = Router::new()
         .route("/status", get(status))
         .route("/fleet/status", get(fleet_status))
+        .route("/secrets", get(secrets))
         .route("/system/pause", post(set_pause))
         .route("/today", get(today))
         .route("/search", get(search))
@@ -270,7 +272,12 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
 
     if !settings.no_worker {
         tokio::spawn(worker::run(state.hub.clone(), Duration::from_secs(2)));
-        tokio::spawn(notify_loop(state.hub.clone(), state.fleet_status_file.clone(), settings.summary_stale_hours));
+        tokio::spawn(notify_loop(
+            state.hub.clone(),
+            state.fleet_status_file.clone(),
+            state.secret_inventory_file.clone(),
+            settings.summary_stale_hours,
+        ));
     }
     let listener = tokio::net::TcpListener::bind(&settings.bind).await.with_context(|| format!("binding {}", settings.bind))?;
     tracing::info!(bind = %settings.bind, "listening");
@@ -284,18 +291,28 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
 
 /// Producers ride one in-process loop next to the worker: no scheduler, no
 /// second process. `--no-worker` starts neither.
-pub async fn notify_loop(hub: Hub, fleet_status_file: Option<std::path::PathBuf>, summary_stale_hours: Option<u32>) {
+pub async fn notify_loop(
+    hub: Hub,
+    fleet_status_file: Option<std::path::PathBuf>,
+    secret_inventory_file: Option<std::path::PathBuf>,
+    summary_stale_hours: Option<u32>,
+) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     loop {
         tick.tick().await;
-        notify_pass(&hub, fleet_status_file.as_deref(), summary_stale_hours).await;
+        notify_pass(&hub, fleet_status_file.as_deref(), secret_inventory_file.as_deref(), summary_stale_hours).await;
     }
 }
 
 /// One pass: each source syncs the set it currently sees, then lapsed snoozes
 /// are announced and old rows pruned. A failed step is logged and the others
 /// still run; nothing here is fatal.
-pub async fn notify_pass(hub: &Hub, fleet_status_file: Option<&FsPath>, summary_stale_hours: Option<u32>) {
+pub async fn notify_pass(
+    hub: &Hub,
+    fleet_status_file: Option<&FsPath>,
+    secret_inventory_file: Option<&FsPath>,
+    summary_stale_hours: Option<u32>,
+) {
     let today = async {
         let today = domain::content::system_today(hub).await?;
         domain::notifications::today_with_stalled(hub, &today).await
@@ -314,6 +331,28 @@ pub async fn notify_pass(hub: &Hub, fleet_status_file: Option<&FsPath>, summary_
             Err(error) => vec![domain::notifications::fleet_unreadable(&error.to_string())],
         };
         notify_sync(hub, "fleet", raises).await;
+    }
+    if let Some(path) = secret_inventory_file {
+        match read_secret_inventory(Some(path)).await {
+            Ok(inventory) => {
+                let now = chrono::Utc::now();
+                let mut raises = domain::notifications::secret_raises(&inventory, now);
+                if domain::notifications::secret_inventory_stale(&inventory, now) {
+                    raises.push(secret_inventory_stale(format!(
+                        "{}: generatedAt {} is stale or invalid",
+                        path.display(),
+                        inventory.generated_at
+                    )));
+                }
+                notify_sync(hub, "secrets", raises).await;
+            }
+            Err(error) => {
+                let raise = secret_inventory_stale(format!("{}: {}: {error}", path.display(), secret_error_code(&error)));
+                if let Err(error) = domain::notifications::raise(hub, &raise).await {
+                    tracing::warn!(%error, "notifications: secret inventory stale raise failed");
+                }
+            }
+        }
     }
     match domain::notifications::summary_raises(hub, summary_stale_hours).await {
         Ok(raises) => notify_sync(hub, "hub", raises).await,
@@ -448,6 +487,59 @@ fn fleet_error(error: FleetStatusError, correlation_id: Option<String>) -> ApiEr
 async fn fleet_status(State(s): State<AppState>, Caller(a): Caller) -> R<contracts::fleet::FleetStatus> {
     a.require(&[Role::Operator, Role::Agent, Role::Procedure, Role::Ingest]).map_err(err(&a))?;
     read_fleet_status(s.fleet_status_file.as_deref()).await.map(Json).map_err(|e| fleet_error(e, a.correlation_id.clone()))
+}
+
+pub async fn read_secret_inventory(path: Option<&FsPath>) -> Result<contracts::SecretInventory, FleetStatusError> {
+    let Some(path) = path else { return Err(FleetStatusError::Unconfigured) };
+    let body = tokio::fs::read_to_string(path).await.map_err(|e| FleetStatusError::Unavailable(format!("{}: {e}", path.display())))?;
+    let inventory: contracts::SecretInventory = serde_json::from_str(&body).map_err(|e| FleetStatusError::Invalid(e.to_string()))?;
+    if inventory.schema_version != 1 {
+        return Err(FleetStatusError::Invalid(format!("schemaVersion {} is not 1", inventory.schema_version)));
+    }
+    Ok(inventory)
+}
+
+fn secret_error_code(error: &FleetStatusError) -> &'static str {
+    match error {
+        FleetStatusError::Unconfigured => "secret_inventory_unconfigured",
+        FleetStatusError::Unavailable(_) => "secret_inventory_unavailable",
+        FleetStatusError::Invalid(_) => "secret_inventory_invalid",
+    }
+}
+
+fn secret_inventory_stale(body: String) -> domain::notifications::Raise {
+    domain::notifications::Raise {
+        source: "secrets".into(),
+        dedupe_key: "secrets:inventory-stale".into(),
+        severity: Severity::Warning,
+        title: "Secret inventory is stale".into(),
+        body,
+        subject_type: None,
+        subject_id: None,
+        url: None,
+    }
+}
+
+async fn secrets(State(s): State<AppState>, Caller(a): Caller) -> R<contracts::SecretInventoryView> {
+    a.require(&[Role::Operator, Role::Agent, Role::Procedure, Role::Ingest]).map_err(err(&a))?;
+    let inventory = read_secret_inventory(s.secret_inventory_file.as_deref()).await.map_err(|e| {
+        let status = match e {
+            FleetStatusError::Unconfigured => StatusCode::NOT_FOUND,
+            FleetStatusError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            FleetStatusError::Invalid(_) => StatusCode::BAD_GATEWAY,
+        };
+        ApiErr::coded(status, secret_error_code(&e), e.to_string(), a.correlation_id.clone())
+    })?;
+    let now = chrono::Utc::now();
+    Ok(Json(contracts::SecretInventoryView {
+        schema_version: inventory.schema_version,
+        generated_at: inventory.generated_at,
+        secrets: inventory
+            .secrets
+            .into_iter()
+            .map(|secret| contracts::SecretView { state: domain::notifications::secret_state(&secret, now).into(), secret })
+            .collect(),
+    }))
 }
 async fn set_pause(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<PauseIn>) -> R<SystemStatus> {
     call!(a, domain::system::set_pause(&s.hub, &a, b))
@@ -865,6 +957,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("plinth") && err.contains("postiz"), "the pack and channel are named: {err}");
+    }
+
+    #[tokio::test]
+    async fn secret_inventory_rejects_unsupported_schema_and_expiry() {
+        let unsupported = temp_file("secret-schema", r#"{"schemaVersion":2,"generatedAt":"invalid","secrets":[]}"#);
+        assert!(matches!(read_secret_inventory(Some(&unsupported)).await, Err(FleetStatusError::Invalid(_))));
+        std::fs::remove_file(unsupported).unwrap();
+        let invalid = temp_file(
+            "secret-expiry",
+            r#"{"schemaVersion":1,"generatedAt":"invalid","secrets":[{"id":"x","tree":"home","scope":"can","category":"oauth","project":null,"kind":"external","custodian":"can","expiry":{"type":"other"},"rotatedAt":null,"rotation":{"method":"manual","command":"","note":""},"consumers":[]}]}"#,
+        );
+        assert!(matches!(read_secret_inventory(Some(&invalid)).await, Err(FleetStatusError::Invalid(_))));
+        std::fs::remove_file(invalid).unwrap();
     }
 
     #[tokio::test]

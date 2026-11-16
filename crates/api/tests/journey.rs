@@ -2432,6 +2432,8 @@ async fn member_notifications_are_isolated() {
     assert_eq!(code(member.today().await.unwrap_err()), "forbidden");
     assert_eq!(code(member.get::<serde_json::Value>("/status").await.unwrap_err()), "forbidden");
     assert_eq!(code(member.get::<serde_json::Value>("/fleet/status").await.unwrap_err()), "forbidden");
+    assert_eq!(code(member.secrets().await.unwrap_err()), "forbidden");
+    assert_eq!(code(h.op.secrets().await.unwrap_err()), "secret_inventory_unconfigured");
     let op = h.op.raise_notification(&notification_in("same", "operator")).await.unwrap();
     let own = member
         .raise_notification(&RaiseNotificationIn { severity: Severity::Critical, ..notification_in("same", "member") })
@@ -2728,6 +2730,53 @@ async fn notification_feed_never_skips_a_truncated_change() {
 }
 
 #[tokio::test]
+async fn secret_inventory_pass_preserves_rows_when_unreadable() {
+    let Some(h) = harness().await else { return };
+    let path = std::env::temp_dir().join(format!("hub-secret-inventory-{}.json", Uuid::new_v4()));
+    let now = Utc::now();
+    let mut inventory = json!({"schemaVersion":1,"generatedAt":now.to_rfc3339(),"secrets":[{"id":"home/can/test","tree":"home","scope":"can","category":"oauth","project":null,"kind":"external","custodian":"can","expiry":{"type":"at","date":now.date_naive().to_string()},"rotatedAt":null,"rotation":{"method":"replace","command":"replace","note":""},"consumers":[]}]});
+    let mut unknown = inventory["secrets"][0].clone();
+    unknown["id"] = json!("home/can/unknown");
+    unknown["expiry"] = json!({"type":"unknown"});
+    inventory["secrets"].as_array_mut().unwrap().push(unknown);
+    std::fs::write(&path, inventory.to_string()).unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, Some(&path), None).await;
+    let rows = h.op.notifications(None, 0, true).await.unwrap().items;
+    let expired = rows.iter().find(|n| n.dedupe_key == "secrets:home-can-test:expired").unwrap();
+    assert!(expired.open);
+    inventory["generatedAt"] = json!((now - chrono::Duration::hours(26)).to_rfc3339());
+    std::fs::write(&path, inventory.to_string()).unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, Some(&path), None).await;
+    let rows = h.op.notifications(None, 0, true).await.unwrap().items;
+    assert!(rows.iter().find(|n| n.dedupe_key == "secrets:home-can-test:expired").unwrap().open);
+    assert!(rows.iter().find(|n| n.dedupe_key == "secrets:inventory-stale").unwrap().open);
+    inventory["generatedAt"] = json!(now.to_rfc3339());
+    inventory["secrets"][0]["expiry"]["date"] = json!((now.date_naive() + chrono::Duration::days(60)).to_string());
+    std::fs::write(&path, inventory.to_string()).unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, Some(&path), None).await;
+    let rows = h.op.notifications(None, 0, true).await.unwrap().items;
+    let expired = rows.iter().find(|n| n.dedupe_key == "secrets:home-can-test:expired").unwrap();
+    assert!(expired.resolved_at.is_some());
+    let seq = expired.seq;
+    let unknown = rows.iter().find(|n| n.dedupe_key == "secrets:home-can-unknown:unknown").unwrap();
+    assert!(unknown.open);
+    let unknown_seq = unknown.seq;
+    std::fs::remove_file(&path).unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, Some(&path), None).await;
+    let rows = h.op.notifications(None, 0, true).await.unwrap().items;
+    assert_eq!(rows.iter().find(|n| n.dedupe_key == "secrets:home-can-test:expired").unwrap().seq, seq);
+    let unknown = rows.iter().find(|n| n.dedupe_key == "secrets:home-can-unknown:unknown").unwrap();
+    assert!(unknown.open);
+    assert_eq!(unknown.seq, unknown_seq);
+    assert!(rows.iter().find(|n| n.dedupe_key == "secrets:inventory-stale").unwrap().open);
+    std::fs::write(&path, inventory.to_string()).unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, Some(&path), None).await;
+    let rows = h.op.notifications(None, 0, true).await.unwrap().items;
+    assert!(rows.iter().find(|n| n.dedupe_key == "secrets:inventory-stale").unwrap().resolved_at.is_some());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn stalled_generation_notifies_and_resolves() {
     let Some(h) = harness().await else { return };
     let item = h.brief(None).await;
@@ -2747,7 +2796,7 @@ async fn stalled_generation_notifies_and_resolves() {
         .execute(&h.hub.db)
         .await
         .unwrap();
-    fleetix_hubd::notify_pass(&h.hub, None, None).await;
+    fleetix_hubd::notify_pass(&h.hub, None, None, None).await;
     let rows = h.op.notifications(None, 0, true).await.unwrap().items;
     let key = format!("today:stalled:{}", old.id);
     let stalled = rows.iter().find(|n| n.dedupe_key == key).expect("old dispatched generation raises");
@@ -2762,7 +2811,7 @@ async fn stalled_generation_notifies_and_resolves() {
         .execute(&h.hub.db)
         .await
         .unwrap();
-    fleetix_hubd::notify_pass(&h.hub, None, None).await;
+    fleetix_hubd::notify_pass(&h.hub, None, None, None).await;
     let rows = h.op.notifications(None, 0, true).await.unwrap().items;
     assert!(rows.iter().find(|n| n.dedupe_key == key).unwrap().resolved_at.is_some());
 }
@@ -2782,7 +2831,7 @@ async fn producer_pass_reopens_a_lapsed_snooze_and_tracks_summary_staleness() {
         .unwrap();
 
     // No summary has ever been written, so the hub source raises staleness.
-    fleetix_hubd::notify_pass(&h.hub, None, Some(26)).await;
+    fleetix_hubd::notify_pass(&h.hub, None, None, Some(26)).await;
     let rows = h.op.notifications(None, 0, true).await.unwrap();
     let reopened = rows.items.iter().find(|n| n.id == row.id).expect("the snoozed row survives");
     assert!(reopened.snoozed_until.is_none() && reopened.open, "a lapsed snooze reopens");
@@ -2792,13 +2841,13 @@ async fn producer_pass_reopens_a_lapsed_snooze_and_tracks_summary_staleness() {
 
     // The day's summary resolves it on the next pass.
     domain::notifications::raise(&h.hub, &notification_raise("summary", "summary:2026-11-15")).await.unwrap();
-    fleetix_hubd::notify_pass(&h.hub, None, Some(26)).await;
+    fleetix_hubd::notify_pass(&h.hub, None, None, Some(26)).await;
     let rows = h.op.notifications(None, 0, true).await.unwrap();
     let stale = rows.items.iter().find(|n| n.dedupe_key == "hub:summary-stale").unwrap();
     assert!(stale.resolved_at.is_some() && !stale.open, "a fresh summary resolves the raise");
 
     // With the rule unset the source syncs empty, so nothing stale can survive.
-    fleetix_hubd::notify_pass(&h.hub, None, None).await;
+    fleetix_hubd::notify_pass(&h.hub, None, None, None).await;
     let rows = h.op.notifications(None, 0, true).await.unwrap();
     assert!(rows.items.iter().find(|n| n.dedupe_key == "hub:summary-stale").unwrap().resolved_at.is_some());
 }
@@ -2895,7 +2944,7 @@ async fn a_queued_pipeline_run_gets_the_pending_bound_until_it_really_runs() {
         }
     };
     let stalled = || async {
-        fleetix_hubd::notify_pass(&h.hub, None, None).await;
+        fleetix_hubd::notify_pass(&h.hub, None, None, None).await;
         h.op.notifications(None, 0, true).await.unwrap().items.into_iter().find(|n| n.dedupe_key == key && n.open)
     };
 
@@ -2955,7 +3004,7 @@ async fn member_renewals_are_private_and_produced() {
     assert_eq!(code(h.op.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{id}")).await.unwrap_err()), "not_found");
     assert_eq!(code(h.agent.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{id}")).await.unwrap_err()), "not_found");
     assert_eq!(code(member.get::<Vec<HistoryEntry>>(&format!("/history/renewal/{id}")).await.unwrap_err()), "forbidden");
-    fleetix_hubd::notify_pass(&h.hub, None, None).await;
+    fleetix_hubd::notify_pass(&h.hub, None, None, None).await;
     let notes = member.notifications(None, 0, true).await.unwrap();
     assert!(notes.items.iter().any(|n| n.dedupe_key == "member:dejana:renewal:private:overdue" && n.severity == Severity::Critical));
     assert!(h.op.notifications(None, 0, true).await.unwrap().items.iter().all(|n| !n.dedupe_key.contains("private")));
@@ -2985,7 +3034,7 @@ async fn member_renewals_are_private_and_produced() {
     );
     domain::sqlx::query("delete from renewals where key = 'last'").execute(&h.hub.db).await.unwrap();
     member.renewal_renewed("private", &RenewalRenewedIn { due_at: None }).await.unwrap();
-    fleetix_hubd::notify_pass(&h.hub, None, None).await;
+    fleetix_hubd::notify_pass(&h.hub, None, None, None).await;
     assert!(
         member
             .notifications(None, 0, true)
