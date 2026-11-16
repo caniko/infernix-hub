@@ -290,7 +290,7 @@ pub fn StudioView() -> Element {
             store.set_selected_persona(Some(persona));
         }
         store.set_focus_proposal(Some(proposal));
-        store.set_workspace(Workspace::Library);
+        store.set_workspace(Workspace::Projects);
     };
 
     rsx! {
@@ -575,7 +575,7 @@ pub fn StudioView() -> Element {
                                                                     class: "btn btn-glass btn-xs",
                                                                     onclick: move |_| {
                                                                         let client = client.clone();
-                                                                        let body = SelectAssetIn { selected: true, alt_text: Some(alt_text.clone()) };
+                                                                        let body = SelectAssetIn { selected: true, alt_text: Some(alt_text.clone()), ..Default::default() };
                                                                         spawn(async move {
                                                                             match api::timed(client.select_asset(asset_id, &body)).await {
                                                                                 Ok(asset) => {

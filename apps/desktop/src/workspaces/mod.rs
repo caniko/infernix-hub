@@ -3,9 +3,11 @@
 
 pub mod calendar;
 pub mod fleet;
+pub mod individual;
 pub mod library;
 pub mod news;
 pub mod notifications;
+pub mod projects;
 pub mod relationships;
 pub mod studio;
 pub mod today;

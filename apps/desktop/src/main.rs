@@ -53,6 +53,7 @@ fn App() -> Element {
         today: use_signal(Loaded::default),
         news: use_signal(Loaded::default),
         personas: use_signal(Loaded::default),
+        projects: use_signal(Loaded::default),
         workflows: use_signal(Loaded::default),
         accounts: use_signal(Loaded::default),
         content: use_signal(Loaded::default),
@@ -68,6 +69,8 @@ fn App() -> Element {
         selected_content: use_signal(|| None),
         selected_news: use_signal(|| None),
         selected_persona: use_signal(|| None),
+        selected_project: use_signal(|| None),
+        projects_show_individual: use_signal(|| false),
         selected_relationship: use_signal(|| None),
         selected_host: use_signal(|| None),
         focus_proposal: use_signal(|| None),
@@ -180,7 +183,7 @@ fn App() -> Element {
                     dioxus.send('escape');
                     return;
                 }
-                if (!editing && !event.ctrlKey && !event.metaKey && !event.altKey && /^[0-9n]$/.test(event.key.toLowerCase())) {
+                if (!editing && !event.ctrlKey && !event.metaKey && !event.altKey && /^[0-9np]$/.test(event.key.toLowerCase())) {
                     dioxus.send('ws:' + event.key.toLowerCase());
                 }
             });
@@ -284,7 +287,7 @@ fn App() -> Element {
             .as_ref()
             .filter(|detail| Some(detail.relationship.id) == (store.selected_relationship).cloned())
             .map(inspector::from_relationship),
-        Workspace::Library => {
+        Workspace::Projects if (store.projects_show_individual).cloned() => {
             let canon = (store.canon).cloned();
             (store.personas)
                 .cloned()
@@ -376,6 +379,7 @@ fn App() -> Element {
                         Workspace::Studio => rsx! { workspaces::studio::StudioView {} },
                         Workspace::Calendar => rsx! { workspaces::calendar::CalendarView {} },
                         Workspace::Relationships => rsx! { workspaces::relationships::RelationshipsView {} },
+                        Workspace::Projects => rsx! { workspaces::projects::ProjectsView {} },
                         Workspace::Library => rsx! { workspaces::library::LibraryView {} },
                     }
                     if (store.inspector_open).cloned() {

@@ -313,12 +313,13 @@ pub async fn today_with_stalled(hub: &Hub, today: &Today) -> DResult<Vec<Raise>>
     // attempts: one really executing gets the running bound from when it
     // started, while attempts still submitted or queued (a pipeline's
     // `Pending`) get the pending bound from when they were queued.
-    let rows: Vec<(Uuid, Uuid, String, String, DateTime<Utc>)> = sqlx::query_as(
-        "select g.id, c.id, c.title,
+    let rows: Vec<(Uuid, Uuid, String, String, String, DateTime<Utc>)> = sqlx::query_as(
+        "select g.id, coalesce(c.id, p.id), case when c.id is not null then 'content' else 'persona' end, coalesce(c.title, p.name || ' look pass'),
                 case when g.state = 'running' then a.label else g.state end,
                 case when g.state = 'running' then a.since else g.state_since end
          from generation_requests g
-         join content_items c on c.id = g.content_item_id
+         left join content_items c on c.id = g.content_item_id
+         left join personas p on p.id = g.persona_id
          left join lateral (
              select case when bool_or(x.state = 'running') then 'running' else 'queued' end as label,
                     coalesce(min(x.state_since) filter (where x.state = 'running'), min(x.state_since)) as since
@@ -335,14 +336,14 @@ pub async fn today_with_stalled(hub: &Hub, today: &Today) -> DResult<Vec<Raise>>
     .fetch_all(&hub.db)
     .await?;
     let mut raises = today_raises(today);
-    raises.extend(rows.into_iter().map(|(id, content_id, title, state, since)| Raise {
+    raises.extend(rows.into_iter().map(|(id, owner_id, owner_type, title, state, since)| Raise {
         source: "today".into(),
         dedupe_key: format!("today:stalled:{id}"),
         severity: Severity::Warning,
         title: format!("{title}: {state}"),
         body: format!("{state} since {}", since.to_rfc3339()),
-        subject_type: Some("content".into()),
-        subject_id: Some(content_id.to_string()),
+        subject_type: Some(owner_type),
+        subject_id: Some(owner_id.to_string()),
         url: None,
     }));
     Ok(merge_same_key(raises))

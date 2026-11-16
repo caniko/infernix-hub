@@ -198,6 +198,8 @@ the `canix-hub` crate in the canix repository; its live channel is not qualified
 
 ### Paperclip
 
+Canon comment issues reuse `create_issue`; CEO wake on assignment is not verified; comments arrive through the hub MCP, not the Paperclip API.
+
 Version `0.3.1-unstable-2026-10-23`, commit `6f1bf1754c4862cbae59a58306652ded8a44cd17`.
 Adapter `live/paperclip.rs`. `create_issue`, `create_approval` and
 `get_approval` are contract-verified against `docs/contracts/paperclip-openapi-subset.json`
@@ -283,6 +285,8 @@ honours a hub-chosen `prompt_id` and `client_id`; `GET /history/{id}` is `{}`
 when unknown; `/ws` events are progress hints only and terminal state comes from
 history. Live-verified against `127.0.0.1:8188`: `GET /system_stats` and
 `GET /queue`. No prompt was submitted.
+`upload` is built against the 0.44.0 server source, not live-verified; the three
+MOSS workflows have never been run by the hub. Engine evidence remains 0.37.0.
 
 ### n8n
 
@@ -308,6 +312,14 @@ pipeline submission/status/cancel paths including the crash-window adoption,
 release freezing, channel dispatch, engagement replies, MCP, the desktop and
 pack registration. It says nothing about a live service.
 
+Projects: fixture-tested against PostgreSQL, including member and account
+rules and delegated brief dynamics. No live adapter is changed by this feature.
+Look image checks: operator attestation; no automated image check exists.
+Desktop individual Image step: built; upload, library selection and look generation are not yet fixture-tested through the desktop.
+Desktop Image, Refine and pin screens are built with unit-test coverage only, not verified in a running GUI.
+The desktop Projects workspace is built and covered by unit tests only; it
+has not been verified in a running GUI.
+
 The desktop shows a `FIXTURE MODE` banner whenever any adapter is simulated,
 and `GET /v1/status` reports the mode and verification level per integration.
 
@@ -321,3 +333,6 @@ and `GET /v1/status` reports the mode and verification level per integration.
 
 These observations date from the original assessment and are not a current
 inventory of all external activity.
+# Per-project models
+
+Per-project models: stored and validated; the hub acts on `checker` after slice 8 and on `image`; `assistant`, `three_d` and `voice` are served to agents and the pipeline only.

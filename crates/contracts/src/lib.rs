@@ -118,6 +118,7 @@ wire_enum!(
 );
 
 wire_enum!(CanonState { Proposed = "proposed", Accepted = "accepted", Rejected = "rejected", Superseded = "superseded" });
+wire_enum!(ProjectKind { Solo = "solo", Group = "group" });
 wire_enum!(CanonSource { Operator = "operator", Chat = "chat", News = "news", Agent = "agent" });
 wire_enum!(ContentState { Idea = "idea", Brief = "brief", Producing = "producing", Selecting = "selecting", Review = "review", Approved = "approved", Scheduled = "scheduled", Published = "published", Archived = "archived" });
 wire_enum!(GenerationState { Requested = "requested", Dispatched = "dispatched", Running = "running", Succeeded = "succeeded", Failed = "failed", Cancelling = "cancelling", Cancelled = "cancelled", OutcomeUnknown = "outcome_unknown" });
@@ -204,14 +205,146 @@ pub struct PauseIn {
 
 // ── Personas & canon ────────────────────────────────────────────────────────
 
+pub const MODEL_ROUTES: &[(&str, &str, &[&str])] = &[
+    ("checker", "openai/gpt-6.1-sol", &["low", "medium", "high", "xhigh"]),
+    ("image", "moss-look", &[]),
+    ("assistant", "hub-default", &[]),
+    ("three_d", "trellis2", &[]),
+    ("voice", "kokoro", &[]),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRoute {
+    pub id: String,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectModels {
+    pub checker: ModelRoute,
+    pub image: String,
+    pub assistant: String,
+    pub three_d: String,
+    pub voice: String,
+}
+
+impl Default for ProjectModels {
+    fn default() -> Self {
+        Self {
+            checker: ModelRoute { id: "openai/gpt-6.1-sol".into(), effort: Some("xhigh".into()) },
+            image: "moss-look".into(),
+            assistant: "hub-default".into(),
+            three_d: "trellis2".into(),
+            voice: "kokoro".into(),
+        }
+    }
+}
+
+impl ProjectModels {
+    pub fn validate(&self) -> Result<(), (&'static str, String)> {
+        for (role, id, effort) in [
+            ("checker", self.checker.id.as_str(), self.checker.effort.as_deref()),
+            ("image", self.image.as_str(), None),
+            ("assistant", self.assistant.as_str(), None),
+            ("three_d", self.three_d.as_str(), None),
+            ("voice", self.voice.as_str(), None),
+        ] {
+            let Some((_, _, efforts)) = MODEL_ROUTES.iter().find(|(r, model, _)| *r == role && *model == id) else {
+                return Err(("unknown_model", format!("unknown {role} model: {id}")));
+            };
+            if effort.is_some_and(|value| !efforts.contains(&value)) {
+                return Err(("unknown_effort", format!("unknown effort for {role}: {}", effort.unwrap_or_default())));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Project {
+    pub id: Uuid,
+    pub company_id: String,
+    pub name: String,
+    pub kind: ProjectKind,
+    pub premise: String,
+    pub dynamics: String,
+    #[serde(default)]
+    pub models: ProjectModels,
+    pub members: Vec<ProjectMember>,
+    pub account_ids: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectMember {
+    pub persona_id: Uuid,
+    pub name: String,
+    pub role: String,
+    pub has_accepted_canon: bool,
+    #[serde(default)]
+    pub reference_asset_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectIn {
+    pub name: String,
+    pub kind: ProjectKind,
+    #[serde(default)]
+    pub premise: String,
+    #[serde(default)]
+    pub dynamics: String,
+    #[serde(default)]
+    pub models: Option<ProjectModels>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectMemberIn {
+    #[serde(default)]
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectAccountsIn {
+    pub account_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Persona {
     pub id: Uuid,
     pub company_id: String,
     pub name: String,
+    #[serde(default)]
+    pub profile: IndividualProfile,
     /// The newest accepted canon, if any.
     pub canon: Option<CanonRevision>,
     pub pending_proposals: i64,
+    #[serde(default)]
+    pub reference_asset_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadsAs {
+    Adult,
+    NonHuman,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IndividualProfile {
+    #[serde(default)]
+    pub bio: String,
+    #[serde(default)]
+    pub reads_as: Option<ReadsAs>,
+    #[serde(default)]
+    pub look: String,
+    #[serde(default)]
+    pub palette: Vec<String>,
+    #[serde(default)]
+    pub voice: Option<String>,
+    #[serde(default)]
+    pub canon_draft: Option<CanonBody>,
 }
 
 /// Persona voice/brand rules plus accepted world canon.
@@ -240,6 +373,32 @@ pub struct CanonRevision {
     pub proposed_by: String,
     pub decided_by: Option<String>,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub review_requested_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub review_issue_url: Option<String>,
+    #[serde(default)]
+    pub comments: Vec<CanonComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonComment {
+    pub id: Uuid,
+    pub revision_id: Uuid,
+    pub author: String,
+    pub author_role: Role,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonCommentIn {
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonDraftIn {
+    pub bio: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -644,7 +803,9 @@ pub struct GenerateIn {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationRequest {
     pub id: Uuid,
-    pub content_item_id: Uuid,
+    pub content_item_id: Option<Uuid>,
+    pub persona_id: Option<Uuid>,
+    pub source_asset_id: Option<Uuid>,
     pub workflow_id: Uuid,
     /// Contract version of the generation request payload.
     pub request_version: i32,
@@ -697,9 +858,19 @@ pub struct ArtifactRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageCheck {
+    pub check_key: String,
+    pub verdict: String,
+    pub checker: String,
+    pub detail: String,
+    pub checked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Asset {
     pub id: Uuid,
-    pub content_item_id: Uuid,
+    pub content_item_id: Option<Uuid>,
+    pub persona_id: Option<Uuid>,
     pub generation_request_id: Option<Uuid>,
     pub sha256: String,
     pub mime: String,
@@ -710,12 +881,82 @@ pub struct Asset {
     /// prompt id, engine instance, workflow hash, node id, filename.
     pub provenance: Value,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub checks: Vec<ImageCheck>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookSize {
+    Test,
+    Final,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LookPassIn {
+    pub source_asset_id: Option<Uuid>,
+    pub prompt: String,
+    pub strength: Option<f32>,
+    pub variants: i32,
+    pub size: LookSize,
+    pub reuse_seeds_from: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LookPass {
+    pub generation: GenerationRequest,
+    pub assets: Vec<Asset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndividualLook {
+    pub uploads: Vec<Asset>,
+    pub passes: Vec<LookPass>,
+    #[serde(default)]
+    pub reference: Option<Reference>,
+    #[serde(default)]
+    pub reference_history: Vec<Reference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reference {
+    pub id: Uuid,
+    pub persona_id: Uuid,
+    pub asset_id: Uuid,
+    pub sha256: String,
+    pub pinned_by: String,
+    pub pinned_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PinIn {
+    pub asset_id: Uuid,
+    #[serde(default)]
+    pub confirm_repin: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PinOut {
+    pub reference: Reference,
+    #[serde(default)]
+    pub affected_projects: Vec<String>,
+    #[serde(default)]
+    pub stale_stages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LookSourceIn {
+    pub asset_id: Uuid,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SelectAssetIn {
     pub selected: bool,
     pub alt_text: Option<String>,
+    #[serde(default)]
+    pub attest: Vec<String>,
+    #[serde(default)]
+    pub advice: std::collections::BTreeMap<String, bool>,
 }
 
 // ── Releases & publication ──────────────────────────────────────────────────
@@ -1024,6 +1265,21 @@ pub struct CancelOut {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn every_default_model_is_in_the_catalog() {
+        assert!(ProjectModels::default().validate().is_ok());
+    }
+
+    #[test]
+    fn individual_profile_defaults_and_preserves_bio() {
+        let empty: IndividualProfile = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty, IndividualProfile::default());
+        let profile: IndividualProfile = serde_json::from_value(json!({"bio": "é  \n\n", "reads_as": "non_human"})).unwrap();
+        assert_eq!(profile.bio, "é  \n\n");
+        assert_eq!(profile.reads_as, Some(ReadsAs::NonHuman));
+        assert_eq!(serde_json::from_value::<IndividualProfile>(serde_json::to_value(&profile).unwrap()).unwrap(), profile);
+    }
 
     #[test]
     fn wire_names_match_serde() {

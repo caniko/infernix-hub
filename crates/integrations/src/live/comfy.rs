@@ -73,6 +73,14 @@ fn queue_item_id(item: &Value) -> Option<&str> {
     item.as_array()?.get(1)?.as_str()
 }
 
+fn upload_accepted(value: &Value, requested: &str) -> PortResult<()> {
+    if value.get("name").and_then(Value::as_str) == Some(requested) && value.get("subfolder").and_then(Value::as_str) == Some("") {
+        Ok(())
+    } else {
+        Err(PortError::Rejected { status: 200, message: format!("unexpected upload location: {value}") })
+    }
+}
+
 /// Flatten every `outputs[node][kind][]` entry with a filename. Covers
 /// `images`, `gifs`, `videos`, `audio`, `latents` and custom-node kinds without
 /// hard-coding a list.
@@ -177,6 +185,21 @@ fn queue_ids(queue: &Value, key: &str) -> Vec<String> {
 
 #[async_trait]
 impl Comfy for ComfyClient {
+    async fn upload(&self, base_url: &str, name: &str, mime: &str, bytes: &[u8]) -> PortResult<()> {
+        let image = reqwest::multipart::Part::bytes(bytes.to_vec())
+            .file_name(name.to_owned())
+            .mime_str(mime)
+            .map_err(|e| PortError::Rejected { status: 400, message: e.to_string() })?;
+        let form = reqwest::multipart::Form::new().part("image", image).text("type", "input").text("overwrite", "true");
+        let response = self
+            .http
+            .post(format!("{}/upload/image", trim_base(base_url)))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| transport_error(e, true))?;
+        upload_accepted(&read_json(response, false, true).await?, name)
+    }
     async fn load(&self, base_url: &str) -> PortResult<EngineLoad> {
         let q = self.queue(&trim_base(base_url)).await?;
         Ok(EngineLoad { running: queue_ids(&q, "queue_running"), pending: queue_ids(&q, "queue_pending") })
@@ -297,6 +320,19 @@ impl Comfy for ComfyClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_response_must_echo_the_requested_name() {
+        assert!(upload_accepted(&json!({"name": "a.png", "subfolder": ""}), "a.png").is_ok());
+        assert!(matches!(
+            upload_accepted(&json!({"name": "b.png", "subfolder": ""}), "a.png"),
+            Err(PortError::Rejected { status: 200, .. })
+        ));
+        assert!(matches!(
+            upload_accepted(&json!({"name": "a.png", "subfolder": "other"}), "a.png"),
+            Err(PortError::Rejected { status: 200, .. })
+        ));
+    }
 
     #[test]
     fn history_success_collects_all_output_kinds() {

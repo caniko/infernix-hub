@@ -231,6 +231,8 @@ pub struct EngineLoad {
 
 #[async_trait]
 pub trait Comfy: Send + Sync {
+    /// Puts an input image where `LoadImage` reads it. Idempotent for the same name and bytes.
+    async fn upload(&self, base_url: &str, name: &str, mime: &str, bytes: &[u8]) -> PortResult<()>;
     /// Current queue, for GPU admission.
     async fn load(&self, base_url: &str) -> PortResult<EngineLoad>;
     /// Streams progress for prompts submitted with `client_id` until the socket

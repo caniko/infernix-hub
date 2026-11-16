@@ -88,6 +88,772 @@ fn code(e: ClientError) -> String {
     }
 }
 
+const LOOK_PNG: &[u8] = b"\x89PNG\r\n\x1a\nfixture";
+
+fn look_input(source: Option<Uuid>, variants: i32) -> LookPassIn {
+    LookPassIn {
+        source_asset_id: source,
+        prompt: "an individual".into(),
+        strength: source.map(|_| 0.5),
+        variants,
+        size: LookSize::Test,
+        reuse_seeds_from: None,
+    }
+}
+
+impl H {
+    async fn look_upload(&self, persona: Uuid) -> Asset {
+        self.op.upload_look_image(persona, "image/png", true, LOOK_PNG.to_vec()).await.unwrap()
+    }
+
+    async fn finish_look(&self, persona: Uuid, pass: Uuid, variants: usize) -> LookPass {
+        self.tick().await;
+        self.wait_queued(variants).await;
+        let comfy = self.fx.comfy.as_ref().unwrap();
+        for _ in 0..variants as u64 * (comfy.steps + 1) {
+            comfy.tick();
+        }
+        self.tick().await;
+        let pass = self.op.individual_look(persona).await.unwrap().passes.into_iter().find(|p| p.generation.id == pass).unwrap();
+        assert_eq!(pass.generation.state, GenerationState::Succeeded, "{pass:?}");
+        pass
+    }
+
+    async fn release_look_outbox(&self) {
+        domain::sqlx::query("update outbox set next_attempt_at = now() where state = 'pending'").execute(&self.hub.db).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_look_pass_uploads_its_source_before_the_procedure_runs() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let source = h.look_upload(persona).await;
+    let pass = h.op.request_look_pass(persona, &look_input(Some(source.id), 1)).await.unwrap();
+    let pass = h.finish_look(persona, pass.generation.id, 1).await;
+    assert!(h.fx.comfy.as_ref().unwrap().uploads().contains(&(format!("hub-{}.png", source.sha256), LOOK_PNG.len())));
+    assert!(!pass.assets.is_empty());
+    assert!(pass.assets.iter().all(|a| a.persona_id == Some(persona)));
+}
+
+#[tokio::test]
+async fn a_source_upload_outage_retries_without_starting_the_procedure() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let source = h.look_upload(persona).await;
+    let comfy = h.fx.comfy.as_ref().unwrap();
+    comfy.fail_uploads.store(true, std::sync::atomic::Ordering::SeqCst);
+    let pass = h.op.request_look_pass(persona, &look_input(Some(source.id), 1)).await.unwrap();
+    h.tick().await;
+    let state: String = domain::sqlx::query_scalar("select state from outbox where idempotency_key=$1")
+        .bind(format!("generation:{}", pass.generation.id))
+        .fetch_one(&h.hub.db)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending");
+    let roots: i64 =
+        domain::sqlx::query_scalar("select count(*) from execution_attempts where generation_request_id=$1 and kind='windmill_root'")
+            .bind(pass.generation.id)
+            .fetch_one(&h.hub.db)
+            .await
+            .unwrap();
+    assert_eq!(roots, 0);
+    assert!(comfy.queued().is_empty());
+    comfy.fail_uploads.store(false, std::sync::atomic::Ordering::SeqCst);
+    h.release_look_outbox().await;
+    h.finish_look(persona, pass.generation.id, 1).await;
+}
+
+#[tokio::test]
+async fn look_passes_form_a_tree_by_source_asset() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let source = h.look_upload(persona).await;
+    let p1 = h.op.request_look_pass(persona, &look_input(Some(source.id), 1)).await.unwrap();
+    let p1 = h.finish_look(persona, p1.generation.id, 1).await;
+    let child = p1.assets[0].id;
+    let p2 = h.op.request_look_pass(persona, &look_input(Some(child), 1)).await.unwrap();
+    let p3 = h.op.request_look_pass(persona, &look_input(Some(source.id), 1)).await.unwrap();
+    let look = h.op.individual_look(persona).await.unwrap();
+    for (id, source) in [(p1.generation.id, source.id), (p2.generation.id, child), (p3.generation.id, source.id)] {
+        assert_eq!(look.passes.iter().find(|p| p.generation.id == id).unwrap().generation.source_asset_id, Some(source));
+    }
+}
+
+#[tokio::test]
+async fn a_second_look_pass_waits_for_the_gpu_gate() {
+    let Some(h) = harness().await else { return };
+    domain::production::register_engine(&h.hub, "comfy-atlas", "fixture://comfyui", json!({"admission":{"max_in_flight":1}}))
+        .await
+        .unwrap();
+    let persona = h.persona().await.id;
+    let p1 = h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap();
+    h.tick().await;
+    h.wait_queued(1).await;
+    let p2 = h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap();
+    h.tick().await;
+    let look = h.op.individual_look(persona).await.unwrap();
+    assert_eq!(look.passes.iter().find(|p| p.generation.id == p2.generation.id).unwrap().generation.state, GenerationState::Requested);
+    let comfy = h.fx.comfy.as_ref().unwrap();
+    for _ in 0..=comfy.steps {
+        comfy.tick();
+    }
+    h.tick().await;
+    assert_eq!(
+        h.op.individual_look(persona).await.unwrap().passes.iter().find(|p| p.generation.id == p1.generation.id).unwrap().generation.state,
+        GenerationState::Succeeded
+    );
+    h.release_look_outbox().await;
+    h.finish_look(persona, p2.generation.id, 1).await;
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_look_pass_never_submits_it() {
+    let Some(h) = harness().await else { return };
+    domain::production::register_engine(
+        &h.hub,
+        "comfy-atlas",
+        "fixture://comfyui",
+        json!({"admission":{"defer_while_llm_loaded":true,"llm_running_url":"http://llama-swap/running"}}),
+    )
+    .await
+    .unwrap();
+    let peer = h.fx.gpu_peer.as_ref().unwrap();
+    peer.loaded.store(true, std::sync::atomic::Ordering::SeqCst);
+    let persona = h.persona().await.id;
+    let pass = h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap();
+    h.tick().await;
+    assert_eq!(h.op.individual_look(persona).await.unwrap().passes[0].generation.state, GenerationState::Requested);
+    h.op.cancel_generation(pass.generation.id).await.unwrap();
+    peer.loaded.store(false, std::sync::atomic::Ordering::SeqCst);
+    h.release_look_outbox().await;
+    h.tick().await;
+    let comfy = h.fx.comfy.as_ref().unwrap();
+    assert!(comfy.queued().is_empty() && comfy.running().is_none());
+    let state: String = domain::sqlx::query_scalar("select state from outbox where idempotency_key=$1")
+        .bind(format!("generation:{}", pass.generation.id))
+        .fetch_one(&h.hub.db)
+        .await
+        .unwrap();
+    assert_eq!(state, "dead");
+}
+
+#[tokio::test]
+async fn reused_seeds_match_the_earlier_pass() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let p1 = h.op.request_look_pass(persona, &look_input(None, 2)).await.unwrap();
+    h.finish_look(persona, p1.generation.id, 2).await;
+    let mut input = look_input(None, 2);
+    input.reuse_seeds_from = Some(p1.generation.id);
+    let p2 = h.op.request_look_pass(persona, &input).await.unwrap();
+    h.finish_look(persona, p2.generation.id, 2).await;
+    input.reuse_seeds_from = Some(p2.generation.id);
+    let p3 = h.op.request_look_pass(persona, &input).await.unwrap();
+    h.finish_look(persona, p3.generation.id, 2).await;
+    let mut seeds = Vec::new();
+    for id in [p1.generation.id, p2.generation.id, p3.generation.id] {
+        let job: serde_json::Value = domain::sqlx::query_scalar("select payload from outbox where idempotency_key=$1")
+            .bind(format!("generation:{id}"))
+            .fetch_one(&h.hub.db)
+            .await
+            .unwrap();
+        seeds.push(job["prompts"].as_array().unwrap().iter().map(|p| p["8"]["inputs"]["seed"].as_u64().unwrap()).collect::<Vec<_>>());
+    }
+    assert_eq!(seeds[0].len(), 2);
+    assert_eq!(seeds[0], seeds[1]);
+    assert_eq!(seeds[1], seeds[2], "a chain of reuse keeps the first pass's seeds");
+}
+
+#[tokio::test]
+async fn a_finished_look_pass_notifies_once() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let pass = h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap();
+    h.finish_look(persona, pass.generation.id, 1).await;
+    domain::look::notify_finished(&h.hub).await.unwrap();
+    let key = format!("look:pass:{}", pass.generation.id);
+    let items = h.op.notifications(None, 0, true).await.unwrap().items;
+    let matching: Vec<_> = items.iter().filter(|n| n.dedupe_key == key).collect();
+    assert_eq!(matching.len(), 1);
+    let id = matching[0].id;
+    h.op.ack_notifications(&AckNotificationsIn { ids: vec![id], all: false }).await.unwrap();
+    domain::look::notify_finished(&h.hub).await.unwrap();
+    let items = h.op.notifications(None, 0, true).await.unwrap().items;
+    let matching: Vec<_> = items.iter().filter(|n| n.dedupe_key == key).collect();
+    assert_eq!(matching.len(), 1);
+    assert!(matching[0].read_at.is_some());
+}
+
+#[tokio::test]
+async fn an_upload_that_is_not_an_image_is_refused() {
+    let Some(h) = harness().await else { return };
+    assert_eq!(
+        code(h.op.upload_look_image(h.persona().await.id, "image/png", true, b"not an image".to_vec()).await.unwrap_err()),
+        "not_an_image"
+    );
+}
+
+#[tokio::test]
+async fn an_upload_without_the_real_person_attestation_is_refused() {
+    let Some(h) = harness().await else { return };
+    assert_eq!(
+        code(h.op.upload_look_image(h.persona().await.id, "image/png", false, LOOK_PNG.to_vec()).await.unwrap_err()),
+        "attestation_required"
+    );
+}
+
+#[tokio::test]
+async fn a_generation_has_exactly_one_owner() {
+    let Some(h) = harness().await else { return };
+    let content = h.brief(None).await;
+    let persona = h.persona().await;
+    let workflow = h.workflow("poster-txt2img").await;
+    for (content_id, persona_id) in [(None, None), (Some(content.id), Some(persona.id))] {
+        let error = domain::sqlx::query(
+            "insert into generation_requests (id, content_item_id, persona_id, workflow_id, request_version, inputs, variants, prompt_ids, state, created_by)
+             values ($1, $2, $3, $4, 1, '{}', 1, '[]', 'requested', 'test')",
+        )
+        .bind(Uuid::new_v4()).bind(content_id).bind(persona_id).bind(workflow.id)
+        .execute(&h.hub.db).await.unwrap_err();
+        assert_eq!(error.as_database_error().and_then(|e| e.constraint()), Some("generation_requests_one_owner"));
+    }
+}
+
+#[tokio::test]
+async fn keeping_a_look_image_needs_the_three_required_attestations() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await;
+    let id = Uuid::new_v4();
+    domain::sqlx::query(
+        "insert into assets (id, persona_id, sha256, storage_key, mime, bytes, state, provenance, source_key)
+         values ($1, $2, 'sha', 'key', 'image/png', 0, 'ready', '{}', $3)",
+    )
+    .bind(id)
+    .bind(persona.id)
+    .bind(id.to_string())
+    .execute(&h.hub.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        code(
+            h.op.select_asset(
+                id,
+                &SelectAssetIn { selected: true, attest: vec!["adult_or_non_human".into(), "not_sexualised".into()], ..Default::default() }
+            )
+            .await
+            .unwrap_err()
+        ),
+        "required_checks_missing"
+    );
+    let selected: bool =
+        domain::sqlx::query_scalar("select selected from assets where id = $1").bind(id).fetch_one(&h.hub.db).await.unwrap();
+    assert!(!selected);
+    let count: i64 =
+        domain::sqlx::query_scalar("select count(*) from image_checks where asset_id=$1").bind(id).fetch_one(&h.hub.db).await.unwrap();
+    assert_eq!(count, 0);
+    let kept =
+        h.op.select_asset(
+            id,
+            &SelectAssetIn {
+                selected: true,
+                attest: vec!["adult_or_non_human".into(), "not_sexualised".into(), "not_real_person".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(kept.selected);
+    assert_eq!(kept.checks.len(), 3);
+    assert!(kept.checks.iter().all(|c| c.checker == "operator:operator" && c.verdict == "pass"));
+    assert_eq!(
+        code(
+            h.op.select_asset(id, &SelectAssetIn { selected: true, attest: vec!["bogus".into()], ..Default::default() }).await.unwrap_err()
+        ),
+        "unknown_check"
+    );
+}
+
+#[tokio::test]
+async fn an_uploaded_image_already_carries_the_real_person_attestation() {
+    let Some(h) = harness().await else { return };
+    let asset = h.look_upload(h.persona().await.id).await;
+    assert!(asset.checks.iter().any(|c| c.check_key == "not_real_person" && c.verdict == "pass" && c.checker == "operator:operator"));
+    let kept =
+        h.op.select_asset(
+            asset.id,
+            &SelectAssetIn { selected: true, attest: vec!["adult_or_non_human".into(), "not_sexualised".into()], ..Default::default() },
+        )
+        .await
+        .unwrap();
+    assert!(kept.selected);
+    assert_eq!(kept.checks.len(), 3);
+}
+
+#[tokio::test]
+async fn advice_checks_never_block_keeping() {
+    let Some(h) = harness().await else { return };
+    let asset = h.look_upload(h.persona().await.id).await;
+    let kept =
+        h.op.select_asset(
+            asset.id,
+            &SelectAssetIn {
+                selected: true,
+                attest: vec!["adult_or_non_human".into(), "not_sexualised".into()],
+                advice: [("stylized".into(), false)].into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(kept.selected);
+    assert!(kept.checks.iter().any(|c| c.check_key == "stylized" && c.verdict == "fail"));
+}
+
+#[tokio::test]
+async fn an_agent_cannot_keep_a_look_image() {
+    let Some(h) = harness().await else { return };
+    let asset = h.look_upload(h.persona().await.id).await;
+    assert_eq!(
+        code(h.agent.select_asset(asset.id, &SelectAssetIn { selected: true, ..Default::default() }).await.unwrap_err()),
+        "forbidden"
+    );
+    let content = h.brief(None).await;
+    let id = Uuid::new_v4();
+    domain::sqlx::query("insert into assets (id, content_item_id, sha256, storage_key, mime, bytes, state, provenance, source_key) values ($1,$2,'sha','key','image/png',0,'ready','{}',$3)")
+        .bind(id).bind(content.id).bind(id.to_string()).execute(&h.hub.db).await.unwrap();
+    assert!(h.agent.select_asset(id, &SelectAssetIn { selected: true, ..Default::default() }).await.unwrap().selected);
+}
+
+#[tokio::test]
+async fn pin_requires_a_kept_image_of_this_individual() {
+    let Some(h) = harness().await else { return };
+    let p = h.persona().await.id;
+    let a = h.look_upload(p).await;
+    let path = format!("/personas/{p}/look/reference");
+    let result: Result<serde_json::Value, _> = h.op.post(&path, &json!({"asset_id": a.id})).await;
+    assert_eq!(code(result.unwrap_err()), "pin_needs_a_kept_image");
+    let other: Persona = h.op.post("/personas", &json!({"name":"Other"})).await.unwrap();
+    h.op.select_asset(
+        a.id,
+        &SelectAssetIn { selected: true, attest: vec!["adult_or_non_human".into(), "not_sexualised".into()], ..Default::default() },
+    )
+    .await
+    .unwrap();
+    let result: Result<serde_json::Value, _> =
+        h.op.post(&format!("/personas/{}/look/reference", other.id), &json!({"asset_id":a.id})).await;
+    assert_eq!(code(result.unwrap_err()), "pin_needs_a_kept_image");
+}
+
+#[tokio::test]
+async fn repinning_asks_first_then_keeps_history_and_names_the_projects() {
+    let Some(h) = harness().await else { return };
+    let p = h.persona().await.id;
+    for name in ["Alpha", "Beta"] {
+        let i: Project = h.op.post("/projects", &json!({"name":name,"kind":"group"})).await.unwrap();
+        let _: Project = h.op.put(&format!("/projects/{}/members/{p}", i.id), &json!({})).await.unwrap();
+    }
+    let a = h.look_upload(p).await;
+    let b = h.op.upload_look_image(p, "image/png", true, b"\x89PNG\r\n\x1a\nsecond".to_vec()).await.unwrap();
+    for id in [a.id, b.id] {
+        h.op.select_asset(
+            id,
+            &SelectAssetIn { selected: true, attest: vec!["adult_or_non_human".into(), "not_sexualised".into()], ..Default::default() },
+        )
+        .await
+        .unwrap();
+    }
+    let path = format!("/personas/{p}/look/reference");
+    let _: serde_json::Value = h.op.post(&path, &json!({"asset_id":a.id})).await.unwrap();
+    let result: Result<serde_json::Value, _> = h.op.post(&path, &json!({"asset_id":b.id})).await;
+    match result.unwrap_err() {
+        ClientError::Api { error, .. } => {
+            assert_eq!(error.code, "repin_needs_confirmation");
+            assert!(error.message.contains("Alpha") && error.message.contains("Beta"));
+        }
+        e => panic!("{e}"),
+    }
+    let result: serde_json::Value = h.op.post(&path, &json!({"asset_id":b.id,"confirm_repin":true})).await.unwrap();
+    assert_eq!(result["affected_projects"], json!(["Alpha", "Beta"]));
+    assert_eq!(result["stale_stages"], json!(["3d", "rig"]));
+    let look: serde_json::Value = h.op.get(&format!("/personas/{p}/look")).await.unwrap();
+    assert_eq!(look["reference_history"].as_array().unwrap().len(), 2);
+    assert_eq!(look["reference"]["asset_id"], json!(b.id));
+    assert_eq!(look["reference_history"][1]["asset_id"], json!(a.id));
+    let same = h.op.pin_look_reference(p, &PinIn { asset_id: b.id, confirm_repin: false }).await.unwrap();
+    assert_eq!(same.reference.asset_id, b.id);
+    assert_eq!(h.op.individual_look(p).await.unwrap().reference_history.len(), 2);
+    assert_eq!(h.op.personas().await.unwrap().into_iter().find(|v| v.id == p).unwrap().reference_asset_id, Some(b.id));
+    for i in h.op.projects().await.unwrap() {
+        assert_eq!(i.members[0].reference_asset_id, Some(b.id));
+    }
+}
+
+#[tokio::test]
+async fn a_pinned_image_cannot_be_unkept() {
+    let Some(h) = harness().await else { return };
+    let p = h.persona().await.id;
+    let a = h.look_upload(p).await;
+    h.op.select_asset(
+        a.id,
+        &SelectAssetIn { selected: true, attest: vec!["adult_or_non_human".into(), "not_sexualised".into()], ..Default::default() },
+    )
+    .await
+    .unwrap();
+    let _: serde_json::Value = h.op.post(&format!("/personas/{p}/look/reference"), &json!({"asset_id":a.id})).await.unwrap();
+    assert_eq!(
+        code(h.op.select_asset(a.id, &SelectAssetIn { selected: false, ..Default::default() }).await.unwrap_err()),
+        "asset_is_pinned"
+    );
+}
+
+async fn canon_test_proposal(h: &H) -> CanonRevision {
+    let p: Persona = h.op.post("/personas", &json!({"name": "Review individual"})).await.unwrap();
+    h.op.propose_canon(
+        p.id,
+        &CanonProposalIn {
+            base_revision: None,
+            body: CanonBody { voice: "distinctive voice".into(), ..Default::default() },
+            source: CanonSource::Operator,
+            rationale: None,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn configure_ceo(h: &H) {
+    domain::sqlx::query(
+        "insert into settings (key, value) values ('paperclip_studio', $1) on conflict (key) do update set value = excluded.value",
+    )
+    .bind(json!({"project_id":"project_studio_content", "ceo_agent_id":"agent_ceo"}))
+    .execute(&h.hub.db)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn canon_r1_goes_to_the_ceo_for_comments_then_the_operator_accepts() {
+    let Some(h) = harness().await else { return };
+    configure_ceo(&h).await;
+    let p = canon_test_proposal(&h).await;
+    h.op.request_canon_comments(p.id).await.unwrap();
+    assert!(h.agent.canon_reviews().await.unwrap().iter().any(|r| r.id == p.id));
+    h.tick().await;
+    let requests = h.fx.paperclip.as_ref().unwrap().issue_requests();
+    let issue = requests.last().unwrap();
+    assert_eq!(issue.assignee_agent_id.as_deref(), Some("agent_ceo"));
+    assert!(issue.description.contains("distinctive voice"));
+    h.agent.comment_canon(p.id, &CanonCommentIn { body: "Looks good".into() }).await.unwrap();
+    assert!(h.op.notifications(None, 0, true).await.unwrap().items.iter().any(|n| n.dedupe_key == format!("canon:comment:{}", p.id)));
+    h.op.decide_canon(p.id, &CanonDecisionIn::Accept).await.unwrap();
+    assert_eq!(h.op.personas().await.unwrap().into_iter().find(|x| x.id == p.persona_id).unwrap().canon.unwrap().id, p.id);
+}
+
+#[tokio::test]
+async fn requesting_comments_twice_files_one_issue() {
+    let Some(h) = harness().await else { return };
+    configure_ceo(&h).await;
+    let p = canon_test_proposal(&h).await;
+    let first = h.op.request_canon_comments(p.id).await.unwrap();
+    assert_eq!(first, h.op.request_canon_comments(p.id).await.unwrap());
+    h.tick().await;
+    assert_eq!(h.fx.paperclip.as_ref().unwrap().issue_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn request_comments_without_a_configured_ceo_fails_closed() {
+    let Some(h) = harness().await else { return };
+    let p = canon_test_proposal(&h).await;
+    assert_eq!(code(h.op.request_canon_comments(p.id).await.unwrap_err()), "ceo_not_configured");
+    let count: i64 = domain::sqlx::query_scalar("select count(*) from outbox where idempotency_key = $1")
+        .bind(format!("issue:canon:{}", p.id))
+        .fetch_one(&h.hub.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn agents_comment_but_cannot_decide_canon() {
+    let Some(h) = harness().await else { return };
+    let p = canon_test_proposal(&h).await;
+    assert_eq!(h.agent.comment_canon(p.id, &CanonCommentIn { body: "Advice".into() }).await.unwrap().comments.len(), 1);
+    assert_eq!(code(h.agent.decide_canon(p.id, &CanonDecisionIn::Accept).await.unwrap_err()), "forbidden");
+}
+
+#[tokio::test]
+async fn a_later_agent_comment_notifies_again_after_acknowledgement() {
+    let Some(h) = harness().await else { return };
+    let p = canon_test_proposal(&h).await;
+    let key = format!("canon:comment:{}", p.id);
+    let open = |items: Vec<contracts::Notification>| items.into_iter().find(|n| n.dedupe_key == key && n.read_at.is_none());
+    h.agent.comment_canon(p.id, &CanonCommentIn { body: "First".into() }).await.unwrap();
+    let first = open(h.op.notifications(None, 0, true).await.unwrap().items).unwrap();
+    h.op.ack_notifications(&AckNotificationsIn { ids: vec![first.id], all: false }).await.unwrap();
+    assert!(open(h.op.notifications(None, 0, true).await.unwrap().items).is_none());
+    h.agent.comment_canon(p.id, &CanonCommentIn { body: "Second".into() }).await.unwrap();
+    assert!(open(h.op.notifications(None, 0, true).await.unwrap().items).unwrap().body.contains("Second"));
+}
+
+#[tokio::test]
+async fn comments_on_a_decided_revision_are_refused() {
+    let Some(h) = harness().await else { return };
+    let p = canon_test_proposal(&h).await;
+    h.op.decide_canon(p.id, &CanonDecisionIn::Accept).await.unwrap();
+    assert_eq!(code(h.agent.comment_canon(p.id, &CanonCommentIn { body: "Late".into() }).await.unwrap_err()), "canon_already_decided");
+}
+
+#[tokio::test]
+async fn agents_read_only_accepted_canon_while_a_proposal_awaits_comments() {
+    let Some(h) = harness().await else { return };
+    configure_ceo(&h).await;
+    let p = canon_test_proposal(&h).await;
+    h.op.decide_canon(p.id, &CanonDecisionIn::Accept).await.unwrap();
+    let next =
+        h.op.propose_canon(
+            p.persona_id,
+            &CanonProposalIn {
+                base_revision: Some(1),
+                body: CanonBody { voice: "new".into(), ..Default::default() },
+                source: CanonSource::Operator,
+                rationale: None,
+            },
+        )
+        .await
+        .unwrap();
+    h.op.request_canon_comments(next.id).await.unwrap();
+    assert_eq!(h.agent.personas().await.unwrap().into_iter().find(|x| x.id == p.persona_id).unwrap().canon.unwrap().id, p.id);
+}
+
+#[tokio::test]
+async fn draft_canon_from_bio_persists_nothing() {
+    let Some(h) = harness().await else { return };
+    let p: Persona = h.op.post("/personas", &json!({"name":"Draft"})).await.unwrap();
+    let draft = h.op.draft_canon(p.id, &CanonDraftIn { bio: "rule: always be kind".into() }).await.unwrap();
+    assert!(draft.rules.iter().any(|r| r.contains("kind")));
+    assert!(h.op.canon(p.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_profile_keeps_the_pasted_bio_verbatim() {
+    let Some(h) = harness().await else { return };
+    let p = h.persona().await;
+    let bio = "  Café  \n\n最後  \n";
+    let profile = IndividualProfile { bio: bio.into(), ..Default::default() };
+    assert_eq!(h.op.set_profile(p.id, &profile).await.unwrap().profile.bio, bio);
+    assert_eq!(h.op.personas().await.unwrap().into_iter().find(|x| x.id == p.id).unwrap().profile.bio, bio);
+}
+
+#[tokio::test]
+async fn a_solo_project_refuses_a_second_member() {
+    let Some(h) = harness().await else { return };
+    let project: serde_json::Value = h.op.post("/projects", &json!({"name":"Solo", "kind":"solo"})).await.unwrap();
+    let id = project["id"].as_str().unwrap();
+    let first = h.persona().await;
+    let second: serde_json::Value = h.op.post("/personas", &json!({"name":"Second"})).await.unwrap();
+    let _: serde_json::Value = h.op.put(&format!("/projects/{id}/members/{}", first.id), &json!({})).await.unwrap();
+    let result: Result<serde_json::Value, _> =
+        h.op.put(&format!("/projects/{id}/members/{}", second["id"].as_str().unwrap()), &json!({})).await;
+    assert_eq!(code(result.unwrap_err()), "solo_has_one_member");
+    let group = h.op.create_project(&project_input("Group", ProjectKind::Group)).await.unwrap();
+    h.op.put_project_member(group.id, first.id, &ProjectMemberIn { role: "".into() }).await.unwrap();
+    h.op.put_project_member(group.id, Uuid::parse_str(second["id"].as_str().unwrap()).unwrap(), &ProjectMemberIn { role: "".into() })
+        .await
+        .unwrap();
+    assert_eq!(code(h.op.update_project(group.id, &project_input("Group", ProjectKind::Solo)).await.unwrap_err()), "solo_has_one_member");
+    let race = h.op.create_project(&project_input("Race", ProjectKind::Solo)).await.unwrap();
+    let second_id = Uuid::parse_str(second["id"].as_str().unwrap()).unwrap();
+    let member = ProjectMemberIn { role: "".into() };
+    let (a, b) = tokio::join!(h.op.put_project_member(race.id, first.id, &member), h.op.put_project_member(race.id, second_id, &member));
+    assert_ne!(a.is_ok(), b.is_ok());
+    assert_eq!(h.op.project(race.id).await.unwrap().members.len(), 1);
+}
+
+fn project_input(name: &str, kind: ProjectKind) -> ProjectIn {
+    ProjectIn { name: name.into(), kind, premise: "".into(), dynamics: "".into(), models: None }
+}
+
+#[tokio::test]
+async fn a_new_project_defaults_to_sol_xhigh_as_its_checker() {
+    let Some(h) = harness().await else { return };
+    let p = h.op.create_project(&project_input("Default", ProjectKind::Solo)).await.unwrap();
+    assert_eq!(p.models, ProjectModels::default());
+}
+
+#[tokio::test]
+async fn a_project_model_outside_the_catalog_is_refused() {
+    let Some(h) = harness().await else { return };
+    let mut input = project_input("Invalid", ProjectKind::Solo);
+    let mut models = ProjectModels::default();
+    models.checker.id = "unknown".into();
+    input.models = Some(models.clone());
+    assert_eq!(code(h.op.create_project(&input).await.unwrap_err()), "unknown_model");
+    models.checker.id = ProjectModels::default().checker.id;
+    models.checker.effort = Some("max".into());
+    input.models = Some(models);
+    assert_eq!(code(h.op.create_project(&input).await.unwrap_err()), "unknown_effort");
+    assert!(!h.op.projects().await.unwrap().iter().any(|p| p.name == "Invalid"));
+}
+
+#[tokio::test]
+async fn saving_premise_keeps_the_project_models() {
+    let Some(h) = harness().await else { return };
+    let mut input = project_input("Preserve", ProjectKind::Solo);
+    let p = h.op.create_project(&input).await.unwrap();
+    let mut models = p.models;
+    models.checker.effort = Some("high".into());
+    input.models = Some(models.clone());
+    h.op.update_project(p.id, &input).await.unwrap();
+    input.models = None;
+    input.premise = "new premise".into();
+    assert_eq!(h.op.update_project(p.id, &input).await.unwrap().models, models);
+}
+
+#[tokio::test]
+async fn projects_stored_before_models_decode_with_defaults() {
+    let Some(h) = harness().await else { return };
+    let p = h.op.create_project(&project_input("Legacy", ProjectKind::Solo)).await.unwrap();
+    for (raw, effort) in [(json!({}), Some("xhigh")), (json!({"checker":{"id":"openai/gpt-6.1-sol"}}), None)] {
+        domain::sqlx::query("update projects set models=$2 where id=$1").bind(p.id).bind(raw).execute(&h.hub.db).await.unwrap();
+        let models = h.op.project(p.id).await.unwrap().models;
+        assert_eq!(models.checker.effort.as_deref(), effort);
+        assert_eq!(models.image, "moss-look");
+    }
+}
+
+#[tokio::test]
+async fn only_the_operator_changes_project_models() {
+    let Some(h) = harness().await else { return };
+    let mut input = project_input("Access", ProjectKind::Solo);
+    let p = h.op.create_project(&input).await.unwrap();
+    input.models = Some(ProjectModels::default());
+    assert_eq!(code(h.agent.update_project(p.id, &input).await.unwrap_err()), "forbidden");
+    assert_eq!(h.agent.project(p.id).await.unwrap().models, p.models);
+}
+
+#[tokio::test]
+async fn a_look_pass_uses_the_projects_image_workflow_set() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let p = h.op.create_project(&project_input("Set", ProjectKind::Solo)).await.unwrap();
+    h.op.put_project_member(p.id, persona, &ProjectMemberIn { role: "".into() }).await.unwrap();
+    domain::sqlx::query("update projects set models=jsonb_set(models, '{image}', '\"other-look\"') where id=$1")
+        .bind(p.id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    let id = Uuid::new_v4();
+    domain::sqlx::query("insert into workflows (id,name,version,engine_instance_id,api_graph,graph_sha256,bindings,windmill_path) select $1,'other-look-txt2img',version,engine_instance_id,api_graph,graph_sha256,bindings,windmill_path from workflows where name='moss-look-txt2img' order by version desc limit 1").bind(id).execute(&h.hub.db).await.unwrap();
+    assert_eq!(h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap().generation.workflow_id, id);
+}
+
+#[tokio::test]
+async fn projects_that_disagree_on_the_image_model_refuse_a_pass() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    for name in ["First", "Second"] {
+        let p = h.op.create_project(&project_input(name, ProjectKind::Solo)).await.unwrap();
+        h.op.put_project_member(p.id, persona, &ProjectMemberIn { role: "".into() }).await.unwrap();
+        if name == "Second" {
+            domain::sqlx::query("update projects set models=jsonb_set(models, '{image}', '\"other-look\"') where id=$1")
+                .bind(p.id)
+                .execute(&h.hub.db)
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(code(h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap_err()), "projects_disagree_on_image_model");
+}
+
+#[tokio::test]
+async fn a_individual_performs_in_a_solo_and_a_group_project() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await;
+    let solo = h.op.create_project(&project_input("Solo", ProjectKind::Solo)).await.unwrap();
+    let group = h.op.create_project(&project_input("Group", ProjectKind::Group)).await.unwrap();
+    for id in [solo.id, group.id] {
+        let result = h.op.put_project_member(id, persona.id, &ProjectMemberIn { role: "lead".into() }).await.unwrap();
+        assert_eq!(result.members[0].persona_id, persona.id);
+        assert_eq!(result.members[0].has_accepted_canon, persona.canon.is_some());
+    }
+    let other: Persona = h.op.post("/personas", &json!({"name": "No canon"})).await.unwrap();
+    let result = h.op.put_project_member(group.id, other.id, &ProjectMemberIn { role: "".into() }).await.unwrap();
+    assert!(!result.members.iter().find(|m| m.persona_id == other.id).unwrap().has_accepted_canon);
+    assert_eq!(h.op.projects().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn an_project_member_must_share_its_company() {
+    let Some(h) = harness().await else { return };
+    let id = Uuid::new_v4();
+    domain::sqlx::query("insert into personas (id, company_id, name) values ($1, 'other', 'Other')")
+        .bind(id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    let group = h.op.create_project(&project_input("Group", ProjectKind::Group)).await.unwrap();
+    assert_eq!(code(h.op.put_project_member(group.id, id, &ProjectMemberIn { role: "".into() }).await.unwrap_err()), "other_company");
+    assert!(h.op.project(group.id).await.unwrap().members.is_empty());
+}
+
+#[tokio::test]
+async fn an_account_belongs_to_the_last_project_that_claimed_it() {
+    let Some(h) = harness().await else { return };
+    let a = h.op.create_project(&project_input("A", ProjectKind::Solo)).await.unwrap();
+    let b = h.op.create_project(&project_input("B", ProjectKind::Solo)).await.unwrap();
+    let accounts = ProjectAccountsIn { account_ids: vec!["fixture-mastodon".into()] };
+    h.op.set_project_accounts(a.id, &accounts).await.unwrap();
+    h.op.set_project_accounts(b.id, &accounts).await.unwrap();
+    assert!(h.op.project(a.id).await.unwrap().account_ids.is_empty());
+    assert_eq!(h.op.project(b.id).await.unwrap().account_ids, accounts.account_ids);
+    assert_eq!(
+        code(h.op.set_project_accounts(b.id, &ProjectAccountsIn { account_ids: vec!["missing".into()] }).await.unwrap_err()),
+        "not_found"
+    );
+    assert_eq!(h.op.project(b.id).await.unwrap().account_ids, accounts.account_ids);
+}
+
+#[tokio::test]
+async fn only_the_operator_changes_projects() {
+    let Some(h) = harness().await else { return };
+    let input = project_input("Group", ProjectKind::Group);
+    let group = h.op.create_project(&input).await.unwrap();
+    let persona = h.persona().await;
+    let before: i64 = domain::sqlx::query_scalar("select count(*) from audit_log").fetch_one(&h.hub.db).await.unwrap();
+    assert_eq!(code(h.agent.create_project(&input).await.unwrap_err()), "forbidden");
+    assert_eq!(code(h.agent.update_project(group.id, &input).await.unwrap_err()), "forbidden");
+    assert_eq!(
+        code(h.agent.put_project_member(group.id, persona.id, &ProjectMemberIn { role: "".into() }).await.unwrap_err()),
+        "forbidden"
+    );
+    assert_eq!(code(h.agent.remove_project_member(group.id, persona.id).await.unwrap_err()), "forbidden");
+    assert_eq!(code(h.agent.set_project_accounts(group.id, &ProjectAccountsIn { account_ids: vec![] }).await.unwrap_err()), "forbidden");
+    assert_eq!(h.agent.project(group.id).await.unwrap().id, group.id);
+    assert_eq!(h.agent.projects().await.unwrap().len(), 1);
+    let after: i64 = domain::sqlx::query_scalar("select count(*) from audit_log").fetch_one(&h.hub.db).await.unwrap();
+    assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn a_delegated_brief_carries_the_project_dynamics() {
+    let Some(h) = harness().await else { return };
+    domain::sqlx::query(
+        "insert into settings (key, value) values ('paperclip_studio', $1) on conflict (key) do update set value = excluded.value",
+    )
+    .bind(json!({"project_id":"project_studio_content", "assignee_agent_id":"agent_studio_showrunner"}))
+    .execute(&h.hub.db)
+    .await
+    .unwrap();
+    let mut input = project_input("Group", ProjectKind::Group);
+    input.dynamics = "They finish each other's sentences".into();
+    let group = h.op.create_project(&input).await.unwrap();
+    h.op.put_project_member(group.id, h.persona().await.id, &ProjectMemberIn { role: "lead".into() }).await.unwrap();
+    h.brief(None).await;
+    h.tick().await;
+    assert!(h.fx.paperclip.as_ref().unwrap().issue_requests().last().unwrap().description.contains(&input.dynamics));
+}
+
 impl H {
     async fn tick(&self) {
         worker::tick(&self.hub).await.unwrap();
@@ -174,7 +940,13 @@ impl H {
     /// Select all ready assets with alt text.
     async fn select_all(&self, content: Uuid) {
         for a in self.op.content_detail(content).await.unwrap().assets {
-            self.op.select_asset(a.id, &SelectAssetIn { selected: true, alt_text: Some("A kiln glowing at dusk".into()) }).await.unwrap();
+            self.op
+                .select_asset(
+                    a.id,
+                    &SelectAssetIn { selected: true, alt_text: Some("A kiln glowing at dusk".into()), ..Default::default() },
+                )
+                .await
+                .unwrap();
         }
     }
 
@@ -265,7 +1037,7 @@ async fn complete_fixture_journey() {
     assert!(String::from_utf8_lossy(&bytes).contains("FIXTURE"));
 
     // Freeze without alt text is refused; then select, freeze, approve.
-    h.op.select_asset(asset.id, &SelectAssetIn { selected: true, alt_text: None }).await.unwrap();
+    h.op.select_asset(asset.id, &SelectAssetIn { selected: true, ..Default::default() }).await.unwrap();
     let err =
         h.op.freeze_release(
             item.id,

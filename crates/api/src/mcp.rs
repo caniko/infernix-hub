@@ -68,6 +68,20 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
         (Effect::Read, hub_status_route(hub.clone())),
         (
             Effect::Read,
+            read_tool("hub_canon_review", "Canon proposals waiting for comments.", hub.clone(), |hub| async move {
+                hub.canon_reviews().await.map(|value| json_text!(value))
+            }),
+        ),
+        (Effect::Write, canon_comment_tool(hub.clone())),
+        (Effect::Read, individual_pass_status_tool(hub.clone())),
+        (
+            Effect::Read,
+            read_tool("hub_projects", "Projects, their members, accounts, dynamics and model settings.", hub.clone(), |hub| async move {
+                hub.projects().await.map(|value| json_text!(value))
+            }),
+        ),
+        (
+            Effect::Read,
             read_tool("hub_secrets", "Secret inventory and expiry states.", hub.clone(), |hub| async move {
                 hub.secrets().await.map(|value| json_text!(value))
             }),
@@ -119,6 +133,74 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
         (Effect::Write, notify_tool(hub.clone())),
         (Effect::Write, summary_tool(hub)),
     ]
+}
+
+fn individual_pass_status_tool(hub: HubClient) -> ToolRoute<()> {
+    ToolRoute::new(
+        Tool::new(
+            "hub_individual_pass_status",
+            "Generation pass status for an individual.",
+            schema(json!({"persona_id": {"type": "string", "description": "Persona UUID."}}), &["persona_id"]),
+        ),
+        move |Parameters(args): Parameters<Value>| {
+            let hub = hub.clone();
+            async move {
+                let id = match required_uuid(&args, "persona_id").and_then(|id| uuid::Uuid::parse_str(id).map_err(|e| e.to_string())) {
+                    Ok(id) => id,
+                    Err(error) => return failed(error),
+                };
+                match hub.individual_look(id).await {
+                    Ok(look) => {
+                        let passes: Vec<Value> = look.passes.into_iter().map(|pass| json!({
+                            "generation_id": pass.generation.id,
+                            "state": pass.generation.state,
+                            "source_asset_id": pass.generation.source_asset_id,
+                            "attempts": pass.generation.attempts.into_iter().map(|a| json!({"state": a.state, "progress": a.progress})).collect::<Vec<_>>(),
+                            "asset_ids": pass.assets.into_iter().map(|asset| asset.id).collect::<Vec<_>>()
+                        })).collect();
+                        render(json_text!(passes))
+                    }
+                    Err(error) => failed(error.to_string()),
+                }
+            }
+        },
+    )
+}
+
+fn canon_comment_tool(hub: HubClient) -> ToolRoute<()> {
+    ToolRoute::new(
+        Tool::new(
+            "hub_canon_comment",
+            "Comment on a proposed canon revision.",
+            schema(
+                json!({
+                    "revision_id": {"type": "string", "description": "Revision UUID."},
+                    "body": {"type": "string"}
+                }),
+                &["revision_id", "body"],
+            ),
+        ),
+        move |Parameters(args): Parameters<Value>| {
+            let hub = hub.clone();
+            async move {
+                let id = match required_uuid(&args, "revision_id") {
+                    Ok(id) => match uuid::Uuid::parse_str(id) {
+                        Ok(id) => id,
+                        Err(error) => return failed(error.to_string()),
+                    },
+                    Err(error) => return failed(error),
+                };
+                let body: contracts::CanonCommentIn = match serde_json::from_value(args) {
+                    Ok(body) => body,
+                    Err(error) => return failed(error.to_string()),
+                };
+                match hub.comment_canon(id, &body).await {
+                    Ok(value) => render(json_text!(value)),
+                    Err(error) => failed(error.to_string()),
+                }
+            }
+        },
+    )
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -587,6 +669,10 @@ mod tests {
             actual,
             [
                 ("hub_status", Effect::Read),
+                ("hub_canon_review", Effect::Read),
+                ("hub_canon_comment", Effect::Write),
+                ("hub_individual_pass_status", Effect::Read),
+                ("hub_projects", Effect::Read),
                 ("hub_secrets", Effect::Read),
                 ("hub_today", Effect::Read),
                 ("hub_content", Effect::Read),

@@ -29,6 +29,9 @@
         "description": "See hub_contracts::CancelOut",
         "type": "object"
       },
+      "CanonCommentIn": {"description": "See hub_contracts::CanonCommentIn", "type": "object"},
+      "CanonDraftIn": {"description": "See hub_contracts::CanonDraftIn", "type": "object"},
+      "IndividualProfile": {"description": "See hub_contracts::IndividualProfile", "type": "object"},
       "CanonDecisionIn": {
         "description": "See hub_contracts::CanonDecisionIn",
         "type": "object"
@@ -248,6 +251,24 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/v1/projects": {
+      "get": { "operationId": "projects", "responses": { "200": { "description": "Project list" } }, "security": [{ "bearer": [] }] },
+      "post": { "operationId": "create_project", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] }
+    },
+    "/v1/projects/{id}": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+      "get": { "operationId": "project", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] },
+      "put": { "operationId": "update_project", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] }
+    },
+    "/v1/projects/{id}/members/{persona_id}": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }, { "in": "path", "name": "persona_id", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+      "put": { "operationId": "put_project_member", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] },
+      "delete": { "operationId": "remove_project_member", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] }
+    },
+    "/v1/projects/{id}/accounts": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+      "put": { "operationId": "set_project_accounts", "responses": { "200": { "description": "Project" } }, "security": [{ "bearer": [] }] }
+    },
     "/healthz": {
       "get": {
         "operationId": "healthz",
@@ -431,6 +452,36 @@
         ],
         "x-roles": "see domain command"
       }
+    },
+    "/v1/canon/reviews": {
+      "get": {"operationId": "canon_reviews", "responses": {"200": {"description": "Canon revisions"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/canon/{id}/request-comments": {
+      "post": {"operationId": "request_canon_comments", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "CanonRevision"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/canon/{id}/comments": {
+      "post": {"operationId": "canon_comment", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CanonCommentIn"}}}}, "responses": {"200": {"description": "CanonRevision"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/profile": {
+      "put": {"operationId": "set_profile", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IndividualProfile"}}}}, "responses": {"200": {"description": "Persona"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/canon-draft": {
+      "post": {"operationId": "draft_canon", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CanonDraftIn"}}}}, "responses": {"200": {"description": "CanonBody"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/look": {
+      "get": {"operationId": "individual_look", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "IndividualLook"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/look/uploads": {
+      "post": {"operationId": "upload_look_image", "description": "Raw image bytes (maximum 32 MiB); content-type identifies the image.", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}, {"in": "header", "name": "x-attest-not-real-person", "required": true, "schema": {"type": "string", "enum": ["true"]}}], "requestBody": {"required": true, "content": {"image/png": {"schema": {"type": "string", "format": "binary"}}, "image/jpeg": {"schema": {"type": "string", "format": "binary"}}, "image/webp": {"schema": {"type": "string", "format": "binary"}}}}, "responses": {"200": {"description": "Asset"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/look/sources": {
+      "post": {"operationId": "add_look_source", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["asset_id"], "properties": {"asset_id": {"type": "string", "format": "uuid"}}}}}}, "responses": {"200": {"description": "Asset"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/look/passes": {
+      "post": {"operationId": "request_look_pass", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"200": {"description": "LookPass"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/look/reference": {
+      "post": {"operationId": "pin_look_reference", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["asset_id"], "properties": {"asset_id": {"type": "string", "format": "uuid"}, "confirm_repin": {"type": "boolean", "default": false}}}}}}, "responses": {"200": {"description": "PinOut"}}, "security": [{"bearer": []}], "x-roles": "operator"}
     },
     "/v1/canon/{id}/decision": {
       "post": {

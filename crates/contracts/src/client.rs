@@ -78,6 +78,14 @@ impl HubClient {
         self.send(self.http.post(self.url(path)).json(body)).await
     }
 
+    pub async fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T, ClientError> {
+        self.send(self.http.put(self.url(path)).json(body)).await
+    }
+
+    pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
+        self.send(self.http.delete(self.url(path))).await
+    }
+
     /// Raw bytes (asset content) — returns `(mime, bytes)`.
     pub async fn get_bytes(&self, path: &str) -> Result<(String, Vec<u8>), ClientError> {
         let resp =
@@ -118,6 +126,47 @@ impl HubClient {
     }
     pub async fn personas(&self) -> Result<Vec<Persona>, ClientError> {
         self.get("/personas").await
+    }
+    pub async fn individual_look(&self, id: Uuid) -> Result<IndividualLook, ClientError> {
+        self.get(&format!("/personas/{id}/look")).await
+    }
+    pub async fn pin_look_reference(&self, id: Uuid, body: &PinIn) -> Result<PinOut, ClientError> {
+        self.post(&format!("/personas/{id}/look/reference"), body).await
+    }
+    pub async fn upload_look_image(&self, id: Uuid, mime: &str, attested: bool, bytes: Vec<u8>) -> Result<Asset, ClientError> {
+        let mut req =
+            self.http.post(self.url(&format!("/personas/{id}/look/uploads"))).header(reqwest::header::CONTENT_TYPE, mime).body(bytes);
+        if attested {
+            req = req.header("x-attest-not-real-person", "true");
+        }
+        self.send(req).await
+    }
+    pub async fn add_look_source(&self, id: Uuid, body: &LookSourceIn) -> Result<Asset, ClientError> {
+        self.post(&format!("/personas/{id}/look/sources"), body).await
+    }
+    pub async fn request_look_pass(&self, id: Uuid, body: &LookPassIn) -> Result<LookPass, ClientError> {
+        self.post(&format!("/personas/{id}/look/passes"), body).await
+    }
+    pub async fn projects(&self) -> Result<Vec<Project>, ClientError> {
+        self.get("/projects").await
+    }
+    pub async fn project(&self, id: Uuid) -> Result<Project, ClientError> {
+        self.get(&format!("/projects/{id}")).await
+    }
+    pub async fn create_project(&self, body: &ProjectIn) -> Result<Project, ClientError> {
+        self.post("/projects", body).await
+    }
+    pub async fn update_project(&self, id: Uuid, body: &ProjectIn) -> Result<Project, ClientError> {
+        self.put(&format!("/projects/{id}"), body).await
+    }
+    pub async fn put_project_member(&self, id: Uuid, persona: Uuid, body: &ProjectMemberIn) -> Result<Project, ClientError> {
+        self.put(&format!("/projects/{id}/members/{persona}"), body).await
+    }
+    pub async fn remove_project_member(&self, id: Uuid, persona: Uuid) -> Result<Project, ClientError> {
+        self.delete(&format!("/projects/{id}/members/{persona}")).await
+    }
+    pub async fn set_project_accounts(&self, id: Uuid, body: &ProjectAccountsIn) -> Result<Project, ClientError> {
+        self.put(&format!("/projects/{id}/accounts"), body).await
     }
     pub async fn workflows(&self) -> Result<Vec<Workflow>, ClientError> {
         self.get("/workflows").await
@@ -191,6 +240,21 @@ impl HubClient {
     }
     pub async fn canon(&self, persona: Uuid) -> Result<Vec<CanonRevision>, ClientError> {
         self.get(&format!("/personas/{persona}/canon")).await
+    }
+    pub async fn set_profile(&self, persona: Uuid, body: &IndividualProfile) -> Result<Persona, ClientError> {
+        self.put(&format!("/personas/{persona}/profile"), body).await
+    }
+    pub async fn draft_canon(&self, persona: Uuid, body: &CanonDraftIn) -> Result<CanonBody, ClientError> {
+        self.post(&format!("/personas/{persona}/canon-draft"), body).await
+    }
+    pub async fn request_canon_comments(&self, revision: Uuid) -> Result<CanonRevision, ClientError> {
+        self.post(&format!("/canon/{revision}/request-comments"), &()).await
+    }
+    pub async fn comment_canon(&self, revision: Uuid, body: &CanonCommentIn) -> Result<CanonRevision, ClientError> {
+        self.post(&format!("/canon/{revision}/comments"), body).await
+    }
+    pub async fn canon_reviews(&self) -> Result<Vec<CanonRevision>, ClientError> {
+        self.get("/canon/reviews").await
     }
     pub async fn propose_canon(&self, persona: Uuid, body: &CanonProposalIn) -> Result<CanonRevision, ClientError> {
         self.post(&format!("/personas/{persona}/canon"), body).await

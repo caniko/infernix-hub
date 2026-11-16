@@ -151,7 +151,21 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/notifications/sync", post(sync_notifications))
         .route("/notifications/{id}/snooze", post(snooze_notification))
         .route("/personas", get(personas).post(create_persona))
+        .route("/projects", get(projects).post(create_project))
+        .route("/projects/{id}", get(project).put(update_project))
+        .route("/projects/{id}/members/{persona_id}", axum::routing::put(put_project_member).delete(remove_project_member))
+        .route("/projects/{id}/accounts", axum::routing::put(set_project_accounts))
         .route("/personas/{id}/canon", get(canon_list).post(canon_propose))
+        .route("/personas/{id}/profile", axum::routing::put(set_profile))
+        .route("/personas/{id}/canon-draft", post(draft_canon))
+        .route("/personas/{id}/look", get(individual_look))
+        .route("/personas/{id}/look/uploads", post(upload_look_image).layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)))
+        .route("/personas/{id}/look/sources", post(add_look_source))
+        .route("/personas/{id}/look/passes", post(request_look_pass))
+        .route("/personas/{id}/look/reference", post(pin_look_reference))
+        .route("/canon/reviews", get(canon_reviews))
+        .route("/canon/{id}/request-comments", post(request_canon_comments))
+        .route("/canon/{id}/comments", post(canon_comment))
         .route("/canon/{id}/decision", post(canon_decide))
         .route("/workflows", get(workflows))
         .route("/accounts", get(accounts))
@@ -721,6 +735,62 @@ async fn snooze_notification(
 async fn personas(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Persona>> {
     call!(a, domain::canon::list_personas(&s.hub, &a))
 }
+
+async fn individual_look(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<IndividualLook> {
+    call!(a, domain::look::get(&s.hub, &a, id))
+}
+async fn pin_look_reference(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<PinIn>) -> R<PinOut> {
+    call!(a, domain::look::pin(&s.hub, &a, id, b))
+}
+async fn upload_look_image(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    h: HeaderMap,
+    body: axum::body::Bytes,
+) -> R<Asset> {
+    let mime = header(&h, axum::http::header::CONTENT_TYPE.as_str()).unwrap_or_default();
+    let attested = h.get("x-attest-not-real-person").is_some_and(|value| value == "true");
+    call!(a, domain::look::upload(&s.hub, &a, id, &mime, attested, &body))
+}
+async fn add_look_source(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<LookSourceIn>) -> R<Asset> {
+    call!(a, domain::look::add_source(&s.hub, &a, id, b))
+}
+async fn request_look_pass(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<LookPassIn>) -> R<LookPass> {
+    call!(a, domain::look::request_pass(&s.hub, &a, id, b))
+}
+
+async fn projects(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Project>> {
+    call!(a, domain::projects::list(&s.hub, &a))
+}
+async fn project(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<Project> {
+    call!(a, domain::projects::get(&s.hub, &a, id))
+}
+async fn create_project(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<ProjectIn>) -> R<Project> {
+    call!(a, domain::projects::create(&s.hub, &a, b))
+}
+async fn update_project(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<ProjectIn>) -> R<Project> {
+    call!(a, domain::projects::update(&s.hub, &a, id, b))
+}
+async fn put_project_member(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path((id, persona)): Path<(Uuid, Uuid)>,
+    Json(b): Json<ProjectMemberIn>,
+) -> R<Project> {
+    call!(a, domain::projects::put_member(&s.hub, &a, id, persona, b))
+}
+async fn remove_project_member(State(s): State<AppState>, Caller(a): Caller, Path((id, persona)): Path<(Uuid, Uuid)>) -> R<Project> {
+    call!(a, domain::projects::remove_member(&s.hub, &a, id, persona))
+}
+async fn set_project_accounts(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<ProjectAccountsIn>,
+) -> R<Project> {
+    call!(a, domain::projects::set_accounts(&s.hub, &a, id, b))
+}
 #[derive(Deserialize)]
 struct NewPersona {
     name: String,
@@ -730,6 +800,26 @@ async fn create_persona(State(s): State<AppState>, Caller(a): Caller, Json(b): J
 }
 async fn canon_list(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<Vec<CanonRevision>> {
     call!(a, domain::canon::list(&s.hub, &a, id))
+}
+async fn set_profile(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<IndividualProfile>) -> R<Persona> {
+    call!(a, domain::canon::set_profile(&s.hub, &a, id, b))
+}
+async fn draft_canon(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<CanonDraftIn>) -> R<CanonBody> {
+    call!(a, domain::canon::draft_canon(&s.hub, &a, id, b))
+}
+async fn canon_reviews(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<CanonRevision>> {
+    call!(a, domain::canon::reviews(&s.hub, &a))
+}
+async fn request_canon_comments(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<CanonRevision> {
+    call!(a, domain::canon::request_comments(&s.hub, &a, id))
+}
+async fn canon_comment(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<CanonCommentIn>,
+) -> R<CanonRevision> {
+    call!(a, domain::canon::comment(&s.hub, &a, id, b))
 }
 async fn canon_propose(
     State(s): State<AppState>,

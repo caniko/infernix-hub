@@ -44,7 +44,11 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
     let p = &row.payload;
     match row.topic.as_str() {
         outbox::PAPERCLIP_CREATE_ISSUE => {
-            let Some(content) = uuid_field(p, "content_item_id") else { return Delivery::Dead("bad payload".into()) };
+            let (id, query) = match (uuid_field(p, "content_item_id"), uuid_field(p, "canon_revision_id")) {
+                (Some(id), None) => (id, "update content_items set paperclip_issue_id = $2, paperclip_issue_url = $3 where id = $1"),
+                (None, Some(id)) => (id, "update canon_revisions set review_issue_id = $2, review_issue_url = $3 where id = $1"),
+                _ => return Delivery::Dead("bad payload".into()),
+            };
             let req = IssueRequest {
                 company_id: p["company_id"].as_str().unwrap_or_default().into(),
                 title: p["title"].as_str().unwrap_or_default().into(),
@@ -56,18 +60,10 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
             };
             // Retrying is safe: adapters dedupe on origin_key.
             match hub.paperclip.create_issue(&req).await {
-                Ok(issue) => {
-                    match domain::sqlx::query("update content_items set paperclip_issue_id = $2, paperclip_issue_url = $3 where id = $1")
-                        .bind(content)
-                        .bind(&issue.id)
-                        .bind(&issue.url)
-                        .execute(&hub.db)
-                        .await
-                    {
-                        Ok(_) => Delivery::Done,
-                        Err(e) => Delivery::Retry(e.to_string()),
-                    }
-                }
+                Ok(issue) => match domain::sqlx::query(query).bind(id).bind(&issue.id).bind(&issue.url).execute(&hub.db).await {
+                    Ok(_) => Delivery::Done,
+                    Err(e) => Delivery::Retry(e.to_string()),
+                },
                 Err(e) => classify(e, true),
             }
         }
@@ -110,6 +106,9 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
                 Err(e) => return Delivery::Dead(format!("bad payload: {e}")),
             };
             let Ok(gen_id) = Uuid::parse_str(&job.generation_request_id) else { return Delivery::Dead("bad payload".into()) };
+            if let Err(e) = production::push_source_image(hub, gen_id).await {
+                return classify(e, true);
+            }
             // A second procedure run could resubmit prompts; on an ambiguous
             // start we stop and let prompt reconciliation find the work.
             match hub.windmill.run_generation(&job).await {
@@ -311,6 +310,9 @@ pub async fn run(hub: Hub, every: Duration) {
     loop {
         if let Err(e) = tick(&hub).await {
             tracing::error!(error = %e, "worker tick failed");
+        }
+        if let Err(e) = domain::look::notify_finished(&hub).await {
+            tracing::warn!(error = %e, "look notification failed");
         }
         tokio::time::sleep(every).await;
     }

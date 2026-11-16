@@ -32,6 +32,11 @@ enum Cmd {
     Today,
     News,
     Personas,
+    Projects,
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
+    },
     Workflows,
     Accounts,
     Content,
@@ -166,6 +171,42 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum ProjectCmd {
+    Models {
+        id: Uuid,
+        #[arg(long)]
+        checker: Option<String>,
+        #[arg(long)]
+        checker_effort: Option<String>,
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        assistant: Option<String>,
+        #[arg(long)]
+        three_d: Option<String>,
+        #[arg(long)]
+        voice: Option<String>,
+    },
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long, default_value = "")]
+        premise: String,
+        #[arg(long, default_value = "")]
+        dynamics: String,
+    },
+    AddMember {
+        id: Uuid,
+        #[arg(long)]
+        persona: Uuid,
+        #[arg(long, default_value = "")]
+        role: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum FleetCmd {
     /// The snapshot written by `canix fleet status --write`.
     Status,
@@ -248,6 +289,54 @@ async fn main() -> Result<()> {
         Cmd::Today => print(c.today().await?),
         Cmd::News => print(c.news().await?),
         Cmd::Personas => print(c.personas().await?),
+        Cmd::Projects => print(c.projects().await?),
+        Cmd::Project { cmd: ProjectCmd::Create { name, kind, premise, dynamics } } => {
+            let kind = ProjectKind::parse(&kind).ok_or_else(|| anyhow::anyhow!("kind must be solo or group"))?;
+            print(c.create_project(&ProjectIn { name, kind, premise, dynamics, models: None }).await?)
+        }
+        Cmd::Project { cmd: ProjectCmd::Models { id, checker, checker_effort, image, assistant, three_d, voice } } => {
+            let project = c.project(id).await?;
+            let changed = checker.is_some()
+                || checker_effort.is_some()
+                || image.is_some()
+                || assistant.is_some()
+                || three_d.is_some()
+                || voice.is_some();
+            let mut models = project.models;
+            if let Some(v) = checker {
+                models.checker.id = v;
+            }
+            if let Some(v) = checker_effort {
+                models.checker.effort = Some(v);
+            }
+            if let Some(v) = image {
+                models.image = v;
+            }
+            if let Some(v) = assistant {
+                models.assistant = v;
+            }
+            if let Some(v) = three_d {
+                models.three_d = v;
+            }
+            if let Some(v) = voice {
+                models.voice = v;
+            }
+            if changed {
+                let input = ProjectIn {
+                    name: project.name,
+                    kind: project.kind,
+                    premise: project.premise,
+                    dynamics: project.dynamics,
+                    models: Some(models),
+                };
+                print(c.update_project(id, &input).await?.models);
+            } else {
+                print(models);
+            }
+        }
+        Cmd::Project { cmd: ProjectCmd::AddMember { id, persona, role } } => {
+            print(c.put_project_member(id, persona, &ProjectMemberIn { role }).await?)
+        }
         Cmd::Workflows => print(c.workflows().await?),
         Cmd::Accounts => print(c.accounts().await?),
         Cmd::Content => print(c.content().await?),
@@ -261,7 +350,9 @@ async fn main() -> Result<()> {
             print(c.generate(content, &GenerateIn { workflow_id: workflow, inputs: json!({ "prompt": prompt }), variants }).await?)
         }
         Cmd::CancelGeneration { id } => print(c.cancel_generation(id).await?),
-        Cmd::Select { asset, alt } => print(c.select_asset(asset, &SelectAssetIn { selected: true, alt_text: Some(alt) }).await?),
+        Cmd::Select { asset, alt } => {
+            print(c.select_asset(asset, &SelectAssetIn { selected: true, alt_text: Some(alt), ..Default::default() }).await?)
+        }
         Cmd::Freeze { content, account, text, not_before, not_after } => print(
             c.freeze_release(
                 content,

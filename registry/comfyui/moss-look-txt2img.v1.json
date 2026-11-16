@@ -1,0 +1,136 @@
+{
+  "name": "moss-look-txt2img",
+  "version": 1,
+  "engine_instance_id": "comfy-atlas",
+  "windmill_path": "f/fleetix_hub/comfy_generate",
+  "bindings": {
+    "prompt": {
+      "node": "5",
+      "input": "text"
+    },
+    "negative": {
+      "node": "6",
+      "input": "text",
+      "default": ""
+    },
+    "seed": {
+      "node": "8",
+      "input": "seed"
+    }
+  },
+  "graph": {
+    "1": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "dirty_moss_v2_bf16.safetensors",
+        "weight_dtype": "default"
+      }
+    },
+    "2": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "qwen3.5_9b_w4a8_gptq.safetensors",
+        "type": "moss_image",
+        "device": "default"
+      }
+    },
+    "3": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "flux2-vae.safetensors"
+      }
+    },
+    "4": {
+      "class_type": "ModelSamplingAuraFlow",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "shift": 5.0
+      }
+    },
+    "5": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "clip": [
+          "2",
+          0
+        ],
+        "text": "POSITIVE"
+      }
+    },
+    "6": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "clip": [
+          "2",
+          0
+        ],
+        "text": "NEGATIVE"
+      }
+    },
+    "7": {
+      "class_type": "EmptyFlux2LatentImage",
+      "inputs": {
+        "width": 896,
+        "height": 1152,
+        "batch_size": 1
+      }
+    },
+    "8": {
+      "class_type": "KSampler",
+      "inputs": {
+        "model": [
+          "4",
+          0
+        ],
+        "positive": [
+          "5",
+          0
+        ],
+        "negative": [
+          "6",
+          0
+        ],
+        "latent_image": [
+          "7",
+          0
+        ],
+        "seed": 0,
+        "steps": 25,
+        "cfg": 2.5,
+        "sampler_name": "er_sde",
+        "scheduler": "simple",
+        "denoise": 1.0
+      }
+    },
+    "9": {
+      "class_type": "VAEDecodeTiled",
+      "inputs": {
+        "samples": [
+          "8",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ],
+        "tile_size": 512,
+        "overlap": 64,
+        "temporal_size": 64,
+        "temporal_overlap": 8
+      }
+    },
+    "20": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "images": [
+          "9",
+          0
+        ],
+        "filename_prefix": "hub/look"
+      }
+    }
+  }
+}

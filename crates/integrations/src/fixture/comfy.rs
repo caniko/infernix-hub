@@ -2,6 +2,7 @@
 //! history, `/view`, targeted cancellation and history clearing.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -25,6 +26,7 @@ struct ComfyState {
     running: Option<FixturePrompt>,
     history: HashMap<String, PromptOutcome>,
     files: HashMap<String, Vec<u8>>,
+    uploads: Vec<(String, usize)>,
 }
 
 /// Simulated ComfyUI with one GPU worker: FIFO queue, per-step progress,
@@ -33,11 +35,12 @@ pub struct FixtureComfy {
     state: Mutex<ComfyState>,
     events: broadcast::Sender<(String, ProgressEvent)>,
     pub steps: u64,
+    pub fail_uploads: AtomicBool,
 }
 
 impl Default for FixtureComfy {
     fn default() -> Self {
-        Self { state: Mutex::default(), events: broadcast::channel(1024).0, steps: 3 }
+        Self { state: Mutex::default(), events: broadcast::channel(1024).0, steps: 3, fail_uploads: AtomicBool::new(false) }
     }
 }
 
@@ -49,7 +52,17 @@ impl FixtureComfy {
             || s.queue.iter().any(|p| p.id == prompt_id)
             || s.running.as_ref().is_some_and(|p| p.id == prompt_id);
         if !known {
-            s.queue.push_back(FixturePrompt { id: prompt_id.into(), client_id: client_id.into(), graph, steps_done: 0 });
+            let missing = graph.as_object().is_some_and(|nodes| {
+                nodes.values().any(|node| {
+                    node["class_type"] == "LoadImage"
+                        && !node["inputs"]["image"].as_str().is_some_and(|name| s.uploads.iter().any(|(uploaded, _)| uploaded == name))
+                })
+            });
+            if missing {
+                s.history.insert(prompt_id.into(), PromptOutcome::Failed { message: "input image not found".into() });
+            } else {
+                s.queue.push_back(FixturePrompt { id: prompt_id.into(), client_id: client_id.into(), graph, steps_done: 0 });
+            }
         }
         prompt_id.into()
     }
@@ -129,6 +142,10 @@ impl FixtureComfy {
     pub fn queued(&self) -> Vec<String> {
         lock(&self.state).queue.iter().map(|p| p.id.clone()).collect()
     }
+
+    pub fn uploads(&self) -> Vec<(String, usize)> {
+        lock(&self.state).uploads.clone()
+    }
 }
 
 pub(super) fn render_svg(graph: &Value, prompt_id: &str) -> Vec<u8> {
@@ -155,6 +172,13 @@ pub(super) fn render_svg(graph: &Value, prompt_id: &str) -> Vec<u8> {
 
 #[async_trait]
 impl Comfy for FixtureComfy {
+    async fn upload(&self, _base_url: &str, name: &str, _mime: &str, bytes: &[u8]) -> PortResult<()> {
+        if self.fail_uploads.load(Ordering::SeqCst) {
+            return Err(PortError::Unreachable("fixture upload unavailable".into()));
+        }
+        lock(&self.state).uploads.push((name.into(), bytes.len()));
+        Ok(())
+    }
     async fn load(&self, _base_url: &str) -> PortResult<EngineLoad> {
         let s = lock(&self.state);
         Ok(EngineLoad {
@@ -214,5 +238,26 @@ impl Comfy for FixtureComfy {
             return Ok(CancelOutcome::AlreadyFinished);
         }
         Err(PortError::NotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn load_image_requires_an_uploaded_input() {
+        let comfy = FixtureComfy::default();
+        let graph = json!({"16": {"class_type": "LoadImage", "inputs": {"image": "hub-a.png"}}});
+        comfy.submit("missing", "client", graph.clone());
+        assert_eq!(comfy.outcome("", "missing").await.unwrap(), PromptOutcome::Failed { message: "input image not found".into() });
+        comfy.fail_uploads.store(true, Ordering::SeqCst);
+        assert!(matches!(comfy.upload("", "hub-a.png", "image/png", b"png").await, Err(PortError::Unreachable(_))));
+        comfy.fail_uploads.store(false, Ordering::SeqCst);
+        comfy.upload("", "hub-a.png", "image/png", b"png").await.unwrap();
+        assert_eq!(comfy.uploads(), vec![("hub-a.png".into(), 3)]);
+        comfy.submit("present", "client", graph);
+        assert!(matches!(comfy.outcome("", "present").await.unwrap(), PromptOutcome::Pending { .. }));
     }
 }
