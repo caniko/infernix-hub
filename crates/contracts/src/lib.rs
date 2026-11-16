@@ -1203,6 +1203,8 @@ pub struct HistoryEntry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TodayItem {
+    #[serde(default)]
+    pub detail: Option<String>,
     pub kind: String,
     pub title: String,
     pub subject_type: String,

@@ -178,6 +178,7 @@ pub(crate) async fn today(hub: &Hub) -> DResult<Vec<TodayItem>> {
         .into_iter()
         .filter(|row| !matches!(row.status.as_str(), "ok" | "never"))
         .map(|row| TodayItem {
+            detail: None,
             kind: "renewal".into(),
             title: row.title.clone(),
             subject_type: "renewal".into(),

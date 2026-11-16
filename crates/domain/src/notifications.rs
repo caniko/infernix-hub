@@ -360,7 +360,9 @@ pub fn today_raises(today: &Today) -> Vec<Raise> {
             dedupe_key,
             severity,
             title: item.title.clone(),
-            body: item.status.clone(),
+            // Adding detail reopens existing acknowledgements once; stable details
+            // and merge ordering keep subsequent unchanged refreshes acknowledged.
+            body: item.detail.as_ref().map_or_else(|| item.status.clone(), |detail| format!("{} — {detail}", item.status)),
             subject_type: Some(item.subject_type.clone()),
             subject_id: Some(item.subject_id.to_string()),
             url: None,
@@ -517,10 +519,15 @@ pub fn fleet_raises(status: &FleetStatus, now: DateTime<Utc>) -> Vec<Raise> {
     if let Some(nightly) = &status.nightly
         && nightly.failed()
     {
-        let body = nightly.error.clone().unwrap_or_else(|| {
-            let failed: Vec<&str> = nightly.hosts.iter().filter(|h| h.outcome == NightlyOutcome::Failed).map(|h| h.host.as_str()).collect();
-            if failed.is_empty() { "the run failed".to_string() } else { format!("failed on {}", failed.join(", ")) }
-        });
+        let mut failed: Vec<&str> = nightly.hosts.iter().filter(|h| h.outcome == NightlyOutcome::Failed).map(|h| h.host.as_str()).collect();
+        failed.sort_unstable();
+        let hosts = (!failed.is_empty()).then(|| format!("failed on {}", failed.join(", ")));
+        let body = match (&nightly.error, hosts) {
+            (Some(error), Some(hosts)) => format!("{error}; {hosts}"),
+            (Some(error), None) => error.clone(),
+            (None, Some(hosts)) => hosts,
+            (None, None) => "the run failed".to_string(),
+        };
         push(format!("fleet:nightly:{}", nightly.started_at), "Nightly update failed".into(), body);
     }
     match snapshot_age_secs(status, now) {
@@ -953,6 +960,7 @@ mod tests {
 
     fn today_item(kind: &str, subject_type: &str, subject_id: Uuid, status: &str) -> TodayItem {
         TodayItem {
+            detail: None,
             kind: kind.into(),
             title: format!("{kind} {status}"),
             subject_type: subject_type.into(),
@@ -960,6 +968,20 @@ mod tests {
             status: status.into(),
             at: None,
         }
+    }
+
+    #[test]
+    fn failure_details_and_nightly_hosts_are_visible() {
+        let mut item = today_item("generation", "content", Uuid::from_u128(1), "failed");
+        item.detail = Some("abc failed at 2026-11-15T12:00:00Z: expired".into());
+        let mut today = Today::default();
+        today.failed_operations.push(item);
+        assert_eq!(today_raises(&today)[0].body, "failed — abc failed at 2026-11-15T12:00:00Z: expired");
+        let mut status: FleetStatus = serde_json::from_str(FLEET_SNAPSHOT).unwrap();
+        status.nightly.as_mut().unwrap().error = Some("update failed".into());
+        let now = DateTime::parse_from_rfc3339("2026-11-10T03:10:00Z").unwrap().with_timezone(&Utc);
+        let raises = fleet_raises(&status, now);
+        assert_eq!(raises.iter().find(|r| r.dedupe_key.starts_with("fleet:nightly:")).unwrap().body, "update failed; failed on nomad");
     }
 
     #[test]

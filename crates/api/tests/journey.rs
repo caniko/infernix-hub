@@ -2844,6 +2844,35 @@ async fn an_agent_may_file_opportunities_but_never_decide_them() {
 }
 
 #[tokio::test]
+async fn today_failure_details_use_latest_attempt_and_are_stable() {
+    let Some(h) = harness().await else { return };
+    let content = h.brief(None).await;
+    let generation = Uuid::new_v4();
+    domain::sqlx::query("insert into generation_requests (id, content_item_id, workflow_id, request_version, inputs, variants, prompt_ids, state, created_by, updated_at) select $1, $2, id, 1, '{}', 1, '[]', 'failed', 'test', '2026-11-15 12:39:40+00' from workflows limit 1")
+        .bind(generation).bind(content.id).execute(&h.hub.db).await.unwrap();
+    for (n, error) in [(1, "old error"), (2, "latest error")] {
+        domain::sqlx::query("insert into execution_attempts (id, generation_request_id, kind, external_id, state, progress, updated_at) values ($1, $2, 'windmill_root', $3, 'failed', $4, '2026-11-15 12:00:00+00'::timestamptz + $5 * interval '1 minute')")
+            .bind(Uuid::new_v4()).bind(generation).bind(format!("attempt-{n}")).bind(json!({"error": error})).bind(n).execute(&h.hub.db).await.unwrap();
+    }
+    let outbox = Uuid::new_v4();
+    domain::sqlx::query("insert into outbox (id, topic, idempotency_key, payload, state, last_error, created_at) values ($1, 'test', $2, '{}', 'dead', 'outbox error', '2026-11-15 08:00:00+00')")
+        .bind(outbox).bind(outbox.to_string()).execute(&h.hub.db).await.unwrap();
+    let first = h.op.today().await.unwrap();
+    let rows: Vec<_> = first.failed_operations.iter().filter(|row| row.subject_id == content.id).collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].detail.as_deref(),
+        Some(format!("{} failed at 2026-11-15 12:39:40.000000 UTC: latest error", &generation.to_string()[..8]).as_str())
+    );
+    let row = first.failed_operations.iter().find(|row| row.subject_id == outbox).unwrap();
+    assert_eq!(
+        row.detail.as_deref(),
+        Some(format!("{} at 2026-11-15 08:00:00.000000 UTC: outbox error", &outbox.to_string()[..8]).as_str())
+    );
+    assert_eq!(first.failed_operations, h.op.today().await.unwrap().failed_operations);
+}
+
+#[tokio::test]
 async fn today_lists_open_calls_due_within_two_weeks() {
     let Some(h) = harness().await else { return };
     let soon = h.ingest.ingest_opportunity(&opportunity_in("soon", Some(Utc::now() + chrono::Duration::days(3)))).await.unwrap();

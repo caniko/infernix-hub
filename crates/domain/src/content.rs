@@ -301,17 +301,21 @@ pub async fn system_today(hub: &Hub) -> DResult<Today> {
         .await?,
         failed_operations: today_items(
             hub,
-            "select 'publication' as kind, c.title || ' → ' || i.account_id as title, 'content' as subject_type, c.id as subject_id, i.state as status, i.updated_at as at
+            "select 'publication' as kind, c.title || ' → ' || i.account_id as title, 'content' as subject_type, c.id as subject_id, i.state as status, i.updated_at as at, null::text as detail
              from publication_intents i join release_revisions r on r.id = i.release_revision_id join content_items c on c.id = r.content_item_id
              where i.state in ('failed', 'outcome_unknown')
              union all
-             select 'generation', c.title, 'content', c.id, g.state, g.updated_at
-             from generation_requests g join content_items c on c.id = g.content_item_id where g.state in ('failed', 'outcome_unknown')
+             select 'generation', c.title, 'content', c.id, g.state, g.updated_at,
+               left(g.id::text, 8) || ' failed at ' || to_char(g.updated_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || ' UTC' || coalesce(': ' || (a.progress->>'error'), '')
+             from generation_requests g join content_items c on c.id = g.content_item_id
+             left join lateral (select progress from execution_attempts where generation_request_id = g.id order by updated_at desc, id desc limit 1) a on true
+             where g.state in ('failed', 'outcome_unknown')
              union all
-             select 'outbox:' || o.topic, coalesce(o.last_error, o.topic), 'outbox', o.id, o.state, o.created_at
+             select 'outbox:' || o.topic, coalesce(o.last_error, o.topic), 'outbox', o.id, o.state, o.created_at,
+               left(o.id::text, 8) || ' at ' || to_char(o.created_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || ' UTC' || coalesce(': ' || o.last_error, '')
              from outbox o where o.state = 'dead' or (o.state = 'pending' and o.attempts >= 3)
              union all
-             select 'reply', rel.counterpart, 'relationship', rel.id, d.state, d.updated_at
+             select 'reply', rel.counterpart, 'relationship', rel.id, d.state, d.updated_at, null::text
              from reply_drafts d join relationships rel on rel.id = d.relationship_id where d.state = 'outcome_unknown'
              order by at desc",
         )
