@@ -33,9 +33,9 @@ fn secret_raises_follow_the_contract() {
         value["secrets"].as_array_mut().unwrap().push(json!({"id":id,"tree":"home","scope":"can","category":"oauth","project":null,"kind":"external","custodian":"can","expiry":expiry,"rotatedAt":null,"rotation":{"method":"replace","command":"rotate","note":""},"consumers":[]}));
     }
     let mut inventory: contracts::SecretInventory = serde_json::from_value(value).unwrap();
-    let raises = secret_raises(&inventory, now);
+    let raises = secret_raises(&inventory, now, &Default::default()).unwrap();
     assert_eq!(
-        raises.iter().map(|r| r.dedupe_key.as_str()).collect::<Vec<_>>(),
+        raises.iter().map(|(_, r)| r.dedupe_key.as_str()).collect::<Vec<_>>(),
         vec!["secrets:expired:expired", "secrets:unknown:unknown", "secrets:warning:expiring"]
     );
     assert!(!secret_inventory_stale(&inventory, now));
@@ -44,6 +44,21 @@ fn secret_raises_follow_the_contract() {
     assert!(secret_inventory_stale(&inventory, now));
     inventory.generated_at = "invalid".into();
     assert!(secret_inventory_stale(&inventory, now));
+}
+
+#[cfg(test)]
+#[test]
+fn secret_custodian_requires_a_member_principal() {
+    let now = Utc::now();
+    let value = json!({"schemaVersion":1,"generatedAt":now.to_rfc3339(),"secrets":[
+        {"id":"private","tree":"home","scope":"dejana","category":"oauth","project":null,"kind":"external","custodian":"dejana","expiry":{"type":"unknown"},"rotatedAt":null,"rotation":{"method":"replace","command":"replace","note":""},"consumers":[]},
+        {"id":"operator","tree":"home","scope":"can","category":"oauth","project":null,"kind":"external","custodian":"can","expiry":{"type":"unknown"},"rotatedAt":null,"rotation":{"method":"replace","command":"replace","note":""},"consumers":[]}
+    ]});
+    let inventory = serde_json::from_value(value).unwrap();
+    let raises = secret_raises(&inventory, now, &["dejana".to_string()].into_iter().collect()).unwrap();
+    assert!(raises.iter().any(|(owner, r)| owner.as_deref() == Some("dejana") && r.dedupe_key == "member:dejana:secrets:private:unknown"));
+    assert!(raises.iter().any(|(owner, r)| owner.is_none() && r.dedupe_key == "secrets:operator:unknown"));
+    assert!(secret_raises(&inventory, now, &Default::default()).unwrap().iter().all(|(owner, _)| owner.is_none()));
 }
 
 /// Producer keys belong to the loop; an HTTP caller that could write them would
@@ -227,8 +242,12 @@ pub fn secret_inventory_stale(inventory: &contracts::SecretInventory, now: DateT
     }
 }
 
-pub fn secret_raises(inventory: &contracts::SecretInventory, now: DateTime<Utc>) -> Vec<Raise> {
-    let mut raises = Vec::new();
+pub fn secret_raises(
+    inventory: &contracts::SecretInventory,
+    now: DateTime<Utc>,
+    members: &std::collections::BTreeSet<String>,
+) -> DResult<Vec<(Option<String>, Raise)>> {
+    let mut groups = std::collections::BTreeMap::<Option<String>, Vec<Raise>>::new();
     for secret in &inventory.secrets {
         let state = secret_state(secret, now);
         let severity = match state {
@@ -241,9 +260,16 @@ pub fn secret_raises(inventory: &contracts::SecretInventory, now: DateTime<Utc>)
             contracts::SecretExpiry::At { date } => date.to_string(),
             _ => "unknown".into(),
         };
-        raises.push(Raise {
+        let owner = members.contains(&secret.custodian).then_some(secret.custodian.clone());
+        let mut key = key_safe(&format!("secrets:{}:{state}", secret.id));
+        if let Some(name) = &owner {
+            let prefix = stored_key(Some(name), "s")?;
+            key.truncate(128 - (prefix.len() - 1));
+        }
+        let key = stored_key(owner.as_deref(), &key)?;
+        groups.entry(owner).or_default().push(Raise {
             source: "secrets".into(),
-            dedupe_key: format!("secrets:{}:{state}", secret.id),
+            dedupe_key: key,
             severity,
             title: format!("Secret {}: {state}", secret.id),
             body: format!(
@@ -255,7 +281,29 @@ pub fn secret_raises(inventory: &contracts::SecretInventory, now: DateTime<Utc>)
             url: None,
         });
     }
-    merge_same_key(raises)
+    Ok(groups.into_iter().flat_map(|(owner, raises)| merge_same_key(raises).into_iter().map(move |raise| (owner.clone(), raise))).collect())
+}
+
+pub async fn sync_secrets(hub: &Hub, current: Vec<(Option<String>, Raise)>) -> DResult<usize> {
+    let mut tx = hub.db.begin().await?;
+    lock_writers(&mut tx).await?;
+    let mut changed = 0;
+    for (owner, raise) in &current {
+        let collision: bool = sqlx::query_scalar("select exists(select 1 from notifications where company_id = $1 and dedupe_key = $2 and (owner is distinct from $3 or source <> 'secrets'))")
+            .bind(&hub.config.company_id).bind(&raise.dedupe_key).bind(owner).fetch_one(&mut *tx).await?;
+        if collision {
+            return Err(invalid("invalid_dedupe_key", "key belongs to another notification owner or source"));
+        }
+        changed += usize::from(upsert(&mut *tx, &hub.config.company_id, owner.as_deref(), raise).await?);
+    }
+    let keys: Vec<&str> = current.iter().map(|(_, r)| r.dedupe_key.as_str()).collect();
+    changed += sqlx::query("update notifications set resolved_at = now(), seq = nextval('notifications_seq'), updated_at = now() where company_id = $1 and source = 'secrets' and resolved_at is null and dedupe_key <> all($2)")
+        .bind(&hub.config.company_id).bind(&keys).execute(&mut *tx).await?.rows_affected() as usize;
+    tx.commit().await?;
+    if changed > 0 {
+        hub.notified.notify_waiters();
+    }
+    Ok(changed)
 }
 
 /// Include every stalled generation, not the capped informational Today list.

@@ -2730,6 +2730,33 @@ async fn notification_feed_never_skips_a_truncated_change() {
 }
 
 #[tokio::test]
+async fn secret_notifications_follow_custodian() {
+    let Some(h) = harness().await else { return };
+    domain::system::issue_token(&h.hub.db, "dejana", Role::Member, Some("member".into())).await.unwrap();
+    let member = HubClient::new(&h.url, "member");
+    let path = std::env::temp_dir().join(format!("hub-secret-owner-{}.json", Uuid::new_v4()));
+    let mut inventory = json!({"schemaVersion":1,"generatedAt":Utc::now().to_rfc3339(),"secrets":[{"id":"private","tree":"home","scope":"dejana","category":"oauth","project":null,"kind":"external","custodian":"dejana","expiry":{"type":"unknown"},"rotatedAt":null,"rotation":{"method":"replace","command":"replace","note":""},"consumers":[]}]});
+    let mut operator = inventory["secrets"][0].clone();
+    operator["id"] = json!("operator");
+    operator["custodian"] = json!("can");
+    inventory["secrets"].as_array_mut().unwrap().push(operator);
+    std::fs::write(&path, inventory.to_string()).unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, Some(&path), None).await;
+    let mine = member.notifications(None, 0, true).await.unwrap().items;
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].dedupe_key, "member:dejana:secrets:private:unknown");
+    let operator = h.op.notifications(None, 0, true).await.unwrap().items;
+    assert!(operator.iter().any(|n| n.dedupe_key == "secrets:operator:unknown"));
+    assert!(!operator.iter().any(|n| n.dedupe_key.contains("private")));
+    inventory["secrets"][0]["custodian"] = json!("can");
+    std::fs::write(&path, inventory.to_string()).unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, Some(&path), None).await;
+    assert!(member.notifications(None, 0, true).await.unwrap().items[0].resolved_at.is_some());
+    assert!(h.op.notifications(None, 0, false).await.unwrap().items.iter().any(|n| n.dedupe_key == "secrets:private:unknown"));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn secret_inventory_pass_preserves_rows_when_unreadable() {
     let Some(h) = harness().await else { return };
     let path = std::env::temp_dir().join(format!("hub-secret-inventory-{}.json", Uuid::new_v4()));
