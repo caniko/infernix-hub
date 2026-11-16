@@ -88,6 +88,262 @@ fn code(e: ClientError) -> String {
     }
 }
 
+const LOOK_PNG: &[u8] = b"\x89PNG\r\n\x1a\nfixture";
+
+fn look_input(source: Option<Uuid>, variants: i32) -> LookPassIn {
+    LookPassIn {
+        source_asset_id: source,
+        prompt: "a character".into(),
+        strength: source.map(|_| 0.5),
+        variants,
+        size: LookSize::Test,
+        reuse_seeds_from: None,
+    }
+}
+
+impl H {
+    async fn look_upload(&self, persona: Uuid) -> Asset {
+        self.op.upload_look_image(persona, "image/png", true, LOOK_PNG.to_vec()).await.unwrap()
+    }
+
+    async fn finish_look(&self, persona: Uuid, pass: Uuid, variants: usize) -> LookPass {
+        self.tick().await;
+        self.wait_queued(variants).await;
+        let comfy = self.fx.comfy.as_ref().unwrap();
+        for _ in 0..variants as u64 * (comfy.steps + 1) {
+            comfy.tick();
+        }
+        self.tick().await;
+        let pass = self.op.character_look(persona).await.unwrap().passes.into_iter().find(|p| p.generation.id == pass).unwrap();
+        assert_eq!(pass.generation.state, GenerationState::Succeeded, "{pass:?}");
+        pass
+    }
+
+    async fn release_look_outbox(&self) {
+        domain::sqlx::query("update outbox set next_attempt_at = now() where state = 'pending'").execute(&self.hub.db).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_look_pass_uploads_its_source_before_the_procedure_runs() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let source = h.look_upload(persona).await;
+    let pass = h.op.request_look_pass(persona, &look_input(Some(source.id), 1)).await.unwrap();
+    let pass = h.finish_look(persona, pass.generation.id, 1).await;
+    assert!(h.fx.comfy.as_ref().unwrap().uploads().contains(&(format!("hub-{}.png", source.sha256), LOOK_PNG.len())));
+    assert!(!pass.assets.is_empty());
+    assert!(pass.assets.iter().all(|a| a.persona_id == Some(persona)));
+}
+
+#[tokio::test]
+async fn a_source_upload_outage_retries_without_starting_the_procedure() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let source = h.look_upload(persona).await;
+    let comfy = h.fx.comfy.as_ref().unwrap();
+    comfy.fail_uploads.store(true, std::sync::atomic::Ordering::SeqCst);
+    let pass = h.op.request_look_pass(persona, &look_input(Some(source.id), 1)).await.unwrap();
+    h.tick().await;
+    let state: String = domain::sqlx::query_scalar("select state from outbox where idempotency_key=$1")
+        .bind(format!("generation:{}", pass.generation.id))
+        .fetch_one(&h.hub.db)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending");
+    let roots: i64 =
+        domain::sqlx::query_scalar("select count(*) from execution_attempts where generation_request_id=$1 and kind='windmill_root'")
+            .bind(pass.generation.id)
+            .fetch_one(&h.hub.db)
+            .await
+            .unwrap();
+    assert_eq!(roots, 0);
+    assert!(comfy.queued().is_empty());
+    comfy.fail_uploads.store(false, std::sync::atomic::Ordering::SeqCst);
+    h.release_look_outbox().await;
+    h.finish_look(persona, pass.generation.id, 1).await;
+}
+
+#[tokio::test]
+async fn look_passes_form_a_tree_by_source_asset() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let source = h.look_upload(persona).await;
+    let p1 = h.op.request_look_pass(persona, &look_input(Some(source.id), 1)).await.unwrap();
+    let p1 = h.finish_look(persona, p1.generation.id, 1).await;
+    let child = p1.assets[0].id;
+    let p2 = h.op.request_look_pass(persona, &look_input(Some(child), 1)).await.unwrap();
+    let p3 = h.op.request_look_pass(persona, &look_input(Some(source.id), 1)).await.unwrap();
+    let look = h.op.character_look(persona).await.unwrap();
+    for (id, source) in [(p1.generation.id, source.id), (p2.generation.id, child), (p3.generation.id, source.id)] {
+        assert_eq!(look.passes.iter().find(|p| p.generation.id == id).unwrap().generation.source_asset_id, Some(source));
+    }
+}
+
+#[tokio::test]
+async fn a_second_look_pass_waits_for_the_gpu_gate() {
+    let Some(h) = harness().await else { return };
+    domain::production::register_engine(&h.hub, "comfy-atlas", "fixture://comfyui", json!({"admission":{"max_in_flight":1}}))
+        .await
+        .unwrap();
+    let persona = h.persona().await.id;
+    let p1 = h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap();
+    h.tick().await;
+    h.wait_queued(1).await;
+    let p2 = h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap();
+    h.tick().await;
+    let look = h.op.character_look(persona).await.unwrap();
+    assert_eq!(look.passes.iter().find(|p| p.generation.id == p2.generation.id).unwrap().generation.state, GenerationState::Requested);
+    let comfy = h.fx.comfy.as_ref().unwrap();
+    for _ in 0..=comfy.steps {
+        comfy.tick();
+    }
+    h.tick().await;
+    assert_eq!(
+        h.op.character_look(persona).await.unwrap().passes.iter().find(|p| p.generation.id == p1.generation.id).unwrap().generation.state,
+        GenerationState::Succeeded
+    );
+    h.release_look_outbox().await;
+    h.finish_look(persona, p2.generation.id, 1).await;
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_look_pass_never_submits_it() {
+    let Some(h) = harness().await else { return };
+    domain::production::register_engine(
+        &h.hub,
+        "comfy-atlas",
+        "fixture://comfyui",
+        json!({"admission":{"defer_while_llm_loaded":true,"llm_running_url":"http://llama-swap/running"}}),
+    )
+    .await
+    .unwrap();
+    let peer = h.fx.gpu_peer.as_ref().unwrap();
+    peer.loaded.store(true, std::sync::atomic::Ordering::SeqCst);
+    let persona = h.persona().await.id;
+    let pass = h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap();
+    h.tick().await;
+    assert_eq!(h.op.character_look(persona).await.unwrap().passes[0].generation.state, GenerationState::Requested);
+    h.op.cancel_generation(pass.generation.id).await.unwrap();
+    peer.loaded.store(false, std::sync::atomic::Ordering::SeqCst);
+    h.release_look_outbox().await;
+    h.tick().await;
+    let comfy = h.fx.comfy.as_ref().unwrap();
+    assert!(comfy.queued().is_empty() && comfy.running().is_none());
+    let state: String = domain::sqlx::query_scalar("select state from outbox where idempotency_key=$1")
+        .bind(format!("generation:{}", pass.generation.id))
+        .fetch_one(&h.hub.db)
+        .await
+        .unwrap();
+    assert_eq!(state, "dead");
+}
+
+#[tokio::test]
+async fn reused_seeds_match_the_earlier_pass() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let p1 = h.op.request_look_pass(persona, &look_input(None, 2)).await.unwrap();
+    h.finish_look(persona, p1.generation.id, 2).await;
+    let mut input = look_input(None, 2);
+    input.reuse_seeds_from = Some(p1.generation.id);
+    let p2 = h.op.request_look_pass(persona, &input).await.unwrap();
+    h.finish_look(persona, p2.generation.id, 2).await;
+    input.reuse_seeds_from = Some(p2.generation.id);
+    let p3 = h.op.request_look_pass(persona, &input).await.unwrap();
+    h.finish_look(persona, p3.generation.id, 2).await;
+    let mut seeds = Vec::new();
+    for id in [p1.generation.id, p2.generation.id, p3.generation.id] {
+        let job: serde_json::Value = domain::sqlx::query_scalar("select payload from outbox where idempotency_key=$1")
+            .bind(format!("generation:{id}"))
+            .fetch_one(&h.hub.db)
+            .await
+            .unwrap();
+        seeds.push(job["prompts"].as_array().unwrap().iter().map(|p| p["8"]["inputs"]["seed"].as_u64().unwrap()).collect::<Vec<_>>());
+    }
+    assert_eq!(seeds[0].len(), 2);
+    assert_eq!(seeds[0], seeds[1]);
+    assert_eq!(seeds[1], seeds[2], "a chain of reuse keeps the first pass's seeds");
+}
+
+#[tokio::test]
+async fn a_finished_look_pass_notifies_once() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await.id;
+    let pass = h.op.request_look_pass(persona, &look_input(None, 1)).await.unwrap();
+    h.finish_look(persona, pass.generation.id, 1).await;
+    domain::look::notify_finished(&h.hub).await.unwrap();
+    let key = format!("look:pass:{}", pass.generation.id);
+    let items = h.op.notifications(None, 0, true).await.unwrap().items;
+    let matching: Vec<_> = items.iter().filter(|n| n.dedupe_key == key).collect();
+    assert_eq!(matching.len(), 1);
+    let id = matching[0].id;
+    h.op.ack_notifications(&AckNotificationsIn { ids: vec![id], all: false }).await.unwrap();
+    domain::look::notify_finished(&h.hub).await.unwrap();
+    let items = h.op.notifications(None, 0, true).await.unwrap().items;
+    let matching: Vec<_> = items.iter().filter(|n| n.dedupe_key == key).collect();
+    assert_eq!(matching.len(), 1);
+    assert!(matching[0].read_at.is_some());
+}
+
+#[tokio::test]
+async fn an_upload_that_is_not_an_image_is_refused() {
+    let Some(h) = harness().await else { return };
+    assert_eq!(
+        code(h.op.upload_look_image(h.persona().await.id, "image/png", true, b"not an image".to_vec()).await.unwrap_err()),
+        "not_an_image"
+    );
+}
+
+#[tokio::test]
+async fn an_upload_without_the_real_person_attestation_is_refused() {
+    let Some(h) = harness().await else { return };
+    assert_eq!(
+        code(h.op.upload_look_image(h.persona().await.id, "image/png", false, LOOK_PNG.to_vec()).await.unwrap_err()),
+        "attestation_required"
+    );
+}
+
+#[tokio::test]
+async fn a_generation_has_exactly_one_owner() {
+    let Some(h) = harness().await else { return };
+    let content = h.brief(None).await;
+    let persona = h.persona().await;
+    let workflow = h.workflow("poster-txt2img").await;
+    for (content_id, persona_id) in [(None, None), (Some(content.id), Some(persona.id))] {
+        let error = domain::sqlx::query(
+            "insert into generation_requests (id, content_item_id, persona_id, workflow_id, request_version, inputs, variants, prompt_ids, state, created_by)
+             values ($1, $2, $3, $4, 1, '{}', 1, '[]', 'requested', 'test')",
+        )
+        .bind(Uuid::new_v4()).bind(content_id).bind(persona_id).bind(workflow.id)
+        .execute(&h.hub.db).await.unwrap_err();
+        assert_eq!(error.as_database_error().and_then(|e| e.constraint()), Some("generation_requests_one_owner"));
+    }
+}
+
+#[tokio::test]
+async fn a_look_image_cannot_be_kept_before_checks_exist() {
+    let Some(h) = harness().await else { return };
+    let persona = h.persona().await;
+    let id = Uuid::new_v4();
+    domain::sqlx::query(
+        "insert into assets (id, persona_id, sha256, storage_key, mime, bytes, state, provenance, source_key)
+         values ($1, $2, 'sha', 'key', 'image/png', 0, 'ready', '{}', $3)",
+    )
+    .bind(id)
+    .bind(persona.id)
+    .bind(id.to_string())
+    .execute(&h.hub.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        code(h.op.select_asset(id, &SelectAssetIn { selected: true, alt_text: None }).await.unwrap_err()),
+        "keep_arrives_with_checks"
+    );
+    let selected: bool =
+        domain::sqlx::query_scalar("select selected from assets where id = $1").bind(id).fetch_one(&h.hub.db).await.unwrap();
+    assert!(!selected);
+}
+
 async fn canon_test_proposal(h: &H) -> CanonRevision {
     let p: Persona = h.op.post("/personas", &json!({"name": "Review character"})).await.unwrap();
     h.op.propose_canon(

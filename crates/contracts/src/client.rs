@@ -124,6 +124,23 @@ impl HubClient {
     pub async fn personas(&self) -> Result<Vec<Persona>, ClientError> {
         self.get("/personas").await
     }
+    pub async fn character_look(&self, id: Uuid) -> Result<CharacterLook, ClientError> {
+        self.get(&format!("/personas/{id}/look")).await
+    }
+    pub async fn upload_look_image(&self, id: Uuid, mime: &str, attested: bool, bytes: Vec<u8>) -> Result<Asset, ClientError> {
+        let mut req =
+            self.http.post(self.url(&format!("/personas/{id}/look/uploads"))).header(reqwest::header::CONTENT_TYPE, mime).body(bytes);
+        if attested {
+            req = req.header("x-attest-not-real-person", "true");
+        }
+        self.send(req).await
+    }
+    pub async fn add_look_source(&self, id: Uuid, body: &LookSourceIn) -> Result<Asset, ClientError> {
+        self.post(&format!("/personas/{id}/look/sources"), body).await
+    }
+    pub async fn request_look_pass(&self, id: Uuid, body: &LookPassIn) -> Result<LookPass, ClientError> {
+        self.post(&format!("/personas/{id}/look/passes"), body).await
+    }
     pub async fn influencers(&self) -> Result<Vec<Influencer>, ClientError> {
         self.get("/influencers").await
     }

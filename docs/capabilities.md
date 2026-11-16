@@ -285,6 +285,8 @@ honours a hub-chosen `prompt_id` and `client_id`; `GET /history/{id}` is `{}`
 when unknown; `/ws` events are progress hints only and terminal state comes from
 history. Live-verified against `127.0.0.1:8188`: `GET /system_stats` and
 `GET /queue`. No prompt was submitted.
+`upload` is built against the 0.44.0 server source, not live-verified; the three
+MOSS workflows have never been run by the hub. Engine evidence remains 0.37.0.
 
 ### n8n
 

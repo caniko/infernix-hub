@@ -677,7 +677,9 @@ pub struct GenerateIn {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationRequest {
     pub id: Uuid,
-    pub content_item_id: Uuid,
+    pub content_item_id: Option<Uuid>,
+    pub persona_id: Option<Uuid>,
+    pub source_asset_id: Option<Uuid>,
     pub workflow_id: Uuid,
     /// Contract version of the generation request payload.
     pub request_version: i32,
@@ -732,7 +734,8 @@ pub struct ArtifactRef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Asset {
     pub id: Uuid,
-    pub content_item_id: Uuid,
+    pub content_item_id: Option<Uuid>,
+    pub persona_id: Option<Uuid>,
     pub generation_request_id: Option<Uuid>,
     pub sha256: String,
     pub mime: String,
@@ -743,6 +746,40 @@ pub struct Asset {
     /// prompt id, engine instance, workflow hash, node id, filename.
     pub provenance: Value,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookSize {
+    Test,
+    Final,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LookPassIn {
+    pub source_asset_id: Option<Uuid>,
+    pub prompt: String,
+    pub strength: Option<f32>,
+    pub variants: i32,
+    pub size: LookSize,
+    pub reuse_seeds_from: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LookPass {
+    pub generation: GenerationRequest,
+    pub assets: Vec<Asset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CharacterLook {
+    pub uploads: Vec<Asset>,
+    pub passes: Vec<LookPass>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LookSourceIn {
+    pub asset_id: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

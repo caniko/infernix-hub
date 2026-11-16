@@ -106,6 +106,9 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
                 Err(e) => return Delivery::Dead(format!("bad payload: {e}")),
             };
             let Ok(gen_id) = Uuid::parse_str(&job.generation_request_id) else { return Delivery::Dead("bad payload".into()) };
+            if let Err(e) = production::push_source_image(hub, gen_id).await {
+                return classify(e, true);
+            }
             // A second procedure run could resubmit prompts; on an ambiguous
             // start we stop and let prompt reconciliation find the work.
             match hub.windmill.run_generation(&job).await {
@@ -307,6 +310,9 @@ pub async fn run(hub: Hub, every: Duration) {
     loop {
         if let Err(e) = tick(&hub).await {
             tracing::error!(error = %e, "worker tick failed");
+        }
+        if let Err(e) = domain::look::notify_finished(&hub).await {
+            tracing::warn!(error = %e, "look notification failed");
         }
         tokio::time::sleep(every).await;
     }

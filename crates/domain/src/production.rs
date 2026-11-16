@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::ports::{
-    CancelOutcome, GenerationJob, JobStatus, OutputFile, PipelineRequest, PipelineRun, PipelineStatus, PortError, ProgressEvent,
-    PromptOutcome,
+    CancelOutcome, GenerationJob, JobStatus, OutputFile, PipelineRequest, PipelineRun, PipelineStatus, PortError, PortResult,
+    ProgressEvent, PromptOutcome,
 };
 use crate::{Actor, DResult, DomainError, Hub, OPERATOR_OR_AGENT, audit, conflict, decode, decode_one, hash, invalid, outbox};
 
@@ -24,6 +24,20 @@ pub const PIPELINE_REQUEST_VERSION: i32 = 1;
 /// Outbox topic that submits one `pipeline_run` attempt. Packs cannot claim
 /// it: a pack topic id always contains `<pack id>.` and this one has no dot.
 pub const PIPELINE_RUN: &str = "pipeline_run";
+
+#[derive(Clone, Copy)]
+pub enum Owner {
+    Content(Uuid),
+    Persona(Uuid),
+}
+
+fn owner_subject(content: Option<Uuid>, persona: Option<Uuid>) -> DResult<(&'static str, Uuid)> {
+    match (content, persona) {
+        (Some(id), None) => Ok(("content", id)),
+        (None, Some(id)) => Ok(("persona", id)),
+        _ => Err(DomainError::Internal("invalid generation or asset owner".into())),
+    }
+}
 
 /// How long a recorded pipeline manifest may wait for artifact uploads before
 /// the generation fails, naming the missing sources.
@@ -174,6 +188,17 @@ pub fn bind_graph(graph: &Value, bindings: &Value, inputs: &Value, variant: i32,
 /// procedure; a pipeline workflow is queued for `hub.pipelines[pipeline_id]`,
 /// whose engine (if any) is only the GPU admission target.
 pub async fn generate(hub: &Hub, actor: &Actor, content_id: Uuid, input: GenerateIn) -> DResult<GenerationRequest> {
+    start(hub, actor, Owner::Content(content_id), input, None, None).await
+}
+
+pub async fn start(
+    hub: &Hub,
+    actor: &Actor,
+    owner: Owner,
+    input: GenerateIn,
+    source_asset_id: Option<Uuid>,
+    seed_from: Option<Uuid>,
+) -> DResult<GenerationRequest> {
     actor.require(OPERATOR_OR_AGENT)?;
     if !(1..=8).contains(&input.variants) {
         return Err(invalid("invalid_variants", "variants must be 1..=8"));
@@ -189,7 +214,19 @@ pub async fn generate(hub: &Hub, actor: &Actor, content_id: Uuid, input: Generat
     let (graph, bindings, windmill_path, engine_id, engine_url, pipeline_id) = wf.ok_or(DomainError::NotFound("workflow"))?;
     let id = Uuid::new_v4();
     let Some(pipeline_id) = pipeline_id else {
-        return start_comfy(hub, actor, content_id, input, id, (graph, bindings, windmill_path, engine_id, engine_url)).await;
+        return start_comfy(
+            hub,
+            actor,
+            owner,
+            input,
+            id,
+            (graph, bindings, windmill_path, engine_id, engine_url),
+            (source_asset_id, seed_from),
+        )
+        .await;
+    };
+    let Owner::Content(content_id) = owner else {
+        return Err(invalid("look_needs_comfy", "look passes require a ComfyUI workflow"));
     };
     // One pipeline run per request: the pipeline expands variants itself from
     // `inputs`.
@@ -201,8 +238,8 @@ pub async fn generate(hub: &Hub, actor: &Actor, content_id: Uuid, input: Generat
     let mut tx = hub.db.begin().await?;
     crate::content::get_item(&mut tx, content_id).await?;
     sqlx::query(
-        "insert into generation_requests (id, content_item_id, workflow_id, request_version, inputs, variants, prompt_ids, state, created_by)
-         values ($1, $2, $3, $4, $5, $6, '[]', 'requested', $7)",
+        "insert into generation_requests (id, content_item_id, workflow_id, request_version, inputs, variants, prompt_ids, state, created_by, source_asset_id)
+         values ($1, $2, $3, $4, $5, $6, '[]', 'requested', $7, $8)",
     )
     .bind(id)
     .bind(content_id)
@@ -211,6 +248,7 @@ pub async fn generate(hub: &Hub, actor: &Actor, content_id: Uuid, input: Generat
     .bind(&input.inputs)
     .bind(input.variants)
     .bind(actor.name())
+    .bind(source_asset_id)
     .execute(&mut *tx)
     .await?;
     // The attempt exists before submission so a receipt (which arrives under
@@ -261,24 +299,48 @@ fn pipeline_request(hub: &Hub, generation_id: Uuid, pipeline_id: String, inputs:
 async fn start_comfy(
     hub: &Hub,
     actor: &Actor,
-    content_id: Uuid,
+    owner: Owner,
     input: GenerateIn,
     id: Uuid,
     spec: ComfySpec,
+    (source_asset_id, seed_from): (Option<Uuid>, Option<Uuid>),
 ) -> DResult<GenerationRequest> {
     let (graph, bindings, windmill_path, engine_id, engine_url) = spec;
     let (Some(graph), Some(engine_id), Some(engine_url)) = (graph, engine_id, engine_url) else {
         return Err(invalid("workflow_without_engine", "this ComfyUI workflow has no engine registered"));
     };
-    let seed_base = u64::from_le_bytes(id.as_bytes()[..8].try_into().unwrap());
+    // Reusing seeds follows the referenced pass back to the generation that first seeded it.
+    let seed_origin: Option<Uuid> = match seed_from {
+        Some(from) => Some(
+            sqlx::query_scalar("select coalesce(seed_origin, id) from generation_requests where id = $1")
+                .bind(from)
+                .fetch_optional(&hub.db)
+                .await?
+                .ok_or(DomainError::NotFound("generation"))?,
+        ),
+        None => None,
+    };
+    let seed_id = seed_origin.unwrap_or(id);
+    let seed_base = u64::from_le_bytes(seed_id.as_bytes()[..8].try_into().unwrap());
     let prompts = (0..input.variants).map(|v| bind_graph(&graph, &bindings, &input.inputs, v, seed_base)).collect::<DResult<Vec<_>>>()?;
     let prompt_ids: Vec<String> = (0..input.variants).map(|_| Uuid::new_v4().to_string()).collect();
 
     let mut tx = hub.db.begin().await?;
-    crate::content::get_item(&mut tx, content_id).await?;
+    let (content_id, persona_id) = match owner {
+        Owner::Content(id) => {
+            crate::content::get_item(&mut tx, id).await?;
+            (Some(id), None)
+        }
+        Owner::Persona(id) => {
+            let found: Option<Uuid> =
+                sqlx::query_scalar("select id from personas where id = $1 for update").bind(id).fetch_optional(&mut *tx).await?;
+            found.ok_or(DomainError::NotFound("persona"))?;
+            (None, Some(id))
+        }
+    };
     sqlx::query(
-        "insert into generation_requests (id, content_item_id, workflow_id, request_version, inputs, variants, prompt_ids, state, created_by)
-         values ($1, $2, $3, $4, $5, $6, $7, 'requested', $8)",
+        "insert into generation_requests (id, content_item_id, workflow_id, request_version, inputs, variants, prompt_ids, state, created_by, persona_id, source_asset_id, seed_origin)
+         values ($1, $2, $3, $4, $5, $6, $7, 'requested', $8, $9, $10, $11)",
     )
     .bind(id)
     .bind(content_id)
@@ -288,6 +350,9 @@ async fn start_comfy(
     .bind(input.variants)
     .bind(json!(prompt_ids))
     .bind(actor.name())
+    .bind(persona_id)
+    .bind(source_asset_id)
+    .bind(seed_origin)
     .execute(&mut *tx)
     .await?;
     // Known prompt ids exist before submission so reconciliation can find
@@ -323,13 +388,16 @@ async fn start_comfy(
         serde_json::to_value(&job).unwrap_or_default(),
     )
     .await?;
-    crate::content::set_state(&mut tx, content_id, ContentState::Producing).await?;
+    if let Some(content_id) = content_id {
+        crate::content::set_state(&mut tx, content_id, ContentState::Producing).await?;
+    }
+    let (subject_type, subject_id) = owner_subject(content_id, persona_id)?;
     audit(
         &mut tx,
         actor,
         "generation.requested",
-        "content",
-        content_id,
+        subject_type,
+        subject_id,
         json!({ "generation_request_id": id, "workflow_id": input.workflow_id, "variants": input.variants }),
     )
     .await?;
@@ -343,8 +411,35 @@ pub fn comfy_client_id() -> String {
     std::env::var("HUB_COMFY_CLIENT_ID").unwrap_or_else(|_| "fleetix-hub".into())
 }
 
-const GEN_SELECT: &str = "select to_jsonb(t) from (
-    select g.id, g.content_item_id, g.workflow_id, g.request_version, g.inputs, g.variants, g.state, g.created_at,
+pub fn source_filename(sha256: &str, mime: &str) -> String {
+    let ext = match mime {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => "png",
+    };
+    format!("hub-{sha256}.{ext}")
+}
+
+pub async fn push_source_image(hub: &Hub, generation_id: Uuid) -> PortResult<()> {
+    let row: Option<(Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "select g.source_asset_id, e.base_url from generation_requests g join workflows w on w.id = g.workflow_id left join engine_instances e on e.id = w.engine_instance_id where g.id = $1",
+    ).bind(generation_id).fetch_optional(&hub.db).await.map_err(|e| PortError::Unreachable(format!("generation lookup: {e}")))?;
+    let (source, base_url) = row.ok_or(PortError::NotFound)?;
+    let Some(source) = source else { return Ok(()) };
+    let base_url = base_url.ok_or(PortError::NotFound)?;
+    let (key, mime, sha): (String, String, String) =
+        sqlx::query_as("select storage_key, mime, sha256 from assets where id = $1 and state = 'ready'")
+            .bind(source)
+            .fetch_optional(&hub.db)
+            .await
+            .map_err(|e| PortError::Unreachable(format!("source lookup: {e}")))?
+            .ok_or(PortError::NotFound)?;
+    let bytes = hub.assets.get(&key).await.map_err(|e| PortError::Unreachable(format!("asset store: {e}")))?;
+    hub.comfy.upload(&base_url, &source_filename(&sha, &mime), &mime, &bytes).await
+}
+
+pub(crate) const GEN_SELECT: &str = "select to_jsonb(t) from (
+    select g.id, g.content_item_id, g.persona_id, g.source_asset_id, g.workflow_id, g.request_version, g.inputs, g.variants, g.state, g.created_at,
       coalesce((select jsonb_agg(to_jsonb(a) order by a.created_at, a.external_id) from (
          select id, parent_id, kind, external_id, engine_instance_id, state, progress, updated_at, created_at
          from execution_attempts where generation_request_id = g.id) a), '[]') as attempts
@@ -787,8 +882,8 @@ pub async fn upload_artifact(
         "pipeline_id": pipeline_id, "generation_request_id": generation_id, "source": source, "storage_key": key,
     });
     let asset_id: Uuid = sqlx::query_scalar(
-        "insert into assets (id, content_item_id, generation_request_id, sha256, storage_key, mime, bytes, state, provenance, source_key)
-         select $1, g.content_item_id, g.id, $2, $3, $4, $5, 'ready', $6, $7 from generation_requests g where g.id = $8
+        "insert into assets (id, content_item_id, persona_id, generation_request_id, sha256, storage_key, mime, bytes, state, provenance, source_key)
+         select $1, g.content_item_id, g.persona_id, g.id, $2, $3, $4, $5, 'ready', $6, $7 from generation_requests g where g.id = $8
          on conflict (source_key) do update
            set sha256 = excluded.sha256, storage_key = excluded.storage_key, mime = excluded.mime, bytes = excluded.bytes, state = 'ready'
          returning id",
@@ -824,14 +919,18 @@ pub async fn upload_artifact(
         // link that did not happen.
         return Err(conflict("artifact_hash_mismatch", format!("{source} is recorded with a different sha256")));
     }
-    let content_id: Uuid =
-        sqlx::query_scalar("select content_item_id from generation_requests where id = $1").bind(generation_id).fetch_one(&mut *tx).await?;
+    let (content_id, persona_id): (Option<Uuid>, Option<Uuid>) =
+        sqlx::query_as("select content_item_id, persona_id from generation_requests where id = $1")
+            .bind(generation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let (subject_type, subject_id) = owner_subject(content_id, persona_id)?;
     audit(
         &mut tx,
         actor,
         "generation.artifact",
-        "content",
-        content_id,
+        subject_type,
+        subject_id,
         json!({ "generation_request_id": generation_id, "asset_id": asset_id, "source": source, "sha256": actual }),
     )
     .await?;
@@ -1354,7 +1453,8 @@ pub async fn record_progress(hub: &Hub, ev: &ProgressEvent) -> DResult<Option<St
 pub struct OpenPrompt {
     pub attempt_id: Uuid,
     pub generation_id: Uuid,
-    pub content_id: Uuid,
+    pub content_id: Option<Uuid>,
+    pub persona_id: Option<Uuid>,
     pub prompt_id: String,
     pub base_url: String,
     pub engine_id: String,
@@ -1366,9 +1466,9 @@ pub struct OpenPrompt {
 /// here: they are followed by [`reconcile_pipelines`] through `Pipeline`, not
 /// by engine history.
 pub async fn open_prompts(hub: &Hub) -> DResult<Vec<OpenPrompt>> {
-    type Row = (Uuid, Uuid, Uuid, String, String, String, Value, chrono::DateTime<chrono::Utc>);
+    type Row = (Uuid, Uuid, Option<Uuid>, Option<Uuid>, String, String, String, Value, chrono::DateTime<chrono::Utc>);
     let rows: Vec<Row> = sqlx::query_as(
-        "select a.id, g.id, g.content_item_id, a.external_id, e.base_url, e.id,
+        "select a.id, g.id, g.content_item_id, g.persona_id, a.external_id, e.base_url, e.id,
            jsonb_build_object('name', w.name, 'version', w.version, 'graph_sha256', w.graph_sha256), a.created_at
          from execution_attempts a join generation_requests g on g.id = a.generation_request_id
          join workflows w on w.id = g.workflow_id left join engine_instances e on e.id = w.engine_instance_id
@@ -1378,10 +1478,11 @@ pub async fn open_prompts(hub: &Hub) -> DResult<Vec<OpenPrompt>> {
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(attempt_id, generation_id, content_id, prompt_id, base_url, engine_id, workflow, created_at)| OpenPrompt {
+        .map(|(attempt_id, generation_id, content_id, persona_id, prompt_id, base_url, engine_id, workflow, created_at)| OpenPrompt {
             attempt_id,
             generation_id,
             content_id,
+            persona_id,
             prompt_id,
             base_url,
             engine_id,
@@ -1556,8 +1657,8 @@ async fn import_output(hub: &Hub, p: &OpenPrompt, out: &OutputFile) -> DResult<(
     });
     let mime = mime_for(&out.filename);
     let asset_id: Uuid = sqlx::query_scalar(
-        "insert into assets (id, content_item_id, generation_request_id, sha256, storage_key, mime, bytes, state, provenance, source_key)
-         values ($1, $2, $3, '', '', $4, 0, 'importing', $5, $6)
+        "insert into assets (id, content_item_id, persona_id, generation_request_id, sha256, storage_key, mime, bytes, state, provenance, source_key)
+         values ($1, $2, $7, $3, '', '', $4, 0, 'importing', $5, $6)
          on conflict (source_key) do update set provenance = excluded.provenance returning id",
     )
     .bind(Uuid::new_v4())
@@ -1566,6 +1667,7 @@ async fn import_output(hub: &Hub, p: &OpenPrompt, out: &OutputFile) -> DResult<(
     .bind(mime)
     .bind(&provenance)
     .bind(&source_key)
+    .bind(p.persona_id)
     .fetch_one(&hub.db)
     .await?;
     let bytes = match hub.comfy.fetch(&p.base_url, out).await {
@@ -1590,12 +1692,13 @@ async fn import_output(hub: &Hub, p: &OpenPrompt, out: &OutputFile) -> DResult<(
         .execute(&hub.db)
         .await?;
     let mut tx = hub.db.begin().await?;
+    let (subject_type, subject_id) = owner_subject(p.content_id, p.persona_id)?;
     audit(
         &mut tx,
         &Actor::system(),
         "asset.imported",
-        "content",
-        p.content_id,
+        subject_type,
+        subject_id,
         json!({ "asset_id": asset_id, "sha256": sha, "prompt_id": p.prompt_id }),
     )
     .await?;
@@ -1668,14 +1771,16 @@ async fn write_derived_state(tx: &mut sqlx::PgConnection, generation_id: Uuid, c
         .await?
         .rows_affected();
     if changed > 0 && matches!(next, GenerationState::Succeeded) {
-        let content: Uuid = sqlx::query_scalar("select content_item_id from generation_requests where id = $1")
+        let content: Option<Uuid> = sqlx::query_scalar("select content_item_id from generation_requests where id = $1")
             .bind(generation_id)
             .fetch_one(&mut *tx)
             .await?;
-        sqlx::query("update content_items set state = 'selecting', updated_at = now() where id = $1 and state = 'producing'")
-            .bind(content)
-            .execute(&mut *tx)
-            .await?;
+        if let Some(content) = content {
+            sqlx::query("update content_items set state = 'selecting', updated_at = now() where id = $1 and state = 'producing'")
+                .bind(content)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
     if changed > 0 {
         audit(tx, &Actor::system(), "generation.state", "generation", generation_id, json!({ "state": next })).await?;
@@ -1792,12 +1897,13 @@ pub async fn cancel(hub: &Hub, actor: &Actor, generation_id: Uuid) -> DResult<Ca
     }
     refresh_generation_state(hub, generation_id).await?;
     let mut tx = hub.db.begin().await?;
+    let (subject_type, subject_id) = owner_subject(generation.content_item_id, generation.persona_id)?;
     audit(
         &mut tx,
         actor,
         "generation.cancel",
-        "content",
-        generation.content_item_id,
+        subject_type,
+        subject_id,
         json!({ "generation_request_id": generation_id, "actions": actions }),
     )
     .await?;
@@ -1882,12 +1988,13 @@ async fn cancel_pipeline(hub: &Hub, actor: &Actor, generation: GenerationRequest
     }
     refresh_generation_state(hub, generation.id).await?;
     let mut tx = hub.db.begin().await?;
+    let (subject_type, subject_id) = owner_subject(generation.content_item_id, generation.persona_id)?;
     audit(
         &mut tx,
         actor,
         "generation.cancel",
-        "content",
-        generation.content_item_id,
+        subject_type,
+        subject_id,
         json!({ "generation_request_id": generation.id, "pipeline_id": pipeline_id, "actions": actions }),
     )
     .await?;
@@ -1985,8 +2092,8 @@ pub async fn admission(hub: &Hub, generation_id: Uuid) -> DResult<Admission> {
 
 // ── Assets ──────────────────────────────────────────────────────────────────
 
-const ASSET_COLS: &str =
-    "id, content_item_id, generation_request_id, sha256, mime, bytes, state, selected, alt_text, provenance, created_at";
+pub(crate) const ASSET_COLS: &str =
+    "id, content_item_id, persona_id, generation_request_id, sha256, mime, bytes, state, selected, alt_text, provenance, created_at";
 
 pub async fn assets_for_content(hub: &Hub, content_id: Uuid) -> DResult<Vec<Asset>> {
     let rows: Vec<Value> = sqlx::query_scalar(&format!(
@@ -2021,12 +2128,16 @@ pub async fn select_asset(hub: &Hub, actor: &Actor, asset_id: Uuid, input: Selec
     .fetch_optional(&mut *tx)
     .await?;
     let asset: Asset = decode_one(row.ok_or(DomainError::NotFound("ready asset"))?)?;
+    if asset.persona_id.is_some() {
+        return Err(invalid("keep_arrives_with_checks", "look images require checks before selection"));
+    }
+    let (subject_type, subject_id) = owner_subject(asset.content_item_id, asset.persona_id)?;
     audit(
         &mut tx,
         actor,
         if input.selected { "asset.selected" } else { "asset.unselected" },
-        "content",
-        asset.content_item_id,
+        subject_type,
+        subject_id,
         json!({ "asset_id": asset_id }),
     )
     .await?;
@@ -2057,6 +2168,28 @@ pub async fn asset_content(hub: &Hub, actor: &Actor, asset_id: Uuid) -> DResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moss_look_workflows_bind_image_prompt_denoise_and_seed() {
+        for (raw, image) in [
+            (include_str!("../../../registry/comfyui/moss-look-txt2img.v1.json"), false),
+            (include_str!("../../../registry/comfyui/moss-look-img2img.v1.json"), true),
+            (include_str!("../../../registry/comfyui/moss-look-img2img-final.v1.json"), true),
+        ] {
+            let spec: WorkflowSpec = serde_json::from_str(raw).unwrap();
+            let graph = spec.graph.unwrap();
+            assert_eq!(graph.as_object().unwrap().values().filter(|n| n["class_type"] == "SaveImage").count(), 1);
+            let inputs = if image { json!({"prompt": "hello", "image": "hub-a.png", "denoise": 0.35}) } else { json!({"prompt": "hello"}) };
+            let a = bind_graph(&graph, &spec.bindings, &inputs, 0, 42).unwrap();
+            let b = bind_graph(&graph, &spec.bindings, &inputs, 1, 42).unwrap();
+            assert_eq!(a["5"]["inputs"]["text"], "hello");
+            assert_ne!(a["8"]["inputs"]["seed"], b["8"]["inputs"]["seed"]);
+            if image {
+                assert_eq!(a["16"]["inputs"]["image"], "hub-a.png");
+                assert_eq!(a["8"]["inputs"]["denoise"], json!(0.35));
+            }
+        }
+    }
 
     #[test]
     fn bind_graph_applies_inputs_and_varies_seed() {

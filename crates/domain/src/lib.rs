@@ -16,6 +16,7 @@ pub mod content;
 pub mod engagement;
 pub mod hash;
 pub mod influencers;
+pub mod look;
 pub mod news;
 pub mod notifications;
 pub mod opportunities;

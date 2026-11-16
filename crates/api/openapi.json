@@ -468,6 +468,18 @@
     "/v1/personas/{id}/canon-draft": {
       "post": {"operationId": "draft_canon", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CanonDraftIn"}}}}, "responses": {"200": {"description": "CanonBody"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
     },
+    "/v1/personas/{id}/look": {
+      "get": {"operationId": "character_look", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "CharacterLook"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/look/uploads": {
+      "post": {"operationId": "upload_look_image", "description": "Raw image bytes (maximum 32 MiB); content-type identifies the image.", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}, {"in": "header", "name": "x-attest-not-real-person", "required": true, "schema": {"type": "string", "enum": ["true"]}}], "requestBody": {"required": true, "content": {"image/png": {"schema": {"type": "string", "format": "binary"}}, "image/jpeg": {"schema": {"type": "string", "format": "binary"}}, "image/webp": {"schema": {"type": "string", "format": "binary"}}}}, "responses": {"200": {"description": "Asset"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/look/sources": {
+      "post": {"operationId": "add_look_source", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["asset_id"], "properties": {"asset_id": {"type": "string", "format": "uuid"}}}}}}, "responses": {"200": {"description": "Asset"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
+    "/v1/personas/{id}/look/passes": {
+      "post": {"operationId": "request_look_pass", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"200": {"description": "LookPass"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
+    },
     "/v1/canon/{id}/decision": {
       "post": {
         "operationId": "canon_decide",

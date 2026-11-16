@@ -64,7 +64,9 @@ pub fn LibraryView() -> Element {
                                             }
                                         }
                                         div { class: "label-tech", "{asset.alt_text}" }
-                                        button { class: "btn btn-glass btn-xs", onclick: move |_| actions::open_subject(store, "content", content_id), "Open content" }
+                                        if let Some(content_id) = content_id {
+                                            button { class: "btn btn-glass btn-xs", onclick: move |_| actions::open_subject(store, "content", content_id), "Open content" }
+                                        }
                                     }
                                 }
                             }

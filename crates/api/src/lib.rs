@@ -156,6 +156,10 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/personas/{id}/canon", get(canon_list).post(canon_propose))
         .route("/personas/{id}/profile", axum::routing::put(set_profile))
         .route("/personas/{id}/canon-draft", post(draft_canon))
+        .route("/personas/{id}/look", get(character_look))
+        .route("/personas/{id}/look/uploads", post(upload_look_image).layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)))
+        .route("/personas/{id}/look/sources", post(add_look_source))
+        .route("/personas/{id}/look/passes", post(request_look_pass))
         .route("/canon/reviews", get(canon_reviews))
         .route("/canon/{id}/request-comments", post(request_canon_comments))
         .route("/canon/{id}/comments", post(canon_comment))
@@ -621,6 +625,27 @@ async fn snooze_notification(
 }
 async fn personas(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Persona>> {
     call!(a, domain::canon::list_personas(&s.hub, &a))
+}
+
+async fn character_look(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<CharacterLook> {
+    call!(a, domain::look::get(&s.hub, &a, id))
+}
+async fn upload_look_image(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    h: HeaderMap,
+    body: axum::body::Bytes,
+) -> R<Asset> {
+    let mime = header(&h, axum::http::header::CONTENT_TYPE.as_str()).unwrap_or_default();
+    let attested = h.get("x-attest-not-real-person").is_some_and(|value| value == "true");
+    call!(a, domain::look::upload(&s.hub, &a, id, &mime, attested, &body))
+}
+async fn add_look_source(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<LookSourceIn>) -> R<Asset> {
+    call!(a, domain::look::add_source(&s.hub, &a, id, b))
+}
+async fn request_look_pass(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<LookPassIn>) -> R<LookPass> {
+    call!(a, domain::look::request_pass(&s.hub, &a, id, b))
 }
 
 async fn influencers(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<Influencer>> {
