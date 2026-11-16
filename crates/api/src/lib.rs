@@ -528,7 +528,7 @@ async fn secrets(State(s): State<AppState>, Caller(a): Caller) -> R<contracts::S
             FleetStatusError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             FleetStatusError::Invalid(_) => StatusCode::BAD_GATEWAY,
         };
-        ApiErr::coded(status, secret_error_code(&e), &e.to_string(), a.correlation_id.clone())
+        ApiErr::coded(status, secret_error_code(&e), e.to_string(), a.correlation_id.clone())
     })?;
     let now = chrono::Utc::now();
     Ok(Json(contracts::SecretInventoryView {
