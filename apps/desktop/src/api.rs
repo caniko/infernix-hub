@@ -35,10 +35,15 @@ pub fn make_client() -> HubClient {
 }
 
 pub async fn timed<T>(future: impl Future<Output = Result<T, ClientError>>) -> Result<T, UiError> {
-    match tokio::time::timeout(REQUEST_TIMEOUT, future).await {
+    timed_for(REQUEST_TIMEOUT, future).await
+}
+
+/// `timed` with a caller's bound, for requests that wait on inference.
+pub async fn timed_for<T>(limit: Duration, future: impl Future<Output = Result<T, ClientError>>) -> Result<T, UiError> {
+    match tokio::time::timeout(limit, future).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(UiError::from_client(error)),
-        Err(_) => Err(UiError::new("timeout", "the hub did not answer within 6s")),
+        Err(_) => Err(UiError::new("timeout", format!("the hub did not answer within {}s", limit.as_secs()))),
     }
 }
 
@@ -135,7 +140,15 @@ pub async fn refresh_base(store: Store, client: HubClient) {
     ensure_selection((store.news).cloned(), store.selected_news, |item| item.id);
     ensure_selection((store.personas).cloned(), store.selected_persona, |item| item.id);
     ensure_selection((store.projects).cloned(), store.selected_project, |item| item.id);
-    ensure_selection((store.relationships).cloned(), store.selected_relationship, |item| item.id);
+    // No default thread: the view filters its list, so an automatic pick could
+    // be one the filter hides. Only drop a selection that no longer exists.
+    let mut selected_relationship = store.selected_relationship;
+    if let Some(items) = (store.relationships).cloned().data
+        && let Some(current) = selected_relationship.cloned()
+        && !items.iter().any(|item| item.id == current)
+    {
+        selected_relationship.set(None);
+    }
 
     store.set_poll_busy(false);
 }

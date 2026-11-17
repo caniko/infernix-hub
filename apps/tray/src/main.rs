@@ -343,8 +343,16 @@ impl Desktop {
         {
             return;
         }
-        // ponytail: no focus-existing on Wayland; one child at a time
-        match tokio::process::Command::new(&self.command).arg("--workspace").arg("notifications").spawn() {
+        // The console gets its own scope: a tray restart neither kills it nor
+        // leaves it in the tray's cgroup, and the fixed unit name keeps one
+        // console per session even after the tray forgot its child.
+        // ponytail: no focus-existing on Wayland; a second open is refused.
+        match tokio::process::Command::new("systemd-run")
+            .args(["--user", "--scope", "--collect", "--quiet", "--unit=fleetix-hub-console", "--"])
+            .arg(&self.command)
+            .args(["--workspace", "notifications"])
+            .spawn()
+        {
             Ok(child) => self.child = Some(child),
             Err(error) => eprintln!("fleetix-hub-tray: cannot start {}: {error}", self.command),
         }
