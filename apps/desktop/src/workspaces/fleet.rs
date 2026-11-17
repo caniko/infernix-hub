@@ -96,8 +96,10 @@ fn CommandBody(status: FleetStatus, stale: bool) -> Element {
             FleetTile {
                 label: "OUTDATED".to_string(),
                 value: counts.outdated.to_string(),
-                detail: Some("older revision".to_string()),
-                tone: Some(if counts.outdated > 0 { "warn" } else { ok }.to_string()),
+                // Day-time switches run newer revisions than the nightly's:
+                // information, not a warning.
+                detail: Some("not on the nightly revision".to_string()),
+                tone: None,
                 on_activate: move |_| store.set_workspace(Workspace::Hosts),
             }
             FleetTile {

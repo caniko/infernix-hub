@@ -164,7 +164,8 @@ pub fn severity(severity: Severity) -> (&'static str, &'static str) {
 pub fn update_state(state: UpdateState) -> (&'static str, &'static str) {
     match state {
         UpdateState::Current => ("Current", "ok"),
-        UpdateState::Outdated => ("Outdated", "warn"),
+        // Another revision than the nightly's, often a newer day-time switch.
+        UpdateState::Outdated => ("Other revision", "info"),
         UpdateState::Unknown => ("Unknown", "muted"),
     }
 }
