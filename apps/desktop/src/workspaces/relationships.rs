@@ -19,22 +19,24 @@ pub enum Filter {
     All,
 }
 
-/// Whether the operator owes this thread a reply. This mirrors the Today query's
-/// overdue-reply rule without its outbound check, which this list does not carry:
-/// a human-owned thread, a due follow-up, or an inbound older than four hours.
-pub fn needs_you(relationship: &Relationship, now: DateTime<Utc>) -> bool {
-    relationship.owner == Owner::Human
-        || relationship.follow_up_at.is_some_and(|at| at <= now)
-        || relationship.last_inbound_at.is_some_and(|at| at < now - chrono::Duration::hours(4))
+/// Whether the operator owes this thread attention: a human-owned thread, a due
+/// follow-up, or a thread the Today queue lists as an overdue interaction (the
+/// server's rule, which also knows whether a reply already went out).
+pub fn needs_you(relationship: &Relationship, now: DateTime<Utc>, overdue: &[Uuid]) -> bool {
+    relationship.owner == Owner::Human || relationship.follow_up_at.is_some_and(|at| at <= now) || overdue.contains(&relationship.id)
 }
 
 /// Rows in display order for one filter: most recent inbound first, threads that
 /// never saw an inbound last.
-pub fn rows(items: &[Relationship], filter: Filter, now: DateTime<Utc>) -> Vec<Relationship> {
-    let mut rows: Vec<Relationship> = items.iter().filter(|item| filter == Filter::All || needs_you(item, now)).cloned().collect();
+pub fn rows(items: &[Relationship], filter: Filter, now: DateTime<Utc>, overdue: &[Uuid]) -> Vec<Relationship> {
+    let mut rows: Vec<Relationship> = items.iter().filter(|item| filter == Filter::All || needs_you(item, now, overdue)).cloned().collect();
     rows.sort_by_key(|item| std::cmp::Reverse(item.last_inbound_at));
     rows
 }
+
+/// Assistant drafting waits for inference; the hub's assistant transport allows
+/// 180 s, so the console waits that long plus a margin.
+const ASSISTANT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(190);
 
 #[component]
 pub fn RelationshipsView() -> Element {
@@ -113,7 +115,7 @@ pub fn RelationshipsView() -> Element {
         assistant_busy.set(true);
         let client_ask_assistant = client_ask_assistant.clone();
         spawn(async move {
-            match api::timed(client_ask_assistant.draft_assistant_reply(id)).await {
+            match api::timed_for(ASSISTANT_TIMEOUT, client_ask_assistant.draft_assistant_reply(id)).await {
                 Ok(_) => {
                     store.notify(true, "Assistant drafted a reply for review.");
                     api::load_relationship_detail(store, client_ask_assistant, id).await;
@@ -218,7 +220,17 @@ pub fn RelationshipsView() -> Element {
 
     let current = filter.cloned();
     let now = Utc::now();
-    let list = relationships.data.as_ref().map(|items| rows(items, current, now));
+    let overdue: Vec<Uuid> = (store.today)
+        .cloned()
+        .data
+        .map(|today| {
+            today.overdue_interactions.into_iter().filter(|item| item.subject_type == "relationship").map(|item| item.subject_id).collect()
+        })
+        .unwrap_or_default();
+    let list = relationships.data.as_ref().map(|items| rows(items, current, now, &overdue));
+    // Detail renders only for a selection the filter shows; the store's default
+    // selection is the first unfiltered row.
+    let detail = detail.filter(|detail| list.as_ref().is_some_and(|items| items.iter().any(|item| item.id == detail.relationship.id)));
     let none_at_all = relationships.data.as_ref().is_some_and(Vec::is_empty);
 
     rsx! {
@@ -289,7 +301,7 @@ pub fn RelationshipsView() -> Element {
                     }
                 },
                 None if list.as_ref().is_some_and(Vec::is_empty) => rsx! { EmptyState { title: "Nothing needs you.".to_string(), hint: None } },
-                None if detail_load.error.is_none() => rsx! { Loading { text: "Loading thread…".to_string() } },
+                None if detail_load.error.is_none() && selected_id.is_some_and(|id| list.as_ref().is_some_and(|items| items.iter().any(|item| item.id == id))) => rsx! { Loading { text: "Loading thread…".to_string() } },
                 None => rsx! { EmptyState { title: "Select a relationship.".to_string(), hint: None } },
                 Some(detail) => rsx! {
                     {
@@ -513,21 +525,22 @@ mod tests {
     #[test]
     fn needs_you_follows_ownership_follow_up_and_inbound_age() {
         let now = at(12);
-        assert!(needs_you(&relationship(Owner::Human, None, Some(at(11))), now), "a human-owned thread always needs the operator");
-        assert!(needs_you(&relationship(Owner::Agent, Some(at(12)), Some(at(11))), now), "a due follow-up needs the operator");
-        assert!(needs_you(&relationship(Owner::Agent, None, Some(at(7))), now), "an inbound older than four hours needs the operator");
-        assert!(!needs_you(&relationship(Owner::Agent, None, Some(at(11))), now), "a fresh inbound with no follow-up does not");
-        assert!(!needs_you(&relationship(Owner::Agent, Some(at(13)), None), now), "a future follow-up does not");
+        assert!(needs_you(&relationship(Owner::Human, None, Some(at(11))), now, &[]), "a human-owned thread always needs the operator");
+        assert!(needs_you(&relationship(Owner::Agent, Some(at(12)), Some(at(11))), now, &[]), "a due follow-up needs the operator");
+        let stale = relationship(Owner::Agent, None, Some(at(7)));
+        assert!(needs_you(&stale, now, &[stale.id]), "a thread Today lists as overdue needs the operator");
+        assert!(!needs_you(&stale, now, &[]), "an answered old inbound (absent from Today) does not");
+        assert!(!needs_you(&relationship(Owner::Agent, Some(at(13)), None), now, &[]), "a future follow-up does not");
 
         let items = vec![
             relationship(Owner::Agent, None, None),
             relationship(Owner::Agent, None, Some(at(11))),
             relationship(Owner::Agent, None, Some(at(7))),
         ];
-        let ordered = rows(&items, Filter::All, now);
+        let ordered = rows(&items, Filter::All, now, &[]);
         assert_eq!(ordered.len(), 3);
         assert_eq!(ordered[0].last_inbound_at, Some(at(11)), "newest inbound leads");
         assert_eq!(ordered[2].last_inbound_at, None, "a thread without inbound goes last");
-        assert_eq!(rows(&items, Filter::NeedsYou, now).len(), 1, "only the stale inbound needs the operator here");
+        assert_eq!(rows(&items, Filter::NeedsYou, now, &[items[2].id]).len(), 1, "only the overdue thread needs the operator here");
     }
 }

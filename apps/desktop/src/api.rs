@@ -35,10 +35,15 @@ pub fn make_client() -> HubClient {
 }
 
 pub async fn timed<T>(future: impl Future<Output = Result<T, ClientError>>) -> Result<T, UiError> {
-    match tokio::time::timeout(REQUEST_TIMEOUT, future).await {
+    timed_for(REQUEST_TIMEOUT, future).await
+}
+
+/// `timed` with a caller's bound, for requests that wait on inference.
+pub async fn timed_for<T>(limit: Duration, future: impl Future<Output = Result<T, ClientError>>) -> Result<T, UiError> {
+    match tokio::time::timeout(limit, future).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(UiError::from_client(error)),
-        Err(_) => Err(UiError::new("timeout", "the hub did not answer within 6s")),
+        Err(_) => Err(UiError::new("timeout", format!("the hub did not answer within {}s", limit.as_secs()))),
     }
 }
 
