@@ -112,7 +112,6 @@ pub fn NotificationsView() -> Element {
                     onclick: move |_| filter.set(Filter::All),
                     "All"
                 }
-                span { class: "label-tech", "{list.len()} shown" }
                 if let Some(error) = renewals.error.clone() {
                     span { class: "label-tech bad", "renewals: {error.code}" }
                 }
