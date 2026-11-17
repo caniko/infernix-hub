@@ -228,9 +228,6 @@ pub fn RelationshipsView() -> Element {
         })
         .unwrap_or_default();
     let list = relationships.data.as_ref().map(|items| rows(items, current, now, &overdue));
-    // Detail renders only for a selection the filter shows; the store's default
-    // selection is the first unfiltered row.
-    let detail = detail.filter(|detail| list.as_ref().is_some_and(|items| items.iter().any(|item| item.id == detail.relationship.id)));
     let none_at_all = relationships.data.as_ref().is_some_and(Vec::is_empty);
 
     rsx! {
@@ -300,8 +297,9 @@ pub fn RelationshipsView() -> Element {
                         hint: Some("Threads arrive when a channel ingests replies, comments or DMs through POST /v1/ingest/interactions.".to_string()),
                     }
                 },
-                None if list.as_ref().is_some_and(Vec::is_empty) => rsx! { EmptyState { title: "Nothing needs you.".to_string(), hint: None } },
-                None if detail_load.error.is_none() && selected_id.is_some_and(|id| list.as_ref().is_some_and(|items| items.iter().any(|item| item.id == id))) => rsx! { Loading { text: "Loading thread…".to_string() } },
+                None if selected_id.is_none() && list.as_ref().is_some_and(Vec::is_empty) => rsx! { EmptyState { title: "Nothing needs you.".to_string(), hint: None } },
+                None if selected_id.is_none() => rsx! { EmptyState { title: "Select a relationship.".to_string(), hint: None } },
+                None if detail_load.error.is_none() => rsx! { Loading { text: "Loading thread…".to_string() } },
                 None => rsx! { EmptyState { title: "Select a relationship.".to_string(), hint: None } },
                 Some(detail) => rsx! {
                     {
