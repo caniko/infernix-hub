@@ -259,7 +259,8 @@ fn App() -> Element {
             shell::StatusSeg { label: "FLEET · STALE".into(), tone: "warn".into() }
         }
         Some(snapshot) => {
-            let attention = snapshot.attention();
+            // The rows the console lists, so the bar and the list agree.
+            let attention = fleet::attention_rows(snapshot).len();
             shell::StatusSeg {
                 label: if attention == 0 { "FLEET · OK".into() } else { format!("FLEET · {attention} ATTENTION") },
                 tone: if attention == 0 { "live".into() } else { "warn".into() },

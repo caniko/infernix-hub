@@ -30,10 +30,11 @@ pub fn counts(status: &FleetStatus) -> Counts {
     }
 }
 
-/// Hosts that need the operator: not healthy, or running an older revision.
+/// Hosts that need the operator: not healthy. A revision other than the
+/// nightly's is not on its own a concern: hosts switched during the day run a
+/// newer revision than the last nightly, so it is shown, never counted.
 pub fn hosts_needing_attention(status: &FleetStatus) -> usize {
-    let target = status.target_revision.as_deref();
-    status.hosts.iter().filter(|host| host.health != Health::Healthy || host.update_state(target) == UpdateState::Outdated).count()
+    status.hosts.iter().filter(|host| host.health != Health::Healthy).count()
 }
 
 /// Alerts plus the monitoring error itself: an unreadable monitor is not
@@ -74,10 +75,10 @@ pub fn attention_rows(status: &FleetStatus) -> Vec<Attention> {
     let target = status.target_revision.as_deref();
     let mut rows = Vec::new();
     for host in &status.hosts {
-        let update = host.update_state(target);
-        if host.health == Health::Healthy && update != UpdateState::Outdated {
+        if host.health == Health::Healthy {
             continue;
         }
+        let update = host.update_state(target);
         rows.push(Attention {
             workspace: Workspace::Hosts,
             title: host.name.clone(),
@@ -144,6 +145,7 @@ mod tests {
               "targetRevision": "new",
               "hosts": [
                 {{"name": "atlas", "health": "healthy", "revision": "new", "checkedAt": "2026-11-10T03:09:00Z"}},
+                {{"name": "starlord", "health": "healthy", "revision": "other", "checkedAt": "2026-11-10T03:09:00Z"}},
                 {{"name": "nomad", "health": "degraded", "revision": "old", "failures": ["forgejo: inactive"], "checkedAt": "2026-11-10T03:09:00Z"}},
                 {{"name": "murph", "health": "healthy", "checkedAt": "2026-11-10T03:09:00Z"}}
               ],
@@ -171,13 +173,13 @@ mod tests {
     fn counts_and_attention_rows_cover_every_concern_once() {
         let status = snapshot("2026-11-10T03:10:00Z");
         let counts = counts(&status);
-        assert_eq!(counts.hosts, 3);
-        assert_eq!(counts.healthy, 2);
-        assert_eq!(counts.outdated, 1, "nomad runs the old revision");
+        assert_eq!(counts.hosts, 4);
+        assert_eq!(counts.healthy, 3);
+        assert_eq!(counts.outdated, 2, "nomad and starlord run another revision");
         assert_eq!(counts.alerts, 2, "one alert plus the monitoring error");
         assert_eq!(counts.approvals, 2);
-        assert_eq!(hosts_ratio(counts), "2/3");
-        assert_eq!(hosts_needing_attention(&status), 1, "nomad is unhealthy and outdated, counted once");
+        assert_eq!(hosts_ratio(counts), "3/4");
+        assert_eq!(hosts_needing_attention(&status), 1, "only unhealthy nomad; healthy starlord on another revision is not a concern");
 
         let rows = attention_rows(&status);
         let titles: Vec<&str> = rows.iter().map(|row| row.title.as_str()).collect();
@@ -187,7 +189,6 @@ mod tests {
         assert_eq!(rows[3].workspace, Workspace::Approvals);
         assert_eq!(rows[5].workspace, Workspace::Hosts);
         assert_eq!(rows[5].detail, "nomad failed");
-        assert_eq!(status.attention(), rows.len(), "the hub's own count agrees");
     }
 
     #[test]
