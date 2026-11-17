@@ -1,16 +1,40 @@
 //! Relationships: thread, ownership epoch, reply drafts and approval gates.
 
-use contracts::{DraftDecisionIn, DraftReplyIn, DraftState, FollowUpIn, Owner, RelationshipDetail, client::HubClient};
+use chrono::{DateTime, Utc};
+use contracts::{DraftDecisionIn, DraftReplyIn, DraftState, FollowUpIn, Owner, Relationship, RelationshipDetail, client::HubClient};
 use dioxus::prelude::*;
 use uuid::Uuid;
 
 use crate::{
-    api,
+    actions, api,
     components::{Chip, EmptyState, ErrorCard, GatePrompt, Loading, Panel},
     format, labels,
     shell::ContextItem,
     state::Store,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filter {
+    NeedsYou,
+    All,
+}
+
+/// Whether the operator owes this thread a reply. This mirrors the Today query's
+/// overdue-reply rule without its outbound check, which this list does not carry:
+/// a human-owned thread, a due follow-up, or an inbound older than four hours.
+pub fn needs_you(relationship: &Relationship, now: DateTime<Utc>) -> bool {
+    relationship.owner == Owner::Human
+        || relationship.follow_up_at.is_some_and(|at| at <= now)
+        || relationship.last_inbound_at.is_some_and(|at| at < now - chrono::Duration::hours(4))
+}
+
+/// Rows in display order for one filter: most recent inbound first, threads that
+/// never saw an inbound last.
+pub fn rows(items: &[Relationship], filter: Filter, now: DateTime<Utc>) -> Vec<Relationship> {
+    let mut rows: Vec<Relationship> = items.iter().filter(|item| filter == Filter::All || needs_you(item, now)).cloned().collect();
+    rows.sort_by_key(|item| std::cmp::Reverse(item.last_inbound_at));
+    rows
+}
 
 #[component]
 pub fn RelationshipsView() -> Element {
@@ -25,16 +49,27 @@ pub fn RelationshipsView() -> Element {
     let mut draft_body = use_signal(String::new);
     let mut in_reply_to = use_signal(|| Option::<Uuid>::None);
     let mut follow_up = use_signal(String::new);
+    let mut reject_reason = use_signal(String::new);
     let mut handoff_url = use_signal(|| Option::<String>::None);
     let mut form_for = use_signal(|| Option::<Uuid>::None);
+    let mut filter = use_signal(|| Filter::NeedsYou);
+    let mut assistant_busy = use_signal(|| false);
 
     use_effect(move || {
         if let Some(id) = (store.selected_relationship).cloned()
             && form_for.cloned() != Some(id)
         {
+            // The list carries every relationship's follow-up, so the prefill
+            // does not wait for the detail read of the new selection.
+            let follow_up_at = (store.relationships)
+                .cloned()
+                .data
+                .and_then(|items| items.into_iter().find(|item| item.id == id))
+                .and_then(|item| item.follow_up_at);
             draft_body.set(String::new());
             in_reply_to.set(None);
-            follow_up.set(String::new());
+            follow_up.set(follow_up_at.map(format::default_local).unwrap_or_default());
+            reject_reason.set(String::new());
             handoff_url.set(None);
             form_for.set(Some(id));
         }
@@ -66,6 +101,26 @@ pub fn RelationshipsView() -> Element {
                 }
                 Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
             }
+        });
+    };
+
+    let client_ask_assistant = client.clone();
+    let ask_assistant = move |_| {
+        let Some(id) = (store.selected_relationship).cloned() else { return };
+        if assistant_busy.cloned() {
+            return;
+        }
+        assistant_busy.set(true);
+        let client_ask_assistant = client_ask_assistant.clone();
+        spawn(async move {
+            match api::timed(client_ask_assistant.draft_assistant_reply(id)).await {
+                Ok(_) => {
+                    store.notify(true, "Assistant drafted a reply for review.");
+                    api::load_relationship_detail(store, client_ask_assistant, id).await;
+                }
+                Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
+            }
+            assistant_busy.set(false);
         });
     };
 
@@ -142,24 +197,71 @@ pub fn RelationshipsView() -> Element {
         });
     };
 
+    let client_clear_follow_up = client.clone();
+    let clear_follow_up = move |_| {
+        let Some(id) = (store.selected_relationship).cloned() else { return };
+        let client_clear_follow_up = client_clear_follow_up.clone();
+        follow_up.set(String::new());
+        spawn(async move {
+            let path = format!("/relationships/{id}/follow-up");
+            match api::timed(client_clear_follow_up.post::<FollowUpIn, contracts::Relationship>(&path, &FollowUpIn { follow_up_at: None }))
+                .await
+            {
+                Ok(_) => {
+                    store.notify(true, "Follow-up cleared.");
+                    api::load_relationship_detail(store, client_clear_follow_up, id).await;
+                }
+                Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
+            }
+        });
+    };
+
+    let current = filter.cloned();
+    let now = Utc::now();
+    let list = relationships.data.as_ref().map(|items| rows(items, current, now));
+    let none_at_all = relationships.data.as_ref().is_some_and(Vec::is_empty);
+
     rsx! {
         aside { class: "context", aria_label: "Relationships",
             div { class: "context-head",
                 h2 { "Threads" }
                 span { class: "label-tech", "{relationships.data.as_ref().map(|v| v.len()).unwrap_or(0)}" }
             }
+            div { class: "row",
+                button {
+                    class: if current == Filter::NeedsYou { "btn btn-primary btn-xs" } else { "btn btn-glass btn-xs" },
+                    onclick: move |_| filter.set(Filter::NeedsYou),
+                    "Needs you"
+                }
+                button {
+                    class: if current == Filter::All { "btn btn-primary btn-xs" } else { "btn btn-glass btn-xs" },
+                    onclick: move |_| filter.set(Filter::All),
+                    "All"
+                }
+            }
             div { class: "context-list",
-                match relationships.data.clone() {
-                    Some(items) if items.is_empty() => rsx! { p { class: "ctx-empty", "No relationships yet." } },
+                match list.clone() {
+                    Some(items) if items.is_empty() => {
+                        let text = if none_at_all { "No conversations yet." } else { "Nothing needs you." };
+                        rsx! { p { class: "ctx-empty", "{text}" } }
+                    }
                     Some(items) => rsx! {
                         for relationship in items {
                             {
                                 let (owner_label, _) = labels::owner(relationship.owner);
+                                let inbound = relationship
+                                    .last_inbound_at
+                                    .map(|at| format::rel_time(at.timestamp_millis().max(0) as u64))
+                                    .unwrap_or_else(|| "never".to_string());
+                                let mut meta = format!("{} · {owner_label} · last inbound {inbound}", relationship.account_id);
+                                if relationship.follow_up_at.is_some_and(|at| at <= now) {
+                                    meta.push_str(" · follow-up due");
+                                }
                                 rsx! {
                                     ContextItem {
                                         key: "{relationship.id}",
                                         title: relationship.counterpart.clone(),
-                                        meta: format!("{} · {owner_label} · epoch {}", relationship.account_id, relationship.owner_epoch),
+                                        meta: meta.clone(),
                                         active: Some(relationship.id) == selected_id,
                                         on_select: move |_| store.set_selected_relationship(Some(relationship.id)),
                                     }
@@ -180,6 +282,13 @@ pub fn RelationshipsView() -> Element {
                 ErrorCard { code: error.code, message: error.message }
             }
             match detail {
+                None if none_at_all => rsx! {
+                    EmptyState {
+                        title: "No conversations yet.".to_string(),
+                        hint: Some("Threads arrive when a channel ingests replies, comments or DMs through POST /v1/ingest/interactions.".to_string()),
+                    }
+                },
+                None if list.as_ref().is_some_and(Vec::is_empty) => rsx! { EmptyState { title: "Nothing needs you.".to_string(), hint: None } },
                 None if detail_load.error.is_none() => rsx! { Loading { text: "Loading thread…".to_string() } },
                 None => rsx! { EmptyState { title: "Select a relationship.".to_string(), hint: None } },
                 Some(detail) => rsx! {
@@ -198,6 +307,12 @@ pub fn RelationshipsView() -> Element {
                                 }
                                 div { class: "spacer" }
                                 Chip { label: owner_label.to_string(), tone: Some(owner_tone.to_string()) }
+                                if let Some(url) = relationship.permalink.clone() {
+                                    button { class: "btn btn-glass", onclick: move |_| api::open_external(&url), "Open permalink" }
+                                }
+                                if let Some(content_id) = relationship.content_item_id {
+                                    button { class: "btn btn-glass", onclick: move |_| actions::open_subject(store, "content", content_id), "Open post" }
+                                }
                                 if is_agent {
                                     button { class: "btn btn-glass", onclick: take_over, "Take over" }
                                 } else {
@@ -265,6 +380,12 @@ pub fn RelationshipsView() -> Element {
                                     }
                                     div { class: "form-actions",
                                         button { class: "btn btn-primary", onclick: submit_draft, "Draft reply" }
+                                        button {
+                                            class: "btn btn-glass",
+                                            disabled: assistant_busy.cloned(),
+                                            onclick: ask_assistant,
+                                            if assistant_busy.cloned() { "Drafting…" } else { "Ask assistant" }
+                                        }
                                     }
                                 }
                             }
@@ -272,6 +393,15 @@ pub fn RelationshipsView() -> Element {
                                 if detail.drafts.is_empty() {
                                     EmptyState { title: "No drafts.".to_string(), hint: Some("Draft a reply above; approval is required before it is sent.".to_string()) }
                                 } else {
+                                    div { class: "field-row",
+                                        label { class: "label-tech", r#for: "reject-reason", "Reject reason" }
+                                        input {
+                                            id: "reject-reason", class: "input", r#type: "text",
+                                            placeholder: "optional — recorded with a rejection",
+                                            value: "{reject_reason}",
+                                            oninput: move |e| reject_reason.set(e.value()),
+                                        }
+                                    }
                                     div { class: "stack",
                                         for draft in detail.drafts.iter() {
                                             {
@@ -308,9 +438,11 @@ pub fn RelationshipsView() -> Element {
                                                                             });
                                                                         },
                                                                         on_reject: move |_| {
+                                                                            let reason = reject_reason.cloned().trim().to_string();
                                                                             let client = client_reject.clone();
                                                                             spawn(async move {
-                                                                                match api::timed(client.decide_draft(draft_id, &DraftDecisionIn::Reject { reason: None })).await {
+                                                                                let reason = (!reason.is_empty()).then_some(reason);
+                                                                                match api::timed(client.decide_draft(draft_id, &DraftDecisionIn::Reject { reason })).await {
                                                                                     Ok(draft) => {
                                                                                         store.notify(true, format!("Draft is now {}.", draft.state));
                                                                                         api::load_relationship_detail(store, client, relationship_id).await;
@@ -341,6 +473,7 @@ pub fn RelationshipsView() -> Element {
                                     }
                                     div { class: "form-actions",
                                         button { class: "btn btn-primary", onclick: save_follow_up, "Save follow-up" }
+                                        button { class: "btn btn-glass", onclick: clear_follow_up, "Clear" }
                                     }
                                 }
                             }
@@ -349,5 +482,52 @@ pub fn RelationshipsView() -> Element {
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(hour: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 17, hour, 0, 0).unwrap()
+    }
+
+    fn relationship(owner: Owner, follow_up_at: Option<DateTime<Utc>>, last_inbound_at: Option<DateTime<Utc>>) -> Relationship {
+        Relationship {
+            id: Uuid::new_v4(),
+            account_id: "studio-ig".into(),
+            external_thread_id: "thread-1".into(),
+            counterpart: "someone".into(),
+            owner,
+            owner_user: None,
+            owner_epoch: 1,
+            follow_up_at,
+            last_inbound_at,
+            content_item_id: None,
+            permalink: None,
+        }
+    }
+
+    #[test]
+    fn needs_you_follows_ownership_follow_up_and_inbound_age() {
+        let now = at(12);
+        assert!(needs_you(&relationship(Owner::Human, None, Some(at(11))), now), "a human-owned thread always needs the operator");
+        assert!(needs_you(&relationship(Owner::Agent, Some(at(12)), Some(at(11))), now), "a due follow-up needs the operator");
+        assert!(needs_you(&relationship(Owner::Agent, None, Some(at(7))), now), "an inbound older than four hours needs the operator");
+        assert!(!needs_you(&relationship(Owner::Agent, None, Some(at(11))), now), "a fresh inbound with no follow-up does not");
+        assert!(!needs_you(&relationship(Owner::Agent, Some(at(13)), None), now), "a future follow-up does not");
+
+        let items = vec![
+            relationship(Owner::Agent, None, None),
+            relationship(Owner::Agent, None, Some(at(11))),
+            relationship(Owner::Agent, None, Some(at(7))),
+        ];
+        let ordered = rows(&items, Filter::All, now);
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].last_inbound_at, Some(at(11)), "newest inbound leads");
+        assert_eq!(ordered[2].last_inbound_at, None, "a thread without inbound goes last");
+        assert_eq!(rows(&items, Filter::NeedsYou, now).len(), 1, "only the stale inbound needs the operator here");
     }
 }
