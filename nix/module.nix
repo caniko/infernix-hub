@@ -251,7 +251,7 @@
 
   # --- unit ordering ------------------------------------------------------
   integrationUnits =
-    optional comfyEnabled "comfyui.service"
+    optional (comfyEnabled && cfg.integrations.comfy == "live") "comfyui.service"
     ++ optional (cfg.assistant.endpoint == "llama-swap" && llamaEnabled) "llama-swap.service"
     ++ optional (cfg.assistant.endpoint == "load-balancer" && lbEnabled) "infernix-lb.service";
   passiveUnits =
