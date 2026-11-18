@@ -3605,6 +3605,44 @@ async fn secret_inventory_pass_preserves_rows_when_unreadable() {
 }
 
 #[tokio::test]
+async fn status_feed_checks_resolve_on_recovery_and_hold_through_errors() {
+    let Some(h) = harness().await else { return };
+    let h = &h;
+    let doc = |status: &str| {
+        let body = json!({"metadata":{"timestamp":Utc::now().to_rfc3339()},"summary":{},
+            "checks":[{"id":"backup.clickhouse","status":status,"message":"no backup in 30 h"}]});
+        domain::feeds::parse(body.to_string().as_bytes())
+    };
+    let pass = move |polled| async move {
+        let eval = domain::feeds::evaluate("syndb", "s3", domain::feeds::CheckStatus::Warn, 2700, polled, Utc::now());
+        fleetix_hubd::feeds::sync(&h.hub, &[("syndb".to_string(), eval)].into_iter().collect()).await.unwrap();
+        h.op.notifications(None, 0, true).await.unwrap().items
+    };
+    let find = |rows: &[Notification], key: &str| rows.iter().find(|n| n.dedupe_key == key).cloned();
+
+    let rows = pass(doc("fail")).await;
+    let check = find(&rows, "monitor:syndb:backup.clickhouse").unwrap();
+    assert!(check.open && check.severity == Severity::Critical && check.source == "monitor");
+    h.op.ack_notifications(&AckNotificationsIn { ids: vec![check.id], all: false }).await.unwrap();
+    let acked = find(&h.op.notifications(None, 0, true).await.unwrap().items, "monitor:syndb:backup.clickhouse").unwrap();
+
+    // An unreadable feed raises its feed row and leaves the check exactly as it was.
+    let rows = pass(Err("HTTP 403 AccessDenied".into())).await;
+    let feed = find(&rows, "monitor:syndb:feed").unwrap();
+    assert!(feed.open && feed.severity == Severity::Warning);
+    let held = find(&rows, "monitor:syndb:backup.clickhouse").unwrap();
+    assert_eq!((held.seq, held.resolved_at, held.read_at), (acked.seq, None, acked.read_at));
+
+    // The check recovers: both rows resolve.
+    let rows = pass(doc("ok")).await;
+    assert!(find(&rows, "monitor:syndb:backup.clickhouse").unwrap().resolved_at.is_some());
+    assert!(find(&rows, "monitor:syndb:feed").unwrap().resolved_at.is_some());
+
+    // The source is reserved: no API caller can fake it.
+    assert!(h.op.raise_notification(&notification_in("monitor:syndb:x", "fake")).await.is_err());
+}
+
+#[tokio::test]
 async fn stalled_generation_notifies_and_resolves() {
     let Some(h) = harness().await else { return };
     let item = h.brief(None).await;

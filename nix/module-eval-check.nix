@@ -47,6 +47,16 @@
         enable = true;
         fleetStatusFile = "/var/lib/fleet-status/fleet.json";
         secretInventoryFile = "/var/lib/secret-inventory/inventory.json";
+        feeds.syndb = {
+          endpoint = "https://s3-west.nrp-nautilus.io";
+          region = "us-east-1";
+          bucket = "syndb-status";
+          key = "report.json";
+          intervalSecs = 300;
+          staleAfterSecs = 2700;
+          credentials.accessKeyId = "/run/agenix/syndb-status-key-id";
+          credentials.secretAccessKey = "/run/agenix/syndb-status-secret";
+        };
         renewals = [
           {
             key = "eval-token";
@@ -76,6 +86,7 @@ in {
   assert !(fixtureHub.environment ? LLM_URL);
   assert !(fixtureHub.environment ? HUB_FLEET_STATUS_FILE);
   assert !(fixtureHub.environment ? HUB_SECRET_INVENTORY_FILE);
+  assert !(fixtureHub.environment ? HUB_FEEDS_CONFIG);
   assert !(fixtureHub.serviceConfig ? BindReadOnlyPaths);
   assert fixture.config.services.harbor-db.projects."fleetix-hub".enable;
   assert lib.elem "fleetix-hub.service" fixtureMigration.requiredBy;
@@ -113,6 +124,9 @@ in {
   # The directory, not the file: atomic replacements must stay visible.
   assert lib.elem "/var/lib/fleet-status" liveHub.serviceConfig.BindReadOnlyPaths;
   assert lib.elem "/var/lib/secret-inventory" liveHub.serviceConfig.BindReadOnlyPaths;
+  # Feed keys reach the unit as credentials; the config names only their ids.
+  assert lib.elem "feed-syndb-access-key-id:/run/agenix/syndb-status-key-id" liveHub.serviceConfig.LoadCredential;
+  assert lib.elem "feed-syndb-secret-access-key:/run/agenix/syndb-status-secret" liveHub.serviceConfig.LoadCredential;
   assert lib.elem "comfyui.service" liveHub.after;
   assert lib.elem "llama-swap.service" liveHub.after;
   assert lib.elem "comfyui.service" liveHub.wants;
@@ -146,6 +160,14 @@ in {
       jq -e '.renewals[0].key == "eval-token"' ${liveSeed}
       jq -e '.renewals[0].urls == ["https://example.org/oauth/apps"]' ${liveSeed}
       jq -e '.renewals[0].expiry_kind == "provider"' ${liveSeed}
+      jq -e '.syndb == {
+        "kind": "s3", "endpoint": "https://s3-west.nrp-nautilus.io", "region": "us-east-1",
+        "bucket": "syndb-status", "key": "report.json",
+        "access_key_id_file": "feed-syndb-access-key-id",
+        "secret_access_key_file": "feed-syndb-secret-access-key",
+        "interval_secs": 300, "stale_after_secs": 2700, "min_status": "warn"
+      }' ${liveHub.environment.HUB_FEEDS_CONFIG}
+      ! grep -q agenix ${liveHub.environment.HUB_FEEDS_CONFIG}
       manifest=$(sed -n 's/.*--manifest //p' ${liveCheck.serviceConfig.ExecStart})
       test -f "$manifest"
       grep -F '"migrate","--check"' "$manifest"

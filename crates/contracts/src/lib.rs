@@ -188,6 +188,28 @@ pub struct SystemStatus {
     pub production_paused: bool,
     pub principal: Principal,
     pub integrations: Vec<IntegrationStatus>,
+    /// Status feeds this process polls (`HUB_FEEDS_CONFIG`); empty when none
+    /// are configured or the producer loop is not running here.
+    #[serde(default)]
+    pub feeds: Vec<FeedState>,
+}
+
+/// One status feed as the last poll saw it. Failing checks themselves are
+/// notifications keyed `monitor:<feed>:<check id>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeedState {
+    pub id: String,
+    /// `s3`.
+    pub kind: String,
+    /// `pending` (not polled yet), `ok`, `stale` or `error`.
+    pub state: String,
+    pub checked_at: Option<DateTime<Utc>>,
+    /// `metadata.timestamp` of the last document read.
+    pub generated_at: Option<DateTime<Utc>>,
+    /// Checks at or above the feed's `min_status` in that document.
+    pub raised: u32,
+    /// Why the feed is `stale` or `error`.
+    pub problem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

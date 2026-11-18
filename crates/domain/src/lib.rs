@@ -14,6 +14,7 @@ use sqlx::PgPool;
 pub mod canon;
 pub mod content;
 pub mod engagement;
+pub mod feeds;
 pub mod hash;
 pub mod look;
 pub mod news;
@@ -104,6 +105,8 @@ pub struct Hub {
     pub topics: Arc<BTreeMap<String, Arc<dyn outbox::OutboxHandler>>>,
     /// Wakes long-polling notification readers after a committed change.
     pub notified: Arc<tokio::sync::Notify>,
+    /// Status feed states the producer loop last saw, for `/v1/status`.
+    pub feeds: Arc<std::sync::RwLock<Vec<contracts::FeedState>>>,
 }
 
 /// The authenticated caller plus the request's correlation id.

@@ -46,6 +46,7 @@ pub async fn status(hub: &Hub, actor: &Actor) -> DResult<SystemStatus> {
         production_paused: paused,
         principal: actor.principal.clone(),
         integrations: hub.config.integrations.clone(),
+        feeds: hub.feeds.read().map(|f| f.clone()).unwrap_or_default(),
     })
 }
 

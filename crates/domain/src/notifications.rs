@@ -63,8 +63,8 @@ fn secret_custodian_requires_a_member_principal() {
 
 /// Producer keys belong to the loop; an HTTP caller that could write them would
 /// fake a source's state, and the next pass would resolve it away.
-const RESERVED_SOURCES: &[&str] = &["today", "fleet", "hub", "secrets"];
-const RESERVED_PREFIXES: &[&str] = &["today:", "fleet:", "hub:", "secrets:"];
+const RESERVED_SOURCES: &[&str] = &["today", "fleet", "hub", "secrets", "monitor"];
+const RESERVED_PREFIXES: &[&str] = &["today:", "fleet:", "hub:", "secrets:", "monitor:"];
 
 /// Agents and procedures raise their own rows; only the operator dismisses.
 const RAISERS: &[Role] = &[Role::Operator, Role::Agent, Role::Procedure, Role::Member];
@@ -165,10 +165,17 @@ where
 /// One producer pass: upsert the current set for `source`, then resolve every
 /// row of that source the pass did not mention. Returns how many rows changed.
 pub async fn sync(hub: &Hub, source: &str, current: Vec<Raise>) -> DResult<usize> {
-    sync_owned(hub, None, source, current).await
+    sync_owned(hub, None, source, current, &[]).await
 }
 
-async fn sync_owned(hub: &Hub, owner: Option<&str>, source: &str, current: Vec<Raise>) -> DResult<usize> {
+/// `sync`, except that unmentioned rows whose key starts with one of `keep` are
+/// left as they are: a status feed that cannot be read must not resolve (or
+/// churn) the checks it last reported.
+pub async fn sync_keeping(hub: &Hub, source: &str, current: Vec<Raise>, keep: &[String]) -> DResult<usize> {
+    sync_owned(hub, None, source, current, keep).await
+}
+
+async fn sync_owned(hub: &Hub, owner: Option<&str>, source: &str, current: Vec<Raise>, keep: &[String]) -> DResult<usize> {
     let mut tx = hub.db.begin().await?;
     lock_writers(&mut tx).await?;
     let mut changed = 0;
@@ -192,12 +199,14 @@ async fn sync_owned(hub: &Hub, owner: Option<&str>, source: &str, current: Vec<R
     changed += sqlx::query(
         "update notifications
          set resolved_at = now(), seq = nextval('notifications_seq'), updated_at = now()
-         where company_id = $1 and source = $2 and resolved_at is null and dedupe_key <> all($3) and owner is not distinct from $4",
+         where company_id = $1 and source = $2 and resolved_at is null and dedupe_key <> all($3) and owner is not distinct from $4
+           and not exists (select 1 from unnest($5::text[]) p where starts_with(dedupe_key, p))",
     )
     .bind(&hub.config.company_id)
     .bind(source)
     .bind(&keys)
     .bind(owner)
+    .bind(keep)
     .execute(&mut *tx)
     .await?
     .rows_affected() as usize;
@@ -426,7 +435,7 @@ pub async fn sync_member_renewals(hub: &Hub) -> DResult<()> {
                 });
             }
         }
-        sync_owned(hub, Some(&owner), &source, raises).await?;
+        sync_owned(hub, Some(&owner), &source, raises, &[]).await?;
     }
     Ok(())
 }
@@ -435,7 +444,7 @@ pub async fn sync_member_renewals(hub: &Hub) -> DResult<()> {
 /// as `2026-11-15T02:00:00.7+00:00`). One key that breaks the table's check
 /// would roll back a whole `sync`, so every producer key is folded into the
 /// allowed alphabet: lowercase, anything else becomes `-`, at most 128 bytes.
-fn key_safe(key: &str) -> String {
+pub(crate) fn key_safe(key: &str) -> String {
     let mut out: String = key
         .chars()
         .map(|c| c.to_ascii_lowercase())
@@ -449,7 +458,7 @@ fn key_safe(key: &str) -> String {
 /// content). Syncing them separately would overwrite one row every pass and
 /// clear its acknowledgement, so rows with the same key become one raise with
 /// a deterministic title and body.
-fn merge_same_key(raises: Vec<Raise>) -> Vec<Raise> {
+pub(crate) fn merge_same_key(raises: Vec<Raise>) -> Vec<Raise> {
     let mut groups: std::collections::BTreeMap<String, Vec<Raise>> = std::collections::BTreeMap::new();
     for raise in raises {
         groups.entry(key_safe(&raise.dedupe_key)).or_default().push(raise);
@@ -841,7 +850,10 @@ fn api_raise(owner: Option<&str>, input: RaiseNotificationIn) -> DResult<Raise> 
         || (owner.is_none() && (source.starts_with("member:") || input.dedupe_key.starts_with("member:")))
         || RESERVED_PREFIXES.iter().any(|p| input.dedupe_key.starts_with(p))
     {
-        return Err(invalid("reserved_key", "the today, fleet and hub sources and their key prefixes belong to the producer loop"));
+        return Err(invalid(
+            "reserved_key",
+            "the producer sources (today, fleet, hub, secrets, monitor) and their key prefixes belong to the producer loop",
+        ));
     }
     let key = stored_key(owner, &input.dedupe_key)?;
     if input.title.trim().is_empty() || input.title.chars().count() > MAX_TITLE {
@@ -893,7 +905,7 @@ pub async fn sync_api(hub: &Hub, actor: &Actor, input: SyncNotificationsIn) -> D
         })
         .collect::<DResult<Vec<_>>>()?;
     let stored_source = owner.map_or_else(|| source.to_string(), |name| format!("member:{name}:{source}"));
-    sync_owned(hub, owner, &stored_source, current).await
+    sync_owned(hub, owner, &stored_source, current, &[]).await
 }
 
 /// The database check constraint, re-checked here so a bad key is a 422 and not

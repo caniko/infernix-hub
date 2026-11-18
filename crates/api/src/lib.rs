@@ -21,6 +21,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub mod bootstrap;
+pub mod feeds;
 
 /// Exit status for a server startup failure, including errors wrapped in context.
 pub fn exit_code(error: &anyhow::Error) -> i32 {
@@ -289,7 +290,17 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
     state.hub = hub;
     register_pack_workflows(&state.hub, &workflows).await.context("registering pack workflows")?;
 
+    let feeds = match &settings.feeds_config {
+        Some(path) => {
+            feeds::load(path, std::env::var_os("CREDENTIALS_DIRECTORY").map(std::path::PathBuf::from).as_deref()).context("status feeds")?
+        }
+        None => Vec::new(),
+    };
     if !settings.no_worker {
+        if let Ok(mut states) = state.hub.feeds.write() {
+            *states = feeds::pending_states(&feeds);
+        }
+        tokio::spawn(feeds::run(state.hub.clone(), feeds));
         tokio::spawn(worker::run(state.hub.clone(), Duration::from_secs(2)));
         tokio::spawn(notify_loop(
             state.hub.clone(),

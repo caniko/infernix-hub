@@ -13,6 +13,7 @@ contracts = { workspace = true, features = ["client"] }
 domain.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+hmac.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

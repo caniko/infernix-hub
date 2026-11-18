@@ -2489,6 +2489,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "hmac",
  "hub-contracts",
  "hub-domain",
  "reqwest",

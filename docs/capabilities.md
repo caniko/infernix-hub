@@ -262,11 +262,46 @@ list|ack|snooze` and `hubctl notify --key --severity --title` drive the same
 routes. The MCP tools are `hub_notifications` (Read, snapshot, optional `all`),
 `hub_notify` (Write, source defaults to `agent` server-side) and
 `hub_post_summary` (Write, one row per day keyed `summary:<YYYY-MM-DD>` with
-title `Daily summary <day>`); the three producer sources `today`, `fleet` and
-`hub` and their key prefixes stay reserved. No MCP tool acknowledges or snoozes.
+title `Daily summary <day>`); the producer sources `today`, `fleet`, `hub`,
+`secrets` and `monitor` and their key prefixes stay reserved. No MCP tool acknowledges or snoozes.
 The worker's notification loop syncs Today and fleet conditions and summary
 staleness. The desktop Notifications workspace displays the feed and renewal
 details; `fleetix-hub-tray` uses long-polling for its tray and desktop popups.
+
+### Status feeds
+
+A project publishes a JSON status document; the hub polls it and keeps the
+`monitor` notification source in step. Contract v1 is the `syndb ops k8s
+report --json` shape without `evidence`: `metadata.timestamp` (RFC 3339) and
+`checks[]` with `id` and `status` (`ok|unknown|warn|fail`) are validated,
+`message` and `remediation` are shown, and every other field is ignored. The
+document is untrusted: 1 MiB cap, at most 1000 checks, ids capped at 200 and
+text at 1000 characters, control characters stripped, and it only ever
+becomes plain notification text (the tray escapes markup in every body).
+
+- Each check at or above the feed's `min_status` (default `warn`) is
+  `monitor:<feed>:<check id>`: fail → critical, warn → warning, unknown →
+  info. A check that recovers, or disappears from the document, is resolved
+  by the same sync every producer uses, so an acknowledgement survives an
+  unchanged condition and a recovered one closes on its own. A changed
+  `message` reopens the row; producers should keep it stable for an unchanged
+  condition.
+- A document older than `stale_after_secs` (or more than 60 s in the future),
+  or a fetch or parse error, raises `monitor:<feed>:feed` (warning) and leaves
+  that feed's check rows exactly as they were.
+- `GET /v1/status` (and MCP `hub_status`) lists each feed as `pending`, `ok`,
+  `stale` or `error`, with `checked_at`, `generated_at`, `raised` and
+  `problem`.
+
+`HUB_FEEDS_CONFIG` is a JSON object mapping feed id (`[a-z0-9-]{1,32}`) to
+`{kind: "s3", endpoint, region, bucket, key, access_key_id_file,
+secret_access_key_file, interval_secs, stale_after_secs, min_status}`;
+unknown fields fail startup. Credential paths that are relative resolve
+against `$CREDENTIALS_DIRECTORY` and are re-read on every poll. `s3` is a
+path-style GetObject signed with SigV4 (HMAC from the already-locked `hmac`
+crate; no SDK); errors carry the HTTP status and the S3 error code, never the
+URL or headers. State: built and fixture-tested against a fake S3 server and
+the AWS SigV4 example; not yet run against NRP Ceph RGW.
 
 ### Windmill
 

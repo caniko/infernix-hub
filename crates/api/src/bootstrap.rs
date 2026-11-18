@@ -50,6 +50,8 @@ pub struct Settings {
     /// hub has no fleet configured.
     pub fleet_status_file: Option<PathBuf>,
     pub secret_inventory_file: Option<PathBuf>,
+    /// Status feeds to poll (`feeds::load`); unset means none.
+    pub feeds_config: Option<PathBuf>,
     /// Raise `hub:summary-stale` when no daily summary has been written for
     /// this many hours; unset disables the rule.
     pub summary_stale_hours: Option<u32>,
@@ -91,6 +93,7 @@ impl Settings {
             seed_file: env("HUB_SEED_FILE").map(PathBuf::from),
             fleet_status_file: env("HUB_FLEET_STATUS_FILE").map(PathBuf::from),
             secret_inventory_file: env("HUB_SECRET_INVENTORY_FILE").map(PathBuf::from),
+            feeds_config: env("HUB_FEEDS_CONFIG").map(PathBuf::from),
             summary_stale_hours: match env("HUB_SUMMARY_STALE_HOURS") {
                 None => None,
                 Some(v) => Some(v.parse().with_context(|| format!("HUB_SUMMARY_STALE_HOURS must be a number of hours, got {v}"))?),
@@ -117,6 +120,7 @@ impl Settings {
             seed_file: Some("registry/hub.fixture.json".into()),
             fleet_status_file: None,
             secret_inventory_file: None,
+            feeds_config: None,
             summary_stale_hours: None,
             company_id: None,
             paperclip: AdapterMode::Fixture,
@@ -409,6 +413,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         pipelines: Arc::new(pipelines),
         topics: Arc::new(BTreeMap::new()),
         notified: Arc::new(tokio::sync::Notify::new()),
+        feeds: Default::default(),
     };
     if let Some(seed) = &seed {
         apply_seed(&hub, seed, &hub.config.company_id).await?;

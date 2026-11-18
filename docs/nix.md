@@ -93,6 +93,9 @@ nix build .#checks.x86_64-linux.module-eval-live
 - `engines`, `personas`, `accounts`, `gpuAdmission`.
 - `tokens`, `credentials`.
 - `packs.<id>`: `enable`, `config`, `credentials`.
+- `feeds.<id>`: `kind`, `endpoint`, `region`, `bucket`, `key`, `intervalSecs`,
+  `staleAfterSecs`, `minStatus`, `credentials.accessKeyId`,
+  `credentials.secretAccessKey`.
 
 ### Database and migrations
 
@@ -329,6 +332,29 @@ raises a warning, because the daily summary task did not run. Unset means no
 staleness rule: the `hub` source syncs an empty set, which resolves any existing
 raise. Atlas sets `26`, so a missed 07:30 summary shows up the next morning.
 
+### Status feeds
+
+`feeds.<id>` renders `HUB_FEEDS_CONFIG` (see "Status feeds" in
+`capabilities.md`). The two credential paths become the systemd credentials
+`feed-<id>-access-key-id` and `feed-<id>-secret-access-key`, and the generated
+config names only those ids, so no key material enters the store, the config
+or the environment.
+
+```nix
+services.fleetix-hub.feeds.syndb = {
+  kind = "s3"; # default
+  endpoint = "https://s3-west.nrp-nautilus.io";
+  region = "us-east-1";
+  bucket = "syndb-status";
+  key = "report.json";
+  intervalSecs = 300;
+  staleAfterSecs = 2700;
+  minStatus = "warn"; # default; unknown | warn | fail
+  credentials.accessKeyId = config.age.secrets.syndb-status-read-key-id.path;
+  credentials.secretAccessKey = config.age.secrets.syndb-status-read-secret.path;
+};
+```
+
 ### Assertions
 
 - fixture Windmill requires fixture ComfyUI (the in-process procedure needs
@@ -336,7 +362,9 @@ raise. Atlas sets `26`, so a missed 07:30 summary shows up the next morning.
 - live Paperclip/Windmill/publisher require their credential files,
 - a live publisher requires live Paperclip (fixture approvals never authorize
   real posts); only the publisher accepts `disabled`,
-- generated `LoadCredential` ids are unique across built-ins, tokens and packs,
+- generated `LoadCredential` ids are unique across built-ins, tokens, packs and feeds,
+- feed ids match `[a-z0-9-]{1,32}`, `staleAfterSecs >= intervalSecs`, and feed
+  credentials are absolute paths outside the store,
 - `companyId` is required unless every integration is fixture,
 - a live assistant requires a resolvable endpoint,
 - `database.urlFile` requires `database.createLocally = false`.
