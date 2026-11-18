@@ -510,9 +510,9 @@ pub fn fleet_raises(status: &FleetStatus, now: DateTime<Utc>) -> Vec<Raise> {
     }
     for op in &status.pending_ops {
         let body = if op.reason.is_empty() {
-            format!("{} — approve with `canix host rops`", op.host)
+            format!("{} — approve with `canix host ops`", op.host)
         } else {
-            format!("{} on {} — approve with `canix host rops`", op.reason, op.host)
+            format!("{} on {} — approve with `canix host ops`", op.reason, op.host)
         };
         push(format!("fleet:op:{}", op.id), format!("Approval waiting: {}", op.title), body);
     }
