@@ -69,6 +69,28 @@
     })
   ];
 
+  # A presigned URL pasted as a feed endpoint: the config must refuse to
+  # render it, even when evaluated on its own.
+  presigned = mkSystem [
+    module
+    ({config, ...}: {
+      system.stateVersion = config.system.nixos.release;
+      services.fleetix-hub = {
+        enable = true;
+        feeds.leak = {
+          endpoint = "https://s3.example.org/b/k?X-Amz-Signature=deadbeef";
+          region = "us-east-1";
+          bucket = "b";
+          key = "k";
+          intervalSecs = 300;
+          staleAfterSecs = 600;
+          credentials.accessKeyId = "/run/agenix/a";
+          credentials.secretAccessKey = "/run/agenix/b";
+        };
+      };
+    })
+  ];
+
   fixtureHub = fixture.config.systemd.services.fleetix-hub;
   fixtureMigration = fixture.config.systemd.services."harbor-db-fleetix-hub";
   fixtureCheck = fixture.config.systemd.services."harbor-db-fleetix-hub-check";
@@ -87,6 +109,7 @@ in {
   assert !(fixtureHub.environment ? HUB_FLEET_STATUS_FILE);
   assert !(fixtureHub.environment ? HUB_SECRET_INVENTORY_FILE);
   assert !(fixtureHub.environment ? HUB_FEEDS_CONFIG);
+  assert !(builtins.tryEval presigned.config.systemd.services.fleetix-hub.environment.HUB_FEEDS_CONFIG).success;
   assert !(fixtureHub.serviceConfig ? BindReadOnlyPaths);
   assert fixture.config.services.harbor-db.projects."fleetix-hub".enable;
   assert lib.elem "fleetix-hub.service" fixtureMigration.requiredBy;

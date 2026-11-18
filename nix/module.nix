@@ -200,7 +200,14 @@
     then null
     else
       pkgs.writeText "fleetix-hub-feeds.json" (builtins.toJSON (lib.mapAttrs (id: feed: {
-          inherit (feed) kind endpoint region bucket key;
+          inherit (feed) kind region bucket key;
+          # Checked here, not only in an assertion: evaluating the config alone
+          # must never put userinfo or a presigned query into a .drv. The
+          # message names no part of the URL.
+          endpoint =
+            if builtins.match "https://[A-Za-z0-9.-]+(:[0-9]+)?/?" feed.endpoint != null
+            then feed.endpoint
+            else throw "fleetix-hub: feed ${id}: endpoint must be a bare https origin (https://host[:port]).";
           access_key_id_file = "feed-${id}-access-key-id";
           secret_access_key_file = "feed-${id}-secret-access-key";
           interval_secs = feed.intervalSecs;
@@ -864,11 +871,6 @@ in {
         {
           assertion = lib.all (id: builtins.match "[a-z0-9-]{1,32}" id != null) (lib.attrNames cfg.feeds);
           message = "fleetix-hub: feed ids must match [a-z0-9-]{1,32}.";
-        }
-        {
-          # A bare origin only: userinfo or a presigned query would be written to the store.
-          assertion = lib.all (feed: builtins.match "https://[A-Za-z0-9.-]+(:[0-9]+)?/?" feed.endpoint != null) (lib.attrValues cfg.feeds);
-          message = "fleetix-hub: a feed endpoint must be a bare https origin (https://host[:port]); it is written to the Nix store.";
         }
         {
           assertion = lib.all (feed: feed.staleAfterSecs >= feed.intervalSecs) (lib.attrValues cfg.feeds);
