@@ -444,7 +444,7 @@ pub async fn sync_member_renewals(hub: &Hub) -> DResult<()> {
 /// as `2026-11-15T02:00:00.7+00:00`). One key that breaks the table's check
 /// would roll back a whole `sync`, so every producer key is folded into the
 /// allowed alphabet: lowercase, anything else becomes `-`, at most 128 bytes.
-pub(crate) fn key_safe(key: &str) -> String {
+fn key_safe(key: &str) -> String {
     let mut out: String = key
         .chars()
         .map(|c| c.to_ascii_lowercase())
@@ -458,7 +458,7 @@ pub(crate) fn key_safe(key: &str) -> String {
 /// content). Syncing them separately would overwrite one row every pass and
 /// clear its acknowledgement, so rows with the same key become one raise with
 /// a deterministic title and body.
-pub(crate) fn merge_same_key(raises: Vec<Raise>) -> Vec<Raise> {
+fn merge_same_key(raises: Vec<Raise>) -> Vec<Raise> {
     let mut groups: std::collections::BTreeMap<String, Vec<Raise>> = std::collections::BTreeMap::new();
     for raise in raises {
         groups.entry(key_safe(&raise.dedupe_key)).or_default().push(raise);

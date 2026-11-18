@@ -10,12 +10,14 @@ use chrono::{DateTime, Utc};
 use contracts::{FeedState, Severity};
 use serde::Deserialize;
 
-use crate::notifications::{Raise, key_safe, merge_same_key};
+use crate::notifications::Raise;
 
 /// Largest document the fetcher reads.
 pub const MAX_DOC_BYTES: usize = 1 << 20;
 const MAX_CHECKS: usize = 1000;
-const MAX_ID: usize = 200;
+/// A check id is stored verbatim in `monitor:<feed>:<id>`, so it must already
+/// be in the key alphabet: 128 bytes minus `monitor:`, a 32-byte feed id and `:`.
+const MAX_ID: usize = 80;
 const MAX_TEXT: usize = 1000;
 /// Clock difference tolerated between the producer and the hub.
 const CLOCK_SKEW_SECS: i64 = 60;
@@ -86,10 +88,22 @@ pub fn parse(bytes: &[u8]) -> Result<Report, String> {
         return Err(format!("{} checks exceed the limit of {MAX_CHECKS}", doc.checks.len()));
     }
     let mut checks = doc.checks;
+    let mut seen = std::collections::BTreeSet::new();
     for check in &mut checks {
-        check.id = clean(&check.id, MAX_ID);
-        if check.id.is_empty() {
-            return Err("a check has an empty id".into());
+        // Ids are never folded: two ids folding into one key would merge (and
+        // could hide) distinct checks, and `feed` is the feed's own row.
+        let valid = check.id.len() <= MAX_ID
+            && check.id.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && check.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'));
+        if !valid || check.id == "feed" {
+            return Err(format!(
+                "check id {:?} must match [a-z0-9][a-z0-9._-]{{0,{}}} and not be \"feed\"",
+                clean(&check.id, 64),
+                MAX_ID - 1
+            ));
+        }
+        if !seen.insert(check.id.clone()) {
+            return Err(format!("check id {:?} appears twice", check.id));
         }
         check.message = check.message.as_deref().map(|m| clean(m, MAX_TEXT));
         check.remediation = check.remediation.as_deref().map(|m| clean(m, MAX_TEXT));
@@ -146,7 +160,7 @@ pub fn evaluate(
                 }
                 raises.push(Raise {
                     source: "monitor".into(),
-                    dedupe_key: key_safe(&format!("monitor:{feed}:{}", check.id)),
+                    dedupe_key: format!("monitor:{feed}:{}", check.id),
                     severity,
                     title: format!("{feed}: {} {}", check.id, check.status.as_str()),
                     body,
@@ -155,7 +169,6 @@ pub fn evaluate(
                     url: None,
                 });
             }
-            let raises = merge_same_key(raises);
             state.raised = raises.len() as u32;
             let age = now.signed_duration_since(report.generated_at).num_seconds();
             if age <= stale_after_secs && age >= -CLOCK_SKEW_SECS {
@@ -171,7 +184,7 @@ pub fn evaluate(
     let title = if state.state == "stale" { format!("Status feed {feed} is stale") } else { format!("Status feed {feed} is unreadable") };
     let raise = Raise {
         source: "monitor".into(),
-        dedupe_key: key_safe(&format!("monitor:{feed}:feed")),
+        dedupe_key: format!("monitor:{feed}:feed"),
         severity: Severity::Warning,
         title,
         body: problem,
@@ -255,10 +268,14 @@ mod tests {
     }
 
     #[test]
-    fn hostile_ids_are_folded_into_the_key_alphabet() {
-        let body = doc("2026-11-18T11:55:00Z").replace("backup.clickhouse", &format!("Backup/ClickHouse {}", "x".repeat(400)));
-        let eval = run(&body, CheckStatus::Warn);
-        let key = &eval.raises[0].dedupe_key;
-        assert!(key.starts_with("monitor:syndb:backup-clickhouse-x") && key.len() == 128, "{key}");
+    fn ids_that_would_fold_or_collide_are_parse_errors() {
+        let ok = doc("2026-11-18T11:55:00Z");
+        for id in ["Disk", "feed", "a/b", "x:y", "", &"x".repeat(MAX_ID + 1)] {
+            let eval = run(&ok.replace("pvc.usage", id), CheckStatus::Warn);
+            assert_eq!(eval.state.state, "error", "{id:?}");
+        }
+        let twice = run(&ok.replace("pvc.usage", "backup.clickhouse"), CheckStatus::Warn);
+        assert_eq!(twice.state.problem.as_deref(), Some("check id \"backup.clickhouse\" appears twice"));
+        assert!(run(&ok.replace("pvc.usage", &"x".repeat(MAX_ID)), CheckStatus::Warn).fresh);
     }
 }

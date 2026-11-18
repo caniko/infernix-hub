@@ -12,8 +12,9 @@
 //! ```
 //!
 //! A relative credential path is resolved against `$CREDENTIALS_DIRECTORY`.
-//! Credentials are read on every poll (so rotation needs no restart) and never
-//! logged: only the fetch error, which carries no URL or header, is.
+//! Credentials are read on every poll and never logged: only the fetch error,
+//! which carries no URL or header, is. systemd copies `LoadCredential` files
+//! when the unit starts, so a rotated key takes effect on the next restart.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -77,12 +78,16 @@ fn validate(id: String, c: FeedConfig, credentials_dir: Option<&Path>) -> anyhow
         "feed id {id:?} must match [a-z0-9-]{{1,32}}"
     );
     let endpoint = reqwest::Url::parse(&c.endpoint).with_context(|| format!("feed {id}: endpoint"))?;
+    anyhow::ensure!(endpoint.username().is_empty() && endpoint.password().is_none(), "feed {id}: endpoint must not carry credentials");
     let loopback = matches!(endpoint.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
     anyhow::ensure!(endpoint.scheme() == "https" || (endpoint.scheme() == "http" && loopback), "feed {id}: endpoint must be https");
     anyhow::ensure!(matches!(endpoint.path(), "" | "/") && endpoint.query().is_none(), "feed {id}: endpoint must have no path or query");
     for (name, value) in [("region", &c.region), ("bucket", &c.bucket), ("key", &c.key)] {
         anyhow::ensure!(!value.trim().is_empty(), "feed {id}: {name} is empty");
     }
+    // A URL normalizes `.` and `..` away, so the signed path would differ from the one sent.
+    anyhow::ensure!(!c.key.split('/').any(|s| s == "." || s == ".."), "feed {id}: key must not contain . or .. segments");
+    anyhow::ensure!(!c.bucket.contains('/'), "feed {id}: bucket must not contain /");
     anyhow::ensure!(c.interval_secs >= 30, "feed {id}: interval_secs must be at least 30");
     anyhow::ensure!(c.stale_after_secs >= c.interval_secs, "feed {id}: stale_after_secs must be at least interval_secs");
     anyhow::ensure!(c.min_status != CheckStatus::Ok, "feed {id}: min_status must be unknown, warn or fail");
@@ -119,7 +124,7 @@ fn read_secret(path: &Path, what: &str) -> Result<String, String> {
 pub async fn poll(http: &reqwest::Client, feed: &Feed) -> domain::feeds::Evaluation {
     let fetched = async {
         let creds = S3Credentials {
-            access_key_id: read_secret(&feed.access_key_id_file, "access_key_id_file")?,
+            access_key_id: SecretString::new(read_secret(&feed.access_key_id_file, "access_key_id_file")?),
             secret_access_key: SecretString::new(read_secret(&feed.secret_access_key_file, "secret_access_key_file")?),
         };
         let body = get_object(http, &feed.object, &creds, MAX_DOC_BYTES).await?;
@@ -132,8 +137,10 @@ pub async fn poll(http: &reqwest::Client, feed: &Feed) -> domain::feeds::Evaluat
 /// The producer loop. Every feed is due on the first pass, so the first sync
 /// already sees all of them; a feed that cannot be read keeps its check rows.
 /// With no feeds it syncs once, resolving rows of feeds removed from config.
+// ponytail: feeds poll serially (30 s timeout each) and sync once per pass;
+// poll concurrently and sync per feed prefix if one hub ever carries many feeds.
 pub async fn run(hub: Hub, feeds: Vec<Feed>) {
-    let http = match reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(30)).build() {
+    let http = match integrations::live::s3::client() {
         Ok(http) => http,
         Err(error) => return tracing::error!(%error, "feeds: no HTTP client"),
     };
@@ -156,11 +163,16 @@ pub async fn run(hub: Hub, feeds: Vec<Feed>) {
             last.insert(feed.id.clone(), eval);
             *due = tokio::time::Instant::now() + feed.interval;
         }
-        if let Err(error) = sync(&hub, &last).await {
+        let synced = sync(&hub, &last).await;
+        if let Err(error) = &synced {
             tracing::warn!(%error, "feeds: notification sync failed");
         }
-        let Some(next) = due.iter().min() else { return };
-        tokio::time::sleep_until(*next).await;
+        match due.iter().min() {
+            Some(next) => tokio::time::sleep_until(*next).await,
+            // No feeds: one successful sync resolves removed feeds' rows.
+            None if synced.is_ok() => return,
+            None => tokio::time::sleep(Duration::from_secs(60)).await,
+        }
     }
 }
 
@@ -244,7 +256,7 @@ mod tests {
         std::fs::write(dir.join("akid"), format!("{ACCESS_KEY}\n")).unwrap();
         std::fs::write(dir.join("secret"), SECRET_KEY).unwrap();
         let feed = feed(&endpoint, &dir);
-        let http = reqwest::Client::new();
+        let http = integrations::live::s3::client().unwrap();
 
         let ok = poll(&http, &feed).await;
         assert_eq!(ok.state.state, "ok", "{:?}", ok.state.problem);
@@ -286,6 +298,8 @@ mod tests {
             ("syndb", serde_json::json!({"min_status": "ok"})),
             ("syndb", serde_json::json!({"secret_access_key": "inline"})),
             ("syndb", serde_json::json!({"access_key_id_file": "relative"})),
+            ("syndb", serde_json::json!({"endpoint": "https://user:pw@s3-west.nrp-nautilus.io"})),
+            ("syndb", serde_json::json!({"key": "a/../report.json"})),
         ] {
             assert!(check(id, patch.clone()).is_err(), "{id} {patch}");
         }

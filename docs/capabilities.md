@@ -297,7 +297,11 @@ becomes plain notification text (the tray escapes markup in every body).
 `{kind: "s3", endpoint, region, bucket, key, access_key_id_file,
 secret_access_key_file, interval_secs, stale_after_secs, min_status}`;
 unknown fields fail startup. Credential paths that are relative resolve
-against `$CREDENTIALS_DIRECTORY` and are re-read on every poll. `s3` is a
+against `$CREDENTIALS_DIRECTORY` and are re-read on every poll (systemd
+copies credentials at unit start, so a rotated key needs a restart). Check
+ids must match `[a-z0-9][a-z0-9._-]{0,79}`, be unique and not be `feed`;
+otherwise the document is a parse error, never a silently merged key. The
+fetch never follows a redirect. `s3` is a
 path-style GetObject signed with SigV4 (HMAC from the already-locked `hmac`
 crate; no SDK); errors carry the HTTP status and the S3 error code, never the
 URL or headers. State: built and fixture-tested against a fake S3 server and

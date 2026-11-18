@@ -22,10 +22,21 @@ pub struct S3Object {
     pub key: String,
 }
 
+/// Both fields redact in `Debug`.
 #[derive(Debug)]
 pub struct S3Credentials {
-    pub access_key_id: String,
+    pub access_key_id: SecretString,
     pub secret_access_key: SecretString,
+}
+
+/// The client feeds must use: bounded, and it never follows a redirect, since a
+/// redirect could swap in another server's unsigned answer.
+pub fn client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
 }
 
 /// Fetch the object, reading at most `max_bytes`. The error is safe to log.
@@ -40,7 +51,14 @@ pub async fn get_object(http: &reqwest::Client, object: &S3Object, creds: &S3Cre
     url.set_path(&path);
     let amz_date = amz_timestamp(Utc::now());
     let headers = [("host", host.as_str()), ("x-amz-content-sha256", EMPTY_SHA256), ("x-amz-date", amz_date.as_str())];
-    let authorization = authorization(creds, &object.region, &amz_date, &canonical_request("GET", &path, &headers));
+    let mut authorization = reqwest::header::HeaderValue::from_str(&authorization(
+        creds,
+        &object.region,
+        &amz_date,
+        &canonical_request("GET", &path, &headers),
+    ))
+    .map_err(|_| "access key id is not a valid header value".to_string())?;
+    authorization.set_sensitive(true);
     let mut resp = http
         .get(url)
         .header("x-amz-content-sha256", EMPTY_SHA256)
@@ -115,7 +133,7 @@ fn authorization(creds: &S3Credentials, region: &str, amz_date: &str, canonical:
     let signed = canonical.lines().rev().nth(1).unwrap_or_default();
     format!(
         "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={}",
-        creds.access_key_id,
+        creds.access_key_id.expose(),
         hex::encode(hmac(&key, &to_sign))
     )
 }
@@ -132,7 +150,7 @@ mod tests {
     #[test]
     fn signature_matches_the_aws_example() {
         let creds = S3Credentials {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+            access_key_id: SecretString::new("AKIAIOSFODNN7EXAMPLE"),
             secret_access_key: SecretString::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
         };
         let at = DateTime::parse_from_rfc3339("2013-05-24T00:00:00Z").unwrap().with_timezone(&Utc);
@@ -153,5 +171,41 @@ mod tests {
         assert_eq!(uri_encode("a b/c+d~", true), "a%20b/c%2Bd~");
         assert_eq!(error_code(b"<Error><Code>NoSuchKey</Code></Error>").as_deref(), Some("NoSuchKey"));
         assert_eq!(error_code(b"<Code><script></Code>"), None);
+    }
+
+    /// A raw HTTP server re-signs the request it actually received (host with
+    /// a non-default port, the encoded path as sent) and answers only a match.
+    #[tokio::test]
+    async fn the_request_on_the_wire_carries_a_valid_signature() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = reqwest::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            while !raw.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8];
+                socket.read_exact(&mut byte).await.unwrap();
+                raw.push(byte[0]);
+            }
+            let text = String::from_utf8(raw).unwrap();
+            let mut lines = text.split("\r\n");
+            let path = lines.next().unwrap().split(' ').nth(1).unwrap().to_string();
+            let header = |name: &str| {
+                text.split("\r\n")
+                    .find_map(|l| l.split_once(": ").filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.to_string()))
+            };
+            let (host, date, auth) = (header("host").unwrap(), header("x-amz-date").unwrap(), header("authorization").unwrap());
+            let creds = S3Credentials { access_key_id: SecretString::new("AKID"), secret_access_key: SecretString::new("secret") };
+            let headers = [("host", host.as_str()), ("x-amz-content-sha256", EMPTY_SHA256), ("x-amz-date", date.as_str())];
+            let ok = auth == authorization(&creds, "us-east-1", &date, &canonical_request("GET", &path, &headers));
+            let reply: &[u8] =
+                if ok { b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}" } else { b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n" };
+            socket.write_all(reply).await.unwrap();
+        });
+        let object = S3Object { endpoint, region: "us-east-1".into(), bucket: "status".into(), key: "dir/a b+c.json".into() };
+        let creds = S3Credentials { access_key_id: SecretString::new("AKID"), secret_access_key: SecretString::new("secret") };
+        assert_eq!(get_object(&client().unwrap(), &object, &creds, 1024).await.unwrap(), b"{}");
+        assert!(!format!("{creds:?}").contains("AKID"));
     }
 }

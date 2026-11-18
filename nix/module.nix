@@ -762,6 +762,8 @@ in {
         resolves when the check recovers; a stale or unreadable document raises
         `monitor:<id>:feed` and leaves the check rows as they were. Key material
         never enters the store or the environment: only the credential ids do.
+        systemd copies credentials at unit start, so restart the unit after
+        rotating a key.
       '';
     };
 
@@ -862,6 +864,10 @@ in {
         {
           assertion = lib.all (id: builtins.match "[a-z0-9-]{1,32}" id != null) (lib.attrNames cfg.feeds);
           message = "fleetix-hub: feed ids must match [a-z0-9-]{1,32}.";
+        }
+        {
+          assertion = lib.all (feed: !lib.hasInfix "@" feed.endpoint) (lib.attrValues cfg.feeds);
+          message = "fleetix-hub: a feed endpoint must not carry credentials (it is written to the Nix store).";
         }
         {
           assertion = lib.all (feed: feed.staleAfterSecs >= feed.intervalSecs) (lib.attrValues cfg.feeds);
