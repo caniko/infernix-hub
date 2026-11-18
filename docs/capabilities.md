@@ -275,8 +275,9 @@ A project publishes a JSON status document; the hub polls it and keeps the
 report --json` shape without `evidence`: `metadata.timestamp` (RFC 3339) and
 `checks[]` with `id` and `status` (`ok|unknown|warn|fail`) are validated,
 `message` and `remediation` are shown, and every other field is ignored. The
-document is untrusted: 1 MiB cap, at most 1000 checks, ids capped at 200 and
-text at 1000 characters, control characters stripped, and it only ever
+document is untrusted: 1 MiB cap, at most 1000 checks, text capped at 1000
+characters, control characters stripped, errors that name only a category
+and position (never document text), and it only ever
 becomes plain notification text (the tray escapes markup in every body).
 
 - Each check at or above the feed's `min_status` (default `warn`) is
@@ -304,7 +305,7 @@ otherwise the document is a parse error, never a silently merged key. The
 fetch never follows a redirect. `s3` is a
 path-style GetObject signed with SigV4 (HMAC from the already-locked `hmac`
 crate; no SDK); errors carry the HTTP status and the S3 error code, never the
-URL or headers. State: built and fixture-tested against a fake S3 server and
+URL or headers; only well-known S3 error codes are echoed. State: built and fixture-tested against a fake S3 server and
 the AWS SigV4 example; not yet run against NRP Ceph RGW.
 
 ### Windmill

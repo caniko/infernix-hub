@@ -79,6 +79,7 @@ fn validate(id: String, c: FeedConfig, credentials_dir: Option<&Path>) -> anyhow
     );
     let endpoint = reqwest::Url::parse(&c.endpoint).with_context(|| format!("feed {id}: endpoint"))?;
     anyhow::ensure!(endpoint.username().is_empty() && endpoint.password().is_none(), "feed {id}: endpoint must not carry credentials");
+    anyhow::ensure!(endpoint.fragment().is_none(), "feed {id}: endpoint must have no fragment");
     let loopback = matches!(endpoint.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
     anyhow::ensure!(endpoint.scheme() == "https" || (endpoint.scheme() == "http" && loopback), "feed {id}: endpoint must be https");
     anyhow::ensure!(matches!(endpoint.path(), "" | "/") && endpoint.query().is_none(), "feed {id}: endpoint must have no path or query");
@@ -87,8 +88,14 @@ fn validate(id: String, c: FeedConfig, credentials_dir: Option<&Path>) -> anyhow
     }
     // A URL normalizes `.` and `..` away, so the signed path would differ from the one sent.
     anyhow::ensure!(!c.key.split('/').any(|s| s == "." || s == ".."), "feed {id}: key must not contain . or .. segments");
-    anyhow::ensure!(!c.bucket.contains('/'), "feed {id}: bucket must not contain /");
-    anyhow::ensure!(c.interval_secs >= 30, "feed {id}: interval_secs must be at least 30");
+    // S3 bucket naming; also keeps `.` and `..` (normalized out of the URL) away.
+    anyhow::ensure!(
+        c.bucket.len() <= 63
+            && c.bucket.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && c.bucket.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-')),
+        "feed {id}: bucket must be an S3 bucket name ([a-z0-9][a-z0-9.-]*)"
+    );
+    anyhow::ensure!((30..=86_400).contains(&c.interval_secs), "feed {id}: interval_secs must be 30..=86400");
     anyhow::ensure!(c.stale_after_secs >= c.interval_secs, "feed {id}: stale_after_secs must be at least interval_secs");
     anyhow::ensure!(c.min_status != CheckStatus::Ok, "feed {id}: min_status must be unknown, warn or fail");
     let resolve = |file: PathBuf| -> anyhow::Result<PathBuf> {
@@ -300,6 +307,9 @@ mod tests {
             ("syndb", serde_json::json!({"access_key_id_file": "relative"})),
             ("syndb", serde_json::json!({"endpoint": "https://user:pw@s3-west.nrp-nautilus.io"})),
             ("syndb", serde_json::json!({"key": "a/../report.json"})),
+            ("syndb", serde_json::json!({"bucket": ".."})),
+            ("syndb", serde_json::json!({"endpoint": "https://s3-west.nrp-nautilus.io/?X-Amz-Signature=abc"})),
+            ("syndb", serde_json::json!({"interval_secs": u64::MAX, "stale_after_secs": u64::MAX})),
         ] {
             assert!(check(id, patch.clone()).is_err(), "{id} {patch}");
         }

@@ -88,11 +88,28 @@ pub async fn get_object(http: &reqwest::Client, object: &S3Object, creds: &S3Cre
     Ok(body)
 }
 
-fn error_code(body: &[u8]) -> Option<String> {
+/// Only well-known S3 codes are echoed; the body is otherwise untrusted text.
+const KNOWN_CODES: &[&str] = &[
+    "AccessDenied",
+    "AuthorizationHeaderMalformed",
+    "ExpiredToken",
+    "InternalError",
+    "InvalidAccessKeyId",
+    "InvalidBucketName",
+    "InvalidRequest",
+    "NoSuchBucket",
+    "NoSuchKey",
+    "RequestTimeTooSkewed",
+    "ServiceUnavailable",
+    "SignatureDoesNotMatch",
+    "SlowDown",
+];
+
+fn error_code(body: &[u8]) -> Option<&'static str> {
     let text = std::str::from_utf8(body).ok()?;
     let start = text.find("<Code>")? + "<Code>".len();
     let code = &text[start..start + text[start..].find("</Code>")?];
-    (!code.is_empty() && code.len() <= 64 && code.chars().all(|c| c.is_ascii_alphanumeric())).then(|| code.to_string())
+    KNOWN_CODES.iter().copied().find(|known| *known == code)
 }
 
 /// SigV4 URI encoding: unreserved characters pass, `/` too inside a key.
@@ -169,8 +186,9 @@ mod tests {
              Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
         );
         assert_eq!(uri_encode("a b/c+d~", true), "a%20b/c%2Bd~");
-        assert_eq!(error_code(b"<Error><Code>NoSuchKey</Code></Error>").as_deref(), Some("NoSuchKey"));
+        assert_eq!(error_code(b"<Error><Code>NoSuchKey</Code></Error>"), Some("NoSuchKey"));
         assert_eq!(error_code(b"<Code><script></Code>"), None);
+        assert_eq!(error_code(b"<Error><Code>Leaked0Token</Code></Error>"), None);
     }
 
     /// A raw HTTP server re-signs the request it actually received (host with

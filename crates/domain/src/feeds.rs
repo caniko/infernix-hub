@@ -79,31 +79,29 @@ pub fn parse(bytes: &[u8]) -> Result<Report, String> {
     struct Metadata {
         timestamp: String,
     }
-    // serde's message can quote the offending value; it is capped like any field.
-    let doc: Doc = serde_json::from_slice(bytes).map_err(|e| clean(&format!("invalid status document: {e}"), MAX_TEXT))?;
+    // Errors name a category and a place, never document text: it reaches
+    // logs, `/v1/status` and notifications, and the document is untrusted.
+    let doc: Doc = serde_json::from_slice(bytes)
+        .map_err(|e| format!("invalid status document ({:?} error at line {} column {})", e.classify(), e.line(), e.column()))?;
     let generated_at = DateTime::parse_from_rfc3339(&doc.metadata.timestamp)
-        .map_err(|_| format!("metadata.timestamp {:?} is not RFC 3339", clean(&doc.metadata.timestamp, 64)))?
+        .map_err(|_| "metadata.timestamp is not RFC 3339".to_string())?
         .with_timezone(&Utc);
     if doc.checks.len() > MAX_CHECKS {
         return Err(format!("{} checks exceed the limit of {MAX_CHECKS}", doc.checks.len()));
     }
     let mut checks = doc.checks;
     let mut seen = std::collections::BTreeSet::new();
-    for check in &mut checks {
+    for (index, check) in checks.iter_mut().enumerate() {
         // Ids are never folded: two ids folding into one key would merge (and
         // could hide) distinct checks, and `feed` is the feed's own row.
         let valid = check.id.len() <= MAX_ID
             && check.id.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
             && check.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'));
         if !valid || check.id == "feed" {
-            return Err(format!(
-                "check id {:?} must match [a-z0-9][a-z0-9._-]{{0,{}}} and not be \"feed\"",
-                clean(&check.id, 64),
-                MAX_ID - 1
-            ));
+            return Err(format!("checks[{index}].id must match [a-z0-9][a-z0-9._-]{{0,{}}} and not be \"feed\"", MAX_ID - 1));
         }
         if !seen.insert(check.id.clone()) {
-            return Err(format!("check id {:?} appears twice", check.id));
+            return Err(format!("checks[{index}].id repeats an earlier check"));
         }
         check.message = check.message.as_deref().map(|m| clean(m, MAX_TEXT));
         check.remediation = check.remediation.as_deref().map(|m| clean(m, MAX_TEXT));
@@ -275,7 +273,7 @@ mod tests {
             assert_eq!(eval.state.state, "error", "{id:?}");
         }
         let twice = run(&ok.replace("pvc.usage", "backup.clickhouse"), CheckStatus::Warn);
-        assert_eq!(twice.state.problem.as_deref(), Some("check id \"backup.clickhouse\" appears twice"));
+        assert_eq!(twice.state.problem.as_deref(), Some("checks[1].id repeats an earlier check"));
         assert!(run(&ok.replace("pvc.usage", &"x".repeat(MAX_ID)), CheckStatus::Warn).fresh);
     }
 }

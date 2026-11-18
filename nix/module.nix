@@ -866,8 +866,9 @@ in {
           message = "fleetix-hub: feed ids must match [a-z0-9-]{1,32}.";
         }
         {
-          assertion = lib.all (feed: !lib.hasInfix "@" feed.endpoint) (lib.attrValues cfg.feeds);
-          message = "fleetix-hub: a feed endpoint must not carry credentials (it is written to the Nix store).";
+          # A bare origin only: userinfo or a presigned query would be written to the store.
+          assertion = lib.all (feed: builtins.match "https://[A-Za-z0-9.-]+(:[0-9]+)?/?" feed.endpoint != null) (lib.attrValues cfg.feeds);
+          message = "fleetix-hub: a feed endpoint must be a bare https origin (https://host[:port]); it is written to the Nix store.";
         }
         {
           assertion = lib.all (feed: feed.staleAfterSecs >= feed.intervalSecs) (lib.attrValues cfg.feeds);
