@@ -299,8 +299,15 @@ impl Notifier {
     async fn popup(&self, popup: &Popup) {
         let mut hints: HashMap<String, Value<'static>> = HashMap::new();
         hints.insert("urgency".into(), Value::U8(if popup.critical { 2 } else { 1 }));
-        let _ = self.proxy.notify("Fleetix Hub", 0, "", &popup.title, &popup.body, &[], hints, -1).await;
+        let _ = self.proxy.notify("Fleetix Hub", 0, "", &popup.title, &escape_markup(&popup.body), &[], hints, -1).await;
     }
+}
+
+/// Notification servers with `body-markup` render a subset of HTML (links,
+/// images) in the body. Bodies are untrusted text (agents, status feeds), so
+/// they are escaped; a server without markup shows the entities instead.
+fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 // The freedesktop `Notify` signature is the specification itself: eight

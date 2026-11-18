@@ -186,6 +186,36 @@
     else pkgs.writeText "fleetix-hub-packs.json" (builtins.toJSON (lib.mapAttrs (_: pack: pack.config) enabledPacks));
   packsArg = lib.optionalString (packsFile != null) " --packs-config ${packsFile}";
 
+  # --- status feeds -------------------------------------------------------
+  # Credentials stay in their agenix files: each becomes a systemd credential
+  # and the config names only its id, which the hub resolves against
+  # `$CREDENTIALS_DIRECTORY`.
+  feedCredentials = lib.concatLists (lib.mapAttrsToList (id: feed: [
+      "feed-${id}-access-key-id:${feed.credentials.accessKeyId}"
+      "feed-${id}-secret-access-key:${feed.credentials.secretAccessKey}"
+    ])
+    cfg.feeds);
+  feedsFile =
+    if cfg.feeds == {}
+    then null
+    else
+      pkgs.writeText "fleetix-hub-feeds.json" (builtins.toJSON (lib.mapAttrs (id: feed: {
+          inherit (feed) kind region bucket key;
+          # Checked here, not only in an assertion: evaluating the config alone
+          # must never put userinfo or a presigned query into a .drv. The
+          # message names no part of the URL.
+          endpoint =
+            if builtins.match "https://[A-Za-z0-9.-]+(:[0-9]+)?/?" feed.endpoint != null
+            then feed.endpoint
+            else throw "fleetix-hub: feed ${id}: endpoint must be a bare https origin (https://host[:port]).";
+          access_key_id_file = "feed-${id}-access-key-id";
+          secret_access_key_file = "feed-${id}-secret-access-key";
+          interval_secs = feed.intervalSecs;
+          stale_after_secs = feed.staleAfterSecs;
+          min_status = feed.minStatus;
+        })
+        cfg.feeds));
+
   # --- credentials --------------------------------------------------------
   credentials = lib.filterAttrs (_: value: value != null) {
     paperclip-token = cfg.credentials.paperclipToken;
@@ -200,7 +230,8 @@
     enabledPacks);
   loadCredentials =
     lib.mapAttrsToList (name: path: "${name}:${path}") (credentials // tokenCredentials)
-    ++ packCredentials;
+    ++ packCredentials
+    ++ feedCredentials;
   # `LoadCredential` silently keeps one entry per repeated id, and an id is
   # ambiguous: `foo` + `bar-baz` and `foo-bar` + `baz` both render
   # `foo-bar-baz`, and a pack credential can shadow a built-in `token-<name>`.
@@ -210,7 +241,8 @@
     ++ lib.attrNames tokenCredentials
     ++ lib.concatLists (lib.mapAttrsToList
       (id: pack: lib.mapAttrsToList (name: _: "${id}-${name}") pack.credentials)
-      enabledPacks);
+      enabledPacks)
+    ++ map (entry: lib.head (lib.splitString ":" entry)) feedCredentials;
   credentialIdsUnique = lib.length credentialIds == lib.length (lib.unique credentialIds);
 
   tokenCommands =
@@ -668,6 +700,80 @@ in {
       };
     };
 
+    feeds = mkOption {
+      type = types.attrsOf (types.submodule {
+        options = {
+          kind = mkOption {
+            type = types.enum ["s3"];
+            default = "s3";
+            description = "How the document is fetched. `s3`: a SigV4-signed, path-style GetObject.";
+          };
+          endpoint = mkOption {
+            type = types.str;
+            example = "https://s3-west.nrp-nautilus.io";
+            description = "S3 endpoint, `https://host[:port]` with no path.";
+          };
+          region = mkOption {
+            type = types.str;
+            example = "us-east-1";
+            description = "SigV4 signing region.";
+          };
+          bucket = mkOption {type = types.str;};
+          key = mkOption {
+            type = types.str;
+            description = "Object key of the status document.";
+          };
+          intervalSecs = mkOption {
+            type = types.ints.between 30 86400;
+            description = "Seconds between polls.";
+          };
+          staleAfterSecs = mkOption {
+            type = types.ints.positive;
+            description = "A document whose `metadata.timestamp` is older than this raises `monitor:<id>:feed`. At least `intervalSecs`.";
+          };
+          minStatus = mkOption {
+            type = types.enum ["unknown" "warn" "fail"];
+            default = "warn";
+            description = "Lowest check status that notifies (fail = critical, warn = warning, unknown = info).";
+          };
+          credentials = {
+            accessKeyId = mkOption {
+              type = types.str;
+              description = "Absolute path to the access key id file (an agenix path). Loaded as the systemd credential `feed-<id>-access-key-id`.";
+            };
+            secretAccessKey = mkOption {
+              type = types.str;
+              description = "Absolute path to the secret access key file (an agenix path). Loaded as the systemd credential `feed-<id>-secret-access-key`.";
+            };
+          };
+        };
+      });
+      default = {};
+      example = lib.literalExpression ''
+        {
+          syndb = {
+            endpoint = "https://s3-west.nrp-nautilus.io";
+            region = "us-east-1";
+            bucket = "syndb-status";
+            key = "report.json";
+            intervalSecs = 300;
+            staleAfterSecs = 2700;
+            credentials.accessKeyId = config.age.secrets.syndb-status-read-key-id.path;
+            credentials.secretAccessKey = config.age.secrets.syndb-status-read-secret.path;
+          };
+        }
+      '';
+      description = ''
+        Status feeds the hub polls (`HUB_FEEDS_CONFIG`). Each check at or above
+        `minStatus` becomes the notification `monitor:<id>:<check id>` and
+        resolves when the check recovers; a stale or unreadable document raises
+        `monitor:<id>:feed` and leaves the check rows as they were. Key material
+        never enters the store or the environment: only the credential ids do.
+        systemd copies credentials at unit start, so restart the unit after
+        rotating a key.
+      '';
+    };
+
     packs = mkOption {
       type = types.attrsOf (types.submodule ({name, ...}: {
         options = {
@@ -763,6 +869,18 @@ in {
           message = "fleetix-hub: pack ids must match [a-z0-9-]+ and credential names [A-Za-z0-9_.-]+, so `<id>-<name>` is a valid systemd credential id.";
         }
         {
+          assertion = lib.all (id: builtins.match "[a-z0-9-]{1,32}" id != null) (lib.attrNames cfg.feeds);
+          message = "fleetix-hub: feed ids must match [a-z0-9-]{1,32}.";
+        }
+        {
+          assertion = lib.all (feed: feed.staleAfterSecs >= feed.intervalSecs) (lib.attrValues cfg.feeds);
+          message = "fleetix-hub: a feed's staleAfterSecs must be at least its intervalSecs.";
+        }
+        {
+          assertion = lib.all (feed: lib.all (p: lib.hasPrefix "/" p && !lib.hasPrefix "/nix/store/" p) [feed.credentials.accessKeyId feed.credentials.secretAccessKey]) (lib.attrValues cfg.feeds);
+          message = "fleetix-hub: feed credentials must be absolute paths outside the Nix store (agenix paths).";
+        }
+        {
           assertion = credentialIdsUnique;
           message = "fleetix-hub: generated LoadCredential ids must be unique across credentials, tokens and packs. `foo` + `bar-baz` and `foo-bar` + `baz` both render `foo-bar-baz`, and a pack `token` + `x` collides with the token credential `token-x`; systemd silently keeps one entry per repeated id. Rename the colliding pack or credential.";
         }
@@ -810,6 +928,7 @@ in {
           // optionalAttrs (seedFile != null) {HUB_SEED_FILE = toString seedFile;}
           // optionalAttrs (cfg.fleetStatusFile != null) {HUB_FLEET_STATUS_FILE = toString cfg.fleetStatusFile;}
           // optionalAttrs (cfg.secretInventoryFile != null) {HUB_SECRET_INVENTORY_FILE = toString cfg.secretInventoryFile;}
+          // optionalAttrs (feedsFile != null) {HUB_FEEDS_CONFIG = toString feedsFile;}
           // optionalAttrs (cfg.database.urlFile == null) {DATABASE_URL = cfg.database.url;}
           // optionalAttrs cfg.migrations.enable {HUB_MIGRATE_ON_START = "0";}
           // optionalAttrs (cfg.integrations.assistant == "live" && llmUrl != null) {

@@ -212,7 +212,7 @@ struct HubStatusArgs {}
 fn hub_status_route(hub: HubClient) -> ToolRoute<()> {
     let schema = schema_for_input::<HubStatusArgs>().expect("hub_status has a static schema");
     ToolRoute::new(
-        Tool::new("hub_status", "Integration modes, pause state and the authenticated principal.", schema),
+        Tool::new("hub_status", "Integration modes, pause state, status feed states and the authenticated principal.", schema),
         move |Parameters(_): Parameters<HubStatusArgs>| {
             let hub = hub.clone();
             async move {

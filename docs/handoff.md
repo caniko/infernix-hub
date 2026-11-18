@@ -28,6 +28,10 @@ for per-integration evidence, and `docs/nix.md` for the flake and NixOS module.
   a snapshot without `after`, or a cursor feed with `after` and optional `wait`.
   Producers sync Today and fleet conditions and summary staleness. MCP
   `hub_post_summary` writes a daily notification keyed `summary:<YYYY-MM-DD>`.
+- **Status feeds.** The hub polls JSON status documents (S3, SigV4) that
+  projects publish; each failing check is a `monitor:<feed>:<check>`
+  notification that resolves on recovery, and a stale or unreadable feed is
+  `monitor:<feed>:feed`. Feed states are in `/v1/status`.
 - **Renewals.** Seeded renewal records include procedures and HTTPS provider URLs;
   the operator can mark a renewal complete and set its next due date.
 - **Clients.** The Dioxus console has a Notifications workspace; `hubctl` and

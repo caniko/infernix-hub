@@ -22,6 +22,7 @@ pub mod comfy;
 pub mod n8n;
 pub mod paperclip;
 pub mod postiz;
+pub mod s3;
 pub mod windmill;
 
 pub use comfy::ComfyClient;
