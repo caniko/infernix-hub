@@ -434,7 +434,7 @@ fn ApprovalsBody(status: FleetStatus) -> Element {
     rsx! {
         p { class: "read-only-note",
             "The hub is read-only here: approve in a terminal with "
-            code { "canix host rops" }
+            code { "canix host ops" }
             "."
         }
         if ops.is_empty() {
