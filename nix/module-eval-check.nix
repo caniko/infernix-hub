@@ -96,6 +96,12 @@
   fixtureCheck = fixture.config.systemd.services."harbor-db-fleetix-hub-check";
 
   liveHub = live.config.systemd.services.fleetix-hub;
+  # ComfyUI enabled but the hub on its fixture: an on-demand ComfyUI must not
+  # be pulled in at boot by the hub.
+  fixtureComfyHub =
+    (live.extendModules {
+      modules = [{services.fleetix-hub.integrations.comfy = "fixture";}];
+    }).config.systemd.services.fleetix-hub;
   liveMigration = live.config.systemd.services."harbor-db-fleetix-hub";
   liveCheck = live.config.systemd.services."harbor-db-fleetix-hub-check";
   liveSeed = liveHub.environment.HUB_SEED_FILE;
@@ -154,6 +160,8 @@ in {
   assert lib.elem "llama-swap.service" liveHub.after;
   assert lib.elem "comfyui.service" liveHub.wants;
   assert lib.elem "llama-swap.service" liveHub.wants;
+  assert !(lib.elem "comfyui.service" fixtureComfyHub.wants);
+  assert lib.elem "llama-swap.service" fixtureComfyHub.wants;
   assert live.config.services.harbor-db.projects."fleetix-hub".enable;
   assert lib.elem "fleetix-hub.service" liveMigration.requiredBy;
   assert lib.elem "--check" live.config.services.harbor-db.projects."fleetix-hub".runner.checkArgs;
