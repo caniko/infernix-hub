@@ -347,7 +347,12 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
                 Verification::ContractVerified,
                 "board API 0.3.1; OpenAPI-checked, no authenticated call made yet",
             ),
-            status("windmill", s.windmill, Verification::ContractVerified, "CE 1.839.0; OpenAPI-checked, procedures not deployed"),
+            status(
+                "windmill",
+                s.windmill,
+                Verification::ContractVerified,
+                "CE 1.839.0; OpenAPI-checked; procedures come from registry/windmill",
+            ),
             status("comfyui", s.comfy, Verification::ContractVerified, "0.37.0; checked against server source"),
             status("publisher", s.publisher, Verification::Built, "Postiz adapter built from public docs; Postiz not deployed"),
             status("assistant", s.assistant, Verification::ContractVerified, "llama-swap OpenAI-compatible endpoint"),
