@@ -265,7 +265,7 @@ async fn file_fleet_issue(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, hub: &
     // absorbs a create, whatever its current state ("degraded", "unreachable").
     let title = format!("Fleet: {condition}");
     crate::outbox::enqueue(
-        &mut **tx,
+        tx,
         &Actor::system(),
         crate::outbox::PAPERCLIP_CREATE_ISSUE,
         &key,
