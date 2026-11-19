@@ -53,7 +53,9 @@ pub struct Secret {
     pub custodian: String,
     pub expiry: SecretExpiry,
     pub rotated_at: Option<String>,
-    pub rotation: SecretRotation,
+    /// `null` until the secret's rotation how-to is documented.
+    #[serde(default)]
+    pub rotation: Option<SecretRotation>,
     pub consumers: Vec<SecretConsumer>,
 }
 

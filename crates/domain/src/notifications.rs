@@ -36,8 +36,14 @@ fn secret_raises_follow_the_contract() {
     let raises = secret_raises(&inventory, now, &Default::default()).unwrap();
     assert_eq!(
         raises.iter().map(|(_, r)| r.dedupe_key.as_str()).collect::<Vec<_>>(),
-        vec!["secrets:expired:expired", "secrets:unknown:unknown", "secrets:warning:expiring"]
+        vec!["secrets:expired:expired", "secrets:unknown", "secrets:warning:expiring"]
     );
+    // The live writer emits `rotation: null` until a how-to is documented.
+    let mut undocumented = serde_json::to_value(&inventory).unwrap();
+    undocumented["secrets"][0]["rotation"] = serde_json::Value::Null;
+    let undocumented: contracts::SecretInventory = serde_json::from_value(undocumented).unwrap();
+    let body = &secret_raises(&undocumented, now, &Default::default()).unwrap()[0].1.body;
+    assert!(body.contains("rotation: not documented"), "{body}");
     assert!(!secret_inventory_stale(&inventory, now));
     assert!(secret_inventory_stale(&inventory, now + chrono::Duration::hours(26)));
     inventory.generated_at = (now + chrono::Duration::seconds(61)).to_rfc3339();
@@ -56,8 +62,12 @@ fn secret_custodian_requires_a_member_principal() {
     ]});
     let inventory = serde_json::from_value(value).unwrap();
     let raises = secret_raises(&inventory, now, &["dejana".to_string()].into_iter().collect()).unwrap();
-    assert!(raises.iter().any(|(owner, r)| owner.as_deref() == Some("dejana") && r.dedupe_key == "member:dejana:secrets:private:unknown"));
-    assert!(raises.iter().any(|(owner, r)| owner.is_none() && r.dedupe_key == "secrets:operator:unknown"));
+    assert!(
+        raises
+            .iter()
+            .any(|(owner, r)| owner.as_deref() == Some("dejana") && r.dedupe_key == "member:dejana:secrets:unknown" && r.body == "private")
+    );
+    assert!(raises.iter().any(|(owner, r)| owner.is_none() && r.dedupe_key == "secrets:unknown" && r.body == "operator"));
     assert!(secret_raises(&inventory, now, &Default::default()).unwrap().iter().all(|(owner, _)| owner.is_none()));
 }
 
@@ -257,19 +267,25 @@ pub fn secret_raises(
     members: &std::collections::BTreeSet<String>,
 ) -> DResult<Vec<(Option<String>, Raise)>> {
     let mut groups = std::collections::BTreeMap::<Option<String>, Vec<Raise>>::new();
+    // Unknown expiry is reportable but not one row per secret: a fresh inventory
+    // lists every source as unknown, so each owner gets one summary row instead.
+    let mut unknown = std::collections::BTreeMap::<Option<String>, Vec<&str>>::new();
     for secret in &inventory.secrets {
         let state = secret_state(secret, now);
+        let owner = members.contains(&secret.custodian).then_some(secret.custodian.clone());
         let severity = match state {
             "expired" => Severity::Critical,
             "expiring" => Severity::Warning,
-            "unknown" => Severity::Info,
+            "unknown" => {
+                unknown.entry(owner).or_default().push(&secret.id);
+                continue;
+            }
             _ => continue,
         };
         let date = match &secret.expiry {
             contracts::SecretExpiry::At { date } => date.to_string(),
             _ => "unknown".into(),
         };
-        let owner = members.contains(&secret.custodian).then_some(secret.custodian.clone());
         let mut key = key_safe(&format!("secrets:{}:{state}", secret.id));
         if let Some(name) = &owner {
             let prefix = stored_key(Some(name), "s")?;
@@ -282,9 +298,31 @@ pub fn secret_raises(
             severity,
             title: format!("Secret {}: {state}", secret.id),
             body: format!(
-                "{}; date: {date}; custodian: {}; rotation: {} — {}",
-                secret.id, secret.custodian, secret.rotation.method, secret.rotation.command
+                "{}; date: {date}; custodian: {}; rotation: {}",
+                secret.id,
+                secret.custodian,
+                secret.rotation.as_ref().map_or("not documented".to_string(), |r| format!("{} — {}", r.method, r.command)),
             ),
+            subject_type: None,
+            subject_id: None,
+            url: None,
+        });
+    }
+    for (owner, mut ids) in unknown {
+        ids.sort_unstable();
+        // ponytail: lists the first ids only; the console/`hub_secrets` hold the full inventory.
+        const LISTED: usize = 50;
+        let mut body = ids.iter().take(LISTED).copied().collect::<Vec<_>>().join("\n");
+        if ids.len() > LISTED {
+            body.push_str(&format!("\n+{} more", ids.len() - LISTED));
+        }
+        let key = stored_key(owner.as_deref(), "secrets:unknown")?;
+        groups.entry(owner).or_default().push(Raise {
+            source: "secrets".into(),
+            dedupe_key: key,
+            severity: Severity::Info,
+            title: format!("{} secrets have no recorded expiry", ids.len()),
+            body,
             subject_type: None,
             subject_id: None,
             url: None,
