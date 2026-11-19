@@ -204,6 +204,10 @@ async fn sync_owned(hub: &Hub, owner: Option<&str>, source: &str, current: Vec<R
             return Err(invalid("invalid_dedupe_key", "key belongs to another notification owner or source"));
         }
         changed += usize::from(upsert(&mut *tx, &hub.config.company_id, owner, raise).await?);
+        // Degradations only: a pending op is an approval for the operator.
+        if hub.config.fleet_issues.is_some() && source == "fleet" && !raise.dedupe_key.starts_with("fleet:op:") {
+            file_fleet_issue(&mut tx, hub, raise).await?;
+        }
     }
     let keys: Vec<&str> = current.iter().map(|r| r.dedupe_key.as_str()).collect();
     changed += sqlx::query(
@@ -225,6 +229,54 @@ async fn sync_owned(hub: &Hub, owner: Option<&str>, source: &str, current: Vec<R
         hub.notified.notify_waiters();
     }
     Ok(changed)
+}
+
+/// Every fleet condition the producer reports is filed with Paperclip for an
+/// agent to fix, in the transaction that records it. The key holds one issue
+/// per condition per UTC day, so a flapping host cannot flood the board, and a
+/// condition still present tomorrow files again. Paperclip folds a create into
+/// an open issue with the same title created in the last 48 h, so a multi-day
+/// outage opens a new issue about every other day.
+// ponytail: one issue per episode needs an episode-start column; add it if the
+// every-other-day issues of long outages become noise.
+async fn file_fleet_issue(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, hub: &Hub, raise: &Raise) -> DResult<()> {
+    let Some(route) = &hub.config.fleet_issues else { return Ok(()) };
+    // Nightly keys carry the run time; every nightly is one condition.
+    let condition = if raise.dedupe_key.starts_with("fleet:nightly:") { "fleet:nightly" } else { raise.dedupe_key.as_str() };
+    let day = Utc::now().date_naive();
+    let key = format!("fleetix-hub:fleet:{condition}:{day}");
+    // Runs every pass: a plain read, unlike enqueue's upsert, never waits on the
+    // worker's row lock while it delivers under the notification writer lock.
+    let filed: bool =
+        sqlx::query_scalar("select exists(select 1 from outbox where idempotency_key = $1)").bind(&key).fetch_one(&mut **tx).await?;
+    if filed {
+        return Ok(());
+    }
+    let notification_id: Uuid = sqlx::query_scalar("select id from notifications where company_id = $1 and dedupe_key = $2")
+        .bind(&hub.config.company_id)
+        .bind(&raise.dedupe_key)
+        .fetch_one(&mut **tx)
+        .await?;
+    let description = format!(
+        "{}\n\n{}\n\nDetected by Fleetix Hub (notification `{}`, {day}). Diagnose from evidence, state the earliest causal failure and land the fix; the Board activates it.",
+        raise.title, raise.body, raise.dedupe_key
+    );
+    // The title is the condition alone, so only this condition's own open issue
+    // absorbs a create, whatever its current state ("degraded", "unreachable").
+    let title = format!("Fleet: {condition}");
+    crate::outbox::enqueue(
+        &mut **tx,
+        &Actor::system(),
+        crate::outbox::PAPERCLIP_CREATE_ISSUE,
+        &key,
+        json!({
+            "notification_id": notification_id, "company_id": route.company_id, "title": title,
+            "description": description, "origin_key": key,
+            "project_id": route.project_id, "assignee_agent_id": route.assignee_agent_id,
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 // ── Producers ───────────────────────────────────────────────────────────────

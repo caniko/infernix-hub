@@ -56,6 +56,8 @@ pub struct Settings {
     /// this many hours; unset disables the rule.
     pub summary_stale_hours: Option<u32>,
     pub company_id: Option<String>,
+    /// Paperclip routing for fleet degradations (`HUB_FLEET_ISSUE_*`).
+    pub fleet_issues: Option<domain::FleetIssues>,
     pub paperclip: AdapterMode,
     pub windmill: AdapterMode,
     pub comfy: AdapterMode,
@@ -99,6 +101,11 @@ impl Settings {
                 Some(v) => Some(v.parse().with_context(|| format!("HUB_SUMMARY_STALE_HOURS must be a number of hours, got {v}"))?),
             },
             company_id: env("HUB_COMPANY_ID"),
+            fleet_issues: env("HUB_FLEET_ISSUE_COMPANY_ID").map(|company_id| domain::FleetIssues {
+                company_id,
+                project_id: env("HUB_FLEET_ISSUE_PROJECT_ID"),
+                assignee_agent_id: env("HUB_FLEET_ISSUE_AGENT_ID"),
+            }),
             paperclip: mode("HUB_PAPERCLIP")?,
             windmill: mode("HUB_WINDMILL")?,
             comfy: mode("HUB_COMFY")?,
@@ -123,6 +130,7 @@ impl Settings {
             feeds_config: None,
             summary_stale_hours: None,
             company_id: None,
+            fleet_issues: None,
             paperclip: AdapterMode::Fixture,
             windmill: AdapterMode::Fixture,
             comfy: AdapterMode::Fixture,
@@ -359,6 +367,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         ],
         dispatch_early_secs: 30,
         dispatch_window_secs: 15 * 60,
+        fleet_issues: s.fleet_issues.clone(),
     };
     // Publishing channels are addressed by `accounts.transport`. The built-in
     // adapter answers under its own real name only; a `fixture` deployment

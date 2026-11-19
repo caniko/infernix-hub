@@ -83,6 +83,17 @@ pub struct HubConfig {
     pub dispatch_early_secs: i64,
     /// How long after `due_at` a dispatch is still within its window.
     pub dispatch_window_secs: i64,
+    /// Where fleet degradations are filed as Paperclip issues; unset files none.
+    pub fleet_issues: Option<FleetIssues>,
+}
+
+/// Paperclip routing for fleet notifications (the operations company, its
+/// project and the agent that starts the fix).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FleetIssues {
+    pub company_id: String,
+    pub project_id: Option<String>,
+    pub assignee_agent_id: Option<String>,
 }
 
 #[derive(Clone)]

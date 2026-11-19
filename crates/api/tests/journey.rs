@@ -3960,3 +3960,91 @@ async fn member_renewal_producer_rejects_legacy_key_collision() {
             .unwrap();
     assert_eq!(title, "old");
 }
+
+#[tokio::test]
+async fn fleet_degradations_file_one_paperclip_issue_per_condition_and_day() {
+    let Some(h) = harness().await else { return };
+    let route = domain::FleetIssues {
+        company_id: "ops-co".into(),
+        project_id: Some("ops-project".into()),
+        assignee_agent_id: Some("ops-agent".into()),
+    };
+    let mut hub = h.hub.clone();
+    hub.config = Arc::new(domain::HubConfig { fleet_issues: Some(route), ..(*h.hub.config).clone() });
+    let raise = |key: &str, body: &str| domain::notifications::Raise {
+        source: "fleet".into(),
+        dedupe_key: key.into(),
+        severity: Severity::Warning,
+        title: format!("{key} degraded"),
+        body: body.into(),
+        subject_type: None,
+        subject_id: None,
+        url: None,
+    };
+    let issues = |hub: domain::Hub| async move {
+        domain::sqlx::query_as::<_, (serde_json::Value, String)>(
+            "select payload, state from outbox where topic = 'paperclip.create_issue' and idempotency_key like 'fleetix-hub:fleet:%' order by created_at",
+        )
+        .fetch_all(&hub.db)
+        .await
+        .unwrap()
+    };
+    async fn sync(hub: &domain::Hub, raises: Vec<domain::notifications::Raise>) -> domain::DResult<usize> {
+        domain::notifications::sync(hub, "fleet", raises).await
+    }
+
+    // Unrouted files nothing; a condition already open when routing starts files
+    // once, and edits, flaps and passes the same day file no second issue. A
+    // pending op is an approval, not a degradation.
+    sync(&h.hub, vec![raise("fleet:host:edge", "first")]).await.unwrap();
+    assert!(issues(hub.clone()).await.is_empty());
+    sync(&hub, vec![raise("fleet:host:edge", "pg-backup-health failed")]).await.unwrap();
+    sync(&hub, vec![raise("fleet:host:edge", "edited")]).await.unwrap();
+    sync(&hub, vec![]).await.unwrap();
+    sync(&hub, vec![raise("fleet:host:edge", "flapped"), raise("fleet:op:op-1", "approve")]).await.unwrap();
+    let rows = issues(hub.clone()).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let payload = &rows[0].0;
+    assert_eq!(payload["company_id"], "ops-co");
+    assert_eq!(payload["project_id"], "ops-project");
+    assert_eq!(payload["assignee_agent_id"], "ops-agent");
+    assert_eq!(payload["title"], "Fleet: fleet:host:edge");
+    assert!(payload["description"].as_str().unwrap().starts_with("fleet:host:edge degraded\n\npg-backup-health failed"));
+    assert!(payload["origin_key"].as_str().unwrap().starts_with("fleetix-hub:fleet:fleet:host:edge:"));
+
+    // Another condition files its own, with producer titles: two alerts share a
+    // display name and two nightly runs share theirs. Other sources and unrouted
+    // hubs file none.
+    let titled = |key: &str, title: &str| domain::notifications::Raise { title: title.into(), ..raise(key, "x") };
+    sync(
+        &hub,
+        vec![
+            raise("fleet:host:edge", "flapped"),
+            titled("fleet:alert:internal_forgejo", "Alert: forgejo"),
+            titled("fleet:alert:public_forgejo", "Alert: forgejo"),
+            titled("fleet:nightly:2026-11-18t02:00:00z", "Nightly update failed"),
+            titled("fleet:nightly:2026-11-19t02:00:00z", "Nightly update failed"),
+        ],
+    )
+    .await
+    .unwrap();
+    domain::notifications::sync(
+        &hub,
+        "monitor",
+        vec![domain::notifications::Raise { source: "monitor".into(), ..raise("monitor:x", "fail") }],
+    )
+    .await
+    .unwrap();
+    sync(&h.hub, vec![raise("fleet:host:edge", "flapped"), raise("fleet:host:nomad", "x")]).await.unwrap();
+    let rows = issues(hub.clone()).await;
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    let titles = |title: &str| rows.iter().filter(|(p, _)| p["title"] == title).count();
+    // Same-named alerts stay apart; every nightly run is one condition.
+    assert_eq!(titles("Fleet: fleet:alert:internal_forgejo"), 1);
+    assert_eq!(titles("Fleet: fleet:alert:public_forgejo"), 1);
+    assert_eq!(titles("Fleet: fleet:nightly"), 1);
+
+    // The worker delivers them through the Paperclip port.
+    h.tick().await;
+    assert!(issues(hub).await.iter().all(|(_, state)| state == "delivered"));
+}
