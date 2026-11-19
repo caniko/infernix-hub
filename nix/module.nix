@@ -313,6 +313,33 @@ in {
       description = "Paperclip company id. Required unless every integration is fixture.";
     };
 
+    fleetIssues = mkOption {
+      type = types.nullOr (types.submodule {
+        options = {
+          companyId = mkOption {
+            type = types.nonEmptyStr;
+            description = "Paperclip company that receives fleet degradation issues.";
+          };
+          projectId = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = "Paperclip project for those issues.";
+          };
+          assigneeAgentId = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = "Paperclip agent assigned to fix them.";
+          };
+        };
+      });
+      default = null;
+      description = ''
+        File each fleet condition the hub reports (pending-op approvals
+        excepted) as a Paperclip issue, at most one per condition per UTC day.
+        Null files none.
+      '';
+    };
+
     assetDir = mkOption {
       type = types.path;
       default = "/var/lib/fleetix-hub/assets";
@@ -927,6 +954,9 @@ in {
           }
           // optionalAttrs (seedFile != null) {HUB_SEED_FILE = toString seedFile;}
           // optionalAttrs (cfg.fleetStatusFile != null) {HUB_FLEET_STATUS_FILE = toString cfg.fleetStatusFile;}
+          // optionalAttrs (cfg.fleetIssues != null) ({HUB_FLEET_ISSUE_COMPANY_ID = cfg.fleetIssues.companyId;}
+            // optionalAttrs (cfg.fleetIssues.projectId != null) {HUB_FLEET_ISSUE_PROJECT_ID = cfg.fleetIssues.projectId;}
+            // optionalAttrs (cfg.fleetIssues.assigneeAgentId != null) {HUB_FLEET_ISSUE_AGENT_ID = cfg.fleetIssues.assigneeAgentId;})
           // optionalAttrs (cfg.secretInventoryFile != null) {HUB_SECRET_INVENTORY_FILE = toString cfg.secretInventoryFile;}
           // optionalAttrs (feedsFile != null) {HUB_FEEDS_CONFIG = toString feedsFile;}
           // optionalAttrs (cfg.database.urlFile == null) {DATABASE_URL = cfg.database.url;}
