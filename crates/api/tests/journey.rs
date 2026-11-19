@@ -3545,15 +3545,17 @@ async fn secret_notifications_follow_custodian() {
     fleetix_hubd::notify_pass(&h.hub, None, Some(&path), None).await;
     let mine = member.notifications(None, 0, true).await.unwrap().items;
     assert_eq!(mine.len(), 1);
-    assert_eq!(mine[0].dedupe_key, "member:dejana:secrets:private:unknown");
+    assert_eq!(mine[0].dedupe_key, "member:dejana:secrets:unknown");
+    assert!(mine[0].body.contains("private"));
     let operator = h.op.notifications(None, 0, true).await.unwrap().items;
-    assert!(operator.iter().any(|n| n.dedupe_key == "secrets:operator:unknown"));
-    assert!(!operator.iter().any(|n| n.dedupe_key.contains("private")));
+    let summary = operator.iter().find(|n| n.dedupe_key == "secrets:unknown").unwrap();
+    assert!(summary.body.contains("operator") && !summary.body.contains("private"));
     inventory["secrets"][0]["custodian"] = json!("can");
     std::fs::write(&path, inventory.to_string()).unwrap();
     fleetix_hubd::notify_pass(&h.hub, None, Some(&path), None).await;
     assert!(member.notifications(None, 0, true).await.unwrap().items[0].resolved_at.is_some());
-    assert!(h.op.notifications(None, 0, false).await.unwrap().items.iter().any(|n| n.dedupe_key == "secrets:private:unknown"));
+    let summary = h.op.notifications(None, 0, false).await.unwrap().items.into_iter().find(|n| n.dedupe_key == "secrets:unknown").unwrap();
+    assert!(summary.body.contains("private") && summary.title.starts_with("2 secrets"));
     std::fs::remove_file(path).unwrap();
 }
 
@@ -3586,14 +3588,14 @@ async fn secret_inventory_pass_preserves_rows_when_unreadable() {
     let expired = rows.iter().find(|n| n.dedupe_key == "secrets:home-can-test:expired").unwrap();
     assert!(expired.resolved_at.is_some());
     let seq = expired.seq;
-    let unknown = rows.iter().find(|n| n.dedupe_key == "secrets:home-can-unknown:unknown").unwrap();
+    let unknown = rows.iter().find(|n| n.dedupe_key == "secrets:unknown").unwrap();
     assert!(unknown.open);
     let unknown_seq = unknown.seq;
     std::fs::remove_file(&path).unwrap();
     fleetix_hubd::notify_pass(&h.hub, None, Some(&path), None).await;
     let rows = h.op.notifications(None, 0, true).await.unwrap().items;
     assert_eq!(rows.iter().find(|n| n.dedupe_key == "secrets:home-can-test:expired").unwrap().seq, seq);
-    let unknown = rows.iter().find(|n| n.dedupe_key == "secrets:home-can-unknown:unknown").unwrap();
+    let unknown = rows.iter().find(|n| n.dedupe_key == "secrets:unknown").unwrap();
     assert!(unknown.open);
     assert_eq!(unknown.seq, unknown_seq);
     assert!(rows.iter().find(|n| n.dedupe_key == "secrets:inventory-stale").unwrap().open);
