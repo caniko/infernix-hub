@@ -705,3 +705,61 @@ async fn rolling_start_targets_one_account_and_does_not_restart_an_open_window()
     assert_eq!(state.activity[0].output_tokens, 1);
     assert_eq!(state.activity[0].purpose, contracts::providers::ActivityPurpose::WindowStarter);
 }
+
+#[tokio::test]
+async fn multi_key_group_edits_only_affect_the_selected_key_and_hub_ids_are_source_scoped() {
+    let dir = Scratch::new();
+    let mock = serve(Router::new()).await;
+    let proxy = fixture(&dir, &mock);
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+
+    // Upload a 2-key API group credential document.
+    let upload = http
+        .management(
+            "POST",
+            "/v8/management/credentials?name=group.json",
+            Some(json!({
+                "type": "api_key",
+                "family": "anthropic",
+                "keys": ["sk-ant-key-one", "sk-ant-key-two"]
+            })),
+        )
+        .await;
+    assert_eq!(upload.status(), 200);
+
+    // Disable and reprioritize ONLY key #1; sibling key #2 must stay enabled with defaults.
+    let edit = http
+        .management(
+            "PATCH",
+            "/v8/management/credentials/fields",
+            Some(json!({
+                "account_id": "group.json#1",
+                "disabled": true,
+                "priority": 9,
+                "weight": 3,
+                "note": "first key only"
+            })),
+        )
+        .await;
+    assert_eq!(edit.status(), 200);
+
+    let state = proxy.state.read().await;
+    let first = &state.pool.accounts["group.json#1"];
+    let second = &state.pool.accounts["group.json#2"];
+    assert!(first.disabled);
+    assert_eq!(first.priority, 9);
+    assert_eq!(first.weight, 3);
+    assert_eq!(first.note.as_deref(), Some("first key only"));
+    assert!(!second.disabled, "sibling key must remain enabled");
+    assert_eq!(second.priority, 0, "sibling key priority must be preserved");
+    assert_eq!(second.weight, 1, "sibling key weight must be preserved");
+    assert_eq!(second.note, None, "sibling key note must be preserved");
+
+    // Verify source-namespaced Hub account IDs distinguish identical local names across hosts/users.
+    let id_a = first.hub_id_for("atlas", "can");
+    let id_b = first.hub_id_for("nomad", "can");
+    assert_ne!(id_a, id_b);
+    assert_eq!(id_a, "claude:atlas:can:group.json#1");
+    assert_eq!(state.pool.find(&state.pool.hub_id(first)).map(|a| a.id.as_str()), Some("group.json#1"));
+}

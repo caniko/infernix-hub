@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use contracts::{
     client::{ClientError, HubClient},
     providers::{ActivityAttemptIn, ActivityExchangeIn, ActivityIngestBatch, ActivityScope, AttemptDetail, CaptureState, RequestRow},
@@ -151,22 +151,7 @@ pub(super) async fn export(client: &HubClient, path: &Path) -> Result<()> {
     let mut size = 0;
     let mut scope = ActivityScope { from: Some(DateTime::<Utc>::UNIX_EPOCH), to: Some(Utc::now()), limit: Some(500), ..Default::default() };
     loop {
-        let mut page = client.activity_requests(&scope).await?;
-        if let Some(cursor) = page.next_cursor.as_deref() {
-            // The API cursor is only a timestamp. Fetch the complete boundary
-            // timestamp separately so no record tied with the last row is lost.
-            let boundary: DateTime<Utc> = cursor.parse()?;
-            let at_boundary = client
-                .activity_requests(&ActivityScope { from: Some(boundary), to: Some(boundary), limit: scope.limit, ..Default::default() })
-                .await?;
-            ensure!(
-                at_boundary.next_cursor.is_none(),
-                "too many activity events share one timestamp; cannot export without dropping records"
-            );
-            page.items.retain(|row| row.occurred_at > boundary);
-            page.items.extend(at_boundary.items);
-            scope.to = boundary.checked_sub_signed(TimeDelta::microseconds(1));
-        }
+        let page = client.activity_requests(&scope).await?;
         for row in page.items {
             let detail = client.activity_request_detail(row.id).await?;
             let event = exchange_row(detail.exchange, detail.attempts);
@@ -176,9 +161,10 @@ pub(super) async fn export(client: &HubClient, path: &Path) -> Result<()> {
             ensure!(size <= MAX_ARCHIVE && archive.exchanges.len() < MAX_EXCHANGES, "activity exceeds offline transfer limits");
             archive.exchanges.push(event);
         }
-        if page.next_cursor.is_none() {
+        let Some(next_cursor) = page.next_cursor else {
             break;
-        }
+        };
+        scope.cursor = Some(next_cursor);
     }
     let encrypted = seal(key.as_os_str().as_bytes(), &serde_json::to_vec(&archive)?)?;
     write_archive(path, &encrypted)?;

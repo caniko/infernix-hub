@@ -52,8 +52,7 @@ pub async fn poll_quota(proxy: Arc<Proxy>) {
     }
 }
 
-pub async fn run(proxy: Arc<Proxy>, url: String, token: String) {
-    let hub = HubClient::new(url, token);
+pub(crate) fn source_identity() -> (String, String) {
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|s| s.trim().to_owned())
@@ -61,6 +60,13 @@ pub async fn run(proxy: Arc<Proxy>, url: String, token: String) {
         .or_else(|| env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "localhost".into());
     let user = env::var("USER").unwrap_or_else(|_| "unknown".into());
+    (host, user)
+}
+
+pub async fn run(proxy: Arc<Proxy>, url: String, token: String) {
+    let hub = HubClient::new(url, token);
+    let host = proxy.source_host.clone();
+    let user = proxy.source_user.clone();
     let claim =
         ClaimOperationsIn { host: host.clone(), unix_user: user.clone(), provider_ids: FAMILIES.map(str::to_owned).into(), limit: 10 };
     let mut receipts = VecDeque::new();
@@ -164,7 +170,7 @@ pub(crate) async fn observations(proxy: &Proxy, host: &str, user: &str) -> Vec<O
                     }
                     let is_next = picks.contains(&a.id);
                     ModelAccount {
-                        id: a.hub_id(),
+                        id: a.hub_id_for(host, user),
                         provider_id: family.into(),
                         source_account_id: a.id.clone(),
                         display_name: a.label.clone(),

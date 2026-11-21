@@ -18,6 +18,11 @@ use crate::{ANY_READER, Actor, DResult, DomainError, Hub, OPERATOR, OPERATOR_OR_
 /// so local imports and proxy streams never double-count historical totals.
 pub async fn ingest_activity(hub: &Hub, actor: &Actor, batch: ActivityIngestBatch) -> DResult<ActivityIngestAck> {
     actor.require(OPERATOR_OR_COLLECTOR)?;
+    super::enforce_collector_source(hub, actor, &batch.source_host, &batch.source_user).await?;
+    let providers: BTreeSet<&str> = batch.exchanges.iter().map(|ex| ex.provider_id.as_str()).collect();
+    for provider_id in providers {
+        super::enforce_collector_scope(hub, actor, &batch.source_host, &batch.source_user, provider_id).await?;
+    }
     let catalog = pricing::default_catalog();
     let capture_policy = capture::get_capture_policy(hub, &super::internal_operator("activity-ingest")).await.unwrap_or_default();
 
@@ -387,7 +392,7 @@ fn parse_enum<T: serde::de::DeserializeOwned>(s: &str, default: T) -> T {
     serde_json::from_value(Value::String(s.to_string())).unwrap_or(default)
 }
 
-async fn query_exchanges(db: &sqlx::PgPool, scope: &ActivityScope, ordinary_only: bool, limit: i64) -> DResult<Vec<ExchangeRow>> {
+async fn query_exchanges(db: &sqlx::PgPool, scope: &ActivityScope, ordinary_only: bool, limit: Option<i64>) -> DResult<Vec<ExchangeRow>> {
     let from = scope.from.unwrap_or_else(|| Utc::now() - Duration::days(30));
     let to = scope.to.unwrap_or_else(Utc::now);
     let source_filter: Option<String> = match scope.source {
@@ -458,7 +463,7 @@ async fn query_exchanges(db: &sqlx::PgPool, scope: &ActivityScope, ordinary_only
 
 pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult<ActivityOverview> {
     actor.require(ANY_READER)?;
-    let rows = query_exchanges(&hub.db, &scope, true, 5000).await?;
+    let rows = query_exchanges(&hub.db, &scope, true, None).await?;
     let catalog = pricing::default_catalog();
     let policy = capture::get_capture_policy(hub, actor).await.unwrap_or_default();
     let tz_offset = Duration::minutes(scope.tz_offset_mins.unwrap_or(0) as i64);
@@ -677,7 +682,7 @@ fn default_overview_tiles() -> Vec<BoardTile> {
 
 pub async fn compare(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult<CompareReport> {
     actor.require(ANY_READER)?;
-    let rows = query_exchanges(&hub.db, &scope, true, 5000).await?;
+    let rows = query_exchanges(&hub.db, &scope, true, None).await?;
     let catalog = pricing::default_catalog();
 
     // Group exchanges by (model, effort) and track root-session tasks & subagent costs.
@@ -801,7 +806,7 @@ fn percentile_u64(sorted: &[u64], p: f64) -> Option<u64> {
 pub async fn requests(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult<RequestPage> {
     actor.require(ANY_READER)?;
     let limit = scope.limit.unwrap_or(100).clamp(1, 500) as i64;
-    let rows = query_exchanges(&hub.db, &scope, false, limit + 1).await?;
+    let rows = query_exchanges(&hub.db, &scope, false, Some(limit + 1)).await?;
     let has_more = rows.len() as i64 > limit;
     let items: Vec<RequestRow> = rows.iter().take(limit as usize).map(ExchangeRow::to_contract).collect();
     let next_cursor = if has_more { items.last().map(|r| format_cursor(r.occurred_at, r.id)) } else { None };
@@ -871,7 +876,7 @@ pub async fn request_capture(hub: &Hub, actor: &Actor, id: Uuid) -> DResult<Capt
 
 pub async fn traces(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult<TracePage> {
     actor.require(ANY_READER)?;
-    let rows = query_exchanges(&hub.db, &scope, false, 5000).await?;
+    let rows = query_exchanges(&hub.db, &scope, false, None).await?;
     let edges: Vec<(String, String, String)> =
         sqlx::query_as("select child_session_id, parent_session_id, edge_kind from activity_session_edges").fetch_all(&hub.db).await?;
 
@@ -1097,6 +1102,25 @@ pub async fn trace_detail(hub: &Hub, actor: &Actor, session_id: &str) -> DResult
         });
     }
 
+    let own_cost_by_sid: BTreeMap<String, f64> = nodes.iter().map(|n| (n.session_id.clone(), n.own_cost_usd)).collect();
+    for node in &mut nodes {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![node.session_id.as_str()];
+        let mut node_subtotal = 0.0;
+        while let Some(curr) = stack.pop() {
+            if !seen.insert(curr) {
+                continue;
+            }
+            node_subtotal += own_cost_by_sid.get(curr).copied().unwrap_or(0.0);
+            if let Some(kids) = children_of.get(curr) {
+                for (kid, _) in kids {
+                    stack.push(kid.as_str());
+                }
+            }
+        }
+        node.known_subtotal_cost_usd = node_subtotal;
+    }
+
     let head = first_row.ok_or(DomainError::NotFound("session trace"))?;
     let own_cost_root = nodes.first().map(|n| n.own_cost_usd).unwrap_or(0.0);
     let own_tok_root = nodes.first().map(|n| n.own_tokens).unwrap_or(0);
@@ -1127,7 +1151,7 @@ pub async fn trace_detail(hub: &Hub, actor: &Actor, session_id: &str) -> DResult
 
 pub async fn drift(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult<DriftReport> {
     actor.require(ANY_READER)?;
-    let rows = query_exchanges(&hub.db, &scope, true, 5000).await?;
+    let rows = query_exchanges(&hub.db, &scope, true, None).await?;
 
     let mut by_me_day: BTreeMap<(String, Option<String>, String), Vec<&ExchangeRow>> = BTreeMap::new();
     let mut version_seen: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
@@ -1351,7 +1375,7 @@ pub async fn totals(hub: &Hub, actor: &Actor, granularity: TotalsGranularity, sc
 
 pub async fn thinking(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult<ThinkingReport> {
     actor.require(ANY_READER)?;
-    let rows = query_exchanges(&hub.db, &scope, true, 5000).await?;
+    let rows = query_exchanges(&hub.db, &scope, true, None).await?;
     let catalog = pricing::default_catalog();
 
     let mut total_turns = 0u64;

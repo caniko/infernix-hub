@@ -422,18 +422,41 @@ pub(crate) fn change(proxy: &Proxy, pool: &mut Pool, id: &str, changes: Changes)
         let path = proxy.config.auth_dir.join(&found.name);
         let original = read_text(&path).map_err(|_| disk())?.ok_or_else(missing)?;
         let mut saved = serde_json::from_str::<Map<String, Value>>(&original).map_err(|_| disk())?;
-        if let Some(v) = changes.disabled {
-            saved.insert("disabled".into(), json!(v));
-            saved.remove("enabled");
-        }
-        if let Some(v) = changes.priority {
-            saved.insert("priority".into(), json!(v));
-        }
-        if let Some(v) = changes.weight {
-            saved.insert("weight".into(), json!(v));
-        }
-        if let Some(v) = &note {
-            saved.insert("note".into(), json!(v));
+        let key_index = found
+            .id
+            .strip_prefix(&found.name)
+            .and_then(|suffix| suffix.strip_prefix('#'))
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|n| n.checked_sub(1));
+        let apply_fields = |target: &mut Map<String, Value>| {
+            if let Some(v) = changes.disabled {
+                target.insert("disabled".into(), json!(v));
+                target.remove("enabled");
+            }
+            if let Some(v) = changes.priority {
+                target.insert("priority".into(), json!(v));
+            }
+            if let Some(v) = changes.weight {
+                target.insert("weight".into(), json!(v));
+            }
+            if let Some(v) = &note {
+                target.insert("note".into(), json!(v));
+            }
+        };
+        if let Some(idx) = key_index {
+            let keys = if saved.get("api_key").and_then(Value::as_object).is_some_and(|o| o.get("keys").is_some_and(Value::is_array)) {
+                saved.get_mut("api_key").and_then(Value::as_object_mut).and_then(|o| o.get_mut("keys")).and_then(Value::as_array_mut)
+            } else {
+                saved.get_mut("keys").and_then(Value::as_array_mut)
+            };
+            let entry = keys.and_then(|arr| arr.get_mut(idx)).ok_or_else(missing)?;
+            if let Some(raw_key) = entry.as_str().map(str::to_owned) {
+                *entry = json!({ "api_key": raw_key });
+            }
+            let obj = entry.as_object_mut().ok_or_else(disk)?;
+            apply_fields(obj);
+        } else {
+            apply_fields(&mut saved);
         }
         let accounts = parse_credentials(&found.name, &Value::Object(saved.clone()), false).map_err(|_| disk())?;
         write_private(&path, &serde_json::to_vec_pretty(&saved).map_err(|_| disk())?, true).map_err(|_| disk())?;

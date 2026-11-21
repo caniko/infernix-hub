@@ -24,6 +24,8 @@ use uuid::Uuid;
 
 pub struct Proxy {
     config: Config,
+    pub(crate) source_host: String,
+    pub(crate) source_user: String,
     state: RwLock<ProxyState>,
     http: reqwest::Client,
     oauth_refresh: Mutex<()>,
@@ -92,7 +94,9 @@ impl Captures {
 
 impl Proxy {
     pub fn new(config: Config) -> Result<Self> {
-        let pool = Pool::load(&config)?;
+        let (source_host, source_user) = hub_sync::source_identity();
+        let mut pool = Pool::load(&config)?;
+        pool.set_source(source_host.clone(), source_user.clone());
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -101,6 +105,8 @@ impl Proxy {
             .build()?;
         Ok(Self {
             config,
+            source_host,
+            source_user,
             http,
             state: RwLock::new(ProxyState { pool, activity: VecDeque::new(), logs: VecDeque::new(), captures: Captures::default() }),
             oauth_refresh: Mutex::new(()),

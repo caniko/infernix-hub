@@ -757,8 +757,10 @@ impl Exchange {
             source_attempt_id: format!("{}:{index}", self.id),
             attempt_index: index as i32,
             provider_id: self.lane.family().into(),
-            account_id: Some(account.hub_id()),
-            moved_from_account_id: previous.filter(|id| *id != account.id).map(|id| format!("{}:{id}", self.lane.family())),
+            account_id: Some(account.hub_id_for(&self.proxy.source_host, &self.proxy.source_user)),
+            moved_from_account_id: previous
+                .filter(|id| *id != account.id)
+                .map(|id| format!("{}:{}:{}:{id}", self.lane.family(), self.proxy.source_host, self.proxy.source_user)),
             requested_model: self.model.clone(),
             effective_model: self.model.clone(),
             effort: None,

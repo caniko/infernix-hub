@@ -430,7 +430,31 @@ async fn upsert_reset_grant(tx: &mut sqlx::PgConnection, provider_id: &str, acco
     Ok(())
 }
 
-async fn enforce_collector_scope(hub: &Hub, actor: &Actor, host: &str, unix_user: &str, provider_id: &str) -> DResult<()> {
+pub(super) async fn enforce_collector_source(hub: &Hub, actor: &Actor, host: &str, unix_user: &str) -> DResult<()> {
+    if actor.principal.role == contracts::Role::Operator {
+        return Ok(());
+    }
+    let has_any_grant: bool = sqlx::query_scalar("select exists(select 1 from model_source_grants where principal_name = $1)")
+        .bind(&actor.principal.name)
+        .fetch_one(&hub.db)
+        .await?;
+    if !has_any_grant {
+        return Ok(());
+    }
+    let exists: bool =
+        sqlx::query_scalar("select exists(select 1 from model_source_grants where principal_name = $1 and host = $2 and unix_user = $3)")
+            .bind(&actor.principal.name)
+            .bind(host)
+            .bind(unix_user)
+            .fetch_one(&hub.db)
+            .await?;
+    if !exists {
+        return Err(DomainError::Forbidden(format!("collector {} is not granted scope for {unix_user}@{host}", actor.principal.name)));
+    }
+    Ok(())
+}
+
+pub(super) async fn enforce_collector_scope(hub: &Hub, actor: &Actor, host: &str, unix_user: &str, provider_id: &str) -> DResult<()> {
     if actor.principal.role == contracts::Role::Operator {
         return Ok(());
     }

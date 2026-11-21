@@ -128,6 +128,10 @@ impl Account {
         format!("{}:{}", self.lane.family(), self.id)
     }
 
+    pub fn hub_id_for(&self, host: &str, user: &str) -> String {
+        format!("{}:{host}:{user}:{}", self.lane.family(), self.id)
+    }
+
     pub fn inventory(&self, pool: &Pool) -> Value {
         let mut row = json!({
             "id": self.id, "name": self.name, "auth_index": self.auth_index, "provider": self.provider,
@@ -271,21 +275,44 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             text(entry, &["plan", "plan_type", "/id_token/plan_type", "/id_token/chatgpt_plan_type", "/claudeAiOauth/subscriptionType"])
                 .or_else(|| text(chat, &["chatgpt_plan_type"]))
                 .map(str::to_owned);
+        let entry_obj = entry.as_object();
+        let disabled = match entry_obj
+            .and_then(|o| o.get("disabled").and_then(Value::as_bool))
+            .or_else(|| entry_obj.and_then(|o| o.get("enabled").and_then(Value::as_bool)).map(|e| !e))
+        {
+            Some(d) => d,
+            None => [raw, group].into_iter().any(|v| v["disabled"].as_bool() == Some(true) || v["enabled"].as_bool() == Some(false)),
+        };
+        let priority = entry_obj
+            .and_then(|o| o.get("priority").and_then(Value::as_i64))
+            .or_else(|| group["priority"].as_i64())
+            .or_else(|| raw["priority"].as_i64())
+            .and_then(|n| i32::try_from(n).ok())
+            .unwrap_or_default();
+        let weight = entry_obj
+            .and_then(|o| o.get("weight").and_then(Value::as_u64))
+            .or_else(|| group["weight"].as_u64())
+            .or_else(|| raw["weight"].as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(1);
+        let note = match entry_obj.and_then(|o| o.get("note")) {
+            Some(Value::Null) => None,
+            Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+            _ => text(group, &["note"]).or_else(|| text(raw, &["note"])).map(str::to_owned),
+        };
         Ok(Account {
             auth_index: hex::encode(&Sha256::digest(format!("fleetix-proxy:{id}"))[..12]),
             id,
             name: name.into(),
             lane,
             provider: if api_key && lane == Lane::Codex { "openai" } else { lane.name() },
-            label: text(raw, &["label", "name"]).unwrap_or(name).into(),
+            label: text(entry, &["label"]).or_else(|| text(raw, &["label", "name"])).unwrap_or(name).into(),
             email: text(entry, &["email"]).or_else(|| text(&claims, &["email"])).map(str::to_owned),
-            note: text(raw, &["note"]).map(str::to_owned),
+            note,
             plan,
-            disabled: [raw, group, entry]
-                .into_iter()
-                .any(|v| v["disabled"].as_bool() == Some(true) || v["enabled"].as_bool() == Some(false)),
-            priority: raw["priority"].as_i64().and_then(|n| i32::try_from(n).ok()).unwrap_or_default(),
-            weight: raw["weight"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(1),
+            disabled,
+            priority,
+            weight,
             multiplier: raw["tier_multiplier"]
                 .as_f64()
                 .or_else(|| raw.pointer("/plan/multiplier").and_then(Value::as_f64))
@@ -334,11 +361,25 @@ pub struct Pool {
     pub overrides: BTreeMap<Lane, String>,
     pub cursors: HashMap<(Lane, bool), u64>,
     pub revision: i64,
+    pub source_host: String,
+    pub source_user: String,
     affinity: HashMap<Session, (String, Instant)>,
     parents: HashMap<Session, String>,
 }
 
 impl Pool {
+    pub fn set_source(&mut self, host: String, user: String) {
+        self.source_host = host;
+        self.source_user = user;
+    }
+
+    pub fn hub_id(&self, account: &Account) -> String {
+        if self.source_host.is_empty() && self.source_user.is_empty() {
+            account.hub_id()
+        } else {
+            account.hub_id_for(&self.source_host, &self.source_user)
+        }
+    }
     pub fn load(config: &Config) -> Result<Self> {
         let mut pool = Self::default();
         for path in paths(&config.auth_dir) {
@@ -380,7 +421,7 @@ impl Pool {
     }
 
     pub fn find(&self, id: &str) -> Option<&Account> {
-        self.accounts.get(id).or_else(|| self.accounts.values().find(|a| a.auth_index == id || a.hub_id() == id))
+        self.accounts.get(id).or_else(|| self.accounts.values().find(|a| a.auth_index == id || self.hub_id(a) == id || a.hub_id() == id))
     }
 
     pub fn next_reset(&self, lane: Lane, model: &str) -> Option<DateTime<Utc>> {

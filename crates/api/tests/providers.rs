@@ -310,6 +310,66 @@ async fn fixture_providers_and_activity_over_http() {
         .unwrap();
     assert_eq!(bad_receipt.status(), 403);
 
+    // collector-b cannot ingest activity for host-a/alice or for an ungranted provider.
+    let mut foreign_ev = fixture.seed_activity().exchanges.pop().unwrap();
+    foreign_ev.source_exchange_id = format!("{name}-forged-1");
+    foreign_ev.occurred_at = chrono::Utc::now() - chrono::Duration::seconds(3);
+    let bad_ingest_source = http
+        .post(format!("http://{addr}/v1/activity/ingest"))
+        .bearer_auth(&collector_b)
+        .json(&ActivityIngestBatch { source_host: "host-a".into(), source_user: "alice".into(), exchanges: vec![foreign_ev.clone()] })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_ingest_source.status(), 403);
+    foreign_ev.source_exchange_id = format!("{name}-forged-2");
+    foreign_ev.provider_id = "opencode".into();
+    let bad_ingest_provider = http
+        .post(format!("http://{addr}/v1/activity/ingest"))
+        .bearer_auth(&collector_b)
+        .json(&ActivityIngestBatch { source_host: "host-b".into(), source_user: "bob".into(), exchanges: vec![foreign_ev] })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_ingest_provider.status(), 403);
+
+    // Verify trace_detail computes known_subtotal_cost_usd over reachable descendants.
+    let root_sid = format!("{name}-root");
+    let child_sid = format!("{name}-child");
+    let mut root_ev = fixture.seed_activity().exchanges.pop().unwrap();
+    root_ev.source_exchange_id = format!("{name}-trace-root");
+    root_ev.session_id = Some(root_sid.clone());
+    root_ev.parent_session_id = None;
+    root_ev.effective_model = "claude-sonnet-4-6".into();
+    root_ev.input_tokens = 1_000_000;
+    root_ev.output_tokens = 0;
+    root_ev.cache_read_tokens = 0;
+    root_ev.cache_write_tokens = 0;
+    root_ev.thinking_tokens = 0;
+    root_ev.occurred_at = chrono::Utc::now() - chrono::Duration::seconds(4);
+    let mut child_ev = root_ev.clone();
+    child_ev.source_exchange_id = format!("{name}-trace-child");
+    child_ev.session_id = Some(child_sid.clone());
+    child_ev.parent_session_id = Some(root_sid.clone());
+    child_ev.input_tokens = 2_000_000;
+    child_ev.occurred_at = chrono::Utc::now() - chrono::Duration::seconds(3);
+    post("activity/ingest")
+        .json(&ActivityIngestBatch { source_host: "test-host".into(), source_user: "test-user".into(), exchanges: vec![root_ev, child_ev] })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let trace: Value = get(&format!("activity/traces/{root_sid}")).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let nodes = trace["nodes"].as_array().unwrap();
+    let root_node = nodes.iter().find(|n| n["session_id"] == root_sid).unwrap();
+    let child_node = nodes.iter().find(|n| n["session_id"] == child_sid).unwrap();
+    let root_own = root_node["own_cost_usd"].as_f64().unwrap();
+    let child_own = child_node["own_cost_usd"].as_f64().unwrap();
+    let root_sub = root_node["known_subtotal_cost_usd"].as_f64().unwrap();
+    assert!(root_own > 0.0 && child_own > 0.0);
+    assert!((root_sub - (root_own + child_own)).abs() < 1e-6, "root subtotal {root_sub} must equal own {root_own} + child {child_own}");
+
     // Verify DeleteGroup side effect removes the key group from the database.
     let groups: Vec<Value> = get("providers/claude/key-groups").send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     let group_id = groups[0]["id"].as_str().expect("fixture provider must have a seeded key group").to_string();
