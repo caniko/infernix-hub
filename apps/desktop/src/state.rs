@@ -11,9 +11,7 @@ use contracts::{
 use dioxus::prelude::*;
 use uuid::Uuid;
 
-/// The eleven operator workspaces. Notifications leads the FLEET section (its
-/// key is `n`); the app still opens on Command. The other ten keep their 1–9/0
-/// keyboard slots regardless of list position.
+/// Operator workspaces. The app opens on Command; slots are independent of sidebar position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Workspace {
     Notifications,
@@ -21,6 +19,7 @@ pub enum Workspace {
     Hosts,
     Alerts,
     Approvals,
+    Providers,
     Today,
     News,
     Studio,
@@ -31,12 +30,13 @@ pub enum Workspace {
 }
 
 impl Workspace {
-    pub const ALL: [Workspace; 12] = [
+    pub const ALL: [Workspace; 13] = [
         Workspace::Notifications,
         Workspace::Command,
         Workspace::Hosts,
         Workspace::Alerts,
         Workspace::Approvals,
+        Workspace::Providers,
         Workspace::Today,
         Workspace::News,
         Workspace::Studio,
@@ -53,6 +53,7 @@ impl Workspace {
             Workspace::Hosts => "Hosts",
             Workspace::Alerts => "Alerts",
             Workspace::Approvals => "Approvals",
+            Workspace::Providers => "AI Usage",
             Workspace::Today => "Today",
             Workspace::News => "News",
             Workspace::Studio => "Studio",
@@ -72,6 +73,7 @@ impl Workspace {
             Workspace::Hosts => "hosts",
             Workspace::Alerts => "alerts",
             Workspace::Approvals => "approvals",
+            Workspace::Providers => "providers",
             Workspace::Today => "today",
             Workspace::News => "news",
             Workspace::Studio => "studio",
@@ -95,6 +97,7 @@ impl Workspace {
             Workspace::Hosts => "2",
             Workspace::Alerts => "3",
             Workspace::Approvals => "4",
+            Workspace::Providers => "u",
             Workspace::Today => "5",
             Workspace::News => "6",
             Workspace::Studio => "7",
@@ -120,6 +123,7 @@ impl Workspace {
             Workspace::Hosts => "health, revision and failed checks per host",
             Workspace::Alerts => "monitored services that are down",
             Workspace::Approvals => "privileged operations waiting for the operator",
+            Workspace::Providers => "model provider accounts, remaining quota, activity, routing and exports",
             Workspace::Today => "reviews, production, due releases, failed work, overdue replies",
             Workspace::News => "coverage, evidence and brief creation",
             Workspace::Studio => "brief, generation, assets, release freeze and scheduling",
@@ -133,7 +137,12 @@ impl Workspace {
     /// Sidebar section heading.
     pub fn section(self) -> &'static str {
         match self {
-            Workspace::Notifications | Workspace::Command | Workspace::Hosts | Workspace::Alerts | Workspace::Approvals => "FLEET",
+            Workspace::Notifications
+            | Workspace::Command
+            | Workspace::Hosts
+            | Workspace::Alerts
+            | Workspace::Approvals
+            | Workspace::Providers => "FLEET",
             _ => "STUDIO",
         }
     }
@@ -506,6 +515,15 @@ mod tests {
         assert_eq!(Workspace::Notifications.key(), "n", "Notifications keeps its letter");
         assert_eq!(Workspace::Command.key(), "1", "the ten original digits do not move");
         assert_eq!(Workspace::Library.key(), "0");
+    }
+
+    #[test]
+    fn ai_usage_is_a_full_width_fleet_workspace() {
+        let usage = Workspace::from_name("providers").expect("AI Usage workspace");
+        assert_eq!(Workspace::from_key("u"), Some(usage));
+        assert_eq!(usage.label(), "AI Usage");
+        assert_eq!(usage.section(), "FLEET");
+        assert!(usage.full_width());
     }
 
     #[test]

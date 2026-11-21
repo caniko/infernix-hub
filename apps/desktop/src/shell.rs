@@ -50,7 +50,7 @@ pub fn Sidebar(workspace: Signal<Workspace>, nav_open: Signal<bool>) -> Element 
             }
             div { class: "sidebar-foot",
                 p { class: "label-tech", "Ctrl+K · commands" }
-                p { class: "label-tech", "1–9, 0, n, p · workspaces" }
+                p { class: "label-tech", "1–9, 0, n, p, u · workspaces" }
             }
         }
     }
@@ -113,12 +113,14 @@ pub fn Topbar(
                 onclick: move |_| on_palette.call(()),
                 "Ctrl+K Commands"
             }
-            button {
-                class: "icon-btn",
-                aria_pressed: if inspector_open.cloned() { "true" } else { "false" },
-                aria_label: "Toggle inspector",
-                onclick: move |_| inspector_open.toggle(),
-                "Inspector"
+            if workspace != Workspace::Providers {
+                button {
+                    class: "icon-btn",
+                    aria_pressed: if inspector_open.cloned() { "true" } else { "false" },
+                    aria_label: "Toggle inspector",
+                    onclick: move |_| inspector_open.toggle(),
+                    "Inspector"
+                }
             }
         }
     }

@@ -12,8 +12,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use contracts::client::HubClient;
+use contracts::providers::{
+    AccountCommand, ProviderCapability, ProviderCommand, ProviderSummary, QuotaCommand, RoutingCommand, SubmitOperationIn,
+};
 use contracts::{AckNotificationsIn, Notification, NotificationPage, Severity, SyncNotificationItem, SyncNotificationsIn};
-use ksni::menu::{MenuItem, StandardItem};
+use ksni::menu::{MenuItem, StandardItem, SubMenu};
 use ksni::{ToolTip, Tray, TrayMethods};
 use tokio::sync::mpsc;
 use zbus::zvariant::Value;
@@ -156,6 +159,9 @@ struct State {
     cursor: Option<i64>,
     /// Newest open rows, at most [`MENU_ROWS`], keyed by id.
     items: Vec<Notification>,
+    /// Observed AI model provider summaries for quick quota overview & switching.
+    providers: Vec<ProviderSummary>,
+    mask_emails: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -165,6 +171,18 @@ struct Popup {
     critical: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ProviderMenuEntry {
+    provider_id: String,
+    label: String,
+    summary_line: String,
+    can_refresh: bool,
+    can_pool_override: bool,
+    can_select_local: bool,
+    preferred_account_id: Option<String>,
+    accounts: Vec<(String, String, bool)>,
+}
+
 #[derive(Debug, PartialEq)]
 struct View {
     icon: &'static str,
@@ -172,6 +190,7 @@ struct View {
     tooltip: String,
     /// Newest open titles; the tray adds its fixed entries around them.
     menu: Vec<String>,
+    providers: Vec<ProviderMenuEntry>,
 }
 
 /// Fold one page into the state and return the popups it announces.
@@ -212,6 +231,44 @@ fn apply(state: &mut State, page: NotificationPage) -> Vec<Popup> {
     popups
 }
 
+fn provider_menu_entries(state: &State) -> Vec<ProviderMenuEntry> {
+    state
+        .providers
+        .iter()
+        .map(|p| {
+            let pool_str = p
+                .pools
+                .first()
+                .and_then(|pool| pool.weighted_remaining_percent.map(|rem| format!("{:.0}% left ({})", rem, pool.label)))
+                .unwrap_or_else(|| format!("{} acct(s)", p.account_count));
+            let accounts = p
+                .accounts
+                .iter()
+                .map(|a| {
+                    let display = if state.mask_emails {
+                        a.masked_email.as_deref().unwrap_or(&a.display_name)
+                    } else {
+                        a.email.as_deref().unwrap_or(&a.display_name)
+                    };
+                    let rem = a.windows.first().and_then(|w| w.remaining_percent).map(|r| format!(" · {r:.0}%")).unwrap_or_default();
+                    let active_mark = if a.is_preferred || a.is_active { "✓ " } else { "" };
+                    (a.id.clone(), format!("{active_mark}{display}{rem}"), a.is_preferred || a.is_active)
+                })
+                .collect();
+            ProviderMenuEntry {
+                provider_id: p.descriptor.id.clone(),
+                label: p.descriptor.label.clone(),
+                summary_line: format!("{}: {pool_str}", p.descriptor.label),
+                can_refresh: p.descriptor.capabilities.contains(&ProviderCapability::RefreshQuota),
+                can_pool_override: p.descriptor.capabilities.contains(&ProviderCapability::SetPoolOverride),
+                can_select_local: p.descriptor.capabilities.contains(&ProviderCapability::SelectLocalAccount),
+                preferred_account_id: p.preferred_account_id.clone(),
+                accounts,
+            }
+        })
+        .collect()
+}
+
 fn view(state: &State) -> View {
     let icon = if state.offline {
         "network-offline-symbolic"
@@ -222,16 +279,26 @@ fn view(state: &State) -> View {
     } else {
         "mail-read-symbolic"
     };
+    let providers = provider_menu_entries(state);
+    let mut tooltip = format!("Fleetix Hub: {} open", state.open);
+    if !providers.is_empty() {
+        let quota_parts: Vec<&str> = providers.iter().take(3).map(|p| p.summary_line.as_str()).collect();
+        tooltip.push_str(" | ");
+        tooltip.push_str(&quota_parts.join(" · "));
+    }
     View {
         icon,
         status: if state.open > 0 { ksni::Status::NeedsAttention } else { ksni::Status::Active },
-        tooltip: format!("Fleetix Hub: {} open", state.open),
+        tooltip,
         menu: state.items.iter().map(|item| item.title.clone()).collect(),
+        providers,
     }
 }
 
 enum Action {
-    Open,
+    Open(&'static str),
+    RefreshProviders,
+    UseProviderAccount { provider_id: String, account_id: Option<String>, pool_override: bool },
     AckAll,
     Quit,
 }
@@ -262,15 +329,63 @@ impl Tray for HubTray {
         ToolTip { title: self.view.tooltip.clone(), ..Default::default() }
     }
     fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.actions.send(Action::Open);
+        let _ = self.actions.send(Action::Open("notifications"));
     }
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let mut menu = vec![entry("Open Fleetix Hub", |tray| {
-            let _ = tray.actions.send(Action::Open);
-        })];
+        let mut menu = vec![
+            entry("Open Fleetix Hub", |tray| {
+                let _ = tray.actions.send(Action::Open("notifications"));
+            }),
+            entry("Open AI Usage", |tray| {
+                let _ = tray.actions.send(Action::Open("providers"));
+            }),
+        ];
+        if !self.view.providers.is_empty() {
+            menu.push(MenuItem::Separator);
+            for p in &self.view.providers {
+                let mut sub = Vec::new();
+                if p.can_refresh {
+                    sub.push(entry("Refresh quota", |tray| {
+                        let _ = tray.actions.send(Action::RefreshProviders);
+                    }));
+                }
+                if p.can_pool_override {
+                    let pid = p.provider_id.clone();
+                    let label = if p.preferred_account_id.is_none() { "✓ Automatic" } else { "Automatic" };
+                    sub.push(entry(label, move |tray| {
+                        let _ = tray.actions.send(Action::UseProviderAccount {
+                            provider_id: pid.clone(),
+                            account_id: None,
+                            pool_override: true,
+                        });
+                    }));
+                }
+                for (aid, label, _) in &p.accounts {
+                    if p.can_pool_override || p.can_select_local {
+                        let pid = p.provider_id.clone();
+                        let aid_c = aid.clone();
+                        let use_pool = p.can_pool_override;
+                        sub.push(entry(format!("Use {label}"), move |tray| {
+                            let _ = tray.actions.send(Action::UseProviderAccount {
+                                provider_id: pid.clone(),
+                                account_id: Some(aid_c.clone()),
+                                pool_override: use_pool,
+                            });
+                        }));
+                    } else {
+                        sub.push(StandardItem { label: label.clone(), enabled: false, ..Default::default() }.into());
+                    }
+                }
+                menu.push(SubMenu { label: p.summary_line.clone(), submenu: sub, ..Default::default() }.into());
+            }
+            menu.push(entry("Refresh AI quotas", |tray| {
+                let _ = tray.actions.send(Action::RefreshProviders);
+            }));
+        }
+        menu.push(MenuItem::Separator);
         menu.extend(self.view.menu.iter().map(|title| {
             entry(title.clone(), |tray| {
-                let _ = tray.actions.send(Action::Open);
+                let _ = tray.actions.send(Action::Open("notifications"));
             })
         }));
         menu.push(MenuItem::Separator);
@@ -344,7 +459,7 @@ struct Desktop {
 }
 
 impl Desktop {
-    fn open(&mut self) {
+    fn open(&mut self, workspace: &str) {
         if let Some(child) = self.child.as_mut()
             && matches!(child.try_wait(), Ok(None))
         {
@@ -357,13 +472,24 @@ impl Desktop {
         match tokio::process::Command::new("systemd-run")
             .args(["--user", "--scope", "--collect", "--quiet", "--unit=fleetix-hub-console", "--"])
             .arg(&self.command)
-            .args(["--workspace", "notifications"])
+            .args(["--workspace", workspace])
             .spawn()
         {
             Ok(child) => self.child = Some(child),
             Err(error) => eprintln!("fleetix-hub-tray: cannot start {}: {error}", self.command),
         }
     }
+}
+
+async fn fetch_providers(client: &HubClient) -> (Vec<ProviderSummary>, bool) {
+    let providers = tokio::time::timeout(ACK_TIMEOUT, client.providers()).await.ok().and_then(|r| r.ok()).unwrap_or_default();
+    let mask = tokio::time::timeout(ACK_TIMEOUT, client.provider_settings())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|s| s.mask_emails)
+        .unwrap_or(true);
+    (providers, mask)
 }
 
 async fn fetch(client: &HubClient, after: Option<i64>, wait: u64) -> Result<NotificationPage, String> {
@@ -377,9 +503,48 @@ async fn fetch(client: &HubClient, after: Option<i64>, wait: u64) -> Result<Noti
 }
 
 /// Handle one tray click; `true` means the daemon should exit.
-async fn act(action: Action, client: &HubClient, desktop: &mut Desktop) -> bool {
+async fn act(action: Action, client: &HubClient, desktop: &mut Desktop, state: &mut State) -> bool {
     match action {
-        Action::Open => desktop.open(),
+        Action::Open(workspace) => desktop.open(workspace),
+        Action::RefreshProviders => {
+            for p in &state.providers {
+                if p.descriptor.capabilities.contains(&ProviderCapability::RefreshQuota) {
+                    let body = SubmitOperationIn {
+                        idempotency_key: format!("tray-refresh-{}-{}", p.descriptor.id, uuid::Uuid::new_v4()),
+                        expected_revision: None,
+                        target_account_id: None,
+                        target_host: None,
+                        target_user: None,
+                        command: ProviderCommand::Quota(QuotaCommand::RefreshQuota { account_id: None }),
+                    };
+                    let _ = tokio::time::timeout(ACK_TIMEOUT, client.submit_provider_operation(&p.descriptor.id, &body)).await;
+                }
+            }
+            let (providers, mask) = fetch_providers(client).await;
+            state.providers = providers;
+            state.mask_emails = mask;
+        }
+        Action::UseProviderAccount { provider_id, account_id, pool_override } => {
+            let command = if pool_override {
+                ProviderCommand::Routing(RoutingCommand::SetPoolOverride { account_id: account_id.clone() })
+            } else if let Some(aid) = account_id.clone() {
+                ProviderCommand::Account(AccountCommand::SelectLocalAccount { account_id: aid, host: None, unix_user: None })
+            } else {
+                return false;
+            };
+            let body = SubmitOperationIn {
+                idempotency_key: format!("tray-use-{provider_id}-{}", uuid::Uuid::new_v4()),
+                expected_revision: None,
+                target_account_id: account_id,
+                target_host: None,
+                target_user: None,
+                command,
+            };
+            let _ = tokio::time::timeout(ACK_TIMEOUT, client.submit_provider_operation(&provider_id, &body)).await;
+            let (providers, mask) = fetch_providers(client).await;
+            state.providers = providers;
+            state.mask_emails = mask;
+        }
         // Nothing is applied here: the acknowledgement bumps `seq`, so the feed
         // reports the rows as closed and the in-flight poll wakes at once.
         Action::AckAll => {
@@ -421,7 +586,9 @@ async fn main() -> Result<()> {
     let handle = tray.assume_sni_available(true).spawn().await.context("registering the status notifier item")?;
     let notifier = Notifier::connect().await;
     let mut desktop = Desktop { command: desktop_command, child: None };
-    let mut state = State::default();
+    let mut state = State { mask_emails: true, ..State::default() };
+    let mut provider_tick = tokio::time::interval(Duration::from_secs(60));
+    provider_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut backoff = BACKOFF_START;
 
     loop {
@@ -429,10 +596,18 @@ async fn main() -> Result<()> {
         let wait = if snapshot { 0 } else { FEED_WAIT };
         let fetched = tokio::select! {
             page = fetch(&client, state.cursor, wait) => page,
+            _ = provider_tick.tick() => {
+                let (providers, mask) = fetch_providers(&client).await;
+                state.providers = providers;
+                state.mask_emails = mask;
+                let _ = handle.update(|tray| tray.view = view(&state)).await;
+                continue;
+            }
             Some(action) = actions.recv() => {
-                if act(action, &client, &mut desktop).await {
+                if act(action, &client, &mut desktop, &mut state).await {
                     break;
                 }
+                let _ = handle.update(|tray| tray.view = view(&state)).await;
                 continue;
             }
             _ = gaming_check.tick(), if quiet && held > 0 => {
@@ -451,7 +626,7 @@ async fn main() -> Result<()> {
                 eprintln!("fleetix-hub-tray: {error}; retrying in {backoff}s");
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
-                    Some(action) = actions.recv() => if act(action, &client, &mut desktop).await {
+                    Some(action) = actions.recv() => if act(action, &client, &mut desktop, &mut state).await {
                         break;
                     },
                 }

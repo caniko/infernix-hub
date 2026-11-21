@@ -27,7 +27,6 @@
     mkOption
     optional
     optionalAttrs
-    optionals
     types
     ;
 
@@ -123,14 +122,14 @@
       warn_days = r.warnDays;
       due_at = r.dueAt;
       expiry_kind = r.expiryKind;
-      owner = r.owner;
+      inherit (r) owner;
     })
     cfg.renewals;
 
   seedContent = {
     engines = engineRecords;
-    personas = cfg.personas;
-    accounts = cfg.accounts;
+    inherit (cfg) personas;
+    inherit (cfg) accounts;
     renewals = renewalRecords;
   };
 
@@ -691,7 +690,7 @@ in {
       type = types.attrsOf (types.submodule {
         options = {
           role = mkOption {
-            type = types.enum ["operator" "agent" "procedure" "ingest" "member"];
+            type = types.enum ["operator" "agent" "procedure" "ingest" "member" "collector"];
           };
           file = mkOption {
             type = types.path;

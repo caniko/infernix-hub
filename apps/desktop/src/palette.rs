@@ -123,7 +123,13 @@ pub fn CommandPalette(on_action: EventHandler<Action>, on_close: EventHandler<()
                                 span { "{entry.label}" }
                                 span { class: "label-tech", "{entry.hint}" }
                             }
-                            span { class: "p-hint", "{entry.kind}" }
+                            span { class: "p-hint",
+                                if let Action::Workspace(workspace) = &entry.action {
+                                    kbd { "{workspace.key()}" }
+                                } else {
+                                    "{entry.kind}"
+                                }
+                            }
                         }
                             }
                         }

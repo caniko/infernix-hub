@@ -94,6 +94,9 @@ in {
   # ksni and zbus only; no webkit, so it stays in the native graph above.
   fleetix-hub-tray = mkBin "fleetix-hub-tray";
 
+  # Spillway-compatible multi-account AI agent proxy (Anthropic/OpenAI/Antigravity + T3 Code /v0/management + /v8/management).
+  fleetix-agent-proxy = mkBin "fleetix-agent-proxy";
+
   fleetix-hub-desktop = cacheRust {
     package = craneLib.buildPackage (desktopArgs
       // {

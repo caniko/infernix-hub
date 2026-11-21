@@ -15,7 +15,7 @@ use axum::Router;
 use contracts::IntegrationStatus;
 use contracts::client::HubClient;
 use domain::outbox::{CORE_TOPICS, OutboxHandler};
-use domain::ports::{Pipeline, Publisher};
+use domain::ports::{ModelProvider, Pipeline, Publisher};
 use domain::production::WorkflowSpec;
 use domain::sqlx::PgPool;
 use rmcp::handler::server::router::tool::ToolRoute;
@@ -65,6 +65,7 @@ pub(crate) struct PackRegistrations {
     pub channels: BTreeMap<String, Arc<dyn Publisher>>,
     pub pipelines: BTreeMap<String, Arc<dyn Pipeline>>,
     pub topics: BTreeMap<String, Arc<dyn OutboxHandler>>,
+    pub model_providers: BTreeMap<String, Arc<dyn ModelProvider>>,
     /// Workflow versions to register once the `Hub` exists.
     pub workflows: Vec<WorkflowSpec>,
     pub routes: Option<Router<AppState>>,
@@ -78,6 +79,7 @@ pub struct ServerHost<'a> {
     channels: BTreeMap<String, Arc<dyn Publisher>>,
     pipelines: BTreeMap<String, Arc<dyn Pipeline>>,
     topics: BTreeMap<String, Arc<dyn OutboxHandler>>,
+    model_providers: BTreeMap<String, Arc<dyn ModelProvider>>,
     workflows: Vec<WorkflowSpec>,
     routes: Option<Router<AppState>>,
     integrations: Vec<IntegrationStatus>,
@@ -91,6 +93,7 @@ impl<'a> ServerHost<'a> {
             channels: BTreeMap::new(),
             pipelines: BTreeMap::new(),
             topics: BTreeMap::new(),
+            model_providers: BTreeMap::new(),
             workflows: Vec::new(),
             routes: None,
             integrations: Vec::new(),
@@ -120,6 +123,19 @@ impl<'a> ServerHost<'a> {
         ensure!(!CORE_TOPICS.contains(&topic), "pack {}: topic {topic} is a core topic", self.pack_id);
         ensure!(!self.topics.contains_key(topic), "pack {}: topic {topic} is already registered", self.pack_id);
         self.topics.insert(topic.to_string(), handler);
+        Ok(())
+    }
+
+    /// Register a generic AI model provider; the id must start with `<pack id>.`
+    /// (or be a valid `[a-z0-9-]+` id unique across built-ins and packs).
+    pub fn model_provider(&mut self, id: &str, provider: Arc<dyn ModelProvider>) -> anyhow::Result<()> {
+        ensure!(
+            !id.is_empty() && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.')),
+            "pack {}: model provider id {id:?} must match [a-z0-9.-]+",
+            self.pack_id
+        );
+        ensure!(!self.model_providers.contains_key(id), "pack {}: model provider {id} is already registered", self.pack_id);
+        self.model_providers.insert(id.to_string(), provider);
         Ok(())
     }
 
@@ -176,6 +192,7 @@ impl<'a> ServerHost<'a> {
             channels: self.channels,
             pipelines: self.pipelines,
             topics: self.topics,
+            model_providers: self.model_providers,
             workflows: self.workflows,
             routes: self.routes,
             integrations: self.integrations,

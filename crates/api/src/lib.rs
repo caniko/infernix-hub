@@ -29,6 +29,7 @@ pub fn exit_code(error: &anyhow::Error) -> i32 {
 }
 pub mod mcp;
 pub mod plugin;
+pub mod providers;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -206,7 +207,8 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/drafts/{id}/decision", post(decide_draft))
         .route("/chat/{subject_type}/{id}", get(chat).post(send_chat))
         .route("/fixtures/paperclip/approvals", get(fixture_approvals))
-        .route("/fixtures/paperclip/approvals/{id}/decide", post(fixture_decide));
+        .route("/fixtures/paperclip/approvals/{id}/decide", post(fixture_decide))
+        .merge(providers::routes());
     for (id, routes) in pack_routes {
         v1 = v1.nest(&format!("/p/{id}"), routes);
     }
@@ -254,6 +256,7 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
     let mut channels = (*state.hub.channels).clone();
     let mut pipelines = (*state.hub.pipelines).clone();
     let mut topics: BTreeMap<String, Arc<dyn domain::outbox::OutboxHandler>> = BTreeMap::new();
+    let mut model_providers = (*state.hub.providers).clone();
     let mut workflows = Vec::new();
     let mut routes = Vec::new();
     let mut integrations = state.hub.config.integrations.clone();
@@ -272,6 +275,10 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
             anyhow::ensure!(!topics.contains_key(&topic), "pack {}: topic {topic} is registered twice", regs.pack_id);
             topics.insert(topic, handler);
         }
+        for (id, provider) in regs.model_providers {
+            anyhow::ensure!(!model_providers.contains_key(&id), "pack {}: model provider {id} is registered twice", regs.pack_id);
+            model_providers.insert(id, provider);
+        }
         workflows.extend(regs.workflows);
         if let Some(router) = regs.routes {
             routes.push((regs.pack_id.to_string(), router));
@@ -287,7 +294,9 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
     hub.channels = Arc::new(channels);
     hub.pipelines = Arc::new(pipelines);
     hub.topics = Arc::new(topics);
+    hub.providers = Arc::new(model_providers);
     state.hub = hub;
+    domain::providers::sync_registered_providers(&state.hub).await.context("syncing registered model providers")?;
     register_pack_workflows(&state.hub, &workflows).await.context("registering pack workflows")?;
 
     let feeds = match &settings.feeds_config {
@@ -301,6 +310,7 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
             *states = feeds::pending_states(&feeds);
         }
         tokio::spawn(feeds::run(state.hub.clone(), feeds));
+        tokio::spawn(providers::run_loop(state.hub.clone()));
         tokio::spawn(worker::run(state.hub.clone(), Duration::from_secs(2)));
         tokio::spawn(notify_loop(
             state.hub.clone(),

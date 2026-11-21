@@ -12,6 +12,7 @@ const CHAT: &str = include_str!("../assets/icons/chat.svg");
 const MEMORY: &str = include_str!("../assets/icons/memory.svg");
 const AGENTS: &str = include_str!("../assets/icons/agents.svg");
 const SETTINGS: &str = include_str!("../assets/icons/settings.svg");
+const USAGE: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4v16h16M8 15l4-5 4 2 4-6"/></svg>"#;
 
 /// The nav icon for a workspace.
 pub fn workspace(w: Workspace) -> &'static str {
@@ -21,6 +22,7 @@ pub fn workspace(w: Workspace) -> &'static str {
         Workspace::Hosts => SETTINGS,
         Workspace::Alerts => CHANNELS,
         Workspace::Approvals => AGENTS,
+        Workspace::Providers => USAGE,
         Workspace::Today => MISSIONS,
         Workspace::News => DOCUMENTS,
         Workspace::Studio => MISSIONS,

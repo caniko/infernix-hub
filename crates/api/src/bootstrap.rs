@@ -413,6 +413,18 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         };
         pipelines.insert(id, pipeline);
     }
+    use integrations::providers::{FullFixtureModelProvider, ReadOnlyFixtureModelProvider};
+    let fixture_providers = s.paperclip == AdapterMode::Fixture || s.assistant == AdapterMode::Fixture;
+    let mut full_fixtures = Vec::new();
+    let mut providers: BTreeMap<String, Arc<dyn ports::ModelProvider>> = BTreeMap::new();
+    if fixture_providers {
+        for (id, label) in [("claude", "Claude"), ("antigravity", "Antigravity"), ("opencode", "OpenCode")] {
+            let provider = Arc::new(FullFixtureModelProvider::new(id, label, id));
+            providers.insert(id.into(), provider.clone());
+            full_fixtures.push(provider);
+        }
+        providers.insert("acme-readonly".into(), Arc::new(ReadOnlyFixtureModelProvider::new("acme-readonly", "Acme Read-Only", "custom")));
+    }
     let hub = Hub {
         db,
         config: Arc::new(config),
@@ -426,6 +438,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         channels: Arc::new(channels),
         pipelines: Arc::new(pipelines),
         topics: Arc::new(BTreeMap::new()),
+        providers: Arc::new(providers),
         notified: Arc::new(tokio::sync::Notify::new()),
         feeds: Default::default(),
     };
@@ -434,6 +447,22 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
     }
     load_registry(&hub, &s.registry_dir.join("comfyui")).await?;
     load_registry(&hub, &s.registry_dir.join("pipeline")).await?;
+    if fixture_providers {
+        let actor = domain::providers::internal_operator("fixture-seed");
+        domain::providers::sync_registered_providers(&hub).await?;
+        if domain::sqlx::query_scalar::<_, bool>("select not exists(select 1 from model_quota_samples)").fetch_one(&hub.db).await? {
+            for (id, provider) in hub.providers.iter() {
+                if let Some(batch) = provider.collect().await? {
+                    domain::providers::ingest_observations(&hub, &actor, id, batch).await?;
+                }
+            }
+        }
+        if domain::sqlx::query_scalar::<_, bool>("select not exists(select 1 from activity_exchanges)").fetch_one(&hub.db).await? {
+            for provider in full_fixtures {
+                domain::providers::activity::ingest_activity(&hub, &actor, provider.seed_activity()).await?;
+            }
+        }
+    }
     Ok((
         AppState {
             hub,

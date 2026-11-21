@@ -8,10 +8,16 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 chrono = { workspace = true, features = ["serde", "clock", "std"] }
 clap.workspace = true
 contracts = { workspace = true, features = ["client"] }
+hex.workspace = true
+integrations.workspace = true
+reqwest.workspace = true
+ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true

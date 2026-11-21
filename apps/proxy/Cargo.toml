@@ -1,0 +1,28 @@
+[package]
+name = "fleetix-agent-proxy"
+description = "Spillway-compatible multi-account AI agent proxy for Fleetix Hub and T3 Code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono = { workspace = true, features = ["serde", "clock", "std"] }
+clap.workspace = true
+contracts = { workspace = true, features = ["client"] }
+futures-util.workspace = true
+hex.workspace = true
+integrations.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["process"] }
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

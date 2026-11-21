@@ -341,6 +341,157 @@ impl HubClient {
     pub async fn link_approval(&self, release: Uuid, body: &LinkApprovalIn) -> Result<ReleaseRevision, ClientError> {
         self.post(&format!("/releases/{release}/link-approval"), body).await
     }
+
+    // ── Model providers, quota, activity, routing & exports ─────────────
+    pub async fn providers(&self) -> Result<Vec<providers::ProviderSummary>, ClientError> {
+        self.get("/providers").await
+    }
+    pub async fn provider(&self, id: &str) -> Result<providers::ProviderSummary, ClientError> {
+        self.get(&format!("/providers/{id}")).await
+    }
+    pub async fn provider_accounts(&self, id: &str) -> Result<Vec<providers::ModelAccount>, ClientError> {
+        self.get(&format!("/providers/{id}/accounts")).await
+    }
+    pub async fn provider_quota(&self, id: &str, query: &providers::QuotaQuery) -> Result<providers::ProviderQuotaReport, ClientError> {
+        self.send(self.http.get(self.url(&format!("/providers/{id}/quota"))).query(query)).await
+    }
+    pub async fn provider_models(&self, id: &str) -> Result<Vec<providers::DiscoveredModel>, ClientError> {
+        self.get(&format!("/providers/{id}/models")).await
+    }
+    pub async fn provider_key_groups(&self, id: &str) -> Result<Vec<providers::KeyGroup>, ClientError> {
+        self.get(&format!("/providers/{id}/key-groups")).await
+    }
+    pub async fn provider_routing(&self, id: &str) -> Result<providers::RoutingView, ClientError> {
+        self.get(&format!("/providers/{id}/routing")).await
+    }
+    pub async fn provider_logs(&self, id: &str) -> Result<Vec<providers::ProxyLogEntry>, ClientError> {
+        self.get(&format!("/providers/{id}/logs")).await
+    }
+    pub async fn submit_provider_operation(
+        &self,
+        provider_id: &str,
+        body: &providers::SubmitOperationIn,
+    ) -> Result<providers::ProviderOperation, ClientError> {
+        self.post(&format!("/providers/{provider_id}/operations"), body).await
+    }
+    pub async fn provider_operation(&self, op_id: Uuid) -> Result<providers::ProviderOperation, ClientError> {
+        self.get(&format!("/providers/operations/{op_id}")).await
+    }
+    pub async fn ingest_provider_observations(
+        &self,
+        provider_id: &str,
+        batch: &providers::ObservationBatch,
+    ) -> Result<providers::ObservationAck, ClientError> {
+        self.post(&format!("/providers/{provider_id}/observations"), batch).await
+    }
+    pub async fn claim_provider_operations(
+        &self,
+        body: &providers::ClaimOperationsIn,
+    ) -> Result<Vec<providers::ProviderOperation>, ClientError> {
+        self.post("/providers/operations/claim", body).await
+    }
+    pub async fn report_provider_operation_receipt(
+        &self,
+        op_id: Uuid,
+        body: &providers::OperationReceiptIn,
+    ) -> Result<providers::ProviderOperation, ClientError> {
+        self.post(&format!("/providers/operations/{op_id}/receipt"), body).await
+    }
+    pub async fn ingest_activity(&self, batch: &providers::ActivityIngestBatch) -> Result<providers::ActivityIngestAck, ClientError> {
+        self.post("/activity/ingest", batch).await
+    }
+    pub async fn activity_overview(&self, scope: &providers::ActivityScope) -> Result<providers::ActivityOverview, ClientError> {
+        self.send(self.http.get(self.url("/activity/overview")).query(scope)).await
+    }
+    pub async fn activity_compare(&self, scope: &providers::ActivityScope) -> Result<providers::CompareReport, ClientError> {
+        self.send(self.http.get(self.url("/activity/compare")).query(scope)).await
+    }
+    pub async fn activity_requests(&self, scope: &providers::ActivityScope) -> Result<providers::RequestPage, ClientError> {
+        self.send(self.http.get(self.url("/activity/requests")).query(scope)).await
+    }
+    pub async fn activity_request_detail(&self, id: Uuid) -> Result<providers::RequestDetail, ClientError> {
+        self.get(&format!("/activity/requests/{id}")).await
+    }
+    pub async fn activity_request_capture(&self, id: Uuid) -> Result<providers::CapturedBodyView, ClientError> {
+        self.get(&format!("/activity/requests/{id}/capture")).await
+    }
+    pub async fn activity_traces(&self, scope: &providers::ActivityScope) -> Result<providers::TracePage, ClientError> {
+        self.send(self.http.get(self.url("/activity/traces")).query(scope)).await
+    }
+    pub async fn activity_trace_detail(&self, session_id: &str) -> Result<providers::TraceDetail, ClientError> {
+        self.get(&format!("/activity/traces/{session_id}")).await
+    }
+    pub async fn activity_drift(&self, scope: &providers::ActivityScope) -> Result<providers::DriftReport, ClientError> {
+        self.send(self.http.get(self.url("/activity/drift")).query(scope)).await
+    }
+    pub async fn activity_totals(
+        &self,
+        granularity: providers::TotalsGranularity,
+        scope: &providers::ActivityScope,
+    ) -> Result<providers::TotalsReport, ClientError> {
+        let g = serde_json::to_value(granularity).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "day".into());
+        self.send(self.http.get(self.url("/activity/totals")).query(&[("granularity", g)]).query(scope)).await
+    }
+    pub async fn activity_thinking(&self, scope: &providers::ActivityScope) -> Result<providers::ThinkingReport, ClientError> {
+        self.send(self.http.get(self.url("/activity/thinking")).query(scope)).await
+    }
+    pub async fn activity_evals(&self) -> Result<Vec<providers::EvalCase>, ClientError> {
+        self.get("/activity/evals").await
+    }
+    pub async fn create_eval_case(&self, body: &providers::EvalCaseIn) -> Result<providers::EvalCase, ClientError> {
+        self.post("/activity/evals", body).await
+    }
+    pub async fn update_eval_case(&self, id: Uuid, body: &providers::EvalCaseIn) -> Result<providers::EvalCase, ClientError> {
+        self.put(&format!("/activity/evals/{id}"), body).await
+    }
+    pub async fn delete_eval_case(&self, id: Uuid) -> Result<serde_json::Value, ClientError> {
+        self.delete(&format!("/activity/evals/{id}")).await
+    }
+    pub async fn replay_eval_case(&self, id: Uuid, body: &serde_json::Value) -> Result<providers::EvalReplayResult, ClientError> {
+        self.post(&format!("/activity/evals/{id}/replay"), body).await
+    }
+    pub async fn export_eval_cases(&self, include_bodies: bool) -> Result<providers::EvalExportBundle, ClientError> {
+        self.send(self.http.get(self.url("/activity/evals/export")).query(&[("include_bodies", include_bodies)])).await
+    }
+    pub async fn import_eval_cases(&self, bundle: &providers::EvalExportBundle) -> Result<Vec<providers::EvalCase>, ClientError> {
+        self.post("/activity/evals/import", bundle).await
+    }
+    pub async fn capture_policy(&self) -> Result<providers::CapturePolicy, ClientError> {
+        self.get("/activity/capture-policy").await
+    }
+    pub async fn set_capture_policy(&self, policy: &providers::CapturePolicy) -> Result<providers::CapturePolicy, ClientError> {
+        self.put("/activity/capture-policy", policy).await
+    }
+    pub async fn clear_activity_data(&self, body: &providers::ClearDataIn) -> Result<providers::ClearDataOut, ClientError> {
+        self.post("/activity/clear", body).await
+    }
+    pub async fn preview_diagnostic_bundle(
+        &self,
+        body: &providers::DiagnosticBundlePreviewIn,
+    ) -> Result<providers::DiagnosticBundlePreview, ClientError> {
+        self.post("/activity/exports/diagnostic-preview", body).await
+    }
+    pub async fn export_portable_archive(
+        &self,
+        body: &providers::PortableArchiveRequest,
+    ) -> Result<providers::PortableArchiveExport, ClientError> {
+        self.post("/activity/exports/portable-archive", body).await
+    }
+    pub async fn clickhouse_status(&self) -> Result<providers::ClickHouseStatus, ClientError> {
+        self.get("/activity/sinks/clickhouse").await
+    }
+    pub async fn set_clickhouse_config(&self, config: &providers::ClickHouseConfig) -> Result<providers::ClickHouseStatus, ClientError> {
+        self.put("/activity/sinks/clickhouse", config).await
+    }
+    pub async fn provider_settings(&self) -> Result<providers::ProviderPanelSettings, ClientError> {
+        self.get("/providers/settings").await
+    }
+    pub async fn set_provider_settings(
+        &self,
+        settings: &providers::ProviderPanelSettings,
+    ) -> Result<providers::ProviderPanelSettings, ClientError> {
+        self.put("/providers/settings", settings).await
+    }
 }
 
 /// The operator's own Paperclip board client.

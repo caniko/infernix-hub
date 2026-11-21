@@ -16,22 +16,28 @@ pub async fn authenticate(hub: &Hub, token: &str) -> DResult<Option<Principal>> 
 }
 
 /// Create or rotate a principal's token: one live token per principal name,
-/// so re-issuing (or a changed credential file) revokes the previous one.
+/// so re-issuing (or a changed credential file) revokes the previous one while
+/// preserving the principal's stable id.
 pub async fn issue_token(db: &sqlx::PgPool, name: &str, role: Role, token: Option<String>) -> DResult<String> {
     let token = token.unwrap_or_else(|| format!("ihub_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
+    let digest = hash::sha256_hex(token.as_bytes());
     let mut tx = db.begin().await?;
-    sqlx::query("delete from principals where name = $1 or token_sha256 = $2")
-        .bind(name)
-        .bind(hash::sha256_hex(token.as_bytes()))
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("insert into principals (id, name, role, token_sha256) values ($1, $2, $3, $4)")
-        .bind(Uuid::new_v4())
+    sqlx::query("delete from principals where token_sha256 = $1 and name <> $2").bind(&digest).bind(name).execute(&mut *tx).await?;
+    let updated = sqlx::query("update principals set role = $2, token_sha256 = $3 where name = $1")
         .bind(name)
         .bind(role.as_str())
-        .bind(hash::sha256_hex(token.as_bytes()))
+        .bind(&digest)
         .execute(&mut *tx)
         .await?;
+    if updated.rows_affected() == 0 {
+        sqlx::query("insert into principals (id, name, role, token_sha256) values ($1, $2, $3, $4)")
+            .bind(Uuid::new_v4())
+            .bind(name)
+            .bind(role.as_str())
+            .bind(&digest)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok(token)
 }

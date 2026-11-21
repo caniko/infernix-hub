@@ -183,7 +183,7 @@ fn App() -> Element {
                     dioxus.send('escape');
                     return;
                 }
-                if (!editing && !event.ctrlKey && !event.metaKey && !event.altKey && /^[0-9np]$/.test(event.key.toLowerCase())) {
+                if (!editing && !event.ctrlKey && !event.metaKey && !event.altKey && /^[0-9npu]$/.test(event.key.toLowerCase())) {
                     dioxus.send('ws:' + event.key.toLowerCase());
                 }
             });
@@ -201,7 +201,7 @@ fn App() -> Element {
                         store.set_nav_open(false);
                     }
                 }
-                // Workspace keys are `Workspace`'s own: 1–9, 0 and `n`.
+                // The key-to-workspace mapping lives in Workspace.
                 message if message.starts_with("ws:") => {
                     if let Some(workspace) = Workspace::from_key(&message[3..]) {
                         store.set_workspace(workspace);
@@ -271,7 +271,7 @@ fn App() -> Element {
     let api_version = status.data.as_ref().map(|status| status.api_version.clone()).unwrap_or_else(|| "v1".into());
     let stage_class = format!(
         "stage{}{}",
-        if (store.inspector_open).cloned() { "" } else { " inspector-closed" },
+        if (store.inspector_open).cloned() && (store.workspace).cloned() != Workspace::Providers { "" } else { " inspector-closed" },
         if (store.workspace).cloned().full_width() { " no-context" } else { "" }
     );
 
@@ -375,6 +375,7 @@ fn App() -> Element {
                         Workspace::Hosts => rsx! { workspaces::fleet::HostsView {} },
                         Workspace::Alerts => rsx! { workspaces::fleet::AlertsView {} },
                         Workspace::Approvals => rsx! { workspaces::fleet::ApprovalsView {} },
+                        Workspace::Providers => rsx! { workspaces::providers::ProvidersView {} },
                         Workspace::Today => rsx! { workspaces::today::TodayView {} },
                         Workspace::News => rsx! { workspaces::news::NewsView {} },
                         Workspace::Studio => rsx! { workspaces::studio::StudioView {} },
@@ -383,7 +384,7 @@ fn App() -> Element {
                         Workspace::Projects => rsx! { workspaces::projects::ProjectsView {} },
                         Workspace::Library => rsx! { workspaces::library::LibraryView {} },
                     }
-                    if (store.inspector_open).cloned() {
+                    if (store.inspector_open).cloned() && (store.workspace).cloned() != Workspace::Providers {
                         inspector::Inspector {
                             data: inspector_data,
                             on_close: move |_| store.set_inspector_open(false),
