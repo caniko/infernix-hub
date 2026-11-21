@@ -10,11 +10,7 @@ use chrono::TimeDelta;
 use contracts::providers::RouteStrategy::*;
 use serde_json::json;
 use sha2::Digest;
-use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
-};
+use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 use tokio::{net::TcpListener, task::JoinHandle};
 
 #[test]
