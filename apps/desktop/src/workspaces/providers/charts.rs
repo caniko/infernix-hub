@@ -153,7 +153,7 @@ pub(super) fn QuotaHistoryChart(
                             .map(|p| (p.at, p.remaining_percent)).collect();
                         // Projection is continuous between supplied forecast points.
                         let coords = points.iter().map(|(at, value)| format!("{:.2},{:.2}", x(*at, from, until), y(*value))).collect::<Vec<_>>().join(" ");
-                        let label = forecast.account_id.as_deref().map(&name).unwrap_or_else(|| "Pool".into());
+                        let label = forecast.account_id.as_deref().map(name).unwrap_or_else(|| "Pool".into());
                         rsx! {
                             polyline { class: "chart-line chart-projection", points: coords, title { "{label} · Estimated projection" } }
                             if let Some(at) = forecast.projected_exhaustion_at.filter(|at| *at >= from && *at <= until) {
@@ -168,7 +168,7 @@ pub(super) fn QuotaHistoryChart(
             if !forecasts.is_empty() {
                 p { class: "label-tech", "Estimated projection · dashed · not a provider guarantee" }
                 for forecast in &forecasts {
-                    p { {format!("{} · {:.2} percentage points/hour · projected exhaustion {}", forecast.account_id.as_deref().map(&name).unwrap_or_else(|| "Pool".into()), forecast.drain_pct_per_hour, date(forecast.projected_exhaustion_at))}
+                    p { {format!("{} · {:.2} percentage points/hour · projected exhaustion {}", forecast.account_id.as_deref().map(name).unwrap_or_else(|| "Pool".into()), forecast.drain_pct_per_hour, date(forecast.projected_exhaustion_at))}
                         if forecast.resets_before_exhaustion { " · resets first" }
                     }
                 }
@@ -176,7 +176,7 @@ pub(super) fn QuotaHistoryChart(
                     summary { "Estimated projection data table" }
                     Table { label: "Estimated projection", headers: &["Scope", "Projected time", "Remaining %", "Used %"],
                         rows: forecasts.iter().flat_map(|forecast| {
-                            let scope = forecast.account_id.as_deref().map(&name).unwrap_or_else(|| "Pool".into());
+                            let scope = forecast.account_id.as_deref().map(name).unwrap_or_else(|| "Pool".into());
                             forecast.points.iter().map(move |point| vec![
                                 scope.clone(), fmt_dt(point.at), number(Some(point.remaining_percent)), number(Some(point.used_percent))
                             ])
