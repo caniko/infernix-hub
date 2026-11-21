@@ -1259,6 +1259,63 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
             .execute(&hub.db)
             .await?;
         }
+        ProviderCommand::KeyGroup(KeyGroupCommand::DeleteGroup { group_id }) => {
+            sqlx::query("delete from model_key_groups where provider_id = $1 and id = $2")
+                .bind(provider_id)
+                .bind(group_id)
+                .execute(&hub.db)
+                .await?;
+        }
+        ProviderCommand::KeyGroup(KeyGroupCommand::SetGroupEnabled { group_id, enabled }) => {
+            sqlx::query("update model_key_groups set enabled = $3, updated_at = now() where provider_id = $1 and id = $2")
+                .bind(provider_id)
+                .bind(group_id)
+                .bind(enabled)
+                .execute(&hub.db)
+                .await?;
+        }
+        ProviderCommand::KeyGroup(KeyGroupCommand::RemoveKey { group_id, key_id }) => {
+            sqlx::query(
+                "update model_key_groups
+                 set keys = coalesce((select jsonb_agg(k) from jsonb_array_elements(keys) k where k->>'id' <> $3), '[]'::jsonb),
+                     updated_at = now()
+                 where provider_id = $1 and id = $2",
+            )
+            .bind(provider_id)
+            .bind(group_id)
+            .bind(key_id)
+            .execute(&hub.db)
+            .await?;
+        }
+        ProviderCommand::KeyGroup(KeyGroupCommand::ToggleKey { group_id, key_id, enabled }) => {
+            sqlx::query(
+                "update model_key_groups
+                 set keys = coalesce((
+                     select jsonb_agg(case when k->>'id' = $3 then jsonb_set(k, '{enabled}', to_jsonb($4::bool), true) else k end)
+                     from jsonb_array_elements(keys) k
+                 ), '[]'::jsonb),
+                 updated_at = now()
+                 where provider_id = $1 and id = $2",
+            )
+            .bind(provider_id)
+            .bind(group_id)
+            .bind(key_id)
+            .bind(enabled)
+            .execute(&hub.db)
+            .await?;
+        }
+        ProviderCommand::Credential(CredentialCommand::RemoveLogin { account_id }) => {
+            sqlx::query("delete from model_reset_grants where provider_id = $1 and account_id = $2")
+                .bind(provider_id)
+                .bind(account_id)
+                .execute(&hub.db)
+                .await?;
+            sqlx::query("delete from model_accounts where provider_id = $1 and id = $2")
+                .bind(provider_id)
+                .bind(account_id)
+                .execute(&hub.db)
+                .await?;
+        }
         _ => {}
     }
     Ok(())
@@ -1300,13 +1357,19 @@ pub async fn get_operation(hub: &Hub, actor: &Actor, op_id: Uuid) -> DResult<Pro
 }
 
 /// Claim pending operations destined for a collector's `(host, unix_user)`.
+/// Dispatched operations hold a 5-minute lease so overlapping collectors cannot
+/// double-claim in-flight work.
 pub async fn claim_operations(hub: &Hub, actor: &Actor, input: ClaimOperationsIn) -> DResult<Vec<ProviderOperation>> {
     actor.require(OPERATOR_OR_COLLECTOR)?;
+    let effective_providers = enforce_collector_claim_scope(hub, actor, &input.host, &input.unix_user, &input.provider_ids).await?;
     let limit = input.limit.clamp(1, 50) as i64;
     let rows: Vec<Value> = sqlx::query_scalar(
         "with picked as (
             select id from model_operations
-            where status in ('pending', 'dispatched')
+            where (
+                status = 'pending'
+                or (status = 'dispatched' and (claimed_at is null or claimed_at < now() - interval '5 minutes'))
+              )
               and (target_host is null or target_host = $1)
               and (target_user is null or target_user = $2)
               and (cardinality($3::text[]) = 0 or provider_id = any($3))
@@ -1322,7 +1385,7 @@ pub async fn claim_operations(hub: &Hub, actor: &Actor, input: ClaimOperationsIn
     )
     .bind(&input.host)
     .bind(&input.unix_user)
-    .bind(&input.provider_ids)
+    .bind(&effective_providers)
     .bind(limit)
     .bind(actor.name())
     .fetch_all(&hub.db)
@@ -1330,9 +1393,69 @@ pub async fn claim_operations(hub: &Hub, actor: &Actor, input: ClaimOperationsIn
     crate::decode(rows)
 }
 
+async fn enforce_collector_claim_scope(
+    hub: &Hub,
+    actor: &Actor,
+    host: &str,
+    unix_user: &str,
+    requested_providers: &[String],
+) -> DResult<Vec<String>> {
+    if actor.principal.role == contracts::Role::Operator {
+        return Ok(requested_providers.to_vec());
+    }
+    let has_any_grant: bool = sqlx::query_scalar("select exists(select 1 from model_source_grants where principal_name = $1)")
+        .bind(&actor.principal.name)
+        .fetch_one(&hub.db)
+        .await?;
+    if !has_any_grant {
+        return Ok(requested_providers.to_vec());
+    }
+    let grant: Option<(Value, bool)> = sqlx::query_as(
+        "select provider_ids, can_claim_operations from model_source_grants
+         where principal_name = $1 and host = $2 and unix_user = $3",
+    )
+    .bind(&actor.principal.name)
+    .bind(host)
+    .bind(unix_user)
+    .fetch_optional(&hub.db)
+    .await?;
+    let Some((providers_json, can_claim)) = grant else {
+        return Err(DomainError::Forbidden(format!("collector {} is not granted scope for {unix_user}@{host}", actor.principal.name)));
+    };
+    if !can_claim {
+        return Err(DomainError::Forbidden(format!(
+            "collector {} is not permitted to claim operations for {unix_user}@{host}",
+            actor.principal.name
+        )));
+    }
+    let allowed: Vec<String> = serde_json::from_value(providers_json).unwrap_or_default();
+    if allowed.is_empty() || allowed.iter().any(|p| p == "*") {
+        return Ok(requested_providers.to_vec());
+    }
+    if requested_providers.is_empty() {
+        return Ok(allowed);
+    }
+    for req in requested_providers {
+        if !allowed.iter().any(|a| a == req) {
+            return Err(DomainError::Forbidden(format!("collector {} is not granted provider {req}", actor.principal.name)));
+        }
+    }
+    Ok(requested_providers.to_vec())
+}
+
 pub async fn report_operation_receipt(hub: &Hub, actor: &Actor, op_id: Uuid, input: OperationReceiptIn) -> DResult<ProviderOperation> {
     actor.require(OPERATOR_OR_COLLECTOR)?;
     let op = get_operation(hub, actor, op_id).await?;
+    if actor.principal.role != contracts::Role::Operator {
+        let claimed_by: Option<String> = sqlx::query_scalar("select claimed_by from model_operations where id = $1")
+            .bind(op_id)
+            .fetch_optional(&hub.db)
+            .await?
+            .flatten();
+        if claimed_by.as_deref() != Some(actor.name().as_str()) {
+            return Err(DomainError::Forbidden(format!("collector {} did not claim operation {op_id}", actor.principal.name)));
+        }
+    }
     let safe_receipt = input.receipt.map(|r| capture::redact_json(&r).0);
     let safe_err = input.error.map(|e| capture::redact_text(&e).0);
     if input.status == OperationStatus::Succeeded {

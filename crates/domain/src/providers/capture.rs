@@ -33,15 +33,26 @@ pub fn redact_text(input: &str) -> (String, bool) {
     let mut out = input.to_string();
     let mut redacted = false;
     for prefix in ["Bearer ", "sk-ant-", "sk-proj-", "sk-", "AIza", "ihub_", "ghp_", "gho_"] {
-        while let Some(pos) = out.find(prefix) {
+        let mut search_from = 0usize;
+        while search_from < out.len() {
+            let Some(rel_pos) = out[search_from..].find(prefix) else {
+                break;
+            };
+            let pos = search_from + rel_pos;
             let start = pos + prefix.len();
             let rest = &out[start..];
             let end_rel = rest.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | '}' | ']' | ';')).unwrap_or(rest.len());
-            if end_rel == 0 || rest.starts_with("<redacted>") {
-                break;
+            if end_rel == 0 {
+                search_from = start;
+                continue;
+            }
+            if rest.starts_with("<redacted>") {
+                search_from = start + "<redacted>".len();
+                continue;
             }
             out.replace_range(start..start + end_rel, "<redacted>");
             redacted = true;
+            search_from = start + "<redacted>".len();
         }
     }
     (out, redacted)
@@ -471,7 +482,7 @@ mod tests {
     fn redacts_bearer_and_secret_keys() {
         let payload = json!({
             "authorization": "Bearer sk-ant-secret123456",
-            "note": "header Bearer tok_abc123 failed",
+            "note": "header Bearer tok_abc123 failed then Bearer tok_def456 and ghp_first ghp_second",
             "nested": { "refresh_token": "rt_secret", "safe": "ok" }
         });
         let (clean, hit) = redact_json(&payload);
@@ -479,6 +490,10 @@ mod tests {
         assert_eq!(clean["authorization"], "<redacted>");
         assert_eq!(clean["nested"]["refresh_token"], "<redacted>");
         assert_eq!(clean["nested"]["safe"], "ok");
-        assert!(!clean["note"].as_str().unwrap().contains("tok_abc123"));
+        let note = clean["note"].as_str().unwrap();
+        assert!(!note.contains("tok_abc123"));
+        assert!(!note.contains("tok_def456"));
+        assert!(!note.contains("first"));
+        assert!(!note.contains("second"));
     }
 }

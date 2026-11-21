@@ -135,9 +135,208 @@ async fn fixture_providers_and_activity_over_http() {
     assert_eq!(lines.next().unwrap()["data"], archive["manifest"]);
     assert!(lines.any(|line| line["type"] == "exchange"));
 
+    // Verify "success" outcome (from agent proxy) counts as non-failure and keyset cursor paginates ties.
+    let tie_ts = chrono::Utc::now() - chrono::Duration::seconds(5);
+    let mut tie_events = Vec::new();
+    for idx in 0..3 {
+        let mut ev = fixture.seed_activity().exchanges.pop().unwrap();
+        ev.source_exchange_id = format!("{name}-tie-{idx}");
+        ev.session_id = Some(format!("{name}-tie-session"));
+        ev.occurred_at = tie_ts;
+        ev.outcome = "success".into();
+        ev.error_message = None;
+        tie_events.push(ev);
+    }
+    post("activity/ingest")
+        .json(&ActivityIngestBatch { source_host: "test-host".into(), source_user: "test-user".into(), exchanges: tie_events })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let p1: RequestPage = get("activity/requests")
+        .query(&ActivityScope { search: Some(format!("{name}-tie-session")), limit: Some(2), ..Default::default() })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(p1.items.len(), 2);
+    let cursor = p1.next_cursor.clone().expect("first page must emit next_cursor");
+    let p2: RequestPage = get("activity/requests")
+        .query(&ActivityScope { search: Some(format!("{name}-tie-session")), limit: Some(2), cursor: Some(cursor), ..Default::default() })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(p2.items.len(), 1);
+    assert!(p2.next_cursor.is_none());
+    assert!(!p1.items.iter().any(|r| r.id == p2.items[0].id));
+
+    let failed_ties: RequestPage = get("activity/requests")
+        .query(&ActivityScope { search: Some(format!("{name}-tie-session")), outcome: Some("failed".into()), ..Default::default() })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(failed_ties.items.is_empty(), "'success' outcome must not match outcome=failed");
+
+    let tie_overview: Value = get("activity/overview")
+        .query(&ActivityScope { search: Some(format!("{name}-tie-session")), ..Default::default() })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tie_overview["requests"], 3);
+    assert_eq!(tie_overview["failures"], 0);
+
+    // Verify totals() grand_total is uncapped even when hourly buckets exceed LIMIT 366.
+    let base_hour = chrono::Utc::now() - chrono::Duration::days(30);
+    for h in 0..370i64 {
+        let bucket = base_hour + chrono::Duration::hours(h);
+        domain::sqlx::query(
+            "insert into activity_totals
+                (hour_bucket, source, provider_id, account_id, client, effective_model, effort,
+                 requests, failures, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                 thinking_tokens, api_equivalent_cost_usd, unpriced_requests)
+             values ($1, 'proxy', 'claude', 'acct-totals', 't3code', 'totals-cap-model', '',
+                     1, 0, 10, 5, 0, 0, 0, 0.01, 0)
+             on conflict do nothing",
+        )
+        .bind(bucket)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    let totals_resp: Value = get("activity/totals")
+        .query(&[("granularity", "hour"), ("model", "totals-cap-model")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(totals_resp["buckets"].as_array().unwrap().len(), 366);
+    assert_eq!(totals_resp["grand_total"]["requests"], 370);
+
+    // Verify collector claim scope grants, active 5-min lease, and receipt ownership.
+    let collector_a = Uuid::new_v4().to_string();
+    let collector_b = Uuid::new_v4().to_string();
+    domain::system::issue_token(&db, "collector-a", contracts::Role::Collector, Some(collector_a.clone())).await.unwrap();
+    domain::system::issue_token(&db, "collector-b", contracts::Role::Collector, Some(collector_b.clone())).await.unwrap();
+    domain::sqlx::query(
+        "insert into model_source_grants (id, principal_name, host, unix_user, provider_ids, can_claim_operations)
+         values ($1, 'collector-a', 'host-a', 'alice', '[\"claude\"]'::jsonb, true),
+                ($2, 'collector-b', 'host-b', 'bob', '[\"claude\"]'::jsonb, true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&db)
+    .await
+    .unwrap();
+    let op_id = Uuid::new_v4();
+    domain::sqlx::query(
+        "insert into model_operations
+            (id, provider_id, actor, idempotency_key, request_sha256, command_kind, command, status, target_host, target_user)
+         values ($1, 'claude', 'operator', 'lease-test-op', 'sha-test', 'quota',
+                 '{\"facet\":\"quota\",\"payload\":{\"op\":\"refresh_quota\",\"account_id\":null}}'::jsonb, 'pending', 'host-a', 'alice')",
+    )
+    .bind(op_id)
+    .execute(&db)
+    .await
+    .unwrap();
+    // collector-b cannot claim host-a/alice operations.
+    let forbidden_claim = http
+        .post(format!("http://{addr}/v1/providers/operations/claim"))
+        .bearer_auth(&collector_b)
+        .json(&json!({"host":"host-a","unix_user":"alice","provider_ids":["claude"],"limit":5}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden_claim.status(), 403);
+    // collector-a claims the pending operation once; immediate re-claim returns empty while leased.
+    let claimed_1: Vec<Value> = http
+        .post(format!("http://{addr}/v1/providers/operations/claim"))
+        .bearer_auth(&collector_a)
+        .json(&json!({"host":"host-a","unix_user":"alice","provider_ids":["claude"],"limit":5}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(claimed_1.len(), 1);
+    assert_eq!(claimed_1[0]["id"], op_id.to_string());
+    let claimed_2: Vec<Value> = http
+        .post(format!("http://{addr}/v1/providers/operations/claim"))
+        .bearer_auth(&collector_a)
+        .json(&json!({"host":"host-a","unix_user":"alice","provider_ids":["claude"],"limit":5}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(claimed_2.is_empty(), "actively leased operation must not be re-claimed");
+    // collector-b cannot report a receipt for collector-a's claimed operation.
+    let bad_receipt = http
+        .post(format!("http://{addr}/v1/providers/operations/{op_id}/receipt"))
+        .bearer_auth(&collector_b)
+        .json(&json!({"status":"succeeded","receipt":{"ok":true}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_receipt.status(), 403);
+
+    // Verify DeleteGroup side effect removes the key group from the database.
+    let groups: Vec<Value> = get("providers/claude/key-groups").send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let group_id = groups[0]["id"].as_str().expect("fixture provider must have a seeded key group").to_string();
+    let del_op: Value = post("providers/claude/operations")
+        .json(&json!({
+            "idempotency_key": "delete-temp-group",
+            "command": {"facet": "key_group", "payload": {"op": "delete_group", "group_id": group_id}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(del_op["status"], "succeeded");
+    let group_still_exists: bool = domain::sqlx::query_scalar("select exists(select 1 from model_key_groups where id = $1)")
+        .bind(&group_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(!group_still_exists, "delete_group operation must remove model_key_groups row");
+
     server.abort();
     let _ = server.await;
     db.close().await;
-    domain::sqlx::query(&format!("drop database {name}")).execute(&admin).await.unwrap();
+    domain::sqlx::query(&format!("drop database {name} with (force)")).execute(&admin).await.unwrap();
     let _ = std::fs::remove_dir_all(assets);
 }

@@ -234,7 +234,7 @@ pub async fn ingest_activity(hub: &Hub, actor: &Actor, batch: ActivityIngestBatc
 
         // Window starters, canaries, thinking tests and eval replays stay outside ordinary activity totals.
         if ex.purpose == ActivityPurpose::Ordinary {
-            let is_fail = i64::from(ex.outcome != "ok" && ex.outcome != "succeeded");
+            let is_fail = i64::from(!is_success_outcome(&ex.outcome));
             let is_unpriced = i64::from(cost.is_none());
             sqlx::query(
                 "insert into activity_totals
@@ -280,6 +280,29 @@ pub async fn ingest_activity(hub: &Hub, actor: &Actor, batch: ActivityIngestBatc
 
     tx.commit().await?;
     Ok(ActivityIngestAck { accepted, deduplicated, recorded_at: Utc::now() })
+}
+
+fn is_success_outcome(outcome: &str) -> bool {
+    matches!(outcome, "ok" | "succeeded" | "success")
+}
+
+fn parse_cursor(raw: &str) -> DResult<(DateTime<Utc>, Option<Uuid>)> {
+    if let Some((ts, id_str)) = raw.split_once('|') {
+        let occurred_at = DateTime::parse_from_rfc3339(ts)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|_| invalid("invalid_cursor", "cursor timestamp must be RFC3339"))?;
+        let id = Uuid::parse_str(id_str).map_err(|_| invalid("invalid_cursor", "cursor id must be a UUID"))?;
+        Ok((occurred_at, Some(id)))
+    } else {
+        let occurred_at = DateTime::parse_from_rfc3339(raw)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|_| invalid("invalid_cursor", "cursor must be RFC3339 or '<rfc3339>|<uuid>'"))?;
+        Ok((occurred_at, None))
+    }
+}
+
+fn format_cursor(occurred_at: DateTime<Utc>, id: Uuid) -> String {
+    format!("{}|{id}", occurred_at.to_rfc3339())
 }
 
 fn enum_str<T: serde::Serialize>(val: T, fallback: &str) -> String {
@@ -371,6 +394,13 @@ async fn query_exchanges(db: &sqlx::PgPool, scope: &ActivityScope, ordinary_only
         None | Some(ActivitySource::All) => None,
         Some(other) => Some(enum_str(other, "proxy")),
     };
+    let (cursor_ts, cursor_id) = match scope.cursor.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => {
+            let (ts, id) = parse_cursor(raw)?;
+            (Some(ts), id)
+        }
+        None => (None, None),
+    };
     let rows = sqlx::query_as::<_, ExchangeRow>(
         "select e.id, e.source_exchange_id, e.source, e.purpose, e.client, e.client_version, e.transport,
                 e.session_id, e.parent_session_id, e.parent_edge_kind, e.provider_id, e.account_id,
@@ -388,12 +418,22 @@ async fn query_exchanges(db: &sqlx::PgPool, scope: &ActivityScope, ordinary_only
            and ($7::text is null or e.account_id = $7)
            and ($8::text is null or e.effective_model ilike '%' || $8 || '%')
            and ($9::text is null or e.effort = $9)
-           and ($10::text is null or ($10 = 'failed' and e.outcome not in ('ok', 'succeeded')) or e.outcome = $10)
+           and (
+                $10::text is null
+                or ($10 = 'failed' and e.outcome not in ('ok', 'succeeded', 'success'))
+                or ($10 in ('ok', 'succeeded', 'success') and e.outcome in ('ok', 'succeeded', 'success'))
+                or e.outcome = $10
+           )
            and ($11::text is null or e.session_id ilike '%' || $11 || '%'
                 or e.effective_model ilike '%' || $11 || '%'
                 or coalesce(e.searchable_text, '') ilike '%' || $11 || '%')
-         order by e.occurred_at desc
-         limit $12",
+           and (
+                $12::timestamptz is null
+                or e.occurred_at < $12
+                or ($13::uuid is not null and e.occurred_at = $12 and e.id < $13)
+           )
+         order by e.occurred_at desc, e.id desc
+         limit $14",
     )
     .bind(from)
     .bind(to)
@@ -406,6 +446,8 @@ async fn query_exchanges(db: &sqlx::PgPool, scope: &ActivityScope, ordinary_only
     .bind(&scope.effort)
     .bind(&scope.outcome)
     .bind(&scope.search)
+    .bind(cursor_ts)
+    .bind(cursor_id)
     .bind(limit)
     .fetch_all(db)
     .await?;
@@ -444,7 +486,7 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
     let mut by_model_effort: BTreeMap<String, BreakdownRow> = BTreeMap::new();
 
     for r in &rows {
-        let is_fail = u64::from(r.outcome != "ok" && r.outcome != "succeeded");
+        let is_fail = u64::from(!is_success_outcome(&r.outcome));
         failures += is_fail;
         let inp = r.input_tokens.max(0) as u64;
         let out = r.output_tokens.max(0) as u64;
@@ -656,10 +698,9 @@ pub async fn compare(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult<
     for (key, group) in by_key {
         let first = group[0];
         let reqs = group.len() as u64;
-        let fails = group.iter().filter(|r| r.outcome != "ok" && r.outcome != "succeeded").count() as u64;
+        let fails = group.iter().filter(|r| !is_success_outcome(&r.outcome)).count() as u64;
         let total_cost: f64 = group.iter().filter_map(|r| r.api_equivalent_cost_usd).sum();
-        let failed_cost: f64 =
-            group.iter().filter(|r| r.outcome != "ok" && r.outcome != "succeeded").filter_map(|r| r.api_equivalent_cost_usd).sum();
+        let failed_cost: f64 = group.iter().filter(|r| !is_success_outcome(&r.outcome)).filter_map(|r| r.api_equivalent_cost_usd).sum();
         let inp: i64 = group.iter().map(|r| r.input_tokens.max(0)).sum();
         let out_tok: i64 = group.iter().map(|r| r.output_tokens.max(0)).sum();
         let cr: i64 = group.iter().map(|r| r.cache_read_tokens.max(0)).sum();
@@ -763,7 +804,7 @@ pub async fn requests(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
     let rows = query_exchanges(&hub.db, &scope, false, limit + 1).await?;
     let has_more = rows.len() as i64 > limit;
     let items: Vec<RequestRow> = rows.iter().take(limit as usize).map(ExchangeRow::to_contract).collect();
-    let next_cursor = if has_more { items.last().map(|r| r.occurred_at.to_rfc3339()) } else { None };
+    let next_cursor = if has_more { items.last().map(|r| format_cursor(r.occurred_at, r.id)) } else { None };
     Ok(RequestPage { total_matched: items.len() as u64, items, next_cursor })
 }
 
@@ -886,7 +927,7 @@ pub async fn traces(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult<T
             if let Some(node_exs) = by_session.get(&curr) {
                 for e in node_exs {
                     total_ex += 1;
-                    if e.outcome != "ok" && e.outcome != "succeeded" {
+                    if !is_success_outcome(&e.outcome) {
                         total_fail += 1;
                     }
                     subtotal_cost += e.api_equivalent_cost_usd.unwrap_or(0.0);
@@ -1020,7 +1061,7 @@ pub async fn trace_detail(hub: &Hub, actor: &Actor, session_id: &str) -> DResult
     for (sid, parent, kind, depth) in &order {
         let exs = by_sid.get(sid).map(Vec::as_slice).unwrap_or(&[]);
         let own_requests = exs.len() as u64;
-        let own_failures = exs.iter().filter(|e| e.outcome != "ok" && e.outcome != "succeeded").count() as u64;
+        let own_failures = exs.iter().filter(|e| !is_success_outcome(&e.outcome)).count() as u64;
         let own_tokens: u64 = exs.iter().map(|e| (e.input_tokens.max(0) + e.output_tokens.max(0)) as u64).sum();
         let own_cost: f64 = exs.iter().filter_map(|e| e.api_equivalent_cost_usd).sum();
         let unpriced = exs.iter().filter(|e| e.api_equivalent_cost_usd.is_none()).count() as u64;
@@ -1104,7 +1145,7 @@ pub async fn drift(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult<Dr
         let thinking_sum: f64 = day_rows.iter().map(|r| r.thinking_tokens.max(0) as f64).sum();
         let output_sum: f64 = day_rows.iter().map(|r| r.output_tokens.max(0) as f64).sum();
         let no_think = day_rows.iter().filter(|r| r.thinking_tokens <= 0).count() as f64;
-        let fails = day_rows.iter().filter(|r| r.outcome != "ok" && r.outcome != "succeeded").count() as f64;
+        let fails = day_rows.iter().filter(|r| !is_success_outcome(&r.outcome)).count() as f64;
         let mut ttfts: Vec<f64> = day_rows.iter().filter_map(|r| r.ttft_ms.map(|t| t as f64)).collect();
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         grouped.entry((model, effort)).or_default().push(DriftDayPoint {
@@ -1241,23 +1282,54 @@ pub async fn totals(hub: &Hub, actor: &Actor, granularity: TotalsGranularity, sc
         TotalsGranularity::Month => "%Y-%m",
     };
 
-    let mut grand = TotalsBucket {
+    type GrandTotalRow = (i64, i64, i64, i64, i64, i64, i64, f64, i64);
+    let (g_reqs, g_fails, g_inp, g_out, g_cr, g_cw, g_th, g_cost, g_unp): GrandTotalRow = sqlx::query_as(
+        "select coalesce(sum(requests), 0)::bigint,
+                coalesce(sum(failures), 0)::bigint,
+                coalesce(sum(input_tokens), 0)::bigint,
+                coalesce(sum(output_tokens), 0)::bigint,
+                coalesce(sum(cache_read_tokens), 0)::bigint,
+                coalesce(sum(cache_write_tokens), 0)::bigint,
+                coalesce(sum(thinking_tokens), 0)::bigint,
+                coalesce(sum(api_equivalent_cost_usd), 0)::double precision,
+                coalesce(sum(unpriced_requests), 0)::bigint
+         from activity_totals
+         where hour_bucket >= $1 and hour_bucket <= $2
+           and ($3::text is null or source = $3)
+           and ($4::text is null or provider_id = $4)
+           and ($5::text is null or account_id = $5)
+           and ($6::text is null or client = $6)
+           and ($7::text is null or effective_model ilike '%' || $7 || '%')
+           and ($8::text is null or effort = $8)",
+    )
+    .bind(from)
+    .bind(to)
+    .bind(&source_filter)
+    .bind(&scope.provider_id)
+    .bind(&scope.account_id)
+    .bind(&scope.client)
+    .bind(&scope.model)
+    .bind(&scope.effort)
+    .fetch_one(&hub.db)
+    .await?;
+
+    let grand = TotalsBucket {
         period: "Total".into(),
-        requests: 0,
-        failures: 0,
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-        thinking_tokens: 0,
-        api_equivalent_cost_usd: 0.0,
-        unpriced_requests: 0,
+        requests: g_reqs.max(0) as u64,
+        failures: g_fails.max(0) as u64,
+        input_tokens: g_inp.max(0) as u64,
+        output_tokens: g_out.max(0) as u64,
+        cache_read_tokens: g_cr.max(0) as u64,
+        cache_write_tokens: g_cw.max(0) as u64,
+        thinking_tokens: g_th.max(0) as u64,
+        api_equivalent_cost_usd: g_cost,
+        unpriced_requests: g_unp.max(0) as u64,
         includes_retained_aggregates: true,
     };
 
     let mut buckets = Vec::with_capacity(rows.len());
     for (p, reqs, fails, inp, out, cr, cw, th, cost, unp) in rows {
-        let b = TotalsBucket {
+        buckets.push(TotalsBucket {
             period: p.format(fmt).to_string(),
             requests: reqs.max(0) as u64,
             failures: fails.max(0) as u64,
@@ -1269,17 +1341,7 @@ pub async fn totals(hub: &Hub, actor: &Actor, granularity: TotalsGranularity, sc
             api_equivalent_cost_usd: cost,
             unpriced_requests: unp.max(0) as u64,
             includes_retained_aggregates: true,
-        };
-        grand.requests += b.requests;
-        grand.failures += b.failures;
-        grand.input_tokens += b.input_tokens;
-        grand.output_tokens += b.output_tokens;
-        grand.cache_read_tokens += b.cache_read_tokens;
-        grand.cache_write_tokens += b.cache_write_tokens;
-        grand.thinking_tokens += b.thinking_tokens;
-        grand.api_equivalent_cost_usd += b.api_equivalent_cost_usd;
-        grand.unpriced_requests += b.unpriced_requests;
-        buckets.push(b);
+        });
     }
 
     Ok(TotalsReport { granularity, buckets, grand_total: grand })
@@ -1555,7 +1617,9 @@ pub async fn replay_eval(
     let response_preview = op.receipt.as_ref().and_then(|r| r.get("response_text").and_then(|v| v.as_str())).unwrap_or("").to_string();
     let actual_outcome = if op.status == OperationStatus::Succeeded { "ok".to_string() } else { "failed".to_string() };
     let predicate_results = evaluate_predicates(&case.predicates, &response_preview);
-    let passed = actual_outcome == case.expected_outcome && predicate_results.iter().all(|r| r.passed);
+    let passed = (actual_outcome == case.expected_outcome
+        || (is_success_outcome(&actual_outcome) && is_success_outcome(&case.expected_outcome)))
+        && predicate_results.iter().all(|r| r.passed);
     let latency_ms = op.receipt.as_ref().and_then(|r| r.get("latency_ms").and_then(|v| v.as_i64()));
 
     let replay_id = Uuid::new_v4();
@@ -1646,5 +1710,29 @@ mod tests {
         assert!(fail[0].passed);
         assert!(!fail[1].passed);
         assert!(!fail[2].passed);
+    }
+
+    #[test]
+    fn success_outcomes_include_proxy_success_variant() {
+        assert!(is_success_outcome("ok"));
+        assert!(is_success_outcome("succeeded"));
+        assert!(is_success_outcome("success"));
+        assert!(!is_success_outcome("failed"));
+        assert!(!is_success_outcome("rate_limited"));
+    }
+
+    #[test]
+    fn cursor_roundtrips_timestamp_and_uuid_and_supports_legacy_timestamp() {
+        let ts = DateTime::parse_from_rfc3339("2026-11-21T12:34:56Z").unwrap().with_timezone(&Utc);
+        let id = Uuid::new_v4();
+        let encoded = format_cursor(ts, id);
+        let (parsed_ts, parsed_id) = parse_cursor(&encoded).unwrap();
+        assert_eq!(parsed_ts, ts);
+        assert_eq!(parsed_id, Some(id));
+
+        let (legacy_ts, legacy_id) = parse_cursor("2026-11-21T12:34:56Z").unwrap();
+        assert_eq!(legacy_ts, ts);
+        assert_eq!(legacy_id, None);
+        assert!(parse_cursor("not-a-timestamp").is_err());
     }
 }

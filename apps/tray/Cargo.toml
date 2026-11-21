@@ -13,9 +13,6 @@ contracts = { workspace = true, features = ["client"] }
 # the runtime with the long-poll.
 ksni = { version = "0.3", features = ["tokio"] }
 tokio = { workspace = true, features = ["process"] }
+uuid.workspace = true
 # zbus at the major version ksni resolves; only `Notify` needs it directly.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
-
-[dev-dependencies]
-# Test fixtures build `Notification` rows, whose ids must be distinct.
-uuid.workspace = true
