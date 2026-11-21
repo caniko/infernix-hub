@@ -404,3 +404,107 @@ pub trait GpuPeer: Send + Sync {
     /// True when any model is loaded or loading at `running_url` (llama-swap `GET /running`).
     async fn busy(&self, running_url: &str) -> PortResult<bool>;
 }
+
+// ── Generic AI Model Providers ──────────────────────────────────────────────
+
+/// Targeted intent handed to a [`ProviderOps`] facet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderIntent {
+    pub operation_id: Uuid,
+    pub provider_id: String,
+    pub actor: String,
+    pub idempotency_key: String,
+    pub target_account_id: Option<String>,
+    pub target_host: Option<String>,
+    pub target_user: Option<String>,
+    pub expected_revision: Option<i64>,
+}
+
+/// Immediate outcome of submitting a typed command to a [`ModelProvider`] facet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProviderDispatch {
+    /// Command completed synchronously with a sanitized receipt.
+    Completed { receipt: Value },
+    /// Command accepted and queued for an async worker or user-session collector.
+    Accepted { receipt: Option<Value> },
+    /// Command requires attended operator action (e.g. FIDO2 / browser login / ops queue).
+    AwaitingOperator { message: String, receipt: Option<Value> },
+}
+
+/// Result of reconciling an earlier submitted operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProviderReconciliation {
+    Applied { receipt: Value },
+    NotApplied { reason: String },
+    StillPending,
+    Unknown { reason: String },
+}
+
+/// Generic capability-gated command facet for a [`ModelProvider`].
+#[async_trait]
+pub trait ProviderOps<C: Send + Sync>: Send + Sync {
+    fn supported(&self) -> contracts::providers::ProviderCapabilities;
+    async fn submit(&self, intent: &ProviderIntent, command: &C) -> PortResult<ProviderDispatch>;
+    async fn reconcile(&self, _intent: &ProviderIntent) -> PortResult<ProviderReconciliation> {
+        Ok(ProviderReconciliation::Unknown { reason: "reconciliation not implemented by provider".into() })
+    }
+}
+
+/// Capability facets exposed by a [`ModelProvider`]. A push-only or read-only
+/// provider leaves command facets `None` instead of implementing fake methods.
+pub struct ProviderFacets<'a> {
+    pub observations: std::collections::BTreeSet<contracts::providers::EvidenceKind>,
+    pub quota: Option<&'a dyn ProviderOps<contracts::providers::QuotaCommand>>,
+    pub accounts: Option<&'a dyn ProviderOps<contracts::providers::AccountCommand>>,
+    pub credentials: Option<&'a dyn ProviderOps<contracts::providers::CredentialCommand>>,
+    pub key_groups: Option<&'a dyn ProviderOps<contracts::providers::KeyGroupCommand>>,
+    pub models: Option<&'a dyn ProviderOps<contracts::providers::ModelCommand>>,
+    pub routing: Option<&'a dyn ProviderOps<contracts::providers::RoutingCommand>>,
+    pub probes: Option<&'a dyn ProviderOps<contracts::providers::ProbeCommand>>,
+}
+
+impl<'a> ProviderFacets<'a> {
+    pub fn observation_only(observations: std::collections::BTreeSet<contracts::providers::EvidenceKind>) -> Self {
+        Self { observations, quota: None, accounts: None, credentials: None, key_groups: None, models: None, routing: None, probes: None }
+    }
+
+    pub fn capabilities(&self) -> contracts::providers::ProviderCapabilities {
+        let mut caps = contracts::providers::ProviderCapabilities::new();
+        if let Some(f) = self.quota {
+            caps.extend(f.supported());
+        }
+        if let Some(f) = self.accounts {
+            caps.extend(f.supported());
+        }
+        if let Some(f) = self.credentials {
+            caps.extend(f.supported());
+        }
+        if let Some(f) = self.key_groups {
+            caps.extend(f.supported());
+        }
+        if let Some(f) = self.models {
+            caps.extend(f.supported());
+        }
+        if let Some(f) = self.routing {
+            caps.extend(f.supported());
+        }
+        if let Some(f) = self.probes {
+            caps.extend(f.supported());
+        }
+        caps
+    }
+}
+
+/// Generic trait implemented by every AI model provider integration (built-ins,
+/// fixtures, push collectors, Spillway-compatible proxies, and Canix packs).
+#[async_trait]
+pub trait ModelProvider: Send + Sync {
+    fn descriptor(&self) -> contracts::providers::ProviderDescriptor;
+    fn facets(&self) -> ProviderFacets<'_>;
+
+    /// Optional server-side observation pull. Push-collected providers return
+    /// `Ok(None)` and emit observations through `POST /v1/providers/{id}/observations`.
+    async fn collect(&self) -> PortResult<Option<contracts::providers::ObservationBatch>> {
+        Ok(None)
+    }
+}

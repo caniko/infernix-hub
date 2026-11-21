@@ -8,6 +8,7 @@ pub mod library;
 pub mod news;
 pub mod notifications;
 pub mod projects;
+pub mod providers;
 pub mod relationships;
 pub mod studio;
 pub mod today;

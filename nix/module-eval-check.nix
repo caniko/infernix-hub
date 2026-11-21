@@ -12,7 +12,7 @@
   mkSystem = modules:
     import (pkgs.path + "/nixos/lib/eval-config.nix") {
       inherit system;
-      modules = modules;
+      inherit modules;
     };
 
   fixture = mkSystem [
@@ -32,7 +32,7 @@
       networking.hostName = "evalhost";
       services.infernix.gpu = {
         vendor = "amd";
-        pkgs = pkgs;
+        inherit pkgs;
       };
       services.infernix.comfyui = {
         enable = true;

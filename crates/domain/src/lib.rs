@@ -24,6 +24,7 @@ pub mod outbox;
 pub mod ports;
 pub mod production;
 pub mod projects;
+pub mod providers;
 pub mod release;
 pub mod renewals;
 pub mod system;
@@ -114,6 +115,8 @@ pub struct Hub {
     pub pipelines: Arc<BTreeMap<String, Arc<dyn ports::Pipeline>>>,
     /// Pack-provided outbox topics. Core topics stay in the worker's match.
     pub topics: Arc<BTreeMap<String, Arc<dyn outbox::OutboxHandler>>>,
+    /// Registered AI model providers (built-ins, fixtures, and pack providers).
+    pub providers: Arc<BTreeMap<String, Arc<dyn ports::ModelProvider>>>,
     /// Wakes long-polling notification readers after a committed change.
     pub notified: Arc<tokio::sync::Notify>,
     /// Status feed states the producer loop last saw, for `/v1/status`.
@@ -152,6 +155,8 @@ pub const OPERATOR_OR_AGENT: &[Role] = &[Role::Operator, Role::Agent];
 /// The procedure role is a machine caller; observations are its only renewal
 /// write, and never a rotation.
 pub const OPERATOR_OR_PROCEDURE: &[Role] = &[Role::Operator, Role::Procedure];
+/// Collectors authenticate per `(host, unix_user)` for telemetry and operation receipts.
+pub const OPERATOR_OR_COLLECTOR: &[Role] = &[Role::Operator, Role::Collector];
 
 /// Decode rows produced by `select to_jsonb(t) from (...) t` into contract
 /// types. Column names are the contract field names.

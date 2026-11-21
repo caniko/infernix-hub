@@ -129,7 +129,7 @@
     });
   in {
     packages = forAllSystems (system: {
-      inherit (perSystem.${system}.packages) fleetix-hubd hubctl fleetix-hub-desktop fleetix-hub-tray;
+      inherit (perSystem.${system}.packages) fleetix-hubd hubctl fleetix-hub-desktop fleetix-hub-tray fleetix-agent-proxy;
       default = perSystem.${system}.packages.fleetix-hubd;
     });
 

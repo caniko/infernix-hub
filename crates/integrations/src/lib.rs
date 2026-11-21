@@ -7,4 +7,5 @@ pub mod assistant;
 pub mod fixture;
 pub mod gpu_peer;
 pub mod live;
+pub mod providers;
 pub mod store;

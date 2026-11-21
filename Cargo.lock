@@ -1737,6 +1737,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleetix-agent-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "futures-util",
+ "hex",
+ "hub-contracts",
+ "hub-integrations",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "fleetix-hub-desktop"
 version = "0.1.0"
 dependencies = [
@@ -2521,11 +2546,17 @@ name = "hubctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
+ "hex",
  "hub-contracts",
+ "hub-integrations",
+ "reqwest",
+ "ring",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "uuid",
 ]

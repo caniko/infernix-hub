@@ -14,6 +14,9 @@ use uuid::Uuid;
 #[cfg(feature = "client")]
 pub mod client;
 
+/// Generic AI model provider, multi-account, quota, activity, routing and export contracts.
+pub mod providers;
+
 /// The fleet operations snapshot (`fleetix::status`), re-exported so the API,
 /// desktop and CLI never disagree about its shape.
 pub use fleetix::status as fleet;
@@ -115,8 +118,9 @@ macro_rules! wire_enum {
 wire_enum!(
     /// Who is calling. Agents get scoped hub tools only; publisher and human
     /// approval credentials never map to `Agent`. A member is a second human:
-    /// it sees and dismisses only its own notifications.
-    Role { Operator = "operator", Agent = "agent", Procedure = "procedure", Ingest = "ingest", Member = "member" }
+    /// it sees and dismisses only its own notifications. A collector is a
+    /// scoped host/user telemetry and operation executor.
+    Role { Operator = "operator", Agent = "agent", Procedure = "procedure", Ingest = "ingest", Member = "member", Collector = "collector" }
 );
 
 wire_enum!(CanonState { Proposed = "proposed", Accepted = "accepted", Rejected = "rejected", Superseded = "superseded" });

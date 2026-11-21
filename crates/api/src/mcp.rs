@@ -131,7 +131,27 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
         (Effect::Write, assistant_draft_tool(hub.clone())),
         (Effect::Write, ingest_opportunity_tool(hub.clone())),
         (Effect::Write, notify_tool(hub.clone())),
-        (Effect::Write, summary_tool(hub)),
+        (Effect::Write, summary_tool(hub.clone())),
+        (
+            Effect::Read,
+            read_tool(
+                "hub_providers",
+                "AI model providers, multi-account pools, active/preferred accounts, and remaining quota windows.",
+                hub.clone(),
+                |hub| async move { hub.providers().await.map(|value| json_text!(value)) },
+            ),
+        ),
+        (Effect::Read, provider_quota_tool(hub.clone())),
+        (
+            Effect::Read,
+            read_tool(
+                "hub_activity_overview",
+                "AI provider activity overview: API-equivalent cost estimate, tokens, cache hit rate, and model/account breakdowns.",
+                hub.clone(),
+                |hub| async move { hub.activity_overview(&contracts::providers::ActivityScope::default()).await.map(|value| json_text!(value)) },
+            ),
+        ),
+        (Effect::Write, provider_select_account_tool(hub)),
     ]
 }
 
@@ -653,6 +673,98 @@ fn uuid_text<'a>(value: &'a str, key: &str) -> Result<&'a str, String> {
     if shaped { Ok(value) } else { Err(format!("{key} must be a UUID")) }
 }
 
+fn provider_quota_tool(hub: HubClient) -> ToolRoute<()> {
+    ToolRoute::new(
+        Tool::new(
+            "hub_provider_quota",
+            "Quota windows, pool capacity, past windows, and drain forecasts for one model provider.",
+            schema(
+                json!({
+                    "provider_id": {"type": "string", "description": "Model provider id (e.g. claude, antigravity, opencode)."},
+                    "account_id": {"type": "string", "description": "Optional account id to drill down into."},
+                    "range_hours": {"type": "integer", "description": "Optional lookback range in hours (default 48)."}
+                }),
+                &["provider_id"],
+            ),
+        ),
+        move |Parameters(args): Parameters<Value>| {
+            let hub = hub.clone();
+            async move {
+                let provider_id = args.get("provider_id").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                if provider_id.is_empty() || !provider_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) {
+                    return failed("invalid provider_id");
+                }
+                let q = contracts::providers::QuotaQuery {
+                    account_id: args.get("account_id").and_then(Value::as_str).map(String::from),
+                    range_hours: args.get("range_hours").and_then(Value::as_u64).map(|v| v as u32),
+                    ..Default::default()
+                };
+                match hub.provider_quota(&provider_id, &q).await {
+                    Ok(report) => render(json_text!(report)),
+                    Err(e) => failed(e.to_string()),
+                }
+            }
+        },
+    )
+}
+
+fn provider_select_account_tool(hub: HubClient) -> ToolRoute<()> {
+    ToolRoute::new(
+        Tool::new(
+            "hub_provider_select_account",
+            "Select an active account for a model provider (capability-gated; may queue an attended switch).",
+            schema(
+                json!({
+                    "provider_id": {"type": "string", "description": "Model provider id."},
+                    "account_id": {"type": "string", "description": "Account id to select."},
+                    "host": {"type": "string", "description": "Optional target host."},
+                    "unix_user": {"type": "string", "description": "Optional target Unix user."},
+                    "persistent_scope": {"type": "string", "description": "Optional persistent scope: fleet, host, or user."}
+                }),
+                &["provider_id", "account_id"],
+            ),
+        ),
+        move |Parameters(args): Parameters<Value>| {
+            let hub = hub.clone();
+            async move {
+                let provider_id = args.get("provider_id").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                let account_id = args.get("account_id").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                if provider_id.is_empty() || account_id.is_empty() {
+                    return failed("provider_id and account_id are required");
+                }
+                let host = args.get("host").and_then(Value::as_str).map(String::from);
+                let unix_user = args.get("unix_user").and_then(Value::as_str).map(String::from);
+                let persistent_scope = args.get("persistent_scope").and_then(Value::as_str).map(String::from);
+                let command = if let Some(scope) = persistent_scope {
+                    contracts::providers::ProviderCommand::Account(contracts::providers::AccountCommand::SelectPersistentAccount {
+                        account_id: account_id.clone(),
+                        scope,
+                        target: host.clone().or_else(|| unix_user.clone()),
+                    })
+                } else {
+                    contracts::providers::ProviderCommand::Account(contracts::providers::AccountCommand::SelectLocalAccount {
+                        account_id: account_id.clone(),
+                        host: host.clone(),
+                        unix_user: unix_user.clone(),
+                    })
+                };
+                let body = contracts::providers::SubmitOperationIn {
+                    idempotency_key: format!("mcp-select-{provider_id}-{}", uuid::Uuid::new_v4()),
+                    expected_revision: None,
+                    target_account_id: Some(account_id),
+                    target_host: host,
+                    target_user: unix_user,
+                    command,
+                };
+                match hub.submit_provider_operation(&provider_id, &body).await {
+                    Ok(op) => render(json_text!(op)),
+                    Err(e) => failed(e.to_string()),
+                }
+            }
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +800,10 @@ mod tests {
                 ("hub_ingest_opportunity", Effect::Write),
                 ("hub_notify", Effect::Write),
                 ("hub_post_summary", Effect::Write),
+                ("hub_providers", Effect::Read),
+                ("hub_provider_quota", Effect::Read),
+                ("hub_activity_overview", Effect::Read),
+                ("hub_provider_select_account", Effect::Write),
             ]
         );
         let mut names: Vec<&str> = actual.iter().map(|(name, _)| *name).collect();
