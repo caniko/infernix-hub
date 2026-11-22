@@ -836,6 +836,12 @@ fn merge_reloaded_account(existing: &mut Account, next: Account) {
         existing.google_client = next.google_client.or_else(|| existing.google_client.clone());
         existing.google_secret = next.google_secret.or_else(|| existing.google_secret.clone());
     } else {
+        let identity_changed = existing.lane != next.lane
+            || existing.chatgpt_id != next.chatgpt_id
+            || existing.chatgpt_user != next.chatgpt_user
+            || existing.email != next.email
+            || existing.organization != next.organization
+            || existing.project != next.project;
         existing.lane = next.lane;
         existing.email = next.email;
         existing.plan = next.plan;
@@ -845,5 +851,13 @@ fn merge_reloaded_account(existing: &mut Account, next: Account) {
         existing.project = next.project;
         existing.google_client = next.google_client;
         existing.google_secret = next.google_secret;
+        if identity_changed {
+            existing.cooldown = None;
+            existing.windows.clear();
+            existing.grants.clear();
+            existing.next_grant = None;
+            existing.observed = None;
+            existing.probe_failed = false;
+        }
     }
 }

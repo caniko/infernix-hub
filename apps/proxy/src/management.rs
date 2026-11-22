@@ -519,8 +519,8 @@ async fn renew_credentials(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Map<
         return Err(bad("name or all required"));
     }
     let mut results = Vec::new();
-    for account in accounts {
-        let renewed = proxy.token(&account, true).await.is_ok();
+    for mut account in accounts {
+        let renewed = proxy.token(&mut account, true).await.is_ok();
         if name.is_some() && !renewed {
             return Err(upstream());
         }
@@ -570,7 +570,9 @@ async fn models(State(proxy): State<Arc<Proxy>>, Query(query): Query<Name>) -> R
 }
 
 async fn probe_models(proxy: &Proxy, account: &Account) -> Result<Vec<(String, Value)>, Failure> {
-    let token = proxy.token(account, false).await.map_err(|_| upstream())?;
+    let mut account = account.clone();
+    let token = proxy.token(&mut account, false).await.map_err(|_| upstream())?;
+    let account = &account;
     let path = match account.lane {
         Lane::Codex if !account.api_key => "/backend-api/codex/models",
         Lane::Google if account.api_key => "/v1beta/models",
@@ -658,7 +660,7 @@ fn allowed_call(account: &Account, url: &reqwest::Url, method: &str) -> bool {
 }
 
 async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) -> Reply {
-    let account = select(&proxy, &json!({"auth_index":call.auth_index})).await?;
+    let mut account = select(&proxy, &json!({"auth_index":call.auth_index})).await?;
     let url = reqwest::Url::parse(&call.url).map_err(|_| bad("invalid upstream URL"))?;
     let method = call.method.to_ascii_uppercase();
     #[cfg(test)]
@@ -678,7 +680,7 @@ async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) ->
         return Err(bad("invalid API call body or headers"));
     }
     let http = if mock { proxy.http.clone() } else { management_http(&url).await? };
-    let token = proxy.token(&account, false).await.map_err(|_| upstream())?;
+    let token = proxy.token(&mut account, false).await.map_err(|_| upstream())?;
     let mut request = http.request(if method == "POST" { reqwest::Method::POST } else { reqwest::Method::GET }, url);
     for (key, value) in call.header {
         let name = key.to_ascii_lowercase();
@@ -864,7 +866,7 @@ async fn reset_credit(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
 
 async fn start_window(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -> Reply {
     let _guard = proxy.quota_actions.lock().await;
-    let account = select(&proxy, &raw).await?;
+    let mut account = select(&proxy, &raw).await?;
     let model = text(&raw, &["model"]).filter(|model| model.len() <= 192).ok_or_else(|| bad("model required"))?;
     if account.api_key || !matches!(account.lane, Lane::Claude | Lane::Codex) {
         return Err(bad("rolling-window start unsupported for this account"));
@@ -878,9 +880,9 @@ async fn start_window(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
     }) {
         return Err(Failure(StatusCode::CONFLICT, "rolling window is already running"));
     }
+    let token = proxy.token(&mut account, false).await.map_err(|_| upstream())?;
     let path = if account.lane == Lane::Claude { "/v1/messages" } else { "/backend-api/codex/responses" };
     let url = crate::router::upstream(&proxy, &account, &axum::http::Uri::from_static(path)).ok_or_else(upstream)?;
-    let token = proxy.token(&account, false).await.map_err(|_| upstream())?;
     let request = proxy.http.post(url).bearer_auth(token);
     let request = if account.lane == Lane::Claude {
         request

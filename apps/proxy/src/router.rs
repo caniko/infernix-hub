@@ -171,7 +171,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         let started = Utc::now();
         let timeout = Duration::from_secs(policy.first_byte_timeout_secs.clamp(1, 600));
         let incoming = async {
-            let token = proxy.token_mut(&mut account, false).await.map_err(|_| ())?;
+            let token = proxy.token(&mut account, false).await.map_err(|_| ())?;
             let url = upstream(&proxy, &account, &parts.uri).ok_or(())?;
             let payload = request_body(&body, &raw, lane, &account);
             let build = |account: &Account, token: String| {
@@ -208,7 +208,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                 && lane == Lane::Google
                 && !account.api_key
                 && account.refresh.is_some()
-                && let Ok(fresh) = proxy.token_mut(&mut account, true).await
+                && let Ok(fresh) = proxy.token(&mut account, true).await
             {
                 res = build(&account, fresh).send().await.map_err(|_| ())?;
             }

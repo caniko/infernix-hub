@@ -1127,7 +1127,20 @@ async fn expired_claude_token_reloads_from_disk_and_activity_preserves_effort() 
 #[tokio::test]
 async fn reload_preserves_newer_google_token_and_updates_codex_identity() {
     let dir = Scratch::new();
-    let mock = serve(Router::new()).await;
+    let seen_models_account = Arc::new(Mutex::new(None::<String>));
+    let seen_models_account_c = seen_models_account.clone();
+    let mock = serve(Router::new().route(
+        "/backend-api/codex/models",
+        get(move |headers: HeaderMap| {
+            let seen = seen_models_account_c.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer codex-new-access");
+                *seen.lock().await = headers.get("chatgpt-account-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
+                axum::Json(json!({"models": [{"slug": "gpt-5.4"}]}))
+            }
+        }),
+    ))
+    .await;
 
     // Seed a local Antigravity ACP token on disk with no access token (only refresh_token).
     let active_hash = "ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32";
@@ -1207,7 +1220,36 @@ async fn reload_preserves_newer_google_token_and_updates_codex_identity() {
         assert_eq!(google.email.as_deref(), Some("hydrated@example.test"));
     }
 
-    // Replace file-backed codex.json with a login for a different ChatGPT account.
+    // Seed stale cooldown and window on the old Codex account before replacing the login.
+    {
+        let mut state = proxy.state.write().await;
+        let codex = state.pool.accounts.get_mut("codex.json").unwrap();
+        codex.cooldown = Some(Utc::now() + TimeDelta::minutes(30));
+        codex.windows.push(contracts::providers::QuotaWindow {
+            window_key: "five_hour".into(),
+            label: "5h".into(),
+            kind: contracts::providers::QuotaWindowKind::Session,
+            scope_model: None,
+            unit: contracts::providers::QuotaUnit::Percent,
+            used_percent: Some(100.0),
+            remaining_percent: Some(0.0),
+            used_amount: None,
+            limit_amount: None,
+            currency: None,
+            resets_at: Some(Utc::now() + TimeDelta::hours(2)),
+            window_duration_mins: Some(300),
+            cadence: contracts::providers::ResetCadence::RollingOnUse,
+            status: contracts::providers::QuotaStatus::Rejected,
+            observation_state: contracts::providers::QuotaObservationState::Measured,
+            stale: false,
+            observed_at: Some(Utc::now()),
+            error_reason: None,
+        });
+    }
+
+    // Replace file-backed codex.json with a login for a different ChatGPT account, and probe
+    // management `/v8/management/models` while the cached token is expired so `probe_models`
+    // triggers the reload and must send the replacement `chatgpt-account-id` header.
     config::write_private(
         &auth_dir.join("codex.json"),
         &serde_json::to_vec(&json!({
@@ -1222,13 +1264,19 @@ async fn reload_preserves_newer_google_token_and_updates_codex_identity() {
         true,
     )
     .unwrap();
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let models = http.management("GET", "/v8/management/models?name=codex.json", None).await;
+    assert_eq!(models.status(), 200);
+    assert_eq!(seen_models_account.lock().await.as_deref(), Some("acct-new"));
     {
-        let mut state = proxy.state.write().await;
-        state.pool.reload_file(&proxy.config, "codex.json");
+        let state = proxy.state.read().await;
         let codex = &state.pool.accounts["codex.json"];
         assert_eq!(codex.access, "codex-new-access");
         assert_eq!(codex.chatgpt_id.as_deref(), Some("acct-new"));
         assert_eq!(codex.chatgpt_user.as_deref(), Some("user-new"));
         assert_eq!(codex.email.as_deref(), Some("new@example.test"));
+        assert!(codex.cooldown.is_none(), "switching to a different account must clear prior cooldown");
+        assert!(codex.windows.is_empty(), "switching to a different account must clear prior quota windows");
     }
 }

@@ -310,12 +310,12 @@ impl Proxy {
         if missing.is_empty() {
             return;
         }
-        let resolved = futures_util::future::join_all(missing.into_iter().map(|account| async move {
-            let token = self.token(&account, false).await.ok()?;
+        let resolved = futures_util::future::join_all(missing.into_iter().map(|mut account| async move {
+            let token = self.token(&mut account, false).await.ok()?;
             let email = match self.google_token_email(&token).await {
                 Some(email) => Some(email),
                 None if account.refresh.is_some() => {
-                    let fresh = self.token(&account, true).await.ok()?;
+                    let fresh = self.token(&mut account, true).await.ok()?;
                     self.google_token_email(&fresh).await
                 }
                 None => None,
@@ -417,12 +417,7 @@ impl Proxy {
         true
     }
 
-    async fn token(&self, a: &Account, force: bool) -> Result<String> {
-        let mut snapshot = a.clone();
-        self.token_mut(&mut snapshot, force).await
-    }
-
-    async fn token_mut(&self, a: &mut Account, force: bool) -> Result<String> {
+    async fn token(&self, a: &mut Account, force: bool) -> Result<String> {
         if a.api_key {
             return if force { Err(anyhow!("credential renewal is unavailable for API keys")) } else { Ok(a.access.clone()) };
         }
@@ -505,7 +500,7 @@ impl Proxy {
         use integrations::providers::{antigravity, claude, opencode};
         let mut account = account.clone();
         let result = async {
-            let token = self.token_mut(&mut account, false).await.map_err(|_| "credential unavailable")?;
+            let token = self.token(&mut account, false).await.map_err(|_| "credential unavailable")?;
             let account = &account;
             match account.lane {
                 Lane::Claude => {
