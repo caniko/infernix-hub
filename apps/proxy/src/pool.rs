@@ -501,22 +501,28 @@ impl Pool {
 
     pub fn insert(&mut self, accounts: Vec<Account>) {
         for mut a in accounts {
-            if let Some(old) =
-                self.accounts.get(&a.id).filter(|old| old.same_credential(&a) && old.access == a.access && old.refresh == a.refresh)
-            {
-                a.cooldown = old.cooldown;
-                a.auth_cooldown = old.auth_cooldown;
-                a.scoped_cooldowns.clone_from(&old.scoped_cooldowns);
-                a.windows.clone_from(&old.windows);
-                a.google_fallback_keys.clone_from(&old.google_fallback_keys);
-                a.grants.clone_from(&old.grants);
-                a.next_grant.clone_from(&old.next_grant);
-                a.observed = old.observed;
-                a.last_used = old.last_used;
-                a.probe_failed = old.probe_failed;
-                a.probe_generation = old.probe_generation;
-                a.success = old.success;
-                a.failure = old.failure;
+            if let Some(old) = self.accounts.get(&a.id) {
+                if a.local && old.local && old.lane == a.lane {
+                    a.disabled = old.disabled;
+                    a.priority = old.priority;
+                    a.weight = old.weight;
+                    a.note.clone_from(&old.note);
+                }
+                if old.same_credential(&a) && old.access == a.access && old.refresh == a.refresh {
+                    a.cooldown = old.cooldown;
+                    a.auth_cooldown = old.auth_cooldown;
+                    a.scoped_cooldowns.clone_from(&old.scoped_cooldowns);
+                    a.windows.clone_from(&old.windows);
+                    a.google_fallback_keys.clone_from(&old.google_fallback_keys);
+                    a.grants.clone_from(&old.grants);
+                    a.next_grant.clone_from(&old.next_grant);
+                    a.observed = old.observed;
+                    a.last_used = old.last_used;
+                    a.probe_failed = old.probe_failed;
+                    a.probe_generation = old.probe_generation;
+                    a.success = old.success;
+                    a.failure = old.failure;
+                }
             }
             self.accounts.insert(a.id.clone(), a);
         }

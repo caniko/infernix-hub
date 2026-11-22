@@ -7,7 +7,10 @@ mod router;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -31,6 +34,7 @@ pub struct Proxy {
     http: reqwest::Client,
     oauth_refresh: Mutex<()>,
     local_discovery: Mutex<Option<Instant>>,
+    local_discovery_generation: AtomicU64,
     quota_actions: Mutex<()>,
     codex_keys: Mutex<CodexKeys>,
     google_tokens: Mutex<HashMap<[u8; 32], VerifiedGoogleToken>>,
@@ -129,6 +133,7 @@ impl Proxy {
             }),
             oauth_refresh: Mutex::new(()),
             local_discovery: Mutex::new(None),
+            local_discovery_generation: AtomicU64::new(0),
             quota_actions: Mutex::new(()),
             codex_keys: Mutex::new(CodexKeys::default()),
             google_tokens: Mutex::new(HashMap::new()),
@@ -218,18 +223,25 @@ impl Proxy {
     pub async fn discover_local_commands(&self) {
         let _last = self.local_discovery.lock().await;
         self.discover_local_commands_locked().await;
+        self.local_discovery_generation.fetch_add(1, Ordering::Release);
     }
 
     pub async fn refresh_local_commands(&self, min_interval: Duration) -> bool {
         if !self.config.discover_local {
             return false;
         }
+        let seen = self.local_discovery_generation.load(Ordering::Acquire);
         let mut last = self.local_discovery.lock().await;
+        if self.local_discovery_generation.load(Ordering::Acquire) != seen {
+            // Another caller finished a discovery pass while we waited for the lock.
+            return true;
+        }
         if last.is_some_and(|at| at.elapsed() < min_interval) {
             return false;
         }
         self.discover_local_commands_locked().await;
         *last = Some(Instant::now());
+        self.local_discovery_generation.fetch_add(1, Ordering::Release);
         true
     }
 
@@ -287,11 +299,14 @@ impl Proxy {
         }))
         .await;
         let mut state = self.state.write().await;
-        let before = state.pool.accounts.len();
+        let before: Vec<_> =
+            state.pool.accounts.values().filter(|a| a.lane == Lane::Google).map(|a| (a.id.clone(), a.refresh.clone())).collect();
         for (label, raw) in loaded.into_iter().flatten() {
             pool::add_provenance_google(&mut state.pool, &label, raw);
         }
-        if state.pool.accounts.len() != before {
+        let after: Vec<_> =
+            state.pool.accounts.values().filter(|a| a.lane == Lane::Google).map(|a| (a.id.clone(), a.refresh.clone())).collect();
+        if after != before {
             state.pool.revision += 1;
         }
     }

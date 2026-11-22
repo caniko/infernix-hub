@@ -1928,6 +1928,7 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
     .unwrap();
 
     let calls_file = dir.join("provenance-calls");
+    let rotated_flag = dir.join("rotated-google");
     let fake_bin = dir.join("fake-provenance-oauth");
     fs::write(
         &fake_bin,
@@ -1935,12 +1936,13 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
             "#!/bin/sh\n\
              printf 'x\\n' >> {}\n\
              case \"$2\" in\n\
-               *-google.json) printf '{{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"project_id\":\"aicode-consumers\",\"refresh_token\":\"refresh-1\"}}' ;;\n\
+               *-google.json) if [ -f {} ]; then printf '{{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"project_id\":\"aicode-consumers\",\"refresh_token\":\"refresh-1-rotated\"}}'; else printf '{{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"project_id\":\"aicode-consumers\",\"refresh_token\":\"refresh-1\"}}'; fi ;;\n\
                *-google-new.json) printf '{{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"project_id\":\"aicode-consumers\",\"refresh_token\":\"refresh-new\"}}' ;;\n\
                *-google-third.json) printf '{{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"project_id\":\"aicode-consumers\",\"refresh_token\":\"refresh-third\"}}' ;;\n\
                *) exit 1 ;;\n\
              esac\n",
-            calls_file.display()
+            calls_file.display(),
+            rotated_flag.display()
         ),
     )
     .unwrap();
@@ -2019,14 +2021,15 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
     assert_eq!(google_count(&proxy).await, 1);
     let rev_before = proxy.state.read().await.pool.revision;
 
-    // A new enrollment arrives after startup; authorize_google reloads and accepts it immediately.
+    // A new enrollment arrives after startup; concurrent authorize_google callers both succeed.
     config::write_private(
         &oauth_dir.join(format!("{user}-google-new.json")),
         &serde_json::to_vec(&json!({"target":{"provider":"google","profile":"antigravity","user":user}})).unwrap(),
         true,
     )
     .unwrap();
-    assert!(proxy.authorize_google("ya29.client-new").await);
+    let (first_ok, second_ok) = tokio::join!(proxy.authorize_google("ya29.client-new"), proxy.authorize_google("ya29.client-new"));
+    assert!(first_ok && second_ok);
     assert_eq!(google_count(&proxy).await, 2);
     assert!(proxy.state.read().await.pool.revision > rev_before);
 
@@ -2035,7 +2038,19 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
     assert!(!proxy.authorize_google("ya29.client-unknown").await);
     assert_eq!(fs::read_to_string(&calls_file).unwrap().lines().count(), calls_after_reload);
 
-    // Explicit unthrottled refresh picks up another newly deployed manifest.
+    // Rotating a discovered account's refresh token preserves operator overrides (disabled/priority/weight/note).
+    let google_id = {
+        let mut state = proxy.state.write().await;
+        let account = state.pool.accounts.values_mut().find(|a| a.lane == Lane::Google && a.label == "google").unwrap();
+        account.disabled = true;
+        account.priority = 7;
+        account.weight = 3;
+        account.note = Some("paused by operator".into());
+        account.id.clone()
+    };
+    let rev_before_rotation = proxy.state.read().await.pool.revision;
+    fs::write(&rotated_flag, "1").unwrap();
+    // Explicit unthrottled refresh picks up the rotated token and another newly deployed manifest.
     config::write_private(
         &oauth_dir.join(format!("{user}-google-third.json")),
         &serde_json::to_vec(&json!({"target":{"provider":"google","profile":"antigravity","user":user}})).unwrap(),
@@ -2044,6 +2059,14 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
     .unwrap();
     assert!(proxy.refresh_local_commands(Duration::ZERO).await);
     assert_eq!(google_count(&proxy).await, 3);
+    let state = proxy.state.read().await;
+    assert!(state.pool.revision > rev_before_rotation);
+    let rotated = state.pool.accounts.get(&google_id).unwrap();
+    assert_eq!(rotated.refresh.as_deref(), Some("refresh-1-rotated"));
+    assert!(rotated.disabled);
+    assert_eq!(rotated.priority, 7);
+    assert_eq!(rotated.weight, 3);
+    assert_eq!(rotated.note.as_deref(), Some("paused by operator"));
 }
 
 #[tokio::test]
