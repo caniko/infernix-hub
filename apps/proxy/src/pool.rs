@@ -409,17 +409,7 @@ impl Pool {
         discover(config, &mut fresh);
         for (_, next) in fresh.accounts {
             if let Some(existing) = self.accounts.get_mut(&next.id) {
-                existing.access = next.access;
-                existing.refresh = next.refresh;
-                existing.expires = next.expires;
-                existing.email = next.email.or_else(|| existing.email.clone());
-                existing.plan = next.plan.or_else(|| existing.plan.clone());
-                existing.chatgpt_id = next.chatgpt_id.or_else(|| existing.chatgpt_id.clone());
-                existing.chatgpt_user = next.chatgpt_user.or_else(|| existing.chatgpt_user.clone());
-                existing.organization = next.organization.or_else(|| existing.organization.clone());
-                existing.project = next.project.or_else(|| existing.project.clone());
-                existing.google_client = next.google_client.or_else(|| existing.google_client.clone());
-                existing.google_secret = next.google_secret.or_else(|| existing.google_secret.clone());
+                merge_reloaded_account(existing, next);
             } else {
                 let duplicate = self.accounts.values().any(|old| {
                     old.lane == next.lane
@@ -443,9 +433,7 @@ impl Pool {
         {
             for next in accounts {
                 if let Some(existing) = self.accounts.get_mut(&next.id) {
-                    existing.access = next.access;
-                    existing.refresh = next.refresh;
-                    existing.expires = next.expires;
+                    merge_reloaded_account(existing, next);
                 } else {
                     self.accounts.insert(next.id.clone(), next);
                 }
@@ -824,5 +812,38 @@ fn discover(config: &Config, pool: &mut Pool) {
             }
             add(pool, Lane::Google, id, raw);
         }
+    }
+}
+
+fn merge_reloaded_account(existing: &mut Account, next: Account) {
+    let same_refresh = existing.lane == next.lane && existing.refresh.is_some() && existing.refresh == next.refresh;
+    let same_credential = same_refresh || (existing.lane == next.lane && !next.access.is_empty() && existing.access == next.access);
+    let keep_in_memory_token = same_refresh
+        && !existing.access.is_empty()
+        && (next.access.is_empty() || existing.expires.is_some_and(|cur| cur > Utc::now() && next.expires.is_none_or(|n| cur > n)));
+    if !keep_in_memory_token {
+        existing.access = next.access;
+        existing.refresh = next.refresh;
+        existing.expires = next.expires;
+    }
+    if same_credential {
+        existing.email = next.email.or_else(|| existing.email.clone());
+        existing.plan = next.plan.or_else(|| existing.plan.clone());
+        existing.chatgpt_id = next.chatgpt_id.or_else(|| existing.chatgpt_id.clone());
+        existing.chatgpt_user = next.chatgpt_user.or_else(|| existing.chatgpt_user.clone());
+        existing.organization = next.organization.or_else(|| existing.organization.clone());
+        existing.project = next.project.or_else(|| existing.project.clone());
+        existing.google_client = next.google_client.or_else(|| existing.google_client.clone());
+        existing.google_secret = next.google_secret.or_else(|| existing.google_secret.clone());
+    } else {
+        existing.lane = next.lane;
+        existing.email = next.email;
+        existing.plan = next.plan;
+        existing.chatgpt_id = next.chatgpt_id;
+        existing.chatgpt_user = next.chatgpt_user;
+        existing.organization = next.organization;
+        existing.project = next.project;
+        existing.google_client = next.google_client;
+        existing.google_secret = next.google_secret;
     }
 }

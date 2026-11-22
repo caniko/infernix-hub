@@ -1123,3 +1123,112 @@ async fn expired_claude_token_reloads_from_disk_and_activity_preserves_effort() 
     assert_eq!(state.pool.accounts["a.json"].windows.len(), 1);
     assert_eq!(state.pool.accounts["a.json"].windows[0].used_percent, Some(25.0));
 }
+
+#[tokio::test]
+async fn reload_preserves_newer_google_token_and_updates_codex_identity() {
+    let dir = Scratch::new();
+    let mock = serve(Router::new()).await;
+
+    // Seed a local Antigravity ACP token on disk with no access token (only refresh_token).
+    let active_hash = "ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32";
+    let acp_dir = dir.join(&format!("userdata/providers/antigravity/{active_hash}/antigravity-acp"));
+    config::write_private(
+        &acp_dir.join("acp_token.json"),
+        &serde_json::to_vec(&json!({
+            "refresh_token": "google-refresh-1",
+            "client_id": "agy-client",
+            "client_secret": "agy-secret",
+            "project_id": "proj-1"
+        }))
+        .unwrap(),
+        true,
+    )
+    .unwrap();
+
+    let make_id_token = |account_id: &str, user_id: &str| {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD
+            .encode(json!({"https://api.openai.com/auth": {"chatgpt_account_id": account_id, "chatgpt_user_id": user_id}}).to_string());
+        format!("{header}.{payload}.sig")
+    };
+
+    // Seed a file-backed Codex credential for account-old.
+    let auth_dir = dir.join("auth");
+    config::write_private(
+        &auth_dir.join("codex.json"),
+        &serde_json::to_vec(&json!({
+            "type": "codex",
+            "access_token": "codex-old-access",
+            "refresh_token": "codex-old-refresh",
+            "id_token": make_id_token("acct-old", "user-old"),
+            "email": "old@example.test",
+            "expires_at": (Utc::now() - TimeDelta::minutes(5)).to_rfc3339()
+        }))
+        .unwrap(),
+        true,
+    )
+    .unwrap();
+
+    let cfg = Config {
+        bind: config::DEFAULT_BIND.parse().unwrap(),
+        home: dir.0.clone(),
+        t3code_home: dir.0.clone(),
+        auth_dir: auth_dir.clone(),
+        discover_local: true,
+        provenance_oauth_dir: dir.join("empty-oauth"),
+        provenance_oauth_bin: None,
+        client_key: "inference-fixture".into(),
+        management_key: "management-fixture".into(),
+        anthropic: mock.0.clone(),
+        openai: mock.0.clone(),
+        codex: mock.0.clone(),
+        antigravity: mock.0.clone(),
+        url: config::DEFAULT_URL.into(),
+    };
+    let proxy = Arc::new(Proxy::new(cfg).unwrap());
+
+    // Simulate an in-memory Google OAuth renewal + hydrated email, then run reload_local.
+    let future_expiry = Utc::now() + TimeDelta::minutes(50);
+    let google_id = {
+        let mut state = proxy.state.write().await;
+        let google = state.pool.accounts.values_mut().find(|a| a.lane == Lane::Google).unwrap();
+        google.access = "ya29.renewed-in-memory".into();
+        google.expires = Some(future_expiry);
+        google.email = Some("hydrated@example.test".into());
+        google.id.clone()
+    };
+    {
+        let mut state = proxy.state.write().await;
+        state.pool.reload_local(&proxy.config);
+        let google = &state.pool.accounts[&google_id];
+        assert_eq!(google.access, "ya29.renewed-in-memory", "reload_local must keep newer in-memory Google access token");
+        assert_eq!(google.expires, Some(future_expiry));
+        assert_eq!(google.email.as_deref(), Some("hydrated@example.test"));
+    }
+
+    // Replace file-backed codex.json with a login for a different ChatGPT account.
+    config::write_private(
+        &auth_dir.join("codex.json"),
+        &serde_json::to_vec(&json!({
+            "type": "codex",
+            "access_token": "codex-new-access",
+            "refresh_token": "codex-new-refresh",
+            "id_token": make_id_token("acct-new", "user-new"),
+            "email": "new@example.test",
+            "expires_at": (Utc::now() + TimeDelta::hours(1)).to_rfc3339()
+        }))
+        .unwrap(),
+        true,
+    )
+    .unwrap();
+    {
+        let mut state = proxy.state.write().await;
+        state.pool.reload_file(&proxy.config, "codex.json");
+        let codex = &state.pool.accounts["codex.json"];
+        assert_eq!(codex.access, "codex-new-access");
+        assert_eq!(codex.chatgpt_id.as_deref(), Some("acct-new"));
+        assert_eq!(codex.chatgpt_user.as_deref(), Some("user-new"));
+        assert_eq!(codex.email.as_deref(), Some("new@example.test"));
+    }
+}
