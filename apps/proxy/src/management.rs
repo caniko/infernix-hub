@@ -332,6 +332,9 @@ async fn windows(State(proxy): State<Arc<Proxy>>) -> Reply {
 }
 
 pub(crate) async fn refresh_selected(proxy: &Proxy, id: Option<&str>, family: Option<&str>) -> Result<Map<String, Value>, Failure> {
+    if id.is_none() && family.is_none_or(|f| f == "antigravity") {
+        proxy.refresh_local_commands(Duration::from_secs(15)).await;
+    }
     let accounts = {
         let state = proxy.state.read().await;
         if let Some(id) = id {
@@ -508,6 +511,9 @@ async fn delete_credential(State(proxy): State<Arc<Proxy>>, Query(query): Query<
 async fn renew_credentials(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Map<String, Value>>) -> Reply {
     let raw = Value::Object(raw);
     let name = text(&raw, &["name"]);
+    if name.is_none() && raw["all"] == true {
+        proxy.refresh_local_commands(Duration::from_secs(15)).await;
+    }
     let accounts = {
         let state = proxy.state.read().await;
         state.pool.accounts.values().filter(|a| !a.disabled && name.is_none_or(|name| a.name == name)).cloned().collect::<Vec<_>>()

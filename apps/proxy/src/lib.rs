@@ -7,7 +7,10 @@ mod router;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -30,6 +33,8 @@ pub struct Proxy {
     state: RwLock<ProxyState>,
     http: reqwest::Client,
     oauth_refresh: Mutex<()>,
+    local_discovery: Mutex<Option<Instant>>,
+    local_discovery_generation: AtomicU64,
     quota_actions: Mutex<()>,
     codex_keys: Mutex<CodexKeys>,
     google_tokens: Mutex<HashMap<[u8; 32], VerifiedGoogleToken>>,
@@ -127,6 +132,8 @@ impl Proxy {
                 captures: Captures::default(),
             }),
             oauth_refresh: Mutex::new(()),
+            local_discovery: Mutex::new(None),
+            local_discovery_generation: AtomicU64::new(0),
             quota_actions: Mutex::new(()),
             codex_keys: Mutex::new(CodexKeys::default()),
             google_tokens: Mutex::new(HashMap::new()),
@@ -214,6 +221,31 @@ impl Proxy {
     }
 
     pub async fn discover_local_commands(&self) {
+        let _last = self.local_discovery.lock().await;
+        self.discover_local_commands_locked().await;
+        self.local_discovery_generation.fetch_add(1, Ordering::Release);
+    }
+
+    pub async fn refresh_local_commands(&self, min_interval: Duration) -> bool {
+        if !self.config.discover_local {
+            return false;
+        }
+        let seen = self.local_discovery_generation.load(Ordering::Acquire);
+        let mut last = self.local_discovery.lock().await;
+        if self.local_discovery_generation.load(Ordering::Acquire) != seen {
+            // Another caller finished a discovery pass while we waited for the lock.
+            return true;
+        }
+        if last.is_some_and(|at| at.elapsed() < min_interval) {
+            return false;
+        }
+        self.discover_local_commands_locked().await;
+        *last = Some(Instant::now());
+        self.local_discovery_generation.fetch_add(1, Ordering::Release);
+        true
+    }
+
+    async fn discover_local_commands_locked(&self) {
         if !self.config.discover_local {
             return;
         }
@@ -267,8 +299,15 @@ impl Proxy {
         }))
         .await;
         let mut state = self.state.write().await;
+        let before: Vec<_> =
+            state.pool.accounts.values().filter(|a| a.lane == Lane::Google).map(|a| (a.id.clone(), a.refresh.clone())).collect();
         for (label, raw) in loaded.into_iter().flatten() {
             pool::add_provenance_google(&mut state.pool, &label, raw);
+        }
+        let after: Vec<_> =
+            state.pool.accounts.values().filter(|a| a.lane == Lane::Google).map(|a| (a.id.clone(), a.refresh.clone())).collect();
+        if after != before {
+            state.pool.revision += 1;
         }
     }
 
@@ -360,14 +399,18 @@ impl Proxy {
             }
         }
         self.hydrate_google_emails().await;
-        let has_candidates = {
-            let state = self.state.read().await;
-            state
-                .pool
-                .accounts
+        let has_pool_candidates = |pool: &Pool| {
+            pool.accounts
                 .values()
                 .any(|a| !a.disabled && !a.api_key && a.lane == Lane::Google && a.google_client.is_some() && a.email.is_some())
         };
+        let mut has_candidates = has_pool_candidates(&self.state.read().await.pool);
+        let mut refreshed = false;
+        if !has_candidates && self.refresh_local_commands(Duration::from_secs(15)).await {
+            refreshed = true;
+            self.hydrate_google_emails().await;
+            has_candidates = has_pool_candidates(&self.state.read().await.pool);
+        }
         if !has_candidates {
             return false;
         }
@@ -384,10 +427,15 @@ impl Proxy {
             return false;
         };
         let clients: Vec<&str> = [pool::text(&info, &["aud"]), pool::text(&info, &["azp"])].into_iter().flatten().collect();
-        let matched_client = {
+        let mut matched_client = {
             let state = self.state.read().await;
-            clients.into_iter().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned)
+            clients.iter().copied().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned)
         };
+        if matched_client.is_none() && !refreshed && self.refresh_local_commands(Duration::from_secs(15)).await {
+            self.hydrate_google_emails().await;
+            let state = self.state.read().await;
+            matched_client = clients.iter().copied().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned);
+        }
         let Some(client_id) = matched_client else {
             return false;
         };
