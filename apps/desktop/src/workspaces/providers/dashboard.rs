@@ -126,12 +126,17 @@ pub(super) fn sorted_accounts(provider: &ProviderSummary, sort: AccountSortOrder
 #[component]
 fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
     let client = use_context::<HubClient>();
+    let mut provider = provider;
+    let other_accounts: Vec<_> = provider
+        .routed_account_ids
+        .as_ref()
+        .map_or_else(Vec::new, |ids| provider.accounts.extract_if(.., |a| !ids.contains(&a.id)).collect());
     let panel = use_context::<PanelState>();
     let prefs = (panel.settings)();
     let mut selected = use_signal(|| None::<String>);
     let id = &provider.descriptor.id;
     let selected_id = selected.cloned();
-    let account = selected_id.as_ref().and_then(|id| provider.accounts.iter().find(|a| &a.id == id));
+    let account = selected_id.as_ref().and_then(|id| provider.accounts.iter().chain(&other_accounts).find(|a| &a.id == id));
     let (health, tone) = provider_health(provider.descriptor.health, stale);
     let (mode, mode_tone) = crate::labels::adapter_mode(provider.descriptor.mode);
     let (verification, verification_tone) = crate::labels::verification(provider.descriptor.verification);
@@ -230,6 +235,20 @@ fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
                             rsx! { AccountSummary { key: "{account.id}", provider: provider.clone(), account: account.clone(), mask: prefs.mask_emails,
                                 forecasts: forecasts.clone(),
                                 chart: move |_| selected.set(Some(account_id.clone())) } }
+                        }
+                    }
+                }
+                if !other_accounts.is_empty() {
+                    details {
+                        summary { "Other account quota history" }
+                        for account in &other_accounts {
+                            {
+                                let account_id = account.id.clone();
+                                rsx! { button { key: "{account.id}", class: "btn ghost btn-xs",
+                                    onclick: move |_| selected.set(Some(account_id.clone())),
+                                    "{account_name(account, prefs.mask_emails)}"
+                                } }
+                            }
                         }
                     }
                 }

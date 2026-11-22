@@ -417,6 +417,12 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
     }
 
     if let Some(routing) = &batch.routing_status {
+        // The native proxy publishes its complete pool with its routing view.
+        // Other collectors may send partial inventory and cannot define a pool.
+        let routed_account_ids = (routing.router_id.as_deref() == Some("fleetix-proxy")
+            && source_publisher == Some("fleetix-agent-proxy")
+            && batch.account_inventory_complete)
+            .then(|| batch.accounts.iter().map(|a| a.id.as_str()).collect::<Vec<_>>());
         let clean_logs: Vec<ProxyLogEntry> = routing
             .recent_logs
             .iter()
@@ -431,8 +437,8 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
             .collect();
         sqlx::query(
             "insert into provider_routing_state
-                (provider_id, router_id, revision, runtime, policy, clients, lockouts, recent_logs, rolling_starter, updated_at)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+                (provider_id, router_id, revision, runtime, policy, clients, lockouts, recent_logs, rolling_starter, routed_account_ids, updated_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
              on conflict (provider_id) do update set
                 router_id = excluded.router_id,
                 revision = greatest(provider_routing_state.revision, excluded.revision),
@@ -442,6 +448,7 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
                 lockouts = excluded.lockouts,
                 recent_logs = excluded.recent_logs,
                 rolling_starter = excluded.rolling_starter,
+                routed_account_ids = coalesce(excluded.routed_account_ids, provider_routing_state.routed_account_ids),
                 updated_at = now()",
         )
         .bind(provider_id)
@@ -453,6 +460,7 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
         .bind(serde_json::to_value(&routing.lockouts).unwrap_or_else(|_| json!([])))
         .bind(serde_json::to_value(&clean_logs).unwrap_or_else(|_| json!([])))
         .bind(serde_json::to_value(&routing.rolling_starter).unwrap_or_else(|_| json!({})))
+        .bind(routed_account_ids)
         .execute(&mut *tx)
         .await?;
     }
@@ -637,7 +645,7 @@ pub async fn get_provider(hub: &Hub, actor: &Actor, provider_id: &str) -> DResul
 pub async fn list_accounts(hub: &Hub, actor: &Actor, provider_id: &str) -> DResult<Vec<ModelAccount>> {
     actor.require(ANY_READER)?;
     let _ = load_descriptor(hub, provider_id).await?;
-    load_accounts_with_latest_windows(&hub.db, provider_id, None).await
+    load_accounts_with_latest_windows(&hub.db, provider_id, None, None).await
 }
 
 pub async fn list_models(hub: &Hub, actor: &Actor, provider_id: &str) -> DResult<Vec<DiscoveredModel>> {
@@ -708,7 +716,8 @@ pub async fn quota_report(hub: &Hub, actor: &Actor, provider_id: &str, query: Qu
     actor.require(ANY_READER)?;
     let as_of = Utc::now();
     let desc = load_descriptor(hub, provider_id).await?;
-    let accounts = load_accounts_with_latest_windows(&hub.db, provider_id, Some(as_of)).await?;
+    let routed = if query.account_id.is_none() { routed_account_ids(&hub.db, provider_id).await? } else { None };
+    let accounts = load_accounts_with_latest_windows(&hub.db, provider_id, Some(as_of), routed.as_deref()).await?;
     let range_hours = query.range_hours.unwrap_or(48).clamp(1, 24 * 35);
     let lookback_hours = query.lookback_hours.unwrap_or(6).clamp(1, 168);
     let horizon_hours = query.horizon_hours.unwrap_or(12).clamp(1, 168);
@@ -727,16 +736,18 @@ pub async fn quota_report(hub: &Hub, actor: &Actor, provider_id: &str, query: Qu
               and observed_at between $2 and $3
               and ($4::text is null or account_id = $4)
               and ($5::text is null or window_key = $5)
+              and ($6::text[] is null or account_id = any($6))
             order by account_id, window_key, coalesce(model_quota_samples.scope_model, ''), observed_at, id desc
          ) s
          order by s.observed_at desc, s.id desc
-         limit $6",
+         limit $7",
     )
     .bind(provider_id)
     .bind(fetch_since)
     .bind(as_of)
     .bind(&query.account_id)
     .bind(&query.window_key)
+    .bind(routed.as_deref())
     .bind((HISTORY_LIMIT + 1) as i64)
     .fetch_all(&hub.db)
     .await?;
@@ -789,28 +800,41 @@ async fn load_descriptor(hub: &Hub, provider_id: &str) -> DResult<ProviderDescri
 }
 
 async fn build_provider_summary(hub: &Hub, descriptor: ProviderDescriptor) -> DResult<ProviderSummary> {
-    let accounts = load_accounts_with_latest_windows(&hub.db, &descriptor.id, None).await?;
-    let enabled_accounts = accounts.iter().filter(|a| a.enabled).count();
-    let active_account_id = accounts.iter().find(|a| a.is_active).map(|a| a.id.clone());
-    let preferred_account_id = accounts.iter().find(|a| a.is_preferred).map(|a| a.id.clone());
-    let next_pick_account_id = accounts.iter().find(|a| a.is_next_pick).map(|a| a.id.clone());
-    let pools = compute_pools(&descriptor.id, &accounts, &[]);
+    let routed_account_ids = routed_account_ids(&hub.db, &descriptor.id).await?.map(|ids| ids.into_iter().collect::<BTreeSet<_>>());
+    let accounts = load_accounts_with_latest_windows(&hub.db, &descriptor.id, None, None).await?;
+    let pool_accounts = accounts.iter().filter(|a| routed_account_ids.as_ref().is_none_or(|ids| ids.contains(&a.id)));
+    let account_count = pool_accounts.clone().count();
+    let enabled_accounts = pool_accounts.clone().filter(|a| a.enabled).count();
+    let active_account_id = pool_accounts.clone().find(|a| a.is_active).map(|a| a.id.clone());
+    let preferred_account_id = pool_accounts.clone().find(|a| a.is_preferred).map(|a| a.id.clone());
+    let next_pick_account_id = pool_accounts.clone().find(|a| a.is_next_pick).map(|a| a.id.clone());
+    let pools = compute_pools(&descriptor.id, pool_accounts, &[]);
     Ok(ProviderSummary {
         descriptor,
-        account_count: accounts.len(),
+        account_count,
         enabled_accounts,
         active_account_id,
         preferred_account_id,
         next_pick_account_id,
         pools,
         accounts,
+        routed_account_ids,
     })
+}
+
+async fn routed_account_ids(db: &sqlx::PgPool, provider_id: &str) -> DResult<Option<Vec<String>>> {
+    Ok(sqlx::query_scalar("select routed_account_ids from provider_routing_state where provider_id = $1")
+        .bind(provider_id)
+        .fetch_optional(db)
+        .await?
+        .flatten())
 }
 
 async fn load_accounts_with_latest_windows(
     db: &sqlx::PgPool,
     provider_id: &str,
     as_of: Option<DateTime<Utc>>,
+    account_ids: Option<&[String]>,
 ) -> DResult<Vec<ModelAccount>> {
     let acct_rows: Vec<Value> = sqlx::query_scalar(
         "select to_jsonb(a) from (
@@ -827,10 +851,12 @@ async fn load_accounts_with_latest_windows(
                    ) end as last_error
             from model_accounts
             where provider_id = $1
+              and ($2::text[] is null or id = any($2))
             order by priority desc, id asc
          ) a",
     )
     .bind(provider_id)
+    .bind(account_ids)
     .fetch_all(db)
     .await?;
 
@@ -841,12 +867,14 @@ async fn load_accounts_with_latest_windows(
                 used_amount, limit_amount, currency, resets_at, window_duration_mins,
                  cadence, nullif(scope_model, '') as scope_model, status, observation_state, observed_at, stale, error_reason
             from model_quota_samples
-            where provider_id = $1 and ($2::timestamptz is null or observed_at <= $2)
+             where provider_id = $1 and ($2::timestamptz is null or observed_at <= $2)
+               and ($3::text[] is null or account_id = any($3))
             order by account_id, window_key, coalesce(model_quota_samples.scope_model, ''), observed_at desc, id desc
          ) w",
     )
     .bind(provider_id)
     .bind(as_of)
+    .bind(account_ids)
     .fetch_all(db)
     .await?;
 
@@ -907,12 +935,15 @@ async fn load_accounts_with_latest_windows(
 /// Combine compatible windows across distinct eligible enabled accounts.
 /// Never averages missing/unobserved accounts as zero and never treats routing
 /// weight as quota capacity (uses plan `tier_multiplier` when available).
-pub fn compute_pools(provider_id: &str, accounts: &[ModelAccount], forecasts: &[QuotaForecast]) -> Vec<PoolWindowSummary> {
-    let eligible: Vec<&ModelAccount> = accounts.iter().filter(|a| a.enabled).collect();
+pub fn compute_pools<'a>(
+    provider_id: &str,
+    accounts: impl IntoIterator<Item = &'a ModelAccount>,
+    forecasts: &[QuotaForecast],
+) -> Vec<PoolWindowSummary> {
     // Deduplicate logical entitlements by credential_fingerprint when present.
     let mut seen_fp: BTreeSet<String> = BTreeSet::new();
     let mut distinct_eligible: Vec<&ModelAccount> = Vec::new();
-    for acct in eligible {
+    for acct in accounts.into_iter().filter(|a| a.enabled) {
         if let Some(fp) = &acct.credential_fingerprint
             && !seen_fp.insert(fp.clone())
         {
@@ -1821,7 +1852,7 @@ pub async fn reconcile_quota_notifications(hub: &Hub) -> DResult<()> {
 
 pub async fn sync_quota_notifications(hub: &Hub, provider_id: &str) -> DResult<()> {
     let settings = get_settings(hub, &internal_operator("provider-notify")).await?;
-    let accounts = load_accounts_with_latest_windows(&hub.db, provider_id, None).await?;
+    let accounts = load_accounts_with_latest_windows(&hub.db, provider_id, None, None).await?;
     let source = format!("providers:{provider_id}");
     notifications::sync(hub, &source, quota_raises(provider_id, &settings, &accounts, Utc::now())).await?;
     Ok(())
@@ -1845,7 +1876,7 @@ pub async fn sync_provider_health_notifications(hub: &Hub, provider_id: &str) ->
 }
 
 async fn sync_provider_health(hub: &Hub, provider: &ProviderDescriptor, settings: &ProviderPanelSettings) -> DResult<()> {
-    let accounts = load_accounts_with_latest_windows(&hub.db, &provider.id, None).await?;
+    let accounts = load_accounts_with_latest_windows(&hub.db, &provider.id, None, None).await?;
     let publishers = sqlx::query_as(
         "select source_host, source_user, max(last_observed_at) from model_provider_publishers
          where provider_id = $1 group by source_host, source_user order by source_host, source_user",

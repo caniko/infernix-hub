@@ -125,13 +125,18 @@ pub struct ProviderDescriptor {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSummary {
     pub descriptor: ProviderDescriptor,
+    /// Counts are scoped to the reported router pool when known.
     pub account_count: usize,
     pub enabled_accounts: usize,
     pub active_account_id: Option<String>,
     pub preferred_account_id: Option<String>,
     pub next_pick_account_id: Option<String>,
     pub pools: Vec<PoolWindowSummary>,
+    /// Retained account inventory, including accounts outside the router pool.
     pub accounts: Vec<ModelAccount>,
+    /// Membership of the latest native proxy report; empty is a known empty pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_account_ids: Option<BTreeSet<String>>,
 }
 
 // ── Accounts & Quota Windows ────────────────────────────────────────────────
