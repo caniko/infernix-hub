@@ -6,15 +6,24 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 
-fn worst(windows: impl IntoIterator<Item = QuotaWindow>) -> Vec<QuotaWindow> {
+/// Keep the most restrictive active observation for each Antigravity quota bucket.
+pub fn merge_antigravity_windows(windows: impl IntoIterator<Item = QuotaWindow>) -> Vec<QuotaWindow> {
+    let now = Utc::now();
+    let severity = |w: &QuotaWindow| {
+        let active = w.resets_at.is_none_or(|t| t > w.observed_at.unwrap_or(now).min(now));
+        let rejected = w.status == QuotaStatus::Rejected;
+        (active, if rejected { Some(100.0) } else { w.used_percent }, w.resets_at, rejected)
+    };
     let mut merged = BTreeMap::<String, QuotaWindow>::new();
     for window in windows {
-        let existing = merged.entry(window.window_key.clone()).or_insert_with(|| window.clone());
-        if window.used_percent > existing.used_percent
-            || (window.used_percent == existing.used_percent && window.resets_at > existing.resets_at)
-        {
-            *existing = window;
-        }
+        merged
+            .entry(window.window_key.clone())
+            .and_modify(|existing| {
+                if severity(&window) > severity(existing) {
+                    *existing = window.clone();
+                }
+            })
+            .or_insert(window);
     }
     merged.into_values().collect()
 }
@@ -28,7 +37,7 @@ fn quota(key: &str, label: &str, raw: &Value, at: DateTime<Utc>) -> QuotaWindow 
 
 pub fn parse_antigravity_summary(body: &Value, requested_at: DateTime<Utc>) -> Vec<QuotaWindow> {
     let groups = rows(&body["groups"]).iter().chain(std::iter::once(body));
-    worst(groups.flat_map(|group| {
+    merge_antigravity_windows(groups.flat_map(|group| {
         rows(&group["buckets"]).iter().filter_map(move |raw| {
             let key = str_field(&raw["bucketId"])?;
             if raw["disabled"].as_bool() == Some(true) {
@@ -74,14 +83,21 @@ pub fn parse_antigravity_summary(body: &Value, requested_at: DateTime<Utc>) -> V
 }
 
 pub fn parse_antigravity_models_fallback(body: &Value, observed_at: DateTime<Utc>) -> Vec<QuotaWindow> {
-    worst(body["models"].as_object().into_iter().flatten().flat_map(|(id, model)| {
+    let models = body["models"].as_object();
+    let corroborated = models.is_some_and(|models| {
+        models.values().any(|model| ["quotaInfo", "weeklyQuotaInfo"].into_iter().any(|key| model[key]["remainingFraction"].is_number()))
+    });
+    merge_antigravity_windows(models.into_iter().flatten().flat_map(|(id, model)| {
         let provider = model["modelProvider"].as_str();
-        let family = if provider == Some("MODEL_PROVIDER_GOOGLE") || id.starts_with("gemini-") {
-            "Gemini"
-        } else if provider == Some("MODEL_PROVIDER_ANTHROPIC") || id.starts_with("claude-") {
-            "Claude"
-        } else if provider == Some("MODEL_PROVIDER_OPENAI") || id.starts_with("gpt-") {
-            "GPT"
+        let (bucket, family) = if id.starts_with("gemini-") && id.contains("argon") {
+            ("gemini-argon", "Gemini 4 Argon")
+        } else if provider == Some("MODEL_PROVIDER_GOOGLE") || id.starts_with("gemini-") {
+            ("gemini", "Gemini")
+        } else if matches!(provider, Some("MODEL_PROVIDER_ANTHROPIC" | "MODEL_PROVIDER_OPENAI"))
+            || id.starts_with("claude-")
+            || id.starts_with("gpt-")
+        {
+            ("3p", "Claude & GPT (shared)")
         } else {
             return Vec::new();
         };
@@ -92,10 +108,25 @@ pub fn parse_antigravity_models_fallback(body: &Value, observed_at: DateTime<Utc
         .into_iter()
         .filter_map(|(key, suffix, label, kind)| {
             let raw = model.get(key)?;
-            let mut window = quota(&format!("{}-{suffix}", family.to_lowercase()), &format!("{family} · {label}"), raw, observed_at);
-            window.kind = kind;
-            window.scope_model = Some(family.into());
+            let mut window = quota(&format!("{bucket}-{suffix}"), &format!("{family} · {label}"), raw, observed_at);
+            if corroborated
+                && raw.is_object()
+                && raw.get("remainingFraction").is_none()
+                && window.resets_at.is_some_and(|t| t > observed_at)
+            {
+                window.used_percent = Some(100.0);
+                window.remaining_percent = Some(0.0);
+                window.status = QuotaStatus::Rejected;
+                window.observation_state = QuotaObservationState::Measured;
+            }
             window.window_duration_mins = uint(&raw["windowDurationMins"]);
+            window.kind = match (kind, window.window_duration_mins) {
+                (QuotaWindowKind::Custom, Some(300)) => QuotaWindowKind::Session,
+                (QuotaWindowKind::Custom, Some(1440)) => QuotaWindowKind::Daily,
+                (QuotaWindowKind::Custom, Some(10080)) => QuotaWindowKind::Weekly,
+                _ => kind,
+            };
+            window.scope_model = Some(family.into());
             Some(window)
         })
         .collect()
@@ -132,7 +163,7 @@ async fn cloud_quota(
     });
     let [daily, standard] = reads;
     let (daily, standard) = tokio::join!(daily, standard);
-    worst(daily.into_iter().chain(standard))
+    merge_antigravity_windows(daily.into_iter().chain(standard))
 }
 
 /// Use a no-redirect HTTP client: the OAuth refresh sends credentials in the request body.

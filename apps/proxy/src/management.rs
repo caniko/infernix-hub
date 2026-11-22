@@ -15,7 +15,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
-use contracts::providers::{ApiKeyOrder, RouteStrategy, RoutingPolicy};
+use contracts::providers::{ApiKeyOrder, QuotaWindowKind, RouteStrategy, RoutingPolicy};
 use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -26,7 +26,7 @@ use crate::{
     clients::Client,
     config::{matches_secret, read_text, write_private},
     openai_account,
-    pool::{Account, Lane, Pool, filename, parse_credentials, text},
+    pool::{Account, Lane, Pool, enforces_quota, filename, parse_credentials, text},
     provider_json,
     router::bearer,
 };
@@ -762,19 +762,30 @@ fn public_ip(ip: IpAddr) -> bool {
     }
 }
 
-fn clear_quota(pool: &mut Pool, account: &Account) -> usize {
-    let Some(a) = pool.accounts.get_mut(&account.id).filter(|a| a.access == account.access) else { return 0 };
+fn clear_quota(pool: &mut Pool, account: &Account, manual: bool) -> usize {
+    let Some(a) = pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account)) else { return 0 };
     a.cooldown = None;
+    a.scoped_cooldowns.clear();
     a.grants.clear();
     a.next_grant = None;
+    a.probe_generation = 0;
+    if manual {
+        a.auth_cooldown = None;
+    }
     let before = a.windows.len();
-    a.windows.retain(|w| !matches!(w.kind, contracts::providers::QuotaWindowKind::Session | contracts::providers::QuotaWindowKind::Weekly));
+    a.windows.retain(|w| match w.kind {
+        QuotaWindowKind::Session | QuotaWindowKind::Weekly => false,
+        QuotaWindowKind::Daily | QuotaWindowKind::Monthly | QuotaWindowKind::ModelScoped => !manual,
+        QuotaWindowKind::Custom => !manual || !enforces_quota(w),
+        QuotaWindowKind::Spend => true,
+    });
+    a.google_fallback_keys.retain(|key| a.windows.iter().any(|w| &w.window_key == key));
     before - a.windows.len()
 }
 
 async fn reset_quota(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -> Reply {
     let account = select(&proxy, &raw).await?;
-    let count = clear_quota(&mut proxy.state.write().await.pool, &account);
+    let count = clear_quota(&mut proxy.state.write().await.pool, &account, true);
     ok(json!({"status":"ok","windows_reset":count}))
 }
 
@@ -843,7 +854,7 @@ async fn reset_credit(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
             .ok_or_else(upstream)?
     };
     let count = if account.lane == Lane::Codex && matches!(code, "reset" | "already_redeemed") {
-        clear_quota(&mut proxy.state.write().await.pool, &account)
+        clear_quota(&mut proxy.state.write().await.pool, &account, false)
     } else {
         0
     };
@@ -880,8 +891,8 @@ async fn start_window(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
     }
     let path = if account.lane == Lane::Claude { "/v1/messages" } else { "/backend-api/codex/responses" };
     let url = crate::router::upstream(&proxy, &account, &axum::http::Uri::from_static(path)).ok_or_else(upstream)?;
-    let token = proxy.token(&account, false).await.map_err(|_| upstream())?;
-    let request = proxy.http.post(url).bearer_auth(token);
+    let account = proxy.token_account(&account, false).await.map_err(|_| upstream())?;
+    let request = proxy.http.post(url).bearer_auth(&account.access);
     let request = if account.lane == Lane::Claude {
         request
             .header("anthropic-version", "2023-06-01")

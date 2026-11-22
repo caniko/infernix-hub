@@ -3,7 +3,7 @@ use contracts::providers::*;
 use domain::ports::{ModelProvider, PortError, ProviderDispatch, ProviderIntent, ProviderReconciliation};
 use hub_integrations::providers::{
     SpillwayProxyProvider,
-    antigravity::{parse_antigravity_models_fallback, parse_antigravity_summary},
+    antigravity::{merge_antigravity_windows, parse_antigravity_models_fallback, parse_antigravity_summary},
     claude::{parse_claude_oauth_usage, parse_meridian_quota_all},
     fixture::{FullFixtureModelProvider, ReadOnlyFixtureModelProvider},
     http_client,
@@ -25,6 +25,7 @@ fn claude_windows_keep_nulls_and_converts_minor_units() {
             "seven_day": {"utilization": null, "resets_at": "2026-11-24T00:00:00Z"},
             "seven_day_opus": null,
             "seven_day_sonnet": {"utilization": 60},
+            "seven_day_haiku": {"utilization": 100},
             "seven_day_oauth_apps": {"utilization": 12},
             "seven_day_cowork": {"utilization": 18},
         "model_scoped": [{"model_id": "custom-one", "display_name": "Custom One", "utilization": 66}],
@@ -41,6 +42,8 @@ fn claude_windows_keep_nulls_and_converts_minor_units() {
     assert_eq!(get("seven_day").used_percent, None);
     assert_eq!(get("seven_day_opus").used_percent, None);
     assert_eq!(get("seven_day_sonnet").scope_model.as_deref(), Some("sonnet"));
+    assert_eq!(get("seven_day_haiku").scope_model.as_deref(), Some("haiku"));
+    assert_eq!(get("seven_day_haiku").kind, QuotaWindowKind::ModelScoped);
     assert_eq!(get("extra_usage").used_amount, Some(5.7));
     assert_eq!(get("extra_usage").used_percent, None);
     assert_eq!(get("spend").used_amount, Some(8.5));
@@ -104,21 +107,87 @@ fn antigravity_merges_summary_and_filters_only_untouched_resets() {
 }
 
 #[test]
+fn antigravity_merges_quota_hosts_by_worst_reading_per_bucket() {
+    let resets = now() + TimeDelta::hours(2);
+    let summary = |session, weekly| {
+        parse_antigravity_summary(
+            &json!({"buckets":[
+                {"bucketId":"gemini-5h","window":"5h","remainingFraction":session,"resetTime":resets},
+                {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":weekly,"resetTime":resets},
+            ]}),
+            now(),
+        )
+    };
+    let daily = summary(0.0, 0.75);
+    let standard = summary(0.5, 0.25);
+    let windows = merge_antigravity_windows(daily.into_iter().chain(standard));
+    assert_eq!(
+        windows.iter().map(|w| (w.window_key.as_str(), w.used_percent)).collect::<Vec<_>>(),
+        [("gemini-5h", Some(100.0)), ("gemini-weekly", Some(75.0))]
+    );
+}
+
+#[test]
 fn antigravity_model_fallback_keeps_worst_family_reading_without_guessing_duration() {
     let windows = parse_antigravity_models_fallback(
         &json!({"models": {
             "gpt-a": {"quotaInfo": {"remainingFraction": 0.5}},
-            "gpt-b": {"quotaInfo": {"remainingFraction": 0.25}, "weeklyQuotaInfo": {"remainingFraction": 0.75}},
+            "claude-b": {"quotaInfo": {"remainingFraction": 0.25}, "weeklyQuotaInfo": {"remainingFraction": 0.75}},
             "gpt-c": {"quotaInfo": {"remainingFraction": null}},
             "unknown": {"quotaInfo": {"remainingFraction": 0}}
         }}),
         now(),
     );
     assert_eq!(windows.len(), 2);
+    assert_eq!(windows[0].window_key, "3p-quota");
+    assert_eq!(windows[1].window_key, "3p-weekly");
+    assert!(windows.iter().all(|w| w.scope_model.as_deref() == Some("Claude & GPT (shared)")));
     assert_eq!(windows[0].used_percent, Some(75.0));
     assert_eq!(windows[0].window_duration_mins, None);
     assert_eq!(windows[0].cadence, ResetCadence::Unknown);
     assert_eq!(windows[1].kind, QuotaWindowKind::Weekly);
+}
+
+#[test]
+fn antigravity_model_fallback_requires_corroboration_for_omitted_zero() {
+    let future = now() + TimeDelta::hours(2);
+    let mut raw = json!({"models": {
+        "gemini-4-neon-high": {"quotaInfo": {"resetTime": future}},
+        "gemini-4-neon-low": {"quotaInfo": {"resetTime": future, "remainingFraction": 0.25}},
+        "gemini-4-argon-high": {"quotaInfo": {"remainingFraction": 0.995}, "weeklyQuotaInfo": {"resetTime": future}},
+        "gemini-4-argon-low": {"quotaInfo": {"resetTime": future, "remainingFraction": null}},
+        "gpt-old": {"quotaInfo": {"resetTime": now()}}
+    }});
+    let windows = parse_antigravity_models_fallback(&raw, now());
+    let get = |key| windows.iter().find(|w| w.window_key == key).unwrap();
+    let neon = get("gemini-quota");
+    assert_eq!(neon.used_percent, Some(100.0));
+    assert_eq!(neon.status, QuotaStatus::Rejected);
+    assert_eq!(neon.observation_state, QuotaObservationState::Measured);
+    assert_eq!(neon.resets_at, Some(future));
+    let argon = get("gemini-argon-quota");
+    assert_eq!(argon.scope_model.as_deref(), Some("Gemini 4 Argon"));
+    assert!((argon.remaining_percent.unwrap() - 99.5).abs() < 1e-9);
+    assert_eq!(get("gemini-argon-weekly").status, QuotaStatus::Rejected);
+    assert_eq!(get("3p-quota").used_percent, None);
+
+    raw["models"]["gemini-4-neon-low"]["quotaInfo"]["remainingFraction"] = Value::Null;
+    raw["models"]["gemini-4-argon-high"]["quotaInfo"]["remainingFraction"] = Value::Null;
+    assert!(parse_antigravity_models_fallback(&raw, now()).iter().all(|w| w.used_percent.is_none()));
+}
+
+#[test]
+fn antigravity_fallback_classifies_explicit_durations() {
+    for (minutes, kind) in
+        [(300, QuotaWindowKind::Session), (1440, QuotaWindowKind::Daily), (10080, QuotaWindowKind::Weekly), (1234, QuotaWindowKind::Custom)]
+    {
+        let windows = parse_antigravity_models_fallback(
+            &json!({"models":{"gemini-4":{"quotaInfo":{"remainingFraction":0.5,"windowDurationMins":minutes}}}}),
+            now(),
+        );
+        assert_eq!(windows[0].window_duration_mins, Some(minutes));
+        assert_eq!(windows[0].kind, kind);
+    }
 }
 
 #[test]
@@ -149,6 +218,47 @@ fn wham_separates_credits_from_reset_grants() {
     assert!(grant.applicable && grant.weekly_credit_back);
     assert_eq!(grant.cleared_windows, ["primary_window"]);
     assert!(parse_chatgpt_wham_usage(&json!({"credits": {"unlimited": true}}), now()).2.is_none());
+}
+
+#[test]
+fn wham_rejection_preserves_fractional_precision_and_missing_readings() {
+    for flag in [json!({"allowed": false}), json!({"limit_reached": true})] {
+        for (used, expected) in [(json!(1.0), Some(100.0)), (Value::Null, None)] {
+            let mut raw = flag.clone();
+            raw["primary_window"] = json!({"used_percent": used});
+            raw["secondary_window"] = json!({"used_percent": 0.999});
+            let (_, windows, _) = parse_chatgpt_wham_usage(&json!({"rate_limit": raw}), now());
+            assert_eq!(windows[0].used_percent, expected);
+            assert_eq!(windows[0].status, QuotaStatus::Rejected);
+            assert_eq!(windows[0].observation_state, QuotaObservationState::Measured);
+            assert!(windows[1].used_percent.unwrap() < 100.0);
+            assert_ne!(windows[1].status, QuotaStatus::Rejected);
+        }
+    }
+    let (_, windows, _) = parse_chatgpt_wham_usage(&json!({"rate_limit":{"primary_window":{"used_percent":1.0}}}), now());
+    assert_eq!(windows[0].used_percent, Some(1.0));
+}
+
+#[test]
+fn wham_scales_the_entire_response_and_enforces_denials_with_expired_windows() {
+    let (_, windows, _) = parse_chatgpt_wham_usage(
+        &json!({"rate_limit":{"primary_window":{"used_percent":1},"secondary_window":{"used_percent":35}}}),
+        now(),
+    );
+    assert_eq!(windows.iter().map(|w| w.used_percent).collect::<Vec<_>>(), [Some(1.0), Some(35.0)]);
+
+    for flag in [json!({"allowed":false}), json!({"limit_reached":true})] {
+        for reset in [now(), now() + TimeDelta::hours(1)] {
+            let mut raw = flag.clone();
+            raw["primary_window"] = json!({"used_percent":100,"reset_at":now() - TimeDelta::seconds(1)});
+            raw["secondary_window"] = json!({"used_percent":35,"reset_at":reset});
+            let (_, windows, _) = parse_chatgpt_wham_usage(&json!({"rate_limit":raw}), now());
+            assert!(windows.iter().any(|w| w.status == QuotaStatus::Rejected && w.resets_at.is_none_or(|t| t > now())));
+            if reset > now() {
+                assert!(windows.iter().any(|w| w.status == QuotaStatus::Rejected && w.resets_at == Some(reset)));
+            }
+        }
+    }
 }
 
 #[test]

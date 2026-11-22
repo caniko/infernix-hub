@@ -77,6 +77,7 @@ pub fn parse_claude_oauth_usage(body: &Value, observed_at: DateTime<Utc>) -> Vec
         "seven_day",
         "seven_day_opus",
         "seven_day_sonnet",
+        "seven_day_haiku",
         "seven_day_oauth_apps",
         "seven_day_cowork",
         "seven_day_omelette",

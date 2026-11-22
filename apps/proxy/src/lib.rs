@@ -6,7 +6,7 @@ mod pool;
 mod router;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -16,8 +16,8 @@ use axum::{Router, extract::Request};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, TimeDelta, Utc};
 use config::Config;
-use contracts::providers::{ActivityExchangeIn, ProxyLogEntry, QuotaObservationState, ResetGrant};
-use pool::{Account, Lane, Pool};
+use contracts::providers::{ActivityExchangeIn, ProxyLogEntry, QuotaObservationState, QuotaStatus, QuotaWindow, ResetGrant};
+use pool::{Account, Lane, Pool, enforces_quota, quota_window_active};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -46,6 +46,8 @@ struct VerifiedGoogleToken {
 
 struct ProxyState {
     pool: Pool,
+    usage_refreshes: HashMap<String, Option<Instant>>,
+    probe_generation: u64,
     activity: VecDeque<ActivityExchangeIn>,
     logs: VecDeque<ProxyLogEntry>,
     captures: Captures,
@@ -116,7 +118,14 @@ impl Proxy {
             source_host,
             source_user,
             http,
-            state: RwLock::new(ProxyState { pool, activity: VecDeque::new(), logs: VecDeque::new(), captures: Captures::default() }),
+            state: RwLock::new(ProxyState {
+                pool,
+                usage_refreshes: HashMap::new(),
+                probe_generation: 0,
+                activity: VecDeque::new(),
+                logs: VecDeque::new(),
+                captures: Captures::default(),
+            }),
             oauth_refresh: Mutex::new(()),
             quota_actions: Mutex::new(()),
             codex_keys: Mutex::new(CodexKeys::default()),
@@ -211,23 +220,7 @@ impl Proxy {
         use std::process::Stdio;
         use tokio::{process::Command, time::timeout};
 
-        let opencode_read = Command::new("opencode")
-            .args(["auth", "list", "--format", "json"])
-            .env_clear()
-            .envs(
-                ["PATH", "HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "OPENCODE_DB"]
-                    .into_iter()
-                    .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
-            )
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .output();
-        if let Ok(Ok(output)) = timeout(Duration::from_secs(3), opencode_read).await
-            && output.status.success()
-            && output.stdout.len() <= 2 * 1024 * 1024
-            && let Ok(raw) = serde_json::from_slice(&output.stdout)
-        {
+        if let Some(raw) = read_local_opencode_auth().await {
             pool::add_opencode(&mut self.state.write().await.pool, &raw);
         }
 
@@ -320,17 +313,14 @@ impl Proxy {
                 }
                 None => None,
             }?;
-            Some((account.id, account.refresh, account.access, email))
+            Some((account, email))
         }))
         .await;
         let mut state = self.state.write().await;
-        for (id, refresh, access, email) in resolved.into_iter().flatten() {
-            if let Some(current) = state.pool.accounts.get_mut(&id).filter(|c| {
-                c.lane == Lane::Google
-                    && !c.disabled
-                    && c.email.is_none()
-                    && (c.access == access || (c.refresh.is_some() && c.refresh == refresh))
-            }) {
+        for (account, email) in resolved.into_iter().flatten() {
+            if let Some(current) =
+                state.pool.accounts.get_mut(&account.id).filter(|c| !c.disabled && c.email.is_none() && c.same_credential(&account))
+            {
                 current.email = Some(email);
             }
         }
@@ -418,12 +408,16 @@ impl Proxy {
     }
 
     async fn token(&self, a: &Account, force: bool) -> Result<String> {
-        if a.lane != Lane::Google || a.api_key {
-            return if force { Err(anyhow!("credential renewal is unavailable for this provider")) } else { Ok(a.access.clone()) };
+        self.token_account(a, force).await.map(|a| a.access)
+    }
+
+    async fn token_account(&self, a: &Account, force: bool) -> Result<Account> {
+        if a.api_key || a.lane == Lane::Go {
+            return if force { Err(anyhow!("credential renewal is unavailable for this provider")) } else { Ok(a.clone()) };
         }
         let valid = |a: &Account| !a.access.is_empty() && a.expires.is_none_or(|expires| expires > Utc::now() + TimeDelta::seconds(30));
         if !force && valid(a) {
-            return Ok(a.access.clone());
+            return Ok(a.clone());
         }
         let _guard = self.oauth_refresh.lock().await;
         let current = self
@@ -432,11 +426,46 @@ impl Proxy {
             .await
             .pool
             .find(&a.id)
-            .filter(|c| c.refresh == a.refresh && !c.disabled)
+            .filter(|c| c.same_credential(a) && !c.disabled)
             .cloned()
             .ok_or_else(|| anyhow!("credential changed or was disabled"))?;
-        if !force && valid(&current) {
-            return Ok(current.access);
+        if (!force || current.access != a.access) && valid(&current) {
+            return Ok(current);
+        }
+        if matches!(a.lane, Lane::Claude | Lane::Codex) {
+            let usable = |next: &Account| {
+                next.lane == current.lane
+                    && !next.api_key
+                    && !next.disabled
+                    && valid(next)
+                    && (current.lane != Lane::Codex || codex_reload_matches(&current, next))
+                    && next.organization.as_ref().zip(current.organization.as_ref()).is_none_or(|(x, y)| x == y)
+            };
+            let mut updated =
+                if current.local { Pool::reload_local(&self.config, &current) } else { Pool::reload_file(&self.config, &current) }
+                    .filter(usable);
+            if current.local
+                && self.config.discover_local
+                && updated.as_ref().is_none_or(|next| next.access == current.access)
+                && let Some(raw) = read_local_opencode_auth().await
+            {
+                // Some OpenCode installs store OAuth only in their database.
+                let mut found = Pool::default();
+                pool::add_opencode(&mut found, &raw);
+                updated = found.accounts.remove(&current.id).filter(usable).or(updated);
+            }
+            let updated = updated.ok_or_else(|| anyhow!("no usable credential found on reload"))?;
+            let mut state = self.state.write().await;
+            let entry = state
+                .pool
+                .accounts
+                .get_mut(&a.id)
+                .filter(|entry| entry.same_credential(&current) && !entry.disabled)
+                .ok_or_else(|| anyhow!("credential changed or was disabled"))?;
+            entry.access = updated.access;
+            entry.refresh = updated.refresh;
+            entry.expires = updated.expires;
+            return Ok(entry.clone());
         }
         let (Some(refresh), Some(id), Some(secret)) = (&current.refresh, &current.google_client, &current.google_secret) else {
             return Err(anyhow!("Google OAuth refresh fields unavailable"));
@@ -459,19 +488,122 @@ impl Proxy {
             .ok_or_else(|| anyhow!("Google OAuth did not return a usable token"))?
             .to_owned();
         let mut state = self.state.write().await;
-        if let Some(next) = state.pool.accounts.get_mut(&a.id).filter(|n| n.refresh == a.refresh && !n.disabled) {
-            next.access.clone_from(&access);
-            next.expires = Some(Utc::now() + TimeDelta::seconds(body["expires_in"].as_i64().unwrap_or(3600).clamp(60, 86400)));
-        } else {
-            return Err(anyhow!("credential changed or was disabled"));
+        let next = state
+            .pool
+            .accounts
+            .get_mut(&a.id)
+            .filter(|n| n.same_credential(&current) && !n.disabled)
+            .ok_or_else(|| anyhow!("credential changed or was disabled"))?;
+        next.access = access;
+        next.expires = Some(Utc::now() + TimeDelta::seconds(body["expires_in"].as_i64().unwrap_or(3600).clamp(60, 86400)));
+        Ok(next.clone())
+    }
+
+    async fn schedule_usage_refresh(self: &Arc<Self>, id: String) {
+        const INTERVAL: Duration = Duration::from_secs(15);
+        let started = Instant::now();
+        let account = {
+            let mut state = self.state.write().await;
+            state.usage_refreshes.retain(|_, last| last.is_none_or(|at| started.saturating_duration_since(at) < INTERVAL));
+            if state.usage_refreshes.contains_key(&id) {
+                return;
+            }
+            let Some(account) = state.pool.accounts.get(&id).filter(|a| !a.disabled && !a.api_key).cloned() else { return };
+            state.usage_refreshes.insert(id.clone(), None);
+            account
+        };
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _ = proxy.refresh_usage(&account).await;
+            proxy.state.write().await.usage_refreshes.insert(id, Some(started));
+        });
+    }
+
+    async fn google_quota_windows(&self, account: &Account, token: &mut String) -> (Vec<QuotaWindow>, bool) {
+        use integrations::providers::antigravity;
+        let project = account.project.as_deref().map_or_else(|| serde_json::json!({}), |id| serde_json::json!({"project":id}));
+        let mut hosts = vec![self.config.antigravity.clone()];
+        if hosts[0].host_str() == Some("daily-cloudcode-pa.googleapis.com") {
+            let mut standard = hosts[0].clone();
+            if standard.set_host(Some("cloudcode-pa.googleapis.com")).is_ok() {
+                hosts.push(standard);
+            }
         }
-        Ok(access)
+        let request = |url, access: &str| {
+            self.http
+                .post(url)
+                .bearer_auth(access)
+                .header("user-agent", "antigravity/hub/2.24.0")
+                .json(&project)
+                .timeout(Duration::from_secs(12))
+        };
+        let mut renewed = false;
+        let mut windows = Vec::new();
+        for (op, parse) in [
+            ("retrieveUserQuotaSummary", antigravity::parse_antigravity_summary as fn(&Value, _) -> _),
+            ("fetchAvailableModels", antigravity::parse_antigravity_models_fallback),
+        ] {
+            let urls: Vec<_> = hosts
+                .iter()
+                .cloned()
+                .map(|mut url| {
+                    url.set_path(&format!("/v1internal:{op}"));
+                    url
+                })
+                .collect();
+            let at = Utc::now();
+            let reads = futures_util::future::join_all(urls.iter().cloned().map(|url| request(url, token).send())).await;
+            let mut retry = Vec::new();
+            for (url, response) in urls.into_iter().zip(reads) {
+                if let Ok(response) = response {
+                    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                        retry.push(url);
+                    } else if let Ok(raw) = provider_response_json(response).await {
+                        windows.extend(parse(&raw, at));
+                    }
+                }
+            }
+            if !renewed && !retry.is_empty() {
+                renewed = true;
+                if let Ok(fresh) = self.token(account, true).await {
+                    *token = fresh;
+                    let at = Utc::now();
+                    let reads = futures_util::future::join_all(retry.into_iter().map(|url| provider_json(request(url, token)))).await;
+                    for raw in reads.into_iter().flatten() {
+                        windows.extend(parse(&raw, at));
+                    }
+                }
+            }
+            if windows.iter().any(quota_evidence) {
+                return (antigravity::merge_antigravity_windows(windows), op == "retrieveUserQuotaSummary");
+            }
+            windows.clear();
+        }
+        (windows, false)
     }
 
     async fn refresh_usage(&self, account: &Account) -> Result<(), &'static str> {
-        use integrations::providers::{antigravity, claude, opencode};
+        use integrations::providers::{claude, opencode};
+        let mut account = {
+            let mut state = self.state.write().await;
+            // Allocate from one sequence so removing and re-enrolling an ID cannot reuse an in-flight generation.
+            let generation = state.probe_generation.checked_add(1).ok_or("quota probe generation exhausted")?;
+            let current = state
+                .pool
+                .accounts
+                .get_mut(&account.id)
+                .filter(|c| !c.disabled && c.same_credential(account))
+                .ok_or("credential changed before quota refresh")?;
+            current.probe_generation = generation;
+            let current = current.clone();
+            state.probe_generation = generation;
+            current
+        };
+        let generation = account.probe_generation;
+        let mut google_summary = false;
         let result = async {
-            let token = self.token(account, false).await.map_err(|_| "credential unavailable")?;
+            let mut token = self.token(&account, false).await.map_err(|_| "credential unavailable")?;
+            account.access.clone_from(&token);
             match account.lane {
                 Lane::Claude => {
                     let mut url = self.config.anthropic.clone();
@@ -484,7 +616,7 @@ impl Proxy {
                 }
                 Lane::Codex => {
                     let (plan, windows, mut grant) = if let Some(url) = self.probe_override(Lane::Codex, "/backend-api/wham/usage") {
-                        let raw = provider_json(openai_account(self.http.get(url).bearer_auth(&token), account)).await?;
+                        let raw = provider_json(openai_account(self.http.get(url).bearer_auth(&token), &account)).await?;
                         opencode::parse_chatgpt_wham_usage(&raw, Utc::now())
                     } else {
                         opencode::probe_chatgpt_wham_usage(&self.http, &token, account.chatgpt_id.as_deref())
@@ -493,7 +625,7 @@ impl Proxy {
                     };
                     let credits = self.wham("/backend-api/wham/rate-limit-reset-credits");
                     let mut grants = Vec::new();
-                    if let Ok(raw) = provider_json(openai_account(self.http.get(credits).bearer_auth(&token), account)).await
+                    if let Ok(raw) = provider_json(openai_account(self.http.get(credits).bearer_auth(&token), &account)).await
                         && let Some(credits) = raw["credits"].as_array()
                     {
                         let at = Utc::now();
@@ -510,7 +642,7 @@ impl Proxy {
                             .collect::<Vec<_>>();
                         usable.sort_unstable();
                         let applicable = grant.as_ref().is_some_and(|g| g.applicable)
-                            || windows.iter().any(|w| w.used_percent.is_some_and(|n| n >= 100.0))
+                            || windows.iter().any(|w| w.status == QuotaStatus::Rejected || w.used_percent.is_some_and(|n| n >= 100.0))
                             || account.cooldown.is_some_and(|t| t > at);
                         grants = usable
                             .into_iter()
@@ -539,43 +671,23 @@ impl Proxy {
                     .map(|w| (None, None, w, vec![], None))
                     .map_err(|_| "OpenCode Go usage probe failed"),
                 Lane::Google => {
+                    let (windows, summary) = self.google_quota_windows(&account, &mut token).await;
+                    google_summary = summary;
+                    account.access.clone_from(&token);
                     let email = if account.email.is_none() { self.google_token_email(&token).await } else { None };
-                    let project = account.project.as_deref().map_or_else(|| serde_json::json!({}), |id| serde_json::json!({"project":id}));
-                    let mut windows = Vec::new();
-                    for (op, parse) in [
-                        ("retrieveUserQuotaSummary", antigravity::parse_antigravity_summary as fn(&Value, _) -> _),
-                        ("fetchAvailableModels", antigravity::parse_antigravity_models_fallback),
-                    ] {
-                        let mut url = self.config.antigravity.clone();
-                        url.set_path(&format!("/v1internal:{op}"));
-                        if let Ok(raw) = provider_json(
-                            self.http.post(url).bearer_auth(&token).header("user-agent", "antigravity/hub/2.24.0").json(&project),
-                        )
-                        .await
-                        {
-                            windows = parse(&raw, Utc::now());
-                            if windows.iter().any(|w: &contracts::providers::QuotaWindow| w.used_percent.is_some()) {
-                                break;
-                            }
-                        }
-                    }
                     Ok((None, email, windows, vec![], None))
                 }
             }
         }
         .await
-        .and_then(|r| if r.2.is_empty() && r.3.is_empty() { Err("provider returned no quota evidence") } else { Ok(r) });
+        .and_then(|r| if r.2.iter().any(quota_evidence) || !r.3.is_empty() { Ok(r) } else { Err("provider returned no quota evidence") });
         let mut state = self.state.write().await;
         let current = state
             .pool
             .accounts
             .get_mut(&account.id)
-            .filter(|c| {
-                c.lane == account.lane
-                    && !c.disabled
-                    && (c.access == account.access || (c.refresh.is_some() && c.refresh == account.refresh))
-            })
-            .ok_or("credential changed during quota refresh")?;
+            .filter(|c| !c.disabled && c.probe_generation == generation)
+            .ok_or("quota refresh was superseded")?;
         match result {
             Ok((plan, email, windows, grants, next)) => {
                 if plan.is_some() {
@@ -584,15 +696,26 @@ impl Proxy {
                 if email.is_some() && current.email.is_none() {
                     current.email = email;
                 }
-                current.windows = windows;
+                let now = Utc::now();
+                merge_probe_windows(current, windows, google_summary, now);
                 current.grants = grants;
                 current.next_grant = next;
-                current.observed = Some(Utc::now());
+                current.observed = Some(now);
                 current.probe_failed = false;
                 Ok(())
             }
             Err(e) => {
                 current.probe_failed = true;
+                if current.lane == Lane::Google {
+                    let now = Utc::now();
+                    current.windows.retain(|w| {
+                        let keep = w.resets_at.is_some() || quota_window_active(Lane::Google, w, now);
+                        if !keep {
+                            current.google_fallback_keys.remove(&w.window_key);
+                        }
+                        keep
+                    });
+                }
                 for window in &mut current.windows {
                     window.stale = true;
                     window.observation_state = QuotaObservationState::StaleLastGood;
@@ -631,6 +754,94 @@ impl Proxy {
             url
         })
     }
+}
+
+fn quota_evidence(window: &QuotaWindow) -> bool {
+    window.used_percent.is_some() || window.status == QuotaStatus::Rejected
+}
+
+fn codex_reload_matches(enrolled: &Account, next: &Account) -> bool {
+    let basic = enrolled.chatgpt_user.as_ref().is_none_or(|user| next.chatgpt_user.as_ref() == Some(user))
+        && enrolled.chatgpt_id.as_ref().is_none_or(|id| next.chatgpt_id.as_ref() == Some(id));
+    if !basic {
+        return false;
+    }
+    if next.access != enrolled.access {
+        let claims = pool::jwt_claims(&next.access);
+        let auth = &claims["https://api.openai.com/auth"];
+        return enrolled.chatgpt_id.as_ref().is_none_or(|id| pool::text(auth, &["chatgpt_account_id"]) == Some(id.as_str()))
+            && enrolled.chatgpt_user.as_ref().is_none_or(|user| pool::text(auth, &["chatgpt_user_id"]) == Some(user.as_str()));
+    }
+    true
+}
+
+fn google_quota_scope(w: &QuotaWindow) -> Option<&str> {
+    ["gemini-argon", "gemini", "3p"]
+        .into_iter()
+        .find(|scope| w.window_key.strip_prefix(scope).is_some_and(|suffix| suffix.starts_with('-')))
+        .or(w.scope_model.as_deref())
+}
+
+fn is_weekly_window(w: &QuotaWindow) -> bool {
+    w.kind == contracts::providers::QuotaWindowKind::Weekly || w.window_key.ends_with("-weekly")
+}
+
+fn merge_probe_windows(account: &mut Account, windows: Vec<QuotaWindow>, google_summary: bool, now: DateTime<Utc>) {
+    let google = account.lane == Lane::Google;
+    let codex_recovered = account.lane == Lane::Codex && !windows.iter().any(|w| w.status == QuotaStatus::Rejected);
+    let measured = |healthy_only: bool| {
+        windows
+            .iter()
+            .filter(|w| quota_evidence(w) && (!healthy_only || !enforces_quota(w)))
+            .filter_map(|w| google_quota_scope(w).map(|scope| (scope.to_owned(), is_weekly_window(w))))
+            .collect::<BTreeSet<_>>()
+    };
+    let covered = if google_summary { measured(false) } else { BTreeSet::new() };
+    let healthy = if google { measured(true) } else { BTreeSet::new() };
+    let mut merged: BTreeMap<_, _> = windows.into_iter().map(|w| (w.window_key.clone(), w)).collect();
+    let mut fallback = if google && !google_summary { merged.keys().cloned().collect() } else { BTreeSet::new() };
+    for old in std::mem::take(&mut account.windows) {
+        if codex_recovered && old.window_key == "rate_limit_denied" {
+            continue;
+        }
+        let from_fallback = account.google_fallback_keys.contains(&old.window_key);
+        let scope_cadence = google_quota_scope(&old).map(|scope| (scope.to_owned(), is_weekly_window(&old)));
+        if quota_window_active(account.lane, &old, now)
+            && !(from_fallback && scope_cadence.as_ref().is_some_and(|key| covered.contains(key)))
+            && !(old.resets_at.is_none() && google && scope_cadence.as_ref().is_some_and(|key| healthy.contains(key)))
+            && merged.get(&old.window_key).is_none_or(|new| quota_evidence(&old) && !quota_evidence(new))
+        {
+            if from_fallback {
+                fallback.insert(old.window_key.clone());
+            } else {
+                fallback.remove(&old.window_key);
+            }
+            merged.insert(old.window_key.clone(), old);
+        }
+    }
+    account.windows = merged.into_values().collect();
+    account.google_fallback_keys = fallback;
+}
+
+async fn read_local_opencode_auth() -> Option<Value> {
+    use std::process::Stdio;
+    let read = tokio::process::Command::new("opencode")
+        .args(["auth", "list", "--format", "json"])
+        .env_clear()
+        .envs(
+            ["PATH", "HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "OPENCODE_DB"]
+                .into_iter()
+                .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
+        )
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(3), read).await.ok()?.ok()?;
+    if !output.status.success() || output.stdout.len() > 2 * 1024 * 1024 {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 fn decode_jwt_segment(segment: &str) -> Option<Value> {
@@ -714,6 +925,10 @@ async fn bounded_body(mut response: reqwest::Response, limit: usize) -> Result<V
 
 async fn provider_json(request: reqwest::RequestBuilder) -> Result<Value, &'static str> {
     let response = request.timeout(Duration::from_secs(12)).send().await.map_err(|_| "upstream request failed")?;
+    provider_response_json(response).await
+}
+
+async fn provider_response_json(response: reqwest::Response) -> Result<Value, &'static str> {
     if !response.status().is_success() {
         return Err("upstream rejected request");
     }
