@@ -48,6 +48,73 @@ impl Lane {
     }
 }
 
+pub(crate) fn window_applies_to_model(w: &QuotaWindow, model: &str) -> bool {
+    if w.kind == QuotaWindowKind::Spend || w.unit == QuotaUnit::Credits {
+        return false;
+    }
+    let Some(scope) = &w.scope_model else { return true };
+    if model.is_empty() {
+        return false;
+    }
+    let (model, key, scope) = (model.to_ascii_lowercase(), w.window_key.to_ascii_lowercase(), scope.to_ascii_lowercase());
+    let gemini = model.starts_with("gemini-");
+    let argon = model.contains("argon");
+    let claude = model.starts_with("claude-");
+    let gpt = model.starts_with("gpt-");
+    if key.starts_with("gemini-argon") {
+        return gemini && argon;
+    }
+    if key.starts_with("gemini-") {
+        return gemini && !argon;
+    }
+    if key.starts_with("3p-") {
+        return claude || gpt;
+    }
+    match key.as_str() {
+        "seven_day_opus" => return model.contains("opus"),
+        "seven_day_sonnet" => return model.contains("sonnet"),
+        "seven_day_haiku" => return model.contains("haiku"),
+        "seven_day_oauth_apps" | "seven_day_cowork" => return model.contains(&scope),
+        _ => {}
+    }
+    match scope.as_str() {
+        _ if scope.contains("argon") => gemini && argon,
+        "gemini" => gemini && !argon,
+        "claude & gpt (shared)" | "claude-gpt" => claude || gpt,
+        "claude" => claude,
+        "gpt" => gpt,
+        "opus" | "claude opus" => model.contains("opus"),
+        "sonnet" | "claude sonnet" => model.contains("sonnet"),
+        "haiku" | "claude haiku" => model.contains("haiku"),
+        _ => model == scope || model.starts_with(&format!("{scope}-")) || (!scope.contains(' ') && model.contains(&scope)),
+    }
+}
+
+pub(crate) fn model_cooldown_scope(lane: Lane, model: &str) -> Option<String> {
+    if lane != Lane::Google || model.is_empty() {
+        return None;
+    }
+    let model = model.to_ascii_lowercase();
+    Some(if model.starts_with("gemini-") {
+        if model.contains("argon") { "gemini-argon".into() } else { "gemini".into() }
+    } else if model.starts_with("claude-") || model.starts_with("gpt-") {
+        "3p".into()
+    } else {
+        "other".into()
+    })
+}
+
+pub(crate) fn enforces_quota(w: &QuotaWindow) -> bool {
+    w.kind != QuotaWindowKind::Spend
+        && w.unit != QuotaUnit::Credits
+        && (w.status == QuotaStatus::Rejected || w.used_percent.is_some_and(|n| n >= 100.0))
+}
+
+pub(crate) fn quota_window_active(lane: Lane, w: &QuotaWindow, now: DateTime<Utc>) -> bool {
+    w.resets_at
+        .map_or_else(|| lane != Lane::Google || w.observed_at.is_some_and(|at| now - at < chrono::TimeDelta::hours(1)), |at| at > now)
+}
+
 #[derive(Clone)]
 pub struct Account {
     pub id: String,
@@ -77,50 +144,52 @@ pub struct Account {
     pub local: bool,
     pub models: Vec<String>,
     pub cooldown: Option<DateTime<Utc>>,
+    pub auth_cooldown: Option<DateTime<Utc>>,
+    pub scoped_cooldowns: BTreeMap<String, DateTime<Utc>>,
     pub windows: Vec<QuotaWindow>,
+    pub google_fallback_keys: BTreeSet<String>,
     pub grants: Vec<ResetGrant>,
     pub next_grant: Option<String>,
     pub observed: Option<DateTime<Utc>>,
     pub last_used: Option<DateTime<Utc>>,
     pub probe_failed: bool,
+    pub probe_generation: u64,
     pub success: u64,
     pub failure: u64,
 }
 
 impl Account {
+    pub(crate) fn same_credential(&self, other: &Self) -> bool {
+        self.lane == other.lane
+            && self.api_key == other.api_key
+            && (self.lane != Lane::Codex || (self.chatgpt_id == other.chatgpt_id && self.chatgpt_user == other.chatgpt_user))
+            && (self.refresh.is_none() || other.refresh.is_none() || self.refresh == other.refresh)
+            && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
+    }
+
     pub fn eligible(&self, now: DateTime<Utc>, model: &str) -> bool {
-        self.supports(model) && self.limited_until(now, model).is_none()
+        self.supports(model) && self.auth_cooldown.is_none_or(|at| at <= now) && self.quota_limited_until(now, model).is_none()
     }
 
     fn supports(&self, model: &str) -> bool {
         !self.disabled && self.weight > 0 && (model.is_empty() || self.models.is_empty() || self.models.iter().any(|id| id == model))
     }
 
-    fn limited_until(&self, now: DateTime<Utc>, model: &str) -> Option<DateTime<Utc>> {
-        let model = model.to_ascii_lowercase();
+    pub fn quota_limited_until(&self, now: DateTime<Utc>, model: &str) -> Option<DateTime<Utc>> {
+        let scoped = model_cooldown_scope(self.lane, model).and_then(|scope| self.scoped_cooldowns.get(&scope).copied());
         self.windows
             .iter()
-            .filter(|w| {
-                matches!(
-                    w.kind,
-                    QuotaWindowKind::Session
-                        | QuotaWindowKind::Weekly
-                        | QuotaWindowKind::Daily
-                        | QuotaWindowKind::Monthly
-                        | QuotaWindowKind::ModelScoped
-                ) && (w.status == QuotaStatus::Rejected || w.used_percent.is_some_and(|n| n >= 100.0))
-                    && w.resets_at.is_none_or(|t| t > now)
-                    && w.scope_model.as_deref().is_none_or(|scope| {
-                        let scope = scope.to_ascii_lowercase();
-                        model.contains(&scope)
-                            || scope.split(" & ").any(|label| {
-                                let family = label.split_whitespace().next().unwrap_or_default();
-                                !family.is_empty() && !family.contains('-') && model.starts_with(family)
-                            })
-                    })
+            .filter(|w| window_applies_to_model(w, model) && enforces_quota(w) && quota_window_active(self.lane, w, now))
+            .map(|w| {
+                w.resets_at.unwrap_or_else(|| {
+                    if self.lane == Lane::Google {
+                        w.observed_at.map_or(DateTime::<Utc>::MAX_UTC, |at| at + chrono::TimeDelta::hours(1))
+                    } else {
+                        DateTime::<Utc>::MAX_UTC
+                    }
+                })
             })
-            .map(|w| w.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC))
-            .chain(self.cooldown.filter(|until| *until > now))
+            .chain(self.cooldown.into_iter().chain(scoped).filter(|until| *until > now))
             .max()
     }
 
@@ -144,6 +213,12 @@ impl Account {
         if let Some(email) = &self.email {
             row["email"] = json!(email);
         }
+        if self.lane == Lane::Google
+            && !self.api_key
+            && let Some(project) = &self.project
+        {
+            row["project_id"] = json!(project);
+        }
         if self.lane == Lane::Codex && !self.api_key {
             let mut metadata = json!({});
             if let Some(id) = &self.chatgpt_id {
@@ -165,7 +240,7 @@ impl Account {
         row["windows"] = json!(self.windows.iter().map(|w| json!({
             "key": w.window_key, "label": w.label, "used_percent": w.used_percent,
             "resets_at": w.resets_at, "duration_seconds": w.window_duration_mins.map(|n| n.saturating_mul(60)),
-            "scoped": w.kind == QuotaWindowKind::ModelScoped, "observed_at": w.observed_at, "stale": w.stale,
+            "scoped": w.scope_model.is_some() || w.kind == QuotaWindowKind::ModelScoped, "observed_at": w.observed_at, "stale": w.stale,
             "reset_cadence": match w.cadence { ResetCadence::Fixed => Some("fixed"), ResetCadence::RollingOnUse => Some("on_use"), _ => None },
             "status": match w.status { QuotaStatus::Allowed => Some("allowed"), QuotaStatus::Warning => Some("allowed_warning"),
                 QuotaStatus::Rejected => Some("rejected"), _ => None }
@@ -334,12 +409,16 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             local,
             models: models.clone(),
             cooldown: None,
+            auth_cooldown: None,
+            scoped_cooldowns: BTreeMap::new(),
             windows: vec![],
+            google_fallback_keys: BTreeSet::new(),
             grants: vec![],
             next_grant: None,
             observed: None,
             last_used: None,
             probe_failed: false,
+            probe_generation: 0,
             success: 0,
             failure: 0,
         })
@@ -359,7 +438,7 @@ pub struct Pool {
     pub accounts: BTreeMap<String, Account>,
     pub policy: RoutingPolicy,
     pub overrides: BTreeMap<Lane, String>,
-    pub cursors: HashMap<(Lane, bool), u64>,
+    pub cursors: HashMap<(Lane, bool, Vec<String>), u64>,
     pub revision: i64,
     pub source_host: String,
     pub source_user: String,
@@ -401,58 +480,41 @@ impl Pool {
         Ok(pool)
     }
 
-    pub(crate) fn reload_local(&mut self, config: &Config) {
-        if !config.discover_local {
-            return;
+    pub fn reload_local(config: &Config, account: &Account) -> Option<Account> {
+        let mut found = Self::default();
+        match account.lane {
+            Lane::Claude => discover_claude(config, &mut found),
+            Lane::Codex => discover_codex(config, &mut found),
+            _ => return None,
         }
-        let mut fresh = Self::default();
-        discover(config, &mut fresh);
-        for (_, next) in fresh.accounts {
-            if let Some(existing) = self.accounts.get_mut(&next.id) {
-                merge_reloaded_account(existing, next);
-            } else {
-                let duplicate = self.accounts.values().any(|old| {
-                    old.lane == next.lane
-                        && ((!next.access.is_empty() && old.access == next.access)
-                            || next.refresh.as_ref().is_some_and(|r| old.refresh.as_ref() == Some(r)))
-                });
-                if !duplicate {
-                    self.accounts.insert(next.id.clone(), next);
-                }
-            }
-        }
+        discover_opencode(config, &mut found);
+        found.accounts.remove(&account.id)
     }
 
-    pub(crate) fn reload_file(&mut self, config: &Config, name: &str) {
-        if !filename(name) {
-            return;
+    pub fn reload_file(config: &Config, account: &Account) -> Option<Account> {
+        if !filename(&account.name) {
+            return None;
         }
-        let path = config.auth_dir.join(name);
-        if let Some(raw) = read_json(&path)
-            && let Ok(accounts) = parse_credentials(name, &raw, false)
-        {
-            for next in accounts {
-                if let Some(existing) = self.accounts.get_mut(&next.id) {
-                    merge_reloaded_account(existing, next);
-                } else {
-                    self.accounts.insert(next.id.clone(), next);
-                }
-            }
-        }
+        let raw = read_json(&config.auth_dir.join(&account.name))?;
+        parse_credentials(&account.name, &raw, false).ok()?.into_iter().find(|a| a.id == account.id)
     }
 
     pub fn insert(&mut self, accounts: Vec<Account>) {
         for mut a in accounts {
             if let Some(old) =
-                self.accounts.get(&a.id).filter(|old| old.lane == a.lane && old.access == a.access && old.refresh == a.refresh)
+                self.accounts.get(&a.id).filter(|old| old.same_credential(&a) && old.access == a.access && old.refresh == a.refresh)
             {
                 a.cooldown = old.cooldown;
+                a.auth_cooldown = old.auth_cooldown;
+                a.scoped_cooldowns.clone_from(&old.scoped_cooldowns);
                 a.windows.clone_from(&old.windows);
+                a.google_fallback_keys.clone_from(&old.google_fallback_keys);
                 a.grants.clone_from(&old.grants);
                 a.next_grant.clone_from(&old.next_grant);
                 a.observed = old.observed;
                 a.last_used = old.last_used;
                 a.probe_failed = old.probe_failed;
+                a.probe_generation = old.probe_generation;
                 a.success = old.success;
                 a.failure = old.failure;
             }
@@ -464,13 +526,21 @@ impl Pool {
         self.accounts.get(id).or_else(|| self.accounts.values().find(|a| a.auth_index == id || self.hub_id(a) == id || a.hub_id() == id))
     }
 
+    fn supported<'a>(&'a self, lane: Lane, model: &'a str) -> impl Iterator<Item = &'a Account> {
+        self.accounts.values().filter(move |a| {
+            a.lane == lane && a.supports(model) && !(a.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly)
+        })
+    }
+
     pub fn next_reset(&self, lane: Lane, model: &str) -> Option<DateTime<Utc>> {
         let now = Utc::now();
-        self.accounts
-            .values()
-            .filter(|a| a.lane == lane && a.supports(model) && !(a.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly))
-            .filter_map(|a| a.limited_until(now, model))
-            .min()
+        self.supported(lane, model).filter_map(|a| a.quota_limited_until(now, model)).min()
+    }
+
+    pub fn all_quota_limited(&self, lane: Lane, model: &str) -> bool {
+        let now = Utc::now();
+        let mut accounts = self.supported(lane, model).peekable();
+        accounts.peek().is_some() && accounts.all(|a| a.quota_limited_until(now, model).is_some())
     }
 
     pub fn preferred(&self, lane: Lane) -> Option<&str> {
@@ -506,23 +576,29 @@ impl Pool {
         let first = *options.first()?;
         match self.policy.strategy {
             RouteStrategy::SoonestReset => options.sort_by_key(|a| {
-                let reset = |kind| {
+                let reset = |applies: fn(&QuotaWindow) -> bool| {
                     a.windows
                         .iter()
-                        .filter(|w| w.kind == kind && w.scope_model.is_none())
+                        .filter(|w| applies(w) && window_applies_to_model(w, model))
                         .filter_map(|w| w.resets_at)
                         .filter(|t| *t > now)
                         .min()
                         .unwrap_or(DateTime::<Utc>::MAX_UTC)
                 };
-                (reset(QuotaWindowKind::Weekly), reset(QuotaWindowKind::Session), std::cmp::Reverse(a.priority))
+                let weekly = reset(|w| {
+                    w.kind == QuotaWindowKind::Weekly
+                        || (w.kind == QuotaWindowKind::ModelScoped && w.window_duration_mins.is_none_or(|m| m >= 1440))
+                });
+                let session = reset(|w| w.kind == QuotaWindowKind::Session);
+                (weekly, session, std::cmp::Reverse(a.priority))
             }),
             RouteStrategy::FillFirst => options.sort_by(|a, b| {
                 let used = |a: &Account| {
                     a.windows
                         .iter()
-                        .filter(|w| matches!(w.kind, QuotaWindowKind::Weekly | QuotaWindowKind::Session))
-                        .filter(|w| w.resets_at.is_none_or(|t| t > now))
+                        .filter(|w| matches!(w.kind, QuotaWindowKind::Weekly | QuotaWindowKind::Session | QuotaWindowKind::ModelScoped))
+                        .filter(|w| window_applies_to_model(w, model))
+                        .filter(|w| quota_window_active(a.lane, w, now))
                         .filter_map(|w| w.used_percent)
                         .fold(0.0_f64, f64::max)
                 };
@@ -532,9 +608,17 @@ impl Pool {
                 let weighted = self.policy.strategy == RouteStrategy::WeightedRoundRobin;
                 let weight = |a: &&Account| if weighted { u64::from(a.weight) } else { 1 };
                 let total: u64 = options.iter().map(weight).sum();
-                let cursor = self.cursors.entry((lane, first.api_key)).or_default();
-                let mut slot = *cursor % total;
+                let key = (lane, first.api_key, options.iter().map(|a| a.id.clone()).collect());
+                let mut slot = self.cursors.get(&key).copied().unwrap_or_default() % total;
                 if tried.is_empty() {
+                    // ponytail: arbitrary eviction at the fixed ceiling; use LRU if account sets churn.
+                    if self.cursors.len() >= 256
+                        && !self.cursors.contains_key(&key)
+                        && let Some(old) = self.cursors.keys().next().cloned()
+                    {
+                        self.cursors.remove(&old);
+                    }
+                    let cursor = self.cursors.entry(key).or_default();
                     *cursor = cursor.wrapping_add(1);
                 }
                 return options
@@ -724,7 +808,7 @@ pub(crate) fn add_opencode(pool: &mut Pool, raw: &Value) {
     }
 }
 
-fn discover(config: &Config, pool: &mut Pool) {
+fn discover_claude(config: &Config, pool: &mut Pool) {
     let home = &config.home;
     let user = env::var("USER").unwrap_or_default();
     let mut claude = paths(&Path::new("/run/claude-code").join(&user));
@@ -764,16 +848,29 @@ fn discover(config: &Config, pool: &mut Pool) {
             add(pool, Lane::Claude, &path.to_string_lossy(), raw);
         }
     }
-    let codex = env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex")).join("auth.json");
+}
+
+fn discover_codex(config: &Config, pool: &mut Pool) {
+    let codex = env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| config.home.join(".codex")).join("auth.json");
     if let Some(raw) = read_json(&codex).filter(|v| text(v, &["/tokens/refresh_token"]) != Some("spillway-pool")) {
         add(pool, Lane::Codex, "codex", raw);
     }
-    let opencode = env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share")).join("opencode/auth.json");
+}
+
+fn discover_opencode(config: &Config, pool: &mut Pool) {
+    let opencode =
+        env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| config.home.join(".local/share")).join("opencode/auth.json");
     if let Some(raw) =
         env::var("OPENCODE_AUTH_CONTENT").ok().and_then(|raw| serde_json::from_str(&raw).ok()).or_else(|| read_json(&opencode))
     {
         add_opencode(pool, &raw);
     }
+}
+
+fn discover(config: &Config, pool: &mut Pool) {
+    discover_claude(config, pool);
+    discover_codex(config, pool);
+    discover_opencode(config, pool);
     for (var, lane) in [
         ("OPENCODE_GO_API_KEY", Lane::Go),
         ("OPENCODE_API_KEY", Lane::Go),
@@ -784,6 +881,7 @@ fn discover(config: &Config, pool: &mut Pool) {
             add(pool, lane, var, json!({"key":key}));
         }
     }
+    let user = env::var("USER").unwrap_or_default();
     let manifests: Vec<_> = paths(&config.provenance_oauth_dir)
         .into_iter()
         .filter(|path| {
@@ -811,53 +909,6 @@ fn discover(config: &Config, pool: &mut Pool) {
                 fields.entry("label").or_insert_with(|| json!(text(metadata, &["/target/account", "/target/enrollment"]).unwrap_or(name)));
             }
             add(pool, Lane::Google, id, raw);
-        }
-    }
-}
-
-fn merge_reloaded_account(existing: &mut Account, next: Account) {
-    let same_refresh = existing.lane == next.lane && existing.refresh.is_some() && existing.refresh == next.refresh;
-    let same_credential = same_refresh || (existing.lane == next.lane && !next.access.is_empty() && existing.access == next.access);
-    let keep_in_memory_token = same_refresh
-        && !existing.access.is_empty()
-        && (next.access.is_empty() || existing.expires.is_some_and(|cur| cur > Utc::now() && next.expires.is_none_or(|n| cur > n)));
-    if !keep_in_memory_token {
-        existing.access = next.access;
-        existing.refresh = next.refresh;
-        existing.expires = next.expires;
-    }
-    if same_credential {
-        existing.email = next.email.or_else(|| existing.email.clone());
-        existing.plan = next.plan.or_else(|| existing.plan.clone());
-        existing.chatgpt_id = next.chatgpt_id.or_else(|| existing.chatgpt_id.clone());
-        existing.chatgpt_user = next.chatgpt_user.or_else(|| existing.chatgpt_user.clone());
-        existing.organization = next.organization.or_else(|| existing.organization.clone());
-        existing.project = next.project.or_else(|| existing.project.clone());
-        existing.google_client = next.google_client.or_else(|| existing.google_client.clone());
-        existing.google_secret = next.google_secret.or_else(|| existing.google_secret.clone());
-    } else {
-        let identity_changed = existing.lane != next.lane
-            || existing.chatgpt_id != next.chatgpt_id
-            || existing.chatgpt_user != next.chatgpt_user
-            || existing.email != next.email
-            || existing.organization != next.organization
-            || existing.project != next.project;
-        existing.lane = next.lane;
-        existing.email = next.email;
-        existing.plan = next.plan;
-        existing.chatgpt_id = next.chatgpt_id;
-        existing.chatgpt_user = next.chatgpt_user;
-        existing.organization = next.organization;
-        existing.project = next.project;
-        existing.google_client = next.google_client;
-        existing.google_secret = next.google_secret;
-        if identity_changed {
-            existing.cooldown = None;
-            existing.windows.clear();
-            existing.grants.clear();
-            existing.next_grant = None;
-            existing.observed = None;
-            existing.probe_failed = false;
         }
     }
 }

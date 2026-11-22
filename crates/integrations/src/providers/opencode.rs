@@ -4,13 +4,15 @@ use domain::ports::{ModelProvider, ProviderFacets};
 
 pub fn parse_chatgpt_wham_usage(body: &Value, observed_at: DateTime<Utc>) -> (Option<String>, Vec<QuotaWindow>, Option<ResetGrant>) {
     let limits = &body["rate_limit"];
+    let mut readings = ["primary_window", "secondary_window"].into_iter().filter_map(|key| limits[key]["used_percent"].as_f64());
+    // A fractional reading only establishes the scale if no window reports percentage points.
+    let fractional = !readings.clone().any(|p| p > 1.0) && readings.any(|p| p > 0.0 && p < 1.0);
     let mut windows = Vec::new();
     for (key, label, kind) in
         [("primary_window", "5-hour", QuotaWindowKind::Session), ("secondary_window", "Weekly", QuotaWindowKind::Weekly)]
     {
         let Some(raw) = limits.get(key).filter(|w| w.is_object()) else { continue };
-        // WHAM has returned both fractional readings and whole percentage points.
-        let used = raw["used_percent"].as_f64().map(|p| (if p < 1.0 { p * 100.0 } else { p }).round().clamp(0.0, 100.0));
+        let used = raw["used_percent"].as_f64().map(|p| (if fractional { p * 100.0 } else { p }).clamp(0.0, 100.0));
         let mut window = percent_window(key, label, used, observed_at);
         window.kind = kind;
         window.resets_at = seconds_or_iso(&raw["reset_at"]);
@@ -24,6 +26,31 @@ pub fn parse_chatgpt_wham_usage(body: &Value, observed_at: DateTime<Utc>) -> (Op
             };
         }
         windows.push(window);
+    }
+    if limits["allowed"] == false || limits["limit_reached"] == true {
+        let active = |w: &QuotaWindow| w.resets_at.is_none_or(|t| t > observed_at);
+        let full = windows.iter().filter(|w| active(w)).any(|w| w.used_percent == Some(100.0));
+        let reject = |w: &mut QuotaWindow| {
+            w.status = QuotaStatus::Rejected;
+            w.observation_state = QuotaObservationState::Measured;
+        };
+        for w in &mut windows {
+            if active(w) && w.used_percent == if full { Some(100.0) } else { None } {
+                reject(w);
+            }
+        }
+        if !windows.iter().any(|w| w.status == QuotaStatus::Rejected) {
+            // Prefer an actual future reset; expired timestamps cannot lift an explicit denial.
+            if let Some(w) = windows.iter_mut().min_by_key(|w| (!active(w), w.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC))) {
+                w.resets_at = w.resets_at.filter(|t| *t > observed_at);
+                reject(w);
+            } else {
+                let mut window = percent_window("rate_limit_denied", "Rate limit", None, observed_at);
+                window.kind = QuotaWindowKind::Session;
+                reject(&mut window);
+                windows.push(window);
+            }
+        }
     }
     let credits = &body["credits"];
     if credits.is_object() && credits["unlimited"].as_bool() != Some(true) {

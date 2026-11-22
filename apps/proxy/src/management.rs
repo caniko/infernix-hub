@@ -15,7 +15,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
-use contracts::providers::{ApiKeyOrder, RouteStrategy, RoutingPolicy};
+use contracts::providers::{ApiKeyOrder, QuotaWindowKind, RouteStrategy, RoutingPolicy};
 use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -26,7 +26,7 @@ use crate::{
     clients::Client,
     config::{matches_secret, read_text, write_private},
     openai_account,
-    pool::{Account, Lane, Pool, filename, parse_credentials, text},
+    pool::{Account, Lane, Pool, enforces_quota, filename, parse_credentials, text},
     provider_json,
     router::bearer,
 };
@@ -519,8 +519,8 @@ async fn renew_credentials(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Map<
         return Err(bad("name or all required"));
     }
     let mut results = Vec::new();
-    for mut account in accounts {
-        let renewed = proxy.token(&mut account, true).await.is_ok();
+    for account in accounts {
+        let renewed = proxy.token(&account, true).await.is_ok();
         if name.is_some() && !renewed {
             return Err(upstream());
         }
@@ -570,8 +570,8 @@ async fn models(State(proxy): State<Arc<Proxy>>, Query(query): Query<Name>) -> R
 }
 
 async fn probe_models(proxy: &Proxy, account: &Account) -> Result<Vec<(String, Value)>, Failure> {
-    let mut account = account.clone();
-    let token = proxy.token(&mut account, false).await.map_err(|_| upstream())?;
+    let account = proxy.token_account(account, false).await.map_err(|_| upstream())?;
+    let token = account.access.clone();
     let account = &account;
     let path = match account.lane {
         Lane::Codex if !account.api_key => "/backend-api/codex/models",
@@ -660,7 +660,7 @@ fn allowed_call(account: &Account, url: &reqwest::Url, method: &str) -> bool {
 }
 
 async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) -> Reply {
-    let mut account = select(&proxy, &json!({"auth_index":call.auth_index})).await?;
+    let account = select(&proxy, &json!({"auth_index":call.auth_index})).await?;
     let url = reqwest::Url::parse(&call.url).map_err(|_| bad("invalid upstream URL"))?;
     let method = call.method.to_ascii_uppercase();
     #[cfg(test)]
@@ -680,7 +680,8 @@ async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) ->
         return Err(bad("invalid API call body or headers"));
     }
     let http = if mock { proxy.http.clone() } else { management_http(&url).await? };
-    let token = proxy.token(&mut account, false).await.map_err(|_| upstream())?;
+    let account = proxy.token_account(&account, false).await.map_err(|_| upstream())?;
+    let token = account.access.clone();
     let mut request = http.request(if method == "POST" { reqwest::Method::POST } else { reqwest::Method::GET }, url);
     for (key, value) in call.header {
         let name = key.to_ascii_lowercase();
@@ -764,19 +765,30 @@ fn public_ip(ip: IpAddr) -> bool {
     }
 }
 
-fn clear_quota(pool: &mut Pool, account: &Account) -> usize {
-    let Some(a) = pool.accounts.get_mut(&account.id).filter(|a| a.access == account.access) else { return 0 };
+fn clear_quota(pool: &mut Pool, account: &Account, manual: bool) -> usize {
+    let Some(a) = pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account)) else { return 0 };
     a.cooldown = None;
+    a.scoped_cooldowns.clear();
     a.grants.clear();
     a.next_grant = None;
+    a.probe_generation = 0;
+    if manual {
+        a.auth_cooldown = None;
+    }
     let before = a.windows.len();
-    a.windows.retain(|w| !matches!(w.kind, contracts::providers::QuotaWindowKind::Session | contracts::providers::QuotaWindowKind::Weekly));
+    a.windows.retain(|w| match w.kind {
+        QuotaWindowKind::Session | QuotaWindowKind::Weekly => false,
+        QuotaWindowKind::Daily | QuotaWindowKind::Monthly | QuotaWindowKind::ModelScoped => !manual,
+        QuotaWindowKind::Custom => !manual || !enforces_quota(w),
+        QuotaWindowKind::Spend => true,
+    });
+    a.google_fallback_keys.retain(|key| a.windows.iter().any(|w| &w.window_key == key));
     before - a.windows.len()
 }
 
 async fn reset_quota(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -> Reply {
     let account = select(&proxy, &raw).await?;
-    let count = clear_quota(&mut proxy.state.write().await.pool, &account);
+    let count = clear_quota(&mut proxy.state.write().await.pool, &account, true);
     ok(json!({"status":"ok","windows_reset":count}))
 }
 
@@ -845,7 +857,7 @@ async fn reset_credit(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
             .ok_or_else(upstream)?
     };
     let count = if account.lane == Lane::Codex && matches!(code, "reset" | "already_redeemed") {
-        clear_quota(&mut proxy.state.write().await.pool, &account)
+        clear_quota(&mut proxy.state.write().await.pool, &account, false)
     } else {
         0
     };
@@ -866,7 +878,7 @@ async fn reset_credit(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
 
 async fn start_window(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -> Reply {
     let _guard = proxy.quota_actions.lock().await;
-    let mut account = select(&proxy, &raw).await?;
+    let account = select(&proxy, &raw).await?;
     let model = text(&raw, &["model"]).filter(|model| model.len() <= 192).ok_or_else(|| bad("model required"))?;
     if account.api_key || !matches!(account.lane, Lane::Claude | Lane::Codex) {
         return Err(bad("rolling-window start unsupported for this account"));
@@ -880,10 +892,10 @@ async fn start_window(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
     }) {
         return Err(Failure(StatusCode::CONFLICT, "rolling window is already running"));
     }
-    let token = proxy.token(&mut account, false).await.map_err(|_| upstream())?;
+    let account = proxy.token_account(&account, false).await.map_err(|_| upstream())?;
     let path = if account.lane == Lane::Claude { "/v1/messages" } else { "/backend-api/codex/responses" };
     let url = crate::router::upstream(&proxy, &account, &axum::http::Uri::from_static(path)).ok_or_else(upstream)?;
-    let request = proxy.http.post(url).bearer_auth(token);
+    let request = proxy.http.post(url).bearer_auth(&account.access);
     let request = if account.lane == Lane::Claude {
         request
             .header("anthropic-version", "2023-06-01")
