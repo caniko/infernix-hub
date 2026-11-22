@@ -1914,6 +1914,139 @@ async fn provenance_oauth_discovers_all_antigravity_enrollments_and_deduplicates
 }
 
 #[tokio::test]
+async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttles() {
+    let dir = Scratch::new();
+    let oauth_dir = dir.join("provenance-oauth");
+    config::private_dir(&oauth_dir).unwrap();
+    let user = hub_sync::source_identity().1;
+
+    config::write_private(
+        &oauth_dir.join(format!("{user}-google.json")),
+        &serde_json::to_vec(&json!({"target":{"provider":"google","profile":"antigravity","user":user}})).unwrap(),
+        true,
+    )
+    .unwrap();
+
+    let calls_file = dir.join("provenance-calls");
+    let fake_bin = dir.join("fake-provenance-oauth");
+    fs::write(
+        &fake_bin,
+        format!(
+            "#!/bin/sh\n\
+             printf 'x\\n' >> {}\n\
+             case \"$2\" in\n\
+               *-google.json) printf '{{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"project_id\":\"aicode-consumers\",\"refresh_token\":\"refresh-1\"}}' ;;\n\
+               *-google-new.json) printf '{{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"project_id\":\"aicode-consumers\",\"refresh_token\":\"refresh-new\"}}' ;;\n\
+               *-google-third.json) printf '{{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"project_id\":\"aicode-consumers\",\"refresh_token\":\"refresh-third\"}}' ;;\n\
+               *) exit 1 ;;\n\
+             esac\n",
+            calls_file.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mock = serve(
+        Router::new()
+            .route(
+                "/test/google-token",
+                post(|body: String| async move {
+                    let token = if body.contains("refresh_token=refresh-new") {
+                        "ya29.pool-new"
+                    } else if body.contains("refresh_token=refresh-third") {
+                        "ya29.pool-third"
+                    } else {
+                        "ya29.pool-1"
+                    };
+                    axum::Json(json!({"access_token": token, "expires_in": 3600})).into_response()
+                }),
+            )
+            .route(
+                "/test/google-tokeninfo",
+                post(|body: String| async move {
+                    match body.as_str() {
+                        "access_token=ya29.pool-1" => axum::Json(json!({
+                            "aud": "agy-client",
+                            "email": "one@example.test",
+                            "email_verified": "true",
+                            "expires_in": "3599"
+                        }))
+                        .into_response(),
+                        "access_token=ya29.client-new" | "access_token=ya29.pool-new" => axum::Json(json!({
+                            "aud": "agy-client",
+                            "email": "new@example.test",
+                            "email_verified": "true",
+                            "expires_in": "3599"
+                        }))
+                        .into_response(),
+                        "access_token=ya29.client-unknown" => axum::Json(json!({
+                            "aud": "agy-client",
+                            "email": "unknown@example.test",
+                            "email_verified": "true",
+                            "expires_in": "3599"
+                        }))
+                        .into_response(),
+                        _ => StatusCode::BAD_REQUEST.into_response(),
+                    }
+                }),
+            ),
+    )
+    .await;
+
+    let config = Config {
+        bind: config::DEFAULT_BIND.parse().unwrap(),
+        home: dir.0.clone(),
+        t3code_home: dir.0.clone(),
+        auth_dir: dir.join("auth"),
+        discover_local: true,
+        provenance_oauth_dir: oauth_dir.clone(),
+        provenance_oauth_bin: Some(fake_bin),
+        client_key: "inference-fixture".into(),
+        management_key: "management-fixture".into(),
+        anthropic: mock.0.clone(),
+        openai: mock.0.clone(),
+        codex: mock.0.clone(),
+        antigravity: mock.0.clone(),
+        url: config::DEFAULT_URL.into(),
+    };
+    let mut proxy = Proxy::new(config).unwrap();
+    proxy.management_mock = Some(mock.0.clone());
+    let proxy = Arc::new(proxy);
+    async fn google_count(proxy: &Proxy) -> usize {
+        proxy.state.read().await.pool.accounts.values().filter(|a| a.lane == Lane::Google).count()
+    }
+    proxy.discover_local_commands().await;
+    assert_eq!(google_count(&proxy).await, 1);
+    let rev_before = proxy.state.read().await.pool.revision;
+
+    // A new enrollment arrives after startup; authorize_google reloads and accepts it immediately.
+    config::write_private(
+        &oauth_dir.join(format!("{user}-google-new.json")),
+        &serde_json::to_vec(&json!({"target":{"provider":"google","profile":"antigravity","user":user}})).unwrap(),
+        true,
+    )
+    .unwrap();
+    assert!(proxy.authorize_google("ya29.client-new").await);
+    assert_eq!(google_count(&proxy).await, 2);
+    assert!(proxy.state.read().await.pool.revision > rev_before);
+
+    // An immediate follow-up miss is throttled and does not re-spawn provenance-oauth.
+    let calls_after_reload = fs::read_to_string(&calls_file).unwrap().lines().count();
+    assert!(!proxy.authorize_google("ya29.client-unknown").await);
+    assert_eq!(fs::read_to_string(&calls_file).unwrap().lines().count(), calls_after_reload);
+
+    // Explicit unthrottled refresh picks up another newly deployed manifest.
+    config::write_private(
+        &oauth_dir.join(format!("{user}-google-third.json")),
+        &serde_json::to_vec(&json!({"target":{"provider":"google","profile":"antigravity","user":user}})).unwrap(),
+        true,
+    )
+    .unwrap();
+    assert!(proxy.refresh_local_commands(Duration::ZERO).await);
+    assert_eq!(google_count(&proxy).await, 3);
+}
+
+#[tokio::test]
 async fn expired_claude_token_reloads_from_disk_and_activity_preserves_effort() {
     let seen_auth = Arc::new(Mutex::new(Vec::<String>::new()));
     let captured = seen_auth.clone();

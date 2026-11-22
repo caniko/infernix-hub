@@ -30,6 +30,7 @@ pub struct Proxy {
     state: RwLock<ProxyState>,
     http: reqwest::Client,
     oauth_refresh: Mutex<()>,
+    local_discovery: Mutex<Option<Instant>>,
     quota_actions: Mutex<()>,
     codex_keys: Mutex<CodexKeys>,
     google_tokens: Mutex<HashMap<[u8; 32], VerifiedGoogleToken>>,
@@ -127,6 +128,7 @@ impl Proxy {
                 captures: Captures::default(),
             }),
             oauth_refresh: Mutex::new(()),
+            local_discovery: Mutex::new(None),
             quota_actions: Mutex::new(()),
             codex_keys: Mutex::new(CodexKeys::default()),
             google_tokens: Mutex::new(HashMap::new()),
@@ -214,6 +216,24 @@ impl Proxy {
     }
 
     pub async fn discover_local_commands(&self) {
+        let _last = self.local_discovery.lock().await;
+        self.discover_local_commands_locked().await;
+    }
+
+    pub async fn refresh_local_commands(&self, min_interval: Duration) -> bool {
+        if !self.config.discover_local {
+            return false;
+        }
+        let mut last = self.local_discovery.lock().await;
+        if last.is_some_and(|at| at.elapsed() < min_interval) {
+            return false;
+        }
+        self.discover_local_commands_locked().await;
+        *last = Some(Instant::now());
+        true
+    }
+
+    async fn discover_local_commands_locked(&self) {
         if !self.config.discover_local {
             return;
         }
@@ -267,8 +287,12 @@ impl Proxy {
         }))
         .await;
         let mut state = self.state.write().await;
+        let before = state.pool.accounts.len();
         for (label, raw) in loaded.into_iter().flatten() {
             pool::add_provenance_google(&mut state.pool, &label, raw);
+        }
+        if state.pool.accounts.len() != before {
+            state.pool.revision += 1;
         }
     }
 
@@ -360,14 +384,18 @@ impl Proxy {
             }
         }
         self.hydrate_google_emails().await;
-        let has_candidates = {
-            let state = self.state.read().await;
-            state
-                .pool
-                .accounts
+        let has_pool_candidates = |pool: &Pool| {
+            pool.accounts
                 .values()
                 .any(|a| !a.disabled && !a.api_key && a.lane == Lane::Google && a.google_client.is_some() && a.email.is_some())
         };
+        let mut has_candidates = has_pool_candidates(&self.state.read().await.pool);
+        let mut refreshed = false;
+        if !has_candidates && self.refresh_local_commands(Duration::from_secs(15)).await {
+            refreshed = true;
+            self.hydrate_google_emails().await;
+            has_candidates = has_pool_candidates(&self.state.read().await.pool);
+        }
         if !has_candidates {
             return false;
         }
@@ -384,10 +412,15 @@ impl Proxy {
             return false;
         };
         let clients: Vec<&str> = [pool::text(&info, &["aud"]), pool::text(&info, &["azp"])].into_iter().flatten().collect();
-        let matched_client = {
+        let mut matched_client = {
             let state = self.state.read().await;
-            clients.into_iter().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned)
+            clients.iter().copied().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned)
         };
+        if matched_client.is_none() && !refreshed && self.refresh_local_commands(Duration::from_secs(15)).await {
+            self.hydrate_google_emails().await;
+            let state = self.state.read().await;
+            matched_client = clients.iter().copied().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned);
+        }
         let Some(client_id) = matched_client else {
             return false;
         };
