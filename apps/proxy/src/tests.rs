@@ -444,7 +444,8 @@ async fn google_placeholder_refreshes_and_caches_oauth() {
     let credentials = pool::parse_credentials(
         "google.json",
         &json!({
-            "type":"antigravity","refresh_token":"google-refresh-fixture","client_id":"fixture-client","client_secret":"fixture-secret"
+            "type":"antigravity","refresh_token":"google-refresh-fixture","client_id":"fixture-client",
+            "client_secret":"fixture-secret","project_id":"fixture-project"
         }),
         true,
     )
@@ -453,6 +454,11 @@ async fn google_placeholder_refreshes_and_caches_oauth() {
     proxy.state.write().await.pool.insert(credentials);
     let server = serve(proxy.app()).await;
     let http = Http::new(&server);
+    let inventory = http.management("GET", "/v0/management/auth-files", None).await.text().await.unwrap();
+    assert!(!inventory.contains("fixture-secret"));
+    let inventory: Value = serde_json::from_str(&inventory).unwrap();
+    let google = inventory["files"].as_array().unwrap().iter().find(|row| row["auth_index"] == index).unwrap();
+    assert_eq!(google["project_id"], "fixture-project");
     let path = "/v1internal:fetchAvailableModels";
     let reply: Value = http
         .management(

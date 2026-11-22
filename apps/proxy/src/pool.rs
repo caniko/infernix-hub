@@ -144,6 +144,12 @@ impl Account {
         if let Some(email) = &self.email {
             row["email"] = json!(email);
         }
+        if self.lane == Lane::Google
+            && !self.api_key
+            && let Some(project) = &self.project
+        {
+            row["project_id"] = json!(project);
+        }
         if self.lane == Lane::Codex && !self.api_key {
             let mut metadata = json!({});
             if let Some(id) = &self.chatgpt_id {
