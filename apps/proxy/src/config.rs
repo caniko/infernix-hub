@@ -21,6 +21,8 @@ pub struct Config {
     pub t3code_home: PathBuf,
     pub auth_dir: PathBuf,
     pub discover_local: bool,
+    pub provenance_oauth_dir: PathBuf,
+    pub provenance_oauth_bin: Option<PathBuf>,
     pub client_key: String,
     pub management_key: String,
     pub anthropic: Url,
@@ -53,6 +55,11 @@ impl Config {
             home,
             auth_dir,
             discover_local,
+            provenance_oauth_dir: env::var_os("PROXY_PROVENANCE_OAUTH_DIR")
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/etc/provenance/oauth")),
+            provenance_oauth_bin: env::var_os("PROXY_PROVENANCE_OAUTH_BIN").filter(|p| !p.is_empty()).map(PathBuf::from),
             client_key,
             management_key,
             anthropic: upstream("PROXY_ANTHROPIC_UPSTREAM", "https://api.anthropic.com")?,

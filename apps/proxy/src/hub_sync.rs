@@ -21,29 +21,6 @@ const ROUTER_ID: &str = "fleetix-proxy";
 const DEADLINE: Duration = Duration::from_secs(10);
 
 pub async fn poll_quota(proxy: Arc<Proxy>) {
-    if proxy.config.discover_local {
-        use std::process::Stdio;
-        use tokio::process::Command;
-        let read = Command::new("opencode")
-            .args(["auth", "list", "--format", "json"])
-            .env_clear()
-            .envs(
-                ["PATH", "HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "OPENCODE_DB"]
-                    .into_iter()
-                    .filter_map(|key| env::var_os(key).map(|value| (key, value))),
-            )
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .output();
-        if let Ok(Ok(output)) = timeout(Duration::from_secs(3), read).await
-            && output.status.success()
-            && output.stdout.len() <= 2 * 1024 * 1024
-            && let Ok(raw) = serde_json::from_slice(&output.stdout)
-        {
-            crate::pool::add_opencode(&mut proxy.state.write().await.pool, &raw);
-        }
-    }
     let mut ticks = interval(Duration::from_secs(300));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {

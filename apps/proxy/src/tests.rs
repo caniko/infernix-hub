@@ -191,6 +191,8 @@ fn fixture(dir: &Scratch, mock: &Server) -> Arc<Proxy> {
         t3code_home: dir.0.clone(),
         auth_dir,
         discover_local: false,
+        provenance_oauth_dir: dir.join("provenance-oauth"),
+        provenance_oauth_bin: None,
         client_key: "inference-fixture".into(),
         management_key: "management-fixture".into(),
         anthropic: mock.0.clone(),
@@ -762,4 +764,267 @@ async fn multi_key_group_edits_only_affect_the_selected_key_and_hub_ids_are_sour
     assert_ne!(id_a, id_b);
     assert_eq!(id_a, "claude:atlas:can:group.json#1");
     assert_eq!(state.pool.find(&state.pool.hub_id(first)).map(|a| a.id.as_str()), Some("group.json#1"));
+}
+
+#[tokio::test]
+async fn antigravity_native_auth_project_rewrite_refresh_and_failover() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let tokeninfo_hits = Arc::new(AtomicUsize::new(0));
+    let tokeninfo_hits_c = tokeninfo_hits.clone();
+    let refresh_hits = Arc::new(AtomicUsize::new(0));
+    let refresh_hits_c = refresh_hits.clone();
+    let a_attempts = Arc::new(AtomicUsize::new(0));
+    let a_attempts_c = a_attempts.clone();
+
+    let mock = serve(
+        Router::new()
+            .route(
+                "/test/google-tokeninfo",
+                post(move |body: String| {
+                    let hits = tokeninfo_hits_c.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                        match body.as_str() {
+                            "access_token=ya29.client-a" | "access_token=ya29.pool-a-fresh" => axum::Json(json!({
+                                "aud": "agy-client-id",
+                                "email": "acct-a@example.test",
+                                "email_verified": "true",
+                                "expires_in": "3599"
+                            }))
+                            .into_response(),
+                            "access_token=ya29.pool-b" => axum::Json(json!({
+                                "aud": "agy-client-id",
+                                "email": "acct-b@example.test",
+                                "email_verified": "true",
+                                "expires_in": "3599"
+                            }))
+                            .into_response(),
+                            "access_token=ya29.stranger" => axum::Json(json!({
+                                "aud": "agy-client-id",
+                                "email": "stranger@example.test",
+                                "email_verified": "true",
+                                "expires_in": "3599"
+                            }))
+                            .into_response(),
+                            "access_token=ya29.wrong-aud" => axum::Json(json!({
+                                "aud": "other-client-id",
+                                "email": "acct-a@example.test",
+                                "email_verified": "true",
+                                "expires_in": "3599"
+                            }))
+                            .into_response(),
+                            "access_token=ya29.unverified" => axum::Json(json!({
+                                "aud": "agy-client-id",
+                                "email": "acct-a@example.test",
+                                "email_verified": "false",
+                                "expires_in": "3599"
+                            }))
+                            .into_response(),
+                            _ => StatusCode::BAD_REQUEST.into_response(),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/test/google-token",
+                post(move |body: String| {
+                    let hits = refresh_hits_c.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                        if body.contains("refresh_token=refresh-a") {
+                            axum::Json(json!({"access_token":"ya29.pool-a-fresh","expires_in":3600})).into_response()
+                        } else if body.contains("refresh_token=refresh-b") {
+                            axum::Json(json!({"access_token":"ya29.pool-b","expires_in":3600})).into_response()
+                        } else {
+                            StatusCode::BAD_REQUEST.into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:streamGenerateContent",
+                post(move |headers: HeaderMap, axum::Json(raw): axum::Json<Value>| {
+                    let a_attempts = a_attempts_c.clone();
+                    async move {
+                        match headers["authorization"].to_str().unwrap() {
+                            "Bearer ya29.pool-a-stale" => {
+                                assert_eq!(raw["project"], "proj-a");
+                                StatusCode::UNAUTHORIZED.into_response()
+                            }
+                            "Bearer ya29.pool-a-fresh" => {
+                                assert_eq!(raw["project"], "proj-a");
+                                let n = a_attempts.fetch_add(1, Ordering::Relaxed);
+                                if n == 0 {
+                                    // First fresh call succeeds; second hits 429 and fails over to account B.
+                                    let body = "data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":5,\"cachedContentTokenCount\":3,\"thoughtsTokenCount\":2,\"totalTokenCount\":17}}}\n\n";
+                                    (StatusCode::OK, [("content-type", "text/event-stream")], body).into_response()
+                                } else {
+                                    (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "60")], "rate limited").into_response()
+                                }
+                            }
+                            "Bearer ya29.pool-b" => {
+                                assert_eq!(raw["project"], "proj-b");
+                                let body = "data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":8,\"totalTokenCount\":28}}}\n\n";
+                                (StatusCode::OK, [("content-type", "text/event-stream")], body).into_response()
+                            }
+                            other => panic!("unexpected upstream bearer: {other}"),
+                        }
+                    }
+                }),
+            ),
+    )
+    .await;
+
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    // Account A starts with a stale access token (exercises router 401 forced refresh).
+    // Account B has lower priority, NO email (exercises lazy email hydration), and a different project_id.
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials(
+            "google-a.json",
+            &json!({
+                "type": "antigravity",
+                "email": "acct-a@example.test",
+                "access_token": "ya29.pool-a-stale",
+                "refresh_token": "refresh-a",
+                "client_id": "agy-client-id",
+                "client_secret": "agy-secret",
+                "project_id": "proj-a",
+                "priority": 10
+            }),
+            true,
+        )
+        .unwrap(),
+    );
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials(
+            "google-b.json",
+            &json!({
+                "type": "antigravity",
+                "refresh_token": "refresh-b",
+                "client_id": "agy-client-id",
+                "client_secret": "agy-secret",
+                "project_id": "proj-b",
+                "priority": 1
+            }),
+            true,
+        )
+        .unwrap(),
+    );
+
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let endpoint = "/v1internal:streamGenerateContent?alt=sse";
+    let payload = json!({
+        "project": "client-default-proj",
+        "model": "gemini-4-neon",
+        "request": {"session_id": "agy-sess-1"}
+    });
+
+    // Reject unauthenticated, unknown-email, wrong-audience, and unverified tokens.
+    assert_eq!(http.request("POST", endpoint).json(&payload).send().await.unwrap().status(), 401);
+    for bad in ["ya29.stranger", "ya29.wrong-aud", "ya29.unverified"] {
+        assert_eq!(http.request("POST", endpoint).bearer_auth(bad).json(&payload).send().await.unwrap().status(), 401);
+    }
+
+    // Valid client token for acct-a: hydrates missing emails, authorizes, hits 401 on stale pool-a,
+    // force-refreshes pool-a, rewrites project -> proj-a, and records /response/usageMetadata.
+    let first = http.request("POST", endpoint).bearer_auth("ya29.client-a").json(&payload).send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    let _ = first.text().await.unwrap();
+    let hits_after_first = tokeninfo_hits.load(Ordering::Relaxed);
+
+    // Second request uses cached client token (zero extra tokeninfo calls), hits 429 on pool-a,
+    // and transparently fails over to pool-b with project rewritten -> proj-b!
+    let second = http.request("POST", endpoint).bearer_auth("ya29.client-a").json(&payload).send().await.unwrap();
+    assert_eq!(second.status(), 200);
+    let _ = second.text().await.unwrap();
+    assert_eq!(tokeninfo_hits.load(Ordering::Relaxed), hits_after_first, "verified Google token must be cached");
+
+    let state = proxy.state.read().await;
+    assert_eq!(state.pool.accounts["google-a.json"].email.as_deref(), Some("acct-a@example.test"));
+    assert_eq!(state.pool.accounts["google-b.json"].email.as_deref(), Some("acct-b@example.test"));
+    assert_eq!(state.activity.len(), 2);
+    assert_eq!(state.activity[0].input_tokens, 12);
+    assert_eq!(state.activity[0].output_tokens, 5);
+    assert_eq!(state.activity[0].cache_read_tokens, 3);
+    assert_eq!(state.activity[0].thinking_tokens, 2);
+    assert_eq!(state.activity[1].input_tokens, 20);
+    assert_eq!(state.activity[1].output_tokens, 8);
+    assert!(refresh_hits.load(Ordering::Relaxed) >= 2);
+}
+
+#[tokio::test]
+async fn provenance_oauth_discovers_all_antigravity_enrollments_and_deduplicates_acp_token() {
+    let dir = Scratch::new();
+    let oauth_dir = dir.join("provenance-oauth");
+    config::private_dir(&oauth_dir).unwrap();
+    let user = hub_sync::source_identity().1;
+
+    // Seed one active ACP profile sharing refresh-1 (opaque hash directory name, as T3 Code writes it).
+    let active_hash = "ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32";
+    let acp_dir = dir.join(&format!("userdata/providers/antigravity/{active_hash}/antigravity-acp"));
+    config::write_private(
+        &acp_dir.join("acp_token.json"),
+        &serde_json::to_vec(&json!({
+            "refresh_token": "refresh-1",
+            "client_id": "agy-client",
+            "client_secret": "agy-secret",
+            "project_id": "aicode-consumers"
+        }))
+        .unwrap(),
+        true,
+    )
+    .unwrap();
+
+    // Create 3 manifests: two google/antigravity enrollments + one unrelated openai manifest.
+    for (file, body) in [
+        (format!("{user}-google.json"), json!({"target":{"provider":"google","profile":"antigravity","user":user}})),
+        (format!("{user}-google-filiz.json"), json!({"target":{"provider":"google","profile":"antigravity","user":user}})),
+        (format!("{user}-openai-main.json"), json!({"target":{"provider":"openai","profile":"codex","user":user}})),
+    ] {
+        config::write_private(&oauth_dir.join(file), &serde_json::to_vec(&body).unwrap(), true).unwrap();
+    }
+
+    let fake_bin = dir.join("fake-provenance-oauth");
+    fs::write(
+        &fake_bin,
+        "#!/bin/sh\n\
+         case \"$2\" in\n\
+           *-google.json) printf '{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"project_id\":\"aicode-consumers\",\"refresh_token\":\"refresh-1\"}' ;;\n\
+           *-google-filiz.json) printf '{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"project_id\":\"aicode-consumers\",\"refresh_token\":\"refresh-2\"}' ;;\n\
+           *) exit 1 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mock = serve(Router::new()).await;
+    let config = Config {
+        bind: config::DEFAULT_BIND.parse().unwrap(),
+        home: dir.0.clone(),
+        t3code_home: dir.0.clone(),
+        auth_dir: dir.join("auth"),
+        discover_local: true,
+        provenance_oauth_dir: oauth_dir,
+        provenance_oauth_bin: Some(fake_bin),
+        client_key: "inference-fixture".into(),
+        management_key: "management-fixture".into(),
+        anthropic: mock.0.clone(),
+        openai: mock.0.clone(),
+        codex: mock.0.clone(),
+        antigravity: mock.0.clone(),
+        url: config::DEFAULT_URL.into(),
+    };
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    proxy.discover_local_commands().await;
+
+    let state = proxy.state.read().await;
+    let mut google: Vec<_> =
+        state.pool.accounts.values().filter(|a| a.lane == Lane::Google).map(|a| (a.label.clone(), a.refresh.clone())).collect();
+    google.sort();
+    assert_eq!(
+        google,
+        vec![("google".to_owned(), Some("refresh-1".to_owned())), ("google-filiz".to_owned(), Some("refresh-2".to_owned())),]
+    );
 }

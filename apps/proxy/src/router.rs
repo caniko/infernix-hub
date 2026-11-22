@@ -71,6 +71,11 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                 Some(token) => proxy.authorize_codex(token).await,
                 None => false,
             })
+        && !(lane == Lane::Google
+            && match provided {
+                Some(token) => proxy.authorize_google(token).await,
+                None => false,
+            })
     {
         return error(StatusCode::UNAUTHORIZED, "invalid inference credentials");
     }
@@ -89,7 +94,20 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
     let model = text(&raw, &["model"]).filter(|s| identifier(s)).unwrap_or_default();
     let metadata_user: Value = text(&raw, &["/metadata/user_id"]).and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
     let session = header_id(&parts.headers, &["x-session-id", "x-claude-session-id", "session_id"])
-        .or_else(|| text(&raw, &["/metadata/session_id", "/metadata/sessionId", "session_id", "prompt_cache_key"]))
+        .or_else(|| {
+            text(
+                &raw,
+                &[
+                    "/metadata/session_id",
+                    "/metadata/sessionId",
+                    "/request/session_id",
+                    "/request/sessionId",
+                    "session_id",
+                    "trajectoryId",
+                    "prompt_cache_key",
+                ],
+            )
+        })
         .or_else(|| text(&metadata_user, &["session_id"]))
         .or_else(|| text(&raw, &["/metadata/user_id"]).and_then(|s| s.rsplit_once("_session_").map(|(_, id)| id)))
         .filter(|s| identifier(s))
@@ -150,36 +168,47 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         let started = Utc::now();
         let timeout = Duration::from_secs(policy.first_byte_timeout_secs.clamp(1, 600));
         let incoming = async {
-            let token = proxy.token(&account, false).await.map_err(|_| ())?;
             let url = upstream(&proxy, &account, &parts.uri).ok_or(())?;
-            let mut req = proxy.http.request(parts.method.clone(), url).body(body.clone());
-            let connection = connection_headers(&parts.headers);
-            for (key, value) in &parts.headers {
-                let name = key.as_str();
-                if (request_header(name) || (name == "anthropic-beta" && account.api_key && lane == Lane::Claude))
-                    && !connection.iter().any(|s| s.eq_ignore_ascii_case(name))
-                {
-                    req = req.header(key, value);
+            let payload = request_body(&body, &raw, lane, &account);
+            let build = |token: String| {
+                let mut req = proxy.http.request(parts.method.clone(), url.clone()).body(payload.clone());
+                let connection = connection_headers(&parts.headers);
+                for (key, value) in &parts.headers {
+                    let name = key.as_str();
+                    if (request_header(name) || (name == "anthropic-beta" && account.api_key && lane == Lane::Claude))
+                        && !connection.iter().any(|s| s.eq_ignore_ascii_case(name))
+                    {
+                        req = req.header(key, value);
+                    }
                 }
-            }
-            req = match lane {
-                Lane::Claude if account.api_key => req.header("x-api-key", token),
-                Lane::Claude => {
-                    let beta = parts.headers.get("anthropic-beta").and_then(|v| v.to_str().ok()).unwrap_or_default();
-                    let beta = if beta.split(',').any(|item| item.trim() == "oauth-2025-04-20") {
-                        beta.to_owned()
-                    } else if beta.is_empty() {
-                        "oauth-2025-04-20".into()
-                    } else {
-                        format!("{beta},oauth-2025-04-20")
-                    };
-                    req.header("anthropic-beta", beta).bearer_auth(token)
+                match lane {
+                    Lane::Claude if account.api_key => req.header("x-api-key", token),
+                    Lane::Claude => {
+                        let beta = parts.headers.get("anthropic-beta").and_then(|v| v.to_str().ok()).unwrap_or_default();
+                        let beta = if beta.split(',').any(|item| item.trim() == "oauth-2025-04-20") {
+                            beta.to_owned()
+                        } else if beta.is_empty() {
+                            "oauth-2025-04-20".into()
+                        } else {
+                            format!("{beta},oauth-2025-04-20")
+                        };
+                        req.header("anthropic-beta", beta).bearer_auth(token)
+                    }
+                    Lane::Codex => openai_account(req.bearer_auth(token), &account),
+                    Lane::Google if account.api_key => req.header("x-goog-api-key", token),
+                    _ => req.bearer_auth(token),
                 }
-                Lane::Codex => openai_account(req.bearer_auth(token), &account),
-                Lane::Google if account.api_key => req.header("x-goog-api-key", token),
-                _ => req.bearer_auth(token),
             };
-            let mut res = req.send().await.map_err(|_| ())?;
+            let token = proxy.token(&account, false).await.map_err(|_| ())?;
+            let mut res = build(token).send().await.map_err(|_| ())?;
+            if res.status() == StatusCode::UNAUTHORIZED
+                && lane == Lane::Google
+                && !account.api_key
+                && account.refresh.is_some()
+                && let Ok(fresh) = proxy.token(&account, true).await
+            {
+                res = build(fresh).send().await.map_err(|_| ())?;
+            }
             let first = res.chunk().await.map_err(|_| ())?;
             Ok::<_, ()>((res, first))
         };
@@ -353,6 +382,21 @@ pub(crate) async fn run_window_start(
     result(&proxy, account, limited, success).await;
     exchange.finish(status, outcome, usage, Some(millis(began.elapsed())), None).await;
     if success { Ok(()) } else { Err(()) }
+}
+
+fn request_body(body: &Bytes, raw: &Value, lane: Lane, account: &Account) -> Bytes {
+    if lane == Lane::Google
+        && let Some(project) = account.project.as_deref()
+        && let Some(obj) = raw.as_object()
+        && obj.get("project").and_then(Value::as_str).is_some_and(|current| current != project)
+    {
+        let mut rewritten = obj.clone();
+        rewritten.insert("project".into(), Value::String(project.to_owned()));
+        if let Ok(bytes) = serde_json::to_vec(&rewritten) {
+            return Bytes::from(bytes);
+        }
+    }
+    body.clone()
 }
 
 fn proxy_model_is_go(model: &str) -> bool {
@@ -534,6 +578,7 @@ impl Usage {
             .get("usage")
             .or_else(|| raw.pointer("/message/usage"))
             .or_else(|| raw.pointer("/response/usage"))
+            .or_else(|| raw.pointer("/response/usageMetadata"))
             .or_else(|| raw.get("usageMetadata"))
             .unwrap_or(raw);
         let get = |keys: &[&str]| {

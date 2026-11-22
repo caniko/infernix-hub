@@ -617,6 +617,62 @@ fn add(pool: &mut Pool, lane: Lane, label: &str, mut raw: Value) {
     }
 }
 
+pub(crate) fn provenance_google_manifests(config: &Config, user: &str) -> Vec<(String, PathBuf)> {
+    if user.is_empty() {
+        return Vec::new();
+    }
+    let prefix = format!("{user}-");
+    paths(&config.provenance_oauth_dir)
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            if !name.starts_with(&prefix) || !name.ends_with(".json") {
+                return None;
+            }
+            let raw = read_json(&path)?;
+            if text(&raw, &["/target/provider"]) != Some("google") || text(&raw, &["/target/profile"]) != Some("antigravity") {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?;
+            let enrollment = stem.strip_prefix(&prefix).unwrap_or(stem);
+            let label = text(&raw, &["/target/enrollment"]).unwrap_or(enrollment).to_owned();
+            Some((label, path))
+        })
+        .collect()
+}
+
+pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value) {
+    let Some(fields) = raw.as_object_mut() else { return };
+    fields.entry("label").or_insert_with(|| json!(label));
+    let refresh = text(&raw, &["refresh_token", "refreshToken", "refresh"]).map(str::to_owned);
+    let client = text(&raw, &["client_id", "clientId"]).map(str::to_owned);
+    let secret = text(&raw, &["client_secret", "clientSecret"]).map(str::to_owned);
+    let project = text(&raw, &["project_id", "projectId", "project"]).map(str::to_owned);
+    let email = text(&raw, &["email"]).map(str::to_owned);
+    if let Some(refresh) = refresh.as_deref()
+        && let Some(existing) =
+            pool.accounts.values_mut().find(|a| a.lane == Lane::Google && a.local && a.refresh.as_deref() == Some(refresh))
+    {
+        if existing.label == existing.name || existing.label.starts_with("local-") || existing.label.len() == 64 {
+            existing.label = label.to_owned();
+        }
+        if existing.google_client.is_none() {
+            existing.google_client = client;
+        }
+        if existing.google_secret.is_none() {
+            existing.google_secret = secret;
+        }
+        if existing.project.is_none() {
+            existing.project = project;
+        }
+        if existing.email.is_none() {
+            existing.email = email;
+        }
+        return;
+    }
+    add(pool, Lane::Google, &format!("provenance:{label}"), raw);
+}
+
 pub(crate) fn add_opencode(pool: &mut Pool, raw: &Value) {
     let rows = raw.get("credentials").unwrap_or(raw);
     let object = rows.as_object().into_iter().flatten().map(|(name, row)| (name.as_str(), row));
@@ -688,7 +744,7 @@ fn discover(config: &Config, pool: &mut Pool) {
             add(pool, lane, var, json!({"key":key}));
         }
     }
-    let manifests: Vec<_> = paths(Path::new("/etc/provenance/oauth"))
+    let manifests: Vec<_> = paths(&config.provenance_oauth_dir)
         .into_iter()
         .filter(|path| {
             !user.is_empty()

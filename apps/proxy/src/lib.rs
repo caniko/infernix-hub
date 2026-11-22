@@ -6,7 +6,7 @@ mod pool;
 mod router;
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -19,6 +19,7 @@ use config::Config;
 use contracts::providers::{ActivityExchangeIn, ProxyLogEntry, QuotaObservationState, ResetGrant};
 use pool::{Account, Lane, Pool};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
 
@@ -31,9 +32,16 @@ pub struct Proxy {
     oauth_refresh: Mutex<()>,
     quota_actions: Mutex<()>,
     codex_keys: Mutex<CodexKeys>,
+    google_tokens: Mutex<HashMap<[u8; 32], VerifiedGoogleToken>>,
     shutdown: Notify,
     #[cfg(test)]
     management_mock: Option<reqwest::Url>,
+}
+
+struct VerifiedGoogleToken {
+    expires: Instant,
+    client_id: String,
+    email: String,
 }
 
 struct ProxyState {
@@ -112,6 +120,7 @@ impl Proxy {
             oauth_refresh: Mutex::new(()),
             quota_actions: Mutex::new(()),
             codex_keys: Mutex::new(CodexKeys::default()),
+            google_tokens: Mutex::new(HashMap::new()),
             shutdown: Notify::new(),
             #[cfg(test)]
             management_mock: None,
@@ -195,6 +204,219 @@ impl Proxy {
             .is_some_and(|key| key.verify(&ring::signature::RSA_PKCS1_2048_8192_SHA256, signed.as_bytes(), &signature).is_ok())
     }
 
+    pub async fn discover_local_commands(&self) {
+        if !self.config.discover_local {
+            return;
+        }
+        use std::process::Stdio;
+        use tokio::{process::Command, time::timeout};
+
+        let opencode_read = Command::new("opencode")
+            .args(["auth", "list", "--format", "json"])
+            .env_clear()
+            .envs(
+                ["PATH", "HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "OPENCODE_DB"]
+                    .into_iter()
+                    .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
+            )
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        if let Ok(Ok(output)) = timeout(Duration::from_secs(3), opencode_read).await
+            && output.status.success()
+            && output.stdout.len() <= 2 * 1024 * 1024
+            && let Ok(raw) = serde_json::from_slice(&output.stdout)
+        {
+            pool::add_opencode(&mut self.state.write().await.pool, &raw);
+        }
+
+        let manifests = pool::provenance_google_manifests(&self.config, &self.source_user);
+        if manifests.is_empty() {
+            return;
+        }
+        let candidates: Vec<std::path::PathBuf> = match &self.config.provenance_oauth_bin {
+            Some(bin) => vec![bin.clone()],
+            None => vec!["provenance-oauth".into(), "/run/current-system/sw/bin/provenance-oauth".into()],
+        };
+        let env_vars: Vec<(&'static str, std::ffi::OsString)> = ["PATH", "HOME", "USER", "XDG_RUNTIME_DIR", "XDG_STATE_HOME"]
+            .into_iter()
+            .filter_map(|key| std::env::var_os(key).map(|value| (key, value)))
+            .collect();
+        let loaded = futures_util::future::join_all(manifests.into_iter().map(|(label, path)| {
+            let candidates = &candidates;
+            let env_vars = &env_vars;
+            async move {
+                for bin in candidates {
+                    let read = Command::new(bin)
+                        .arg("--config")
+                        .arg(&path)
+                        .arg("agy-token")
+                        .env_clear()
+                        .envs(env_vars.iter().map(|(k, v)| (*k, v)))
+                        .stdin(Stdio::null())
+                        .stderr(Stdio::null())
+                        .kill_on_drop(true)
+                        .output();
+                    match timeout(Duration::from_secs(5), read).await {
+                        Ok(Ok(output)) if output.status.success() && output.stdout.len() <= 2 * 1024 * 1024 => {
+                            if let Ok(raw) = serde_json::from_slice::<Value>(&output.stdout) {
+                                return Some((label, raw));
+                            }
+                            return None;
+                        }
+                        Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        _ => return None,
+                    }
+                }
+                None
+            }
+        }))
+        .await;
+        let mut state = self.state.write().await;
+        for (label, raw) in loaded.into_iter().flatten() {
+            pool::add_provenance_google(&mut state.pool, &label, raw);
+        }
+    }
+
+    async fn google_tokeninfo(&self, token: &str) -> Result<Value, &'static str> {
+        let tokeninfo_url = "https://oauth2.googleapis.com/tokeninfo".to_owned();
+        #[cfg(test)]
+        let tokeninfo_url = self
+            .management_mock
+            .as_ref()
+            .and_then(|base| base.join("/test/google-tokeninfo").ok())
+            .map_or(tokeninfo_url, |url| url.to_string());
+        provider_json(self.http.post(tokeninfo_url).form(&[("access_token", token)])).await
+    }
+
+    async fn google_token_email(&self, token: &str) -> Option<String> {
+        let info = self.google_tokeninfo(token).await.ok()?;
+        let verified = info["email_verified"] == true || info["email_verified"] == "true";
+        verified.then(|| pool::text(&info, &["email"]).map(str::to_owned)).flatten()
+    }
+
+    async fn hydrate_google_emails(&self) {
+        let missing: Vec<Account> = {
+            let state = self.state.read().await;
+            state
+                .pool
+                .accounts
+                .values()
+                .filter(|a| a.lane == Lane::Google && !a.disabled && !a.api_key && a.email.is_none() && a.google_client.is_some())
+                .cloned()
+                .collect()
+        };
+        if missing.is_empty() {
+            return;
+        }
+        let resolved = futures_util::future::join_all(missing.into_iter().map(|account| async move {
+            let token = self.token(&account, false).await.ok()?;
+            let email = match self.google_token_email(&token).await {
+                Some(email) => Some(email),
+                None if account.refresh.is_some() => {
+                    let fresh = self.token(&account, true).await.ok()?;
+                    self.google_token_email(&fresh).await
+                }
+                None => None,
+            }?;
+            Some((account.id, account.refresh, account.access, email))
+        }))
+        .await;
+        let mut state = self.state.write().await;
+        for (id, refresh, access, email) in resolved.into_iter().flatten() {
+            if let Some(current) = state.pool.accounts.get_mut(&id).filter(|c| {
+                c.lane == Lane::Google
+                    && !c.disabled
+                    && c.email.is_none()
+                    && (c.access == access || (c.refresh.is_some() && c.refresh == refresh))
+            }) {
+                current.email = Some(email);
+            }
+        }
+    }
+
+    async fn authorize_google(&self, token: &str) -> bool {
+        if token.is_empty() || token.len() > 32_768 || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return false;
+        }
+        let matches_pool = |pool: &Pool, client_id: &str, email: &str| {
+            pool.accounts.values().any(|a| {
+                !a.disabled
+                    && !a.api_key
+                    && a.lane == Lane::Google
+                    && a.google_client.as_deref() == Some(client_id)
+                    && a.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(email))
+            })
+        };
+        {
+            let state = self.state.read().await;
+            if state.pool.accounts.values().any(|a| {
+                !a.disabled && !a.api_key && a.lane == Lane::Google && !a.access.is_empty() && config::matches_secret(&a.access, token)
+            }) {
+                return true;
+            }
+        }
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        {
+            let now = Instant::now();
+            let mut cache = self.google_tokens.lock().await;
+            cache.retain(|_, entry| entry.expires > now);
+            if let Some(entry) = cache.get(&digest) {
+                let client_id = entry.client_id.clone();
+                let email = entry.email.clone();
+                drop(cache);
+                return matches_pool(&self.state.read().await.pool, &client_id, &email);
+            }
+        }
+        self.hydrate_google_emails().await;
+        let has_candidates = {
+            let state = self.state.read().await;
+            state
+                .pool
+                .accounts
+                .values()
+                .any(|a| !a.disabled && !a.api_key && a.lane == Lane::Google && a.google_client.is_some() && a.email.is_some())
+        };
+        if !has_candidates {
+            return false;
+        }
+        let Ok(info) = self.google_tokeninfo(token).await else {
+            return false;
+        };
+        let verified = info["email_verified"] == true || info["email_verified"] == "true";
+        let Some(email) = verified.then(|| pool::text(&info, &["email"])).flatten() else {
+            return false;
+        };
+        let Some(expires_in) =
+            info["expires_in"].as_u64().or_else(|| info["expires_in"].as_str().and_then(|s| s.parse::<u64>().ok())).filter(|n| *n > 0)
+        else {
+            return false;
+        };
+        let clients: Vec<&str> = [pool::text(&info, &["aud"]), pool::text(&info, &["azp"])].into_iter().flatten().collect();
+        let matched_client = {
+            let state = self.state.read().await;
+            clients.into_iter().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned)
+        };
+        let Some(client_id) = matched_client else {
+            return false;
+        };
+        let now = Instant::now();
+        let mut cache = self.google_tokens.lock().await;
+        cache.retain(|_, entry| entry.expires > now);
+        if cache.len() >= 256
+            && !cache.contains_key(&digest)
+            && let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.expires).map(|(k, _)| *k)
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            digest,
+            VerifiedGoogleToken { expires: now + Duration::from_secs(expires_in.clamp(1, 3600)), client_id, email: email.to_owned() },
+        );
+        true
+    }
+
     async fn token(&self, a: &Account, force: bool) -> Result<String> {
         if a.lane != Lane::Google || a.api_key {
             return if force { Err(anyhow!("credential renewal is unavailable for this provider")) } else { Ok(a.access.clone()) };
@@ -258,7 +480,7 @@ impl Proxy {
                     let raw = provider_json(self.claude_oauth(self.http.get(url), &token)).await?;
                     let now = Utc::now();
                     let (grants, next) = claude_grants(&raw, now);
-                    Ok((None, claude::parse_claude_oauth_usage(&raw, now), grants, next))
+                    Ok((None, None, claude::parse_claude_oauth_usage(&raw, now), grants, next))
                 }
                 Lane::Codex => {
                     let (plan, windows, mut grant) = if let Some(url) = self.probe_override(Lane::Codex, "/backend-api/wham/usage") {
@@ -310,13 +532,14 @@ impl Proxy {
                     if grants.is_empty() {
                         grants.extend(grant);
                     }
-                    Ok((plan, windows, grants, next))
+                    Ok((plan, None, windows, grants, next))
                 }
                 Lane::Go => opencode::probe_opencode_go_usage(&self.http, &token)
                     .await
-                    .map(|w| (None, w, vec![], None))
+                    .map(|w| (None, None, w, vec![], None))
                     .map_err(|_| "OpenCode Go usage probe failed"),
                 Lane::Google => {
+                    let email = if account.email.is_none() { self.google_token_email(&token).await } else { None };
                     let project = account.project.as_deref().map_or_else(|| serde_json::json!({}), |id| serde_json::json!({"project":id}));
                     let mut windows = Vec::new();
                     for (op, parse) in [
@@ -336,12 +559,12 @@ impl Proxy {
                             }
                         }
                     }
-                    Ok((None, windows, vec![], None))
+                    Ok((None, email, windows, vec![], None))
                 }
             }
         }
         .await
-        .and_then(|r| if r.1.is_empty() && r.2.is_empty() { Err("provider returned no quota evidence") } else { Ok(r) });
+        .and_then(|r| if r.2.is_empty() && r.3.is_empty() { Err("provider returned no quota evidence") } else { Ok(r) });
         let mut state = self.state.write().await;
         let current = state
             .pool
@@ -354,9 +577,12 @@ impl Proxy {
             })
             .ok_or("credential changed during quota refresh")?;
         match result {
-            Ok((plan, windows, grants, next)) => {
+            Ok((plan, email, windows, grants, next)) => {
                 if plan.is_some() {
                     current.plan = plan;
+                }
+                if email.is_some() && current.email.is_none() {
+                    current.email = email;
                 }
                 current.windows = windows;
                 current.grants = grants;

@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
             }
             let addr = config.bind;
             let proxy = Arc::new(Proxy::new(config)?);
+            proxy.discover_local_commands().await;
             let quota = tokio::spawn(hub_sync::poll_quota(proxy.clone()));
             let sync = hub.map(|(url, token)| tokio::spawn(hub_sync::run(proxy.clone(), url, token)));
             tracing::info!(%addr, "agent proxy listening");
