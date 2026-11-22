@@ -130,21 +130,21 @@ fn OverviewBoard(report: ActivityOverview, board: Signal<Option<Vec<BoardTile>>>
                 span { class: "label-tech", "API-equivalent cost" }
                 strong { class: "value", "{usd(report.api_equivalent_cost_usd)}" }
                 span { "List-price estimate, not billed spend" }
-                span { "{report.unpriced_requests} unpriced requests" }
+                span { "{fmt_count(report.unpriced_requests)} unpriced requests" }
                 if !unpriced.is_empty() { details { summary { "Unpriced models" } p { "{unpriced}" } } }
             }
             article { class: "glass-card stat-card", span { class: "label-tech", "Tokens" }
-                strong { class: "value", "{report.total_tokens}" } span { "{report.output_tokens} output" }
+                strong { class: "value", "{fmt_count(report.total_tokens)}" } span { "{fmt_count(report.output_tokens)} output" }
             }
             article { class: "glass-card stat-card", span { class: "label-tech", "Requests" }
-                strong { class: "value", "{report.requests}" } span { "{report.failures} failed" }
+                strong { class: "value", "{fmt_count(report.requests)}" } span { "{fmt_count(report.failures)} failed" }
             }
             article { class: "glass-card stat-card", span { class: "label-tech", "Cache hit" }
                 strong { class: "value", "{hit_pct:.1}%" } span { "{usd(report.cache_savings_usd)} estimated savings" }
             }
             article { class: "glass-card stat-card", span { class: "label-tech", "Traffic coverage" }
-                span { "{report.matched_proxy_requests} matched proxy" }
-                span { "{report.bypassed_local_requests} bypassed local" }
+                span { "{fmt_count(report.matched_proxy_requests)} matched proxy" }
+                span { "{fmt_count(report.bypassed_local_requests)} bypassed local" }
             }
         }
         p { class: "muted", "Price catalog as of {report.price_as_of} · {report.cache_write_assumption} · detail retention {report.detail_retention_days} days." }
@@ -175,7 +175,7 @@ fn OverviewBoard(report: ActivityOverview, board: Signal<Option<Vec<BoardTile>>>
                             "heatmap" => rsx! { ActivityHeatmap { cells: report.heatmap.clone(), metric } },
                             "rhythm" => rsx! { ActivityRhythmChart { points: report.rhythm.clone(), metric } },
                             "cache" => rsx! {
-                                p { "{report.cache_read_tokens} read tokens · {report.cache_write_tokens} written tokens" }
+                                p { "{fmt_count(report.cache_read_tokens)} read tokens · {fmt_count(report.cache_write_tokens)} written tokens" }
                                 p { "Estimated savings {usd(report.cache_savings_usd)} relative to uncached input." }
                             },
                             "models" => breakdown("Models", &report.by_model),
@@ -218,8 +218,8 @@ fn breakdown(label: &'static str, list: &[BreakdownRow]) -> Element {
     rsx! { Table { label, headers: &["Group", "Requests", "Failed", "Tokens", "Output", "Cache read", "Thinking", "API-equivalent USD", "Unpriced"],
     rows: list.iter().map(|r| vec![
         if label == "Accounts" && mask && r.label.contains('@') { mask_email(&r.label) } else { r.label.clone() },
-        r.requests.to_string(), r.failures.to_string(), r.total_tokens.to_string(), r.output_tokens.to_string(),
-        r.cache_read_tokens.to_string(), r.thinking_tokens.to_string(), usd(r.api_equivalent_cost_usd), r.unpriced_requests.to_string()
+        fmt_count(r.requests), fmt_count(r.failures), fmt_count(r.total_tokens), fmt_count(r.output_tokens),
+        fmt_count(r.cache_read_tokens), fmt_count(r.thinking_tokens), usd(r.api_equivalent_cost_usd), fmt_count(r.unpriced_requests)
     ]).collect() } }
 }
 
@@ -387,15 +387,15 @@ fn Totals(scope: ActivityScope) -> Element {
     let row = |b: &TotalsBucket, period: String| {
         vec![
             period,
-            b.requests.to_string(),
-            b.failures.to_string(),
-            b.input_tokens.to_string(),
-            b.output_tokens.to_string(),
-            b.cache_read_tokens.to_string(),
-            b.cache_write_tokens.to_string(),
-            b.thinking_tokens.to_string(),
+            fmt_count(b.requests),
+            fmt_count(b.failures),
+            fmt_count(b.input_tokens),
+            fmt_count(b.output_tokens),
+            fmt_count(b.cache_read_tokens),
+            fmt_count(b.cache_write_tokens),
+            fmt_count(b.thinking_tokens),
             usd(b.api_equivalent_cost_usd),
-            b.unpriced_requests.to_string(),
+            fmt_count(b.unpriced_requests),
             if b.includes_retained_aggregates { "Retained aggregates" } else { "Detail" }.into(),
         ]
     };
@@ -406,7 +406,7 @@ fn Totals(scope: ActivityScope) -> Element {
             change: move |key: String| if let Some((v, _)) = GRANULARITIES.iter().find(|(v, _)| format!("{v:?}") == key) { granularity.set(*v); } }
         p { class: "muted", "Historical totals can survive request-detail expiry. API-equivalent USD is not billing. Local hourly views use the displayed session’s local UTC offset." }
         {read_view(result.as_ref(), |r| rsx! {
-            p { "Showing {r.granularity:?} aggregates" }
+            p { "Showing {granularity_label(r.granularity)} aggregates" }
             Table { label: "Activity totals", headers: &["Period", "Requests", "Failures", "Input", "Output", "Cache read", "Cache write", "Thinking", "API-equivalent USD", "Unpriced", "Coverage"],
                 rows: r.buckets.iter().map(|b| row(b, b.period.clone())).chain(std::iter::once(row(&r.grand_total, "Grand Total".into()))).collect() }
         })}
@@ -429,7 +429,7 @@ fn Thinking(scope: ActivityScope, providers: Vec<ProviderSummary>) -> Element {
         h2 { "Thinking analysis" }
         {read_view(result.as_ref(), |r| rsx! {
             p { class: "gateprompt", role: "status", "{r.verdict}" }
-            p { "{r.total_turns} turns · {r.thinking_tokens} thinking tokens · {usd(r.thinking_cost_usd)} estimated thinking cost" }
+            p { "{fmt_count(r.total_turns)} turns · {fmt_count(r.thinking_tokens)} thinking tokens · {usd(r.thinking_cost_usd)} estimated thinking cost" }
             p { class: "muted", "{r.method_note}" }
             {thinking_buckets("Thinking buckets", &r.buckets)}
             {thinking_buckets("Effort kinds", &r.kinds)}
@@ -447,7 +447,7 @@ fn Thinking(scope: ActivityScope, providers: Vec<ProviderSummary>) -> Element {
 
 fn thinking_buckets(label: &'static str, rows: &[ThinkingBucket]) -> Element {
     rsx! { Table { label, headers: &["Bucket", "Turns", "Thinking", "Output", "Estimated thinking cost"],
-    rows: rows.iter().map(|b| vec![b.label.clone(), b.turns.to_string(), b.thinking_tokens.to_string(), b.output_tokens.to_string(), usd(b.estimated_thinking_cost_usd)]).collect() } }
+    rows: rows.iter().map(|b| vec![b.label.clone(), fmt_count(b.turns), fmt_count(b.thinking_tokens), fmt_count(b.output_tokens), usd(b.estimated_thinking_cost_usd)]).collect() } }
 }
 
 #[component]

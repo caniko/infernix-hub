@@ -100,9 +100,9 @@ pub(super) fn Requests(scope: ActivityScope, providers: Vec<ProviderSummary>) ->
                                             td { "{row.effective_model}" }
                                             td { "{row.outcome}" }
                                             td { "{maybe_i64(row.latency_ms)}" }
-                                            td { "{token_count(row)}" }
+                                            td { "{fmt_signed_count(token_count(row))}" }
                                             td { "{money(row.api_equivalent_cost_usd)}" }
-                                            td { "{row.source:?} · {row.client}" }
+                                            td { "{activity_source_label(row.source)} · {row.client}" }
                                             td { button { class: "btn btn-glass btn-xs", aria_pressed: selected() == Some(id), onclick: move |_| selected.set(Some(id)), "Inspect" } }
                                         } }
                                     }
@@ -150,23 +150,23 @@ fn RequestInspector(id: Uuid, providers: Vec<ProviderSummary>, operator: bool, c
         {read_view(result.as_ref(), |detail| {
             let r = &detail.exchange;
             rsx! {
-                p { "{r.client} · {r.source:?} · {r.purpose:?} · {text(&r.transport)} · {fmt_dt(r.occurred_at)}" }
+                p { "{r.client} · {activity_source_label(r.source)} · {activity_purpose_label(r.purpose)} · {text(&r.transport)} · {fmt_dt(r.occurred_at)}" }
                 p { "Provider {r.provider_id} · Account {text(&r.account_id)} · Session {text(&r.session_id)} · Moved from {text(&r.moved_from_account_id)}" }
                 p { "Requested {r.requested_model} → effective {r.effective_model} · effort {text(&r.effort)} · {r.outcome} · HTTP {maybe_i64(r.status_code.map(i64::from))}" }
                 p { "Latency {maybe_i64(r.latency_ms)} ms · TTFT {maybe_i64(r.ttft_ms)} ms · API-equivalent {money(r.api_equivalent_cost_usd)}" }
-                p { "Input {r.input_tokens} · Output {r.output_tokens} · Cache read {r.cache_read_tokens} · Cache write {r.cache_write_tokens} · Thinking {r.thinking_tokens}" }
+                p { "Input {fmt_signed_count(r.input_tokens)} · Output {fmt_signed_count(r.output_tokens)} · Cache read {fmt_signed_count(r.cache_read_tokens)} · Cache write {fmt_signed_count(r.cache_write_tokens)} · Thinking {fmt_signed_count(r.thinking_tokens)}" }
                 if let Some(error) = &r.error_message { p { "{error}" } }
                 h3 { "Upstream attempts ({r.attempt_count})" }
                 Table { label: "Upstream attempts", headers: &["Attempt", "Provider", "Account", "Moved from", "Requested → effective", "Effort", "Outcome", "HTTP", "Error", "Latency ms", "TTFT ms", "Input", "Output", "Cache read", "Cache write", "Thinking", "API-equivalent USD", "Capture", "Started"],
                     rows: detail.attempts.iter().map(|a| vec![a.attempt_index.to_string(), a.provider_id.clone(), text(&a.account_id), text(&a.moved_from_account_id),
                         format!("{} → {}", a.requested_model, a.effective_model), text(&a.effort), a.outcome.clone(), a.status_code.map_or_else(|| "—".into(), |v| v.to_string()),
-                        text(&a.error_message), maybe_i64(a.latency_ms), maybe_i64(a.ttft_ms), a.input_tokens.to_string(), a.output_tokens.to_string(),
-                        a.cache_read_tokens.to_string(), a.cache_write_tokens.to_string(), a.thinking_tokens.to_string(), money(a.api_equivalent_cost_usd), format!("{:?}", a.capture_state), fmt_dt(a.started_at)
+                        text(&a.error_message), maybe_i64(a.latency_ms), maybe_i64(a.ttft_ms), fmt_signed_count(a.input_tokens), fmt_signed_count(a.output_tokens),
+                        fmt_signed_count(a.cache_read_tokens), fmt_signed_count(a.cache_write_tokens), fmt_signed_count(a.thinking_tokens), money(a.api_equivalent_cost_usd), capture_state_label(a.capture_state).into(), fmt_dt(a.started_at)
                     ]).collect() }
                 if let Some(session_id) = &r.session_id && let Some(provider) = providers.iter().find(|p| p.descriptor.id == r.provider_id) {
                     MoveConversation { provider: provider.clone(), session_id: session_id.clone() }
                 }
-                p { "Capture: {r.capture_state:?}" if let Some(reason) = &detail.capture_gap_reason { " · {reason}" } }
+                p { "Capture: {capture_state_label(r.capture_state)}" if let Some(reason) = &detail.capture_gap_reason { " · {reason}" } }
                 if detail.capture_available && operator {
                     button { class: "btn btn-glass", disabled: pending(), onclick: {
                         let client = capture_client.clone();
@@ -185,7 +185,7 @@ fn RequestInspector(id: Uuid, providers: Vec<ProviderSummary>, operator: bool, c
         if pending() { p { role: "status", "Loading captured body…" } }
         if operator && let Some(result) = capture.read().as_ref() {
             {read_view(Some(result), |body| rsx! {
-                p { "{body.representation:?} · {body.size_bytes} bytes · " if body.redacted { "Redacted" } else { "Not redacted — sensitive content" } }
+                p { "{capture_state_label(body.representation)} · {fmt_count(body.size_bytes)} bytes · " if body.redacted { "Redacted" } else { "Not redacted — sensitive content" } }
                 pre { class: "raw-json", "{pretty(&body.payload)}" }
                 button { class: "btn btn-glass", onclick: move |_| capture.set(None), "Hide body" }
             })}
@@ -258,7 +258,7 @@ fn TraceInspector(session: String, pin: EventHandler<EvalSeed>, close: EventHand
         {read_view(result.as_ref(), |trace| {
             let s = &trace.summary;
             rsx! {
-                p { "Own: {usd(s.own_cost_usd)} · {s.own_tokens} tokens. Known subtotal: {usd(s.subtotal_cost_usd)} · {s.subtotal_tokens} tokens (includes own usage)." }
+                p { "Own: {usd(s.own_cost_usd)} · {fmt_count(s.own_tokens)} tokens. Known subtotal: {usd(s.subtotal_cost_usd)} · {fmt_count(s.subtotal_tokens)} tokens (includes own usage)." }
                 if s.has_unobserved_parent || s.has_parent_conflict || s.has_cycle {
                     p { class: "monitoring-error", role: "status",
                         if s.has_unobserved_parent { "Unobserved parent. " }
@@ -279,7 +279,7 @@ fn TraceInspector(session: String, pin: EventHandler<EvalSeed>, close: EventHand
                                     if edge.cycle { span { class: "chip bad", "Cycle" } }
                                 }
                             }
-                            p { "Depth {node.depth} · own {node.own_requests} requests ({node.own_failures} failed), {node.own_tokens} tokens and {usd(node.own_cost_usd)} · known subtotal {usd(node.known_subtotal_cost_usd)} · {node.unpriced_requests} unpriced" }
+                            p { "Depth {node.depth} · own {fmt_count(node.own_requests)} requests ({fmt_count(node.own_failures)} failed), {fmt_count(node.own_tokens)} tokens and {usd(node.own_cost_usd)} · known subtotal {usd(node.known_subtotal_cost_usd)} · {fmt_count(node.unpriced_requests)} unpriced" }
                             if let Some(parent) = &node.parent_session_id { p { class: "muted", "Parent: {parent}" } }
                             for (from, to) in &node.moves { p { class: "muted", "Moved {from} → {to}" } }
                             if !node.exchanges.is_empty() {
@@ -289,7 +289,7 @@ fn TraceInspector(session: String, pin: EventHandler<EvalSeed>, close: EventHand
                                             let value = EvalSeed { provider: exchange.provider_id.clone(), model: exchange.effective_model.clone(),
                                                 effort: exchange.effort.clone(), exchange: exchange.source_exchange_id.clone() };
                                             rsx! { div { key: "{exchange.id}", class: "row quota-window",
-                                                span { "{fmt_dt(exchange.occurred_at)} · {exchange.effective_model} · {exchange.outcome} · {exchange.attempt_count} attempts · {exchange.capture_state:?}" }
+                                                span { "{fmt_dt(exchange.occurred_at)} · {exchange.effective_model} · {exchange.outcome} · {exchange.attempt_count} attempts · {capture_state_label(exchange.capture_state)}" }
                                                 if panel.operator() {
                                                     button { class: "btn btn-glass", onclick: move |_| pin.call(value.clone()), "Pin as Eval" }
                                                 }

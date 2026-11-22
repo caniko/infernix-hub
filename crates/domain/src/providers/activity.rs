@@ -1688,6 +1688,9 @@ pub async fn export_evals(hub: &Hub, actor: &Actor, include_bodies: bool) -> DRe
     if !include_bodies {
         for c in &mut cases {
             c.prompt_text = "<omitted>".into();
+            if let Some(replay) = &mut c.last_replay {
+                replay.response_preview = "<omitted>".into();
+            }
         }
     }
     Ok(EvalExportBundle { schema_version: 1, exported_at: Utc::now(), include_bodies, cases })

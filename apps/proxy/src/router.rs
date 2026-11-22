@@ -96,6 +96,9 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         (!model.contains('/')).then_some(model)
     };
     let model = path_model().or_else(|| text(&raw, &["model"])).filter(|s| identifier(s)).unwrap_or_default();
+    let effort = text(&raw, &["/reasoning/effort", "reasoning_effort", "/output_config/effort", "effort"])
+        .filter(|s| identifier(s))
+        .map(str::to_owned);
     let metadata_user: Value = text(&raw, &["/metadata/user_id"]).and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
     let session_id = |s: &str| {
         let digits = s.strip_prefix('-').unwrap_or(s);
@@ -154,7 +157,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             state.captures.enabled().then_some((state.captures.epoch, state.captures.lease_generation)),
         )
     };
-    let mut exchange = Exchange::new(proxy.clone(), lane, model, session, parent, purpose);
+    let mut exchange = Exchange::new(proxy.clone(), lane, model, effort, session, parent, purpose);
     if let Some((epoch, lease_generation)) = capture {
         exchange.capture = Some(Capture {
             epoch,
@@ -390,7 +393,7 @@ pub(crate) async fn run_window_start(
     model: &str,
     request: reqwest::RequestBuilder,
 ) -> Result<(), ()> {
-    let mut exchange = Exchange::new(proxy.clone(), account.lane, model, None, None, ActivityPurpose::WindowStarter);
+    let mut exchange = Exchange::new(proxy.clone(), account.lane, model, None, None, None, ActivityPurpose::WindowStarter);
     let began = Instant::now();
     let started = Utc::now();
     let response = request.timeout(Duration::from_secs(45)).send().await;
@@ -962,6 +965,7 @@ struct Exchange {
     occurred: DateTime<Utc>,
     lane: Lane,
     model: String,
+    effort: Option<String>,
     purpose: ActivityPurpose,
     session: Option<String>,
     parent: Option<String>,
@@ -970,7 +974,15 @@ struct Exchange {
 }
 
 impl Exchange {
-    fn new(proxy: Arc<Proxy>, lane: Lane, model: &str, session: Option<String>, parent: Option<String>, purpose: ActivityPurpose) -> Self {
+    fn new(
+        proxy: Arc<Proxy>,
+        lane: Lane,
+        model: &str,
+        effort: Option<String>,
+        session: Option<String>,
+        parent: Option<String>,
+        purpose: ActivityPurpose,
+    ) -> Self {
         Self {
             proxy,
             id: Uuid::new_v4().to_string(),
@@ -978,6 +990,7 @@ impl Exchange {
             occurred: Utc::now(),
             lane,
             model: model.into(),
+            effort,
             purpose,
             session,
             parent,
@@ -1006,7 +1019,7 @@ impl Exchange {
                 .map(|id| format!("{}:{}:{}:{id}", self.lane.family(), self.proxy.source_host, self.proxy.source_user)),
             requested_model: self.model.clone(),
             effective_model: self.model.clone(),
-            effort: None,
+            effort: self.effort.clone(),
             status_code: status.map(|s| i32::from(s.as_u16())),
             outcome: outcome.into(),
             error_message: None,
@@ -1127,7 +1140,7 @@ impl Exchange {
             account_id: last.and_then(|a| a.account_id.clone()),
             requested_model: self.model.clone(),
             effective_model: self.model,
-            effort: None,
+            effort: self.effort,
             outcome: outcome.into(),
             status_code: status.map(|s| i32::from(s.as_u16())),
             error_message: None,

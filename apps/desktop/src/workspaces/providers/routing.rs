@@ -95,7 +95,7 @@ fn RouterDetails(provider: ProviderSummary, view: RoutingView) -> Element {
                     article { key: "{client.client_id}", class: "quota-window",
                         div { class: "row",
                             strong { "{client.display_name}" }
-                            span { "{client.state:?} · Backup: " if client.backup_available { "Available" } else { "None" } }
+                            span { "{client_wiring_label(client.state)} · Backup: " if client.backup_available { "Available" } else { "None" } }
                         }
                         if let Some(owner) = &client.managed_by { p { "Managed by {owner}" } }
                         if let Some(detail) = &client.detail { p { "{detail}" } }
@@ -182,7 +182,7 @@ fn RoutingPolicyView(provider: ProviderSummary, policy: RoutingPolicy, revision:
     );
     rsx! { div { class: "provider-inset stack",
         h3 { "Routing policy" }
-        p { class: "muted", "Revision {revision} · current strategy: {current.strategy:?} · key order: {current.api_key_order:?}" }
+        p { class: "muted", "Revision {revision} · current strategy: {route_strategy_label(current.strategy)} · key order: {api_key_order_label(current.api_key_order)}" }
         if supports(&provider, None, ProviderCapability::SetRoutePolicy) {
             div { class: "row",
                 Choice { label: "Strategy", value: format!("{:?}", current.strategy),

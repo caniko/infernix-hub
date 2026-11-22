@@ -177,7 +177,7 @@ pub(super) fn AccountIdentity(provider: ProviderSummary, account: ModelAccount, 
         div { class: "row",
             strong { "{account_name(&account, mask)}" }
             Chip { label: label.to_string(), tone: Some(tone.to_string()) }
-            Chip { label: format!("{:?}", account.enrollment_state), tone: Some("muted".to_string()) }
+            Chip { label: enrollment_state_label(account.enrollment_state).to_string(), tone: Some("muted".to_string()) }
             if account.is_active { Chip { label: "Active".to_string(), tone: Some("info".to_string()) } }
             if account.is_preferred { Chip { label: "Preferred".to_string(), tone: Some("info".to_string()) } }
         }
@@ -197,14 +197,18 @@ fn AccountSummary(provider: ProviderSummary, account: ModelAccount, mask: bool, 
         section { class: "provider-inset stack",
             div { class: "spread",
                 div { AccountIdentity { provider: provider.clone(), account: account.clone(), mask } }
-                if !account.windows.is_empty() || provider.descriptor.evidence_kinds.contains(&EvidenceKind::QuotaWindows) {
-                    button { class: "btn btn-glass", onclick: move |_| chart.call(()), "Chart" }
+                div { class: "row",
+                    if !account.windows.is_empty() || provider.descriptor.evidence_kinds.contains(&EvidenceKind::QuotaWindows) {
+                        button { class: "btn btn-glass", onclick: move |_| chart.call(()), "Chart" }
+                    }
+                    OperationButton { provider: provider.clone(), account: account.clone(), label: "Refresh quota",
+                        command: ProviderCommand::Quota(QuotaCommand::RefreshQuota { account_id: Some(account.id.clone()) }) }
+                    OperationButton { provider: provider.clone(), account: account.clone(), label: "Refresh reset credits",
+                        command: ProviderCommand::Quota(QuotaCommand::RefreshGrants { account_id: Some(account.id.clone()) }) }
                 }
             }
-            OperationButton { provider: provider.clone(), account: account.clone(), label: "Refresh quota",
-                command: ProviderCommand::Quota(QuotaCommand::RefreshQuota { account_id: Some(account.id.clone()) }) }
             if account.windows.is_empty() {
-                p { class: "muted", "No quota windows · {account.success_count} successes · {account.failure_count} failures" }
+                p { class: "muted", "No quota windows · {fmt_count(account.success_count)} successes · {fmt_count(account.failure_count)} failures" }
             }
             for window in account.windows.iter().filter(|w| !is_extra(w.kind)) {
                 QuotaLimitBar { key: "{window.window_key}", window: window.clone() }
@@ -221,13 +225,11 @@ fn AccountSummary(provider: ProviderSummary, account: ModelAccount, mask: bool, 
                     p { if grant.applicable { "Applicable" } else { "Not applicable" } " · expires {date(grant.expires_at)} · checked {date(Some(grant.checked_at))}" }
                     p { {format!("Scope: {} · Clears: {} · Weekly credit-back: {}", grant.scope.as_deref().unwrap_or("—"), grant.cleared_windows.join(", "), grant.weekly_credit_back)} }
                     if let Some(reason) = &grant.unavailable_reason { p { "{reason}" } }
-                    OperationButton { provider: provider.clone(), account: account.clone(), label: "Claim Reset Credit", confirm: true,
+                    OperationButton { provider, account: account.clone(), label: "Claim Reset Credit", confirm: true,
                         disabled: !grant.applicable || grant.available_count == 0 || grant.expires_at.is_some_and(|t| t <= Utc::now()),
                         command: ProviderCommand::Quota(QuotaCommand::ClaimResetGrant { account_id: account.id.clone(), grant_id: grant.grant_id.clone() }) }
                 }
             }
-            OperationButton { provider, account: account.clone(), label: "Refresh reset credits",
-                command: ProviderCommand::Quota(QuotaCommand::RefreshGrants { account_id: Some(account.id) }) }
         }
     }
 }

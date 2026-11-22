@@ -394,6 +394,115 @@ async fn fixture_providers_and_activity_over_http() {
         .unwrap();
     assert!(!group_still_exists, "delete_group operation must remove model_key_groups row");
 
+    // Verify RunCanary persists into model_probe_runs and surfaces in activity/drift.
+    let canary_op: Value = post("providers/claude/operations")
+        .json(&json!({
+            "idempotency_key": "canary-persist-test",
+            "command": {"facet": "probe", "payload": {"op": "run_canary", "model_id": "claude-sonnet-4-6", "effort": "medium", "account_id": null}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(canary_op["status"], "succeeded");
+    let drift: Value = get("activity/drift").send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert!(
+        drift["recent_canaries"].as_array().unwrap().iter().any(|c| c["id"] == canary_op["id"]),
+        "completed canary must appear in drift.recent_canaries"
+    );
+
+    // Verify duplicate receipt retries are idempotent and do not re-apply routing revision bumps.
+    let route_op_id = Uuid::new_v4();
+    domain::sqlx::query(
+        "insert into model_operations
+            (id, provider_id, actor, idempotency_key, request_sha256, command_kind, command, status, target_host, target_user)
+         values ($1, 'claude', 'operator', 'idemp-receipt-op', 'sha-idemp', 'routing',
+                 '{\"facet\":\"routing\",\"payload\":{\"op\":\"set_pool_override\",\"account_id\":null}}'::jsonb,
+                 'pending', 'host-a', 'alice')",
+    )
+    .bind(route_op_id)
+    .execute(&db)
+    .await
+    .unwrap();
+    let claimed_route: Vec<Value> = http
+        .post(format!("http://{addr}/v1/providers/operations/claim"))
+        .bearer_auth(&collector_a)
+        .json(&json!({"host":"host-a","unix_user":"alice","provider_ids":["claude"],"limit":5}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(claimed_route.len(), 1);
+    assert_eq!(claimed_route[0]["id"], route_op_id.to_string());
+    let rev_before: i64 = domain::sqlx::query_scalar("select revision from provider_routing_state where provider_id = 'claude'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        http.post(format!("http://{addr}/v1/providers/operations/{route_op_id}/receipt"))
+            .bearer_auth(&collector_a)
+            .json(&json!({"status":"succeeded","receipt":{"applied":true}}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    let rev_after: i64 = domain::sqlx::query_scalar("select revision from provider_routing_state where provider_id = 'claude'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(rev_after, rev_before + 1, "duplicate receipt retry must not re-apply side effects");
+
+    // Verify export_evals?include_bodies=false omits replay response_preview as well as prompt_text.
+    let eval_created: Value = post("activity/evals")
+        .json(&json!({
+            "name": "body-redaction-eval",
+            "provider_id": "claude",
+            "model_id": "claude-sonnet-4-6",
+            "prompt_text": "SECRET_PROMPT_BODY",
+            "expected_outcome": "ok",
+            "predicates": []
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let eval_id = Uuid::parse_str(eval_created["id"].as_str().unwrap()).unwrap();
+    domain::sqlx::query(
+        "insert into model_eval_replays (id, case_id, model_id, actual_outcome, response_preview, passed)
+         values ($1, $2, 'claude-sonnet-4-6', 'ok', 'SECRET_REPLAY_RESPONSE', true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(eval_id)
+    .execute(&db)
+    .await
+    .unwrap();
+    let exported: Value = get("activity/evals/export")
+        .query(&[("include_bodies", "false")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!exported.to_string().contains("SECRET_PROMPT_BODY"));
+    assert!(!exported.to_string().contains("SECRET_REPLAY_RESPONSE"));
+
     server.abort();
     let _ = server.await;
     db.close().await;

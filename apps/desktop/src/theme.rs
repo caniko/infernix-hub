@@ -35,32 +35,60 @@ const FONT_DISPLAY: &[u8] = include_bytes!("../assets/fonts/space-grotesk-var.wo
 const FONT_BODY: &[u8] = include_bytes!("../assets/fonts/inter-var.woff2");
 const FONT_MONO: &[u8] = include_bytes!("../assets/fonts/jetbrains-mono-var.woff2");
 
+pub type Rgba = (u8, u8, u8, u8);
+
+const DEFAULT_BG_RGBA: Rgba = (0, 0, 0, 255);
+
+struct ResolvedTheme {
+    css: String,
+    bg_rgba: Rgba,
+}
+
+fn resolved() -> &'static ResolvedTheme {
+    static THEME: OnceLock<ResolvedTheme> = OnceLock::new();
+    THEME.get_or_init(|| {
+        let (overrides, bg_rgba) = load_overrides();
+        ResolvedTheme { css: format!("{}{}{}", font_faces(), THEME_CSS, overrides), bg_rgba }
+    })
+}
+
 /// `@font-face` rules with the font bytes inlined, followed by the theme and
 /// the palette overrides (a second `:root` block, so only provided keys win).
-pub fn style_sheet() -> String {
-    format!("{}{}{}", font_faces(), THEME_CSS, palette_overrides())
+/// Built once per process so poll re-renders never re-encode the embedded fonts.
+pub fn style_sheet() -> &'static str {
+    &resolved().css
 }
 
-/// Read once per process: the stylesheet is rebuilt on every poll tick.
-fn palette_overrides() -> &'static str {
-    static OVERRIDES: OnceLock<String> = OnceLock::new();
-    OVERRIDES.get_or_init(load_overrides)
+/// Resolved window background color (`--bg`), used before the webview paints to
+/// avoid a white startup flash.
+pub fn window_background_rgba() -> Rgba {
+    resolved().bg_rgba
 }
 
-fn load_overrides() -> String {
-    let Some(path) = theme_path() else { return String::new() };
+/// Whether the active palette has a dark background, used to pick the matching
+/// window decoration theme on GTK/Windows/macOS.
+pub fn is_dark_theme() -> bool {
+    is_dark_rgb(resolved().bg_rgba)
+}
+
+fn is_dark_rgb((r, g, b, _): Rgba) -> bool {
+    (0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b)) < 128.0
+}
+
+fn load_overrides() -> (String, Rgba) {
+    let Some(path) = theme_path() else { return (String::new(), DEFAULT_BG_RGBA) };
     let body = match std::fs::read_to_string(&path) {
         Ok(body) => body,
         Err(error) => {
             eprintln!("theme: cannot read {} ({error}); using the built-in palette", path.display());
-            return String::new();
+            return (String::new(), DEFAULT_BG_RGBA);
         }
     };
-    match overrides_from_json(&body) {
-        Ok(css) => css,
+    match parse_theme_json(&body) {
+        Ok((css, bg)) => (css, bg.unwrap_or(DEFAULT_BG_RGBA)),
         Err(error) => {
             eprintln!("theme: {} is malformed ({error}); using the built-in palette", path.display());
-            String::new()
+            (String::new(), DEFAULT_BG_RGBA)
         }
     }
 }
@@ -76,27 +104,42 @@ fn theme_path() -> Option<PathBuf> {
     Some(config.join("fleetix-hub").join("theme.json"))
 }
 
-/// Build the `:root{...}` override block. Only `#rrggbb` strings survive; the
-/// file is operator-owned but its values become CSS, so this is a trust
-/// boundary. Unknown keys and invalid values are dropped.
-fn overrides_from_json(body: &str) -> Result<String, String> {
+/// Build the `:root{...}` override block and resolve `--bg` if valid. Only
+/// `#rrggbb` strings survive; the file is operator-owned but its values become
+/// CSS, so this is a trust boundary. Unknown keys and invalid values are dropped.
+fn parse_theme_json(body: &str) -> Result<(String, Option<Rgba>), String> {
     let value: serde_json::Value = serde_json::from_str(body).map_err(|error| error.to_string())?;
     let Some(object) = value.as_object() else {
         return Err("the theme file is not a JSON object".into());
     };
     let mut declarations = String::new();
+    let mut bg = None;
     for (key, variable) in PALETTE {
         let Some(color) = object.get(*key).and_then(|value| value.as_str()) else { continue };
-        if !is_hex_color(color) {
-            continue;
+        let Some(rgba) = parse_hex_rgba(color) else { continue };
+        if *key == "bg" {
+            bg = Some(rgba);
         }
         declarations.push_str(&format!("{variable}:{color};"));
     }
-    Ok(if declarations.is_empty() { String::new() } else { format!(":root{{{declarations}}}") })
+    let css = if declarations.is_empty() { String::new() } else { format!(":root{{{declarations}}}") };
+    Ok((css, bg))
 }
 
-fn is_hex_color(value: &str) -> bool {
-    value.len() == 7 && value.starts_with('#') && value.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+#[cfg(test)]
+fn overrides_from_json(body: &str) -> Result<String, String> {
+    parse_theme_json(body).map(|(css, _)| css)
+}
+
+fn parse_hex_rgba(value: &str) -> Option<Rgba> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some((r, g, b, 255))
 }
 
 fn font_faces() -> String {
@@ -162,5 +205,15 @@ mod tests {
         assert_eq!(overrides_from_json("{}").unwrap(), "");
         assert!(overrides_from_json("[]").is_err());
         assert!(overrides_from_json("not json").is_err());
+    }
+
+    #[test]
+    fn stylesheet_is_cached_and_bg_luminance_classifies_theme() {
+        assert!(std::ptr::eq(style_sheet(), style_sheet()));
+        assert_eq!(parse_hex_rgba("#181714"), Some((0x18, 0x17, 0x14, 255)));
+        assert_eq!(parse_hex_rgba("#f7f4ec"), Some((0xf7, 0xf4, 0xec, 255)));
+        assert_eq!(parse_hex_rgba("not-hex"), None);
+        assert!(is_dark_rgb(DEFAULT_BG_RGBA));
+        assert!(!is_dark_rgb((0xf7, 0xf4, 0xec, 255)));
     }
 }

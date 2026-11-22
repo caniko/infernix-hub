@@ -18,13 +18,16 @@ use uuid::Uuid;
 use crate::{
     api::{timed, timed_for},
     components::{Chip, EmptyState, ErrorCard, Loading},
-    format::fmt_dt,
+    format::{fmt_count, fmt_dt, fmt_signed_count},
     state::{Loaded, Store, UiError},
 };
 
 #[derive(Clone, Copy)]
 struct PanelState {
     settings: Signal<ProviderPanelSettings>,
+    saved_settings: Signal<Option<ProviderPanelSettings>>,
+    toolbar_save_pending: Signal<bool>,
+    toolbar_saving: Signal<bool>,
     epoch: Signal<u64>,
     busy: Signal<bool>,
     notice: Signal<Option<(bool, String)>>,
@@ -105,6 +108,138 @@ fn sort_order(key: &str) -> AccountSortOrder {
     }
 }
 
+fn operation_status_label(status: OperationStatus) -> &'static str {
+    match status {
+        OperationStatus::Pending => "Pending",
+        OperationStatus::Dispatched => "Dispatched",
+        OperationStatus::AwaitingOperator => "Awaiting operator",
+        OperationStatus::Succeeded => "Succeeded",
+        OperationStatus::Failed => "Failed",
+        OperationStatus::Ambiguous => "Ambiguous",
+        OperationStatus::Cancelled => "Cancelled",
+    }
+}
+
+fn enrollment_state_label(state: EnrollmentState) -> &'static str {
+    match state {
+        EnrollmentState::Catalogued => "Catalogued",
+        EnrollmentState::Deployed => "Deployed",
+        EnrollmentState::Selected => "Selected",
+        EnrollmentState::Verified => "Verified",
+        EnrollmentState::Unobserved => "Unobserved",
+        EnrollmentState::Error => "Error",
+    }
+}
+
+fn quota_status_label(status: QuotaStatus) -> Option<&'static str> {
+    match status {
+        QuotaStatus::Allowed => Some("Allowed"),
+        QuotaStatus::Warning => Some("Warning"),
+        QuotaStatus::Rejected => Some("Rejected"),
+        QuotaStatus::Unknown => None,
+    }
+}
+
+fn quota_unit_label(unit: QuotaUnit) -> &'static str {
+    match unit {
+        QuotaUnit::Percent => "%",
+        QuotaUnit::Credits => "credits",
+        QuotaUnit::Currency => "currency",
+        QuotaUnit::Requests => "requests",
+        QuotaUnit::Tokens => "tokens",
+    }
+}
+
+fn reset_cadence_label(cadence: ResetCadence) -> Option<&'static str> {
+    match cadence {
+        ResetCadence::Fixed => Some("Fixed reset"),
+        ResetCadence::RollingOnUse => Some("Rolling on use"),
+        ResetCadence::Unknown => None,
+    }
+}
+
+fn client_wiring_label(state: ClientWiringState) -> &'static str {
+    match state {
+        ClientWiringState::Applied => "Applied",
+        ClientWiringState::Outdated => "Outdated",
+        ClientWiringState::NotApplied => "Not applied",
+        ClientWiringState::ExternallyManaged => "Externally managed",
+        ClientWiringState::Error => "Error",
+    }
+}
+
+fn route_strategy_label(strategy: RouteStrategy) -> &'static str {
+    match strategy {
+        RouteStrategy::SoonestReset => "Soonest Reset",
+        RouteStrategy::FillFirst => "Fill First",
+        RouteStrategy::RoundRobin => "Round Robin",
+        RouteStrategy::WeightedRoundRobin => "Weighted Round Robin",
+    }
+}
+
+fn api_key_order_label(order: ApiKeyOrder) -> &'static str {
+    match order {
+        ApiKeyOrder::KeysLast => "Keys last",
+        ApiKeyOrder::KeysFirst => "Keys first",
+        ApiKeyOrder::SubscriptionsOnly => "Subscriptions only",
+    }
+}
+
+fn request_identity_label(mode: RequestIdentityMode) -> &'static str {
+    match mode {
+        RequestIdentityMode::Api => "API identity",
+        RequestIdentityMode::AutoClient => "Automatic client identity",
+    }
+}
+
+fn activity_source_label(source: ActivitySource) -> &'static str {
+    match source {
+        ActivitySource::Proxy => "Proxy",
+        ActivitySource::LocalImport => "Local import",
+        ActivitySource::All => "All",
+    }
+}
+
+fn activity_purpose_label(purpose: ActivityPurpose) -> &'static str {
+    match purpose {
+        ActivityPurpose::Ordinary => "Ordinary",
+        ActivityPurpose::WindowStarter => "Window starter",
+        ActivityPurpose::Canary => "Canary",
+        ActivityPurpose::ThinkingTest => "Thinking test",
+        ActivityPurpose::EvalReplay => "Eval replay",
+    }
+}
+
+fn capture_state_label(state: CaptureState) -> &'static str {
+    match state {
+        CaptureState::None => "None",
+        CaptureState::MetadataOnly => "Metadata only",
+        CaptureState::Transformed => "Transformed",
+        CaptureState::RawWire => "Raw wire",
+        CaptureState::Truncated => "Truncated",
+        CaptureState::Evicted => "Evicted",
+        CaptureState::Dropped => "Dropped",
+        CaptureState::Rejected => "Rejected",
+    }
+}
+
+fn granularity_label(granularity: TotalsGranularity) -> &'static str {
+    match granularity {
+        TotalsGranularity::Hour => "hourly",
+        TotalsGranularity::Day => "daily",
+        TotalsGranularity::Week => "weekly",
+        TotalsGranularity::Month => "monthly",
+    }
+}
+
+fn eval_predicate_label(kind: EvalPredicateKind) -> &'static str {
+    match kind {
+        EvalPredicateKind::Contains => "Contains",
+        EvalPredicateKind::NotContains => "Does not contain",
+        EvalPredicateKind::Equals => "Equals",
+    }
+}
+
 #[component]
 pub fn ProvidersView() -> Element {
     let client = use_context::<HubClient>();
@@ -112,6 +247,9 @@ pub fn ProvidersView() -> Element {
     let scope = current_scope_id();
     let mut panel = use_context_provider(|| PanelState {
         settings: Signal::new(ProviderPanelSettings::default()),
+        saved_settings: Signal::new(None),
+        toolbar_save_pending: Signal::new(false),
+        toolbar_saving: Signal::new(false),
         epoch: Signal::new(0),
         busy: Signal::new(false),
         notice: Signal::new(None),
@@ -131,7 +269,8 @@ pub fn ProvidersView() -> Element {
         async move {
             match timed(client.provider_settings()).await {
                 Ok(settings) => {
-                    panel.settings.set(settings);
+                    panel.settings.set(settings.clone());
+                    panel.saved_settings.set(Some(settings));
                     settings_ready.set(true);
                     settings_error.set(None);
                 }
@@ -162,6 +301,8 @@ pub fn ProvidersView() -> Element {
     let settings = panel.settings.cloned();
     let refreshable: Vec<_> = scoped.iter().filter(|p| supports(p, None, ProviderCapability::RefreshQuota)).cloned().collect();
     let refresh_client = client.clone();
+    let mask_client = client.clone();
+    let sort_client = client.clone();
     rsx! {
         main { class: "work providers-work stack",
             header { class: "glass-card providers-toolbar stack",
@@ -179,9 +320,20 @@ pub fn ProvidersView() -> Element {
                     }
                     div { class: "spacer" }
                     Check { label: "Mask emails", value: settings.mask_emails, disabled: !settings_ready(),
-                        change: move |value| panel.settings.write().mask_emails = value }
+                        change: move |value| {
+                            panel.settings.write().mask_emails = value;
+                            if panel.operator() && settings_ready() {
+                                schedule_toolbar_settings_save(panel, mask_client.clone());
+                            }
+                        } }
                     Choice { label: "Account sort", value: sort_key(settings.account_sort), options: pairs(SORTS),
-                        change: move |value: String| panel.settings.write().account_sort = sort_order(&value) }
+                        change: move |value: String| {
+                            let order = sort_order(&value);
+                            panel.settings.write().account_sort = order;
+                            if panel.operator() && settings_ready() {
+                                schedule_toolbar_settings_save(panel, sort_client.clone());
+                            }
+                        } }
                     button { class: "btn btn-glass", onclick: move |_| panel.changed(), "Reload provider data" }
                     button {
                         class: "btn btn-primary", disabled: refreshable.is_empty() || (panel.busy)() || inventory_stale || !panel.operator(),
@@ -238,7 +390,7 @@ pub fn ProvidersView() -> Element {
             }
             if let Some(op) = (panel.operation)() {
                 div { class: "provider-inset stack",
-                    p { class: "mono", "{op.kind} · {op.status:?} · {op.id}" }
+                    p { class: "mono", "{op.kind} · {operation_status_label(op.status)} · {op.id}" }
                     if let Some(detail) = &op.detail { p { "{detail}" } }
                     if let Some(value) = &op.output {
                         Output { label: "Credential export receipt (redacted by the hub)", value: value.clone() }
@@ -283,6 +435,41 @@ pub fn ProvidersView() -> Element {
             } }}
         }
     }
+}
+
+fn schedule_toolbar_settings_save(mut panel: PanelState, client: HubClient) {
+    panel.toolbar_save_pending.set(true);
+    let Ok(mut saving) = panel.toolbar_saving.try_write() else {
+        return;
+    };
+    if *saving {
+        return;
+    }
+    *saving = true;
+    drop(saving);
+    Runtime::current().spawn(panel.scope, async move {
+        let _guard = Busy(panel.toolbar_saving);
+        while *panel.toolbar_save_pending.peek() {
+            while *panel.busy.peek() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !*panel.toolbar_save_pending.peek() {
+                break;
+            }
+            panel.toolbar_save_pending.set(false);
+            let current = panel.settings.peek().clone();
+            let mut updated = panel.saved_settings.peek().clone().unwrap_or_else(|| current.clone());
+            updated.mask_emails = current.mask_emails;
+            updated.account_sort = current.account_sort;
+            match timed(client.set_provider_settings(&updated)).await {
+                Ok(saved) => panel.saved_settings.set(Some(saved)),
+                Err(error) => {
+                    panel.report(Err(error));
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn supports(provider: &ProviderSummary, account: Option<&ModelAccount>, cap: ProviderCapability) -> bool {
@@ -363,15 +550,18 @@ async fn execute_operation(
             if !matches!(op.status, OperationStatus::Pending | OperationStatus::Dispatched) {
                 break;
             }
-            panel.report(Ok(format!("{} · {:?} · {}", op.command_kind, op.status, op.id)));
+            panel.report(Ok(format!("{} · {} · {}", op.command_kind, operation_status_label(op.status), op.id)));
             tokio::time::sleep(Duration::from_secs(2)).await;
             op = timed(client.provider_operation(op.id)).await?;
         }
         record_operation(panel, &op);
         if matches!(op.status, OperationStatus::Failed | OperationStatus::Ambiguous | OperationStatus::Cancelled) {
-            Err(UiError::new("operation", format!("{} · {:?} · {}. {}", op.command_kind, op.status, op.id, op.error.unwrap_or_default())))
+            Err(UiError::new(
+                "operation",
+                format!("{} · {} · {}. {}", op.command_kind, operation_status_label(op.status), op.id, op.error.unwrap_or_default()),
+            ))
         } else {
-            Ok(format!("{} · {:?} · {}", op.command_kind, op.status, op.id))
+            Ok(format!("{} · {} · {}", op.command_kind, operation_status_label(op.status), op.id))
         }
     }
     .await;
@@ -544,6 +734,9 @@ mod tests {
                 };
                 PanelState {
                     settings: Signal::new(ProviderPanelSettings::default()),
+                    saved_settings: Signal::new(None),
+                    toolbar_save_pending: Signal::new(false),
+                    toolbar_saving: Signal::new(false),
                     epoch: Signal::new(0),
                     busy: Signal::new(false),
                     notice: Signal::new(None),

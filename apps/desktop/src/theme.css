@@ -60,7 +60,7 @@ a:hover { color: var(--focus); text-decoration: underline; }
   text-transform: uppercase;
   color: var(--text-2);
 }
-.mono { font-family: var(--font-mono); }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .muted { color: var(--text-2); }
 .sr-only {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
@@ -83,6 +83,7 @@ a:hover { color: var(--focus); text-decoration: underline; }
   display: flex; flex-direction: column;
   padding: 14px 10px; gap: 3px;
   min-height: 0;
+  overflow-y: auto;
 }
 .brand-lockup { display: flex; align-items: center; gap: 10px; padding: 4px 8px 16px; }
 .brand-mark {
@@ -213,6 +214,13 @@ a:hover { color: var(--focus); text-decoration: underline; }
   letter-spacing: 0.06em; text-transform: uppercase;
 }
 .fixture-banner strong { font-weight: 700; }
+.fixture-banner.partial {
+  padding: 5px 18px;
+  background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+  color: var(--warn);
+  border-bottom: 1px solid color-mix(in srgb, var(--warn) 28%, transparent);
+  font-weight: 500;
+}
 
 /* ── Components ────────────────────────────────────────────────────────── */
 .btn {
@@ -285,6 +293,7 @@ input[type="checkbox"] { accent-color: var(--honey); }
 .stat-card .value {
   font-family: var(--font-display); font-weight: 700; font-size: 25px;
   color: var(--text); line-height: 1.15;
+  font-variant-numeric: tabular-nums;
 }
 .stat-card .value.ok { color: var(--ok); }
 .stat-card .value.bad { color: var(--bad); }
@@ -698,6 +707,7 @@ input[type="checkbox"] { accent-color: var(--honey); }
   padding: 7px 10px; border-bottom: 1px solid var(--border); text-align: left;
   vertical-align: top; min-width: 64px; overflow-wrap: anywhere;
 }
+.provider-table td { font-variant-numeric: tabular-nums; }
 .provider-table th { color: var(--text-2); background: var(--panel); }
 .provider-table tr:last-child td { border-bottom: 0; }
 .provider-table tbody tr:nth-child(even) { background: var(--card); }
@@ -707,6 +717,8 @@ input[type="checkbox"] { accent-color: var(--honey); }
 .quota-meter { width: 100%; height: 6px; border-radius: 3px; }
 .quota-track { fill: var(--elevated); }
 .quota-left { fill: var(--ok); }
+.quota-left.warn { fill: var(--warn); }
+.quota-left.bad { fill: var(--bad); }
 .provider-chart { margin: 0; min-width: 0; }
 .provider-chart > svg { display: block; width: 100%; max-height: 275px; margin-block: 6px; }
 .provider-chart figcaption { color: var(--text-2); font-size: 12px; }

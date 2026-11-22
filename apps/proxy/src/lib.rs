@@ -304,12 +304,12 @@ impl Proxy {
             return;
         }
         let resolved = futures_util::future::join_all(missing.into_iter().map(|account| async move {
-            let token = self.token(&account, false).await.ok()?;
-            let email = match self.google_token_email(&token).await {
+            let mut account = self.token_account(&account, false).await.ok()?;
+            let email = match self.google_token_email(&account.access).await {
                 Some(email) => Some(email),
                 None if account.refresh.is_some() => {
-                    let fresh = self.token(&account, true).await.ok()?;
-                    self.google_token_email(&fresh).await
+                    account = self.token_account(&account, true).await.ok()?;
+                    self.google_token_email(&account.access).await
                 }
                 None => None,
             }?;
@@ -602,8 +602,8 @@ impl Proxy {
         let generation = account.probe_generation;
         let mut google_summary = false;
         let result = async {
-            let mut token = self.token(&account, false).await.map_err(|_| "credential unavailable")?;
-            account.access.clone_from(&token);
+            account = self.token_account(&account, false).await.map_err(|_| "credential unavailable")?;
+            let mut token = account.access.clone();
             match account.lane {
                 Lane::Claude => {
                     let mut url = self.config.anthropic.clone();

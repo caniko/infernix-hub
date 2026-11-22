@@ -27,9 +27,12 @@ pub use state::Workspace;
 use state::{Loaded, Store};
 
 fn main() {
-    use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
-    let window = WindowBuilder::new().with_title("fleetix hub").with_inner_size(LogicalSize::new(1440.0, 900.0));
-    dioxus::LaunchBuilder::desktop().with_cfg(Config::new().with_window(window)).launch(App);
+    use dioxus::desktop::{Config, LogicalSize, WindowBuilder, tao::window::Theme};
+    let window_theme = if theme::is_dark_theme() { Theme::Dark } else { Theme::Light };
+    let window =
+        WindowBuilder::new().with_title("fleetix hub").with_inner_size(LogicalSize::new(1440.0, 900.0)).with_theme(Some(window_theme));
+    let cfg = Config::new().with_window(window).with_menu(None).with_background_color(theme::window_background_rgba());
+    dioxus::LaunchBuilder::desktop().with_cfg(cfg).launch(App);
 }
 
 #[component]
@@ -223,6 +226,21 @@ fn App() -> Element {
     }
     .to_string();
     let fixture = status.data.as_ref().is_some_and(|status| status.fixture_mode);
+    let (all_fixture, simulated_integrations): (bool, Vec<String>) = status
+        .data
+        .as_ref()
+        .filter(|status| status.fixture_mode)
+        .map(|status| {
+            let simulated = status
+                .integrations
+                .iter()
+                .filter(|integration| integration.mode == contracts::AdapterMode::Fixture)
+                .map(|integration| integration.name.clone())
+                .collect();
+            let any_live = status.integrations.iter().any(|integration| integration.mode == contracts::AdapterMode::Live);
+            (!any_live, simulated)
+        })
+        .unwrap_or((false, Vec::new()));
     let mut segments: Vec<shell::StatusSeg> = status
         .data
         .as_ref()
@@ -353,7 +371,7 @@ fn App() -> Element {
                     on_palette: move |_| store.set_palette_open(true),
                 }
                 if fixture {
-                    shell::FixtureBanner {}
+                    shell::FixtureBanner { all_fixture, simulated: simulated_integrations }
                 }
                 if let Some(notice) = (store.notice).cloned() {
                     div {
