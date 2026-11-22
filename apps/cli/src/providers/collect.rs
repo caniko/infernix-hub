@@ -461,7 +461,7 @@ impl Collector {
     fn proxy_id(&self, provider: &str, row: &Value) -> Option<String> {
         proxy_family(provider, row)?;
         let id = str_field(&row["id"])?;
-        Some(format!("{provider}:{}:{}:proxy:{id}", self.host, self.user))
+        Some(format!("{provider}:{}:{}:{id}", self.host, self.user))
     }
 
     fn proxy_accounts(&self, provider: &str, rows: &[Value], now: DateTime<Utc>) -> Vec<ModelAccount> {

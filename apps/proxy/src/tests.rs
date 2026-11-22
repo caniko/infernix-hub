@@ -1028,3 +1028,60 @@ async fn provenance_oauth_discovers_all_antigravity_enrollments_and_deduplicates
         vec![("google".to_owned(), Some("refresh-1".to_owned())), ("google-filiz".to_owned(), Some("refresh-2".to_owned())),]
     );
 }
+
+#[tokio::test]
+async fn expired_claude_token_reloads_from_disk_and_activity_preserves_effort() {
+    let seen_auth = Arc::new(Mutex::new(Vec::<String>::new()));
+    let captured = seen_auth.clone();
+    let mock = serve(Router::new().route(
+        "/v1/messages",
+        post(move |headers: HeaderMap| {
+            let captured = captured.clone();
+            async move {
+                if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                    captured.lock().await.push(auth.to_owned());
+                }
+                axum::Json(json!({"usage":{"input_tokens":10,"output_tokens":5}}))
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    let cred_path = dir.0.join("auth/a.json");
+    // Mark a.json expired in memory, and write a fresher token to disk.
+    {
+        let mut state = proxy.state.write().await;
+        if let Some(a) = state.pool.accounts.get_mut("a.json") {
+            a.expires = Some(Utc::now() - TimeDelta::minutes(5));
+        }
+        if let Some(b) = state.pool.accounts.get_mut("b.json") {
+            b.disabled = true;
+        }
+    }
+    fs::write(
+        &cred_path,
+        json!({
+            "type": "claude",
+            "access_token": "reloaded-fresh-token",
+            "expires_at": (Utc::now() + TimeDelta::hours(1)).to_rfc3339()
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let response = http
+        .request("POST", "/v1/messages")
+        .bearer_auth("inference-fixture")
+        .json(&json!({"model":"claude-fixture","reasoning":{"effort":"high"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(seen_auth.lock().await.as_slice(), ["Bearer reloaded-fresh-token"]);
+    let state = proxy.state.read().await;
+    let recorded = state.activity.back().expect("exchange must be recorded");
+    assert_eq!(recorded.effort.as_deref(), Some("high"));
+    assert_eq!(recorded.attempts[0].effort.as_deref(), Some("high"));
+}

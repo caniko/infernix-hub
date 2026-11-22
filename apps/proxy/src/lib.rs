@@ -418,14 +418,37 @@ impl Proxy {
     }
 
     async fn token(&self, a: &Account, force: bool) -> Result<String> {
-        if a.lane != Lane::Google || a.api_key {
-            return if force { Err(anyhow!("credential renewal is unavailable for this provider")) } else { Ok(a.access.clone()) };
+        if a.api_key {
+            return if force { Err(anyhow!("credential renewal is unavailable for API keys")) } else { Ok(a.access.clone()) };
         }
         let valid = |a: &Account| !a.access.is_empty() && a.expires.is_none_or(|expires| expires > Utc::now() + TimeDelta::seconds(30));
         if !force && valid(a) {
             return Ok(a.access.clone());
         }
         let _guard = self.oauth_refresh.lock().await;
+        if a.lane != Lane::Google {
+            {
+                let mut state = self.state.write().await;
+                if a.local {
+                    state.pool.reload_local(&self.config);
+                } else {
+                    state.pool.reload_file(&self.config, &a.name);
+                }
+            }
+            let current = self
+                .state
+                .read()
+                .await
+                .pool
+                .find(&a.id)
+                .filter(|c| !c.disabled)
+                .cloned()
+                .ok_or_else(|| anyhow!("credential changed or was disabled"))?;
+            if valid(&current) {
+                return Ok(current.access);
+            }
+            return Err(anyhow!("credential expired and no fresher token was found on reload"));
+        }
         let current = self
             .state
             .read()

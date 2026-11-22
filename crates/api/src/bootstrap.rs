@@ -414,7 +414,8 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         pipelines.insert(id, pipeline);
     }
     use integrations::providers::{FullFixtureModelProvider, ReadOnlyFixtureModelProvider};
-    let fixture_providers = s.paperclip == AdapterMode::Fixture || s.assistant == AdapterMode::Fixture;
+    let fixture_providers =
+        s.paperclip == AdapterMode::Fixture && s.windmill == AdapterMode::Fixture && s.assistant == AdapterMode::Fixture;
     let mut full_fixtures = Vec::new();
     let mut providers: BTreeMap<String, Arc<dyn ports::ModelProvider>> = BTreeMap::new();
     if fixture_providers {

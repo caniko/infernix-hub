@@ -401,6 +401,58 @@ impl Pool {
         Ok(pool)
     }
 
+    pub(crate) fn reload_local(&mut self, config: &Config) {
+        if !config.discover_local {
+            return;
+        }
+        let mut fresh = Self::default();
+        discover(config, &mut fresh);
+        for (_, next) in fresh.accounts {
+            if let Some(existing) = self.accounts.get_mut(&next.id) {
+                existing.access = next.access;
+                existing.refresh = next.refresh;
+                existing.expires = next.expires;
+                existing.email = next.email.or_else(|| existing.email.clone());
+                existing.plan = next.plan.or_else(|| existing.plan.clone());
+                existing.chatgpt_id = next.chatgpt_id.or_else(|| existing.chatgpt_id.clone());
+                existing.chatgpt_user = next.chatgpt_user.or_else(|| existing.chatgpt_user.clone());
+                existing.organization = next.organization.or_else(|| existing.organization.clone());
+                existing.project = next.project.or_else(|| existing.project.clone());
+                existing.google_client = next.google_client.or_else(|| existing.google_client.clone());
+                existing.google_secret = next.google_secret.or_else(|| existing.google_secret.clone());
+            } else {
+                let duplicate = self.accounts.values().any(|old| {
+                    old.lane == next.lane
+                        && ((!next.access.is_empty() && old.access == next.access)
+                            || next.refresh.as_ref().is_some_and(|r| old.refresh.as_ref() == Some(r)))
+                });
+                if !duplicate {
+                    self.accounts.insert(next.id.clone(), next);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn reload_file(&mut self, config: &Config, name: &str) {
+        if !filename(name) {
+            return;
+        }
+        let path = config.auth_dir.join(name);
+        if let Some(raw) = read_json(&path)
+            && let Ok(accounts) = parse_credentials(name, &raw, false)
+        {
+            for next in accounts {
+                if let Some(existing) = self.accounts.get_mut(&next.id) {
+                    existing.access = next.access;
+                    existing.refresh = next.refresh;
+                    existing.expires = next.expires;
+                } else {
+                    self.accounts.insert(next.id.clone(), next);
+                }
+            }
+        }
+    }
+
     pub fn insert(&mut self, accounts: Vec<Account>) {
         for mut a in accounts {
             if let Some(old) =

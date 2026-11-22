@@ -721,7 +721,21 @@ async fn load_accounts_with_latest_windows(db: &sqlx::PgPool, provider_id: &str)
     let mut out = Vec::with_capacity(acct_rows.len());
     for row in acct_rows {
         let mut acct: ModelAccount = crate::decode_one(row)?;
-        acct.windows = windows_by_acct.remove(&acct.id).unwrap_or_default();
+        let mut windows = windows_by_acct.remove(&acct.id).unwrap_or_default();
+        // Ignore a superseded synthetic `quota` probe-failure marker once a newer good observation arrives.
+        let latest_good = windows
+            .iter()
+            .filter(|w| !matches!(w.observation_state, QuotaObservationState::ProbeFailed))
+            .filter_map(|w| w.observed_at)
+            .max();
+        if let Some(good_at) = latest_good {
+            windows.retain(|w| {
+                !(w.window_key == "quota"
+                    && matches!(w.observation_state, QuotaObservationState::ProbeFailed)
+                    && w.observed_at.is_none_or(|fail_at| fail_at <= good_at))
+            });
+        }
+        acct.windows = windows;
         acct.reset_grant = grants_by_acct.remove(&acct.id);
         let has_err = acct.enrollment_state == EnrollmentState::Error
             || acct.windows.iter().any(|w| matches!(w.observation_state, QuotaObservationState::ProbeFailed));
@@ -1152,8 +1166,10 @@ pub async fn submit_operation(hub: &Hub, actor: &Actor, provider_id: &str, input
         match dispatch_result {
             Ok(ProviderDispatch::Completed { receipt }) => {
                 let (safe_receipt, _) = capture::redact_json(&receipt);
-                apply_hub_side_effects(hub, provider_id, &input.command).await?;
-                update_operation_state(&hub.db, op_id, OperationStatus::Succeeded, Some(safe_receipt), None).await?;
+                let mut tx = hub.db.begin().await?;
+                apply_hub_side_effects(&mut tx, op_id, provider_id, &input.command, Some(&safe_receipt)).await?;
+                update_operation_state(&mut *tx, op_id, OperationStatus::Succeeded, Some(safe_receipt), None).await?;
+                tx.commit().await?;
                 if let Ok(Some(batch)) = provider.collect().await {
                     let _ = ingest_observations(hub, &internal_operator("provider-refresh"), provider_id, batch).await;
                 }
@@ -1184,14 +1200,20 @@ pub async fn submit_operation(hub: &Hub, actor: &Actor, provider_id: &str, input
 }
 
 /// Apply hub-persisted metadata reflections for completed commands so DB views stay immediate.
-async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &ProviderCommand) -> DResult<()> {
+async fn apply_hub_side_effects(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    op_id: Uuid,
+    provider_id: &str,
+    command: &ProviderCommand,
+    receipt: Option<&Value>,
+) -> DResult<()> {
     match command {
         ProviderCommand::Account(AccountCommand::SetEnabled { account_id, enabled }) => {
             sqlx::query("update model_accounts set enabled = $3, updated_at = now() where provider_id = $1 and id = $2")
                 .bind(provider_id)
                 .bind(account_id)
                 .bind(enabled)
-                .execute(&hub.db)
+                .execute(&mut **tx)
                 .await?;
         }
         ProviderCommand::Account(AccountCommand::SetPriority { account_id, priority }) => {
@@ -1199,7 +1221,7 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
                 .bind(provider_id)
                 .bind(account_id)
                 .bind(priority)
-                .execute(&hub.db)
+                .execute(&mut **tx)
                 .await?;
         }
         ProviderCommand::Account(AccountCommand::SetWeight { account_id, weight }) => {
@@ -1207,7 +1229,7 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
                 .bind(provider_id)
                 .bind(account_id)
                 .bind(*weight as i32)
-                .execute(&hub.db)
+                .execute(&mut **tx)
                 .await?;
         }
         ProviderCommand::Account(AccountCommand::SetNote { account_id, note }) => {
@@ -1215,7 +1237,7 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
                 .bind(provider_id)
                 .bind(account_id)
                 .bind(note)
-                .execute(&hub.db)
+                .execute(&mut **tx)
                 .await?;
         }
         ProviderCommand::Account(AccountCommand::SelectLocalAccount { account_id, .. })
@@ -1223,7 +1245,7 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
             sqlx::query("update model_accounts set is_active = (id = $2), updated_at = now() where provider_id = $1")
                 .bind(provider_id)
                 .bind(account_id)
-                .execute(&hub.db)
+                .execute(&mut **tx)
                 .await?;
         }
         ProviderCommand::Routing(RoutingCommand::SetPoolOverride { account_id }) => {
@@ -1232,7 +1254,7 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
             )
             .bind(provider_id)
             .bind(account_id)
-            .execute(&hub.db)
+            .execute(&mut **tx)
             .await?;
             sqlx::query(
                 "update provider_routing_state
@@ -1243,7 +1265,7 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
             )
             .bind(provider_id)
             .bind(account_id)
-            .execute(&hub.db)
+            .execute(&mut **tx)
             .await?;
         }
         ProviderCommand::Routing(RoutingCommand::SetRoutePolicy { policy }) => {
@@ -1257,7 +1279,7 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
             )
             .bind(provider_id)
             .bind(serde_json::to_value(policy).unwrap_or_else(|_| json!({})))
-            .execute(&hub.db)
+            .execute(&mut **tx)
             .await?;
         }
         ProviderCommand::Quota(QuotaCommand::ConfigureRollingStarter { config }) => {
@@ -1271,7 +1293,7 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
             )
             .bind(provider_id)
             .bind(serde_json::to_value(config).unwrap_or_else(|_| json!({})))
-            .execute(&hub.db)
+            .execute(&mut **tx)
             .await?;
         }
         ProviderCommand::Probe(ProbeCommand::ConfigureCanarySchedule { schedule }) => {
@@ -1280,14 +1302,78 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
                  on conflict (key) do update set value = excluded.value, updated_at = now()",
             )
             .bind(serde_json::to_value(schedule).unwrap_or_else(|_| json!({})))
-            .execute(&hub.db)
+            .execute(&mut **tx)
+            .await?;
+        }
+        ProviderCommand::Probe(ProbeCommand::RunCanary { model_id, effort, .. }) => {
+            let ran_at = receipt
+                .and_then(|r| r.get("ran_at").and_then(Value::as_str))
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now);
+            let run = CanaryRun {
+                id: op_id,
+                provider_id: provider_id.to_string(),
+                model_id: model_id.clone(),
+                effort: effort.clone(),
+                prompts_run: receipt.and_then(|r| r.get("prompts_run").and_then(Value::as_u64)).unwrap_or(0) as u32,
+                prompts_passed: receipt.and_then(|r| r.get("prompts_passed").and_then(Value::as_u64)).unwrap_or(0) as u32,
+                mean_thinking_tokens: receipt.and_then(|r| r.get("mean_thinking_tokens").and_then(Value::as_f64)).unwrap_or(0.0),
+                mean_ttft_ms: receipt.and_then(|r| r.get("mean_ttft_ms").and_then(Value::as_f64)),
+                ran_at,
+                error: receipt.and_then(|r| r.get("error").and_then(Value::as_str)).map(str::to_owned),
+            };
+            sqlx::query(
+                "insert into model_probe_runs (id, kind, provider_id, payload, ran_at)
+                 values ($1, 'canary', $2, $3, $4)
+                 on conflict (id) do nothing",
+            )
+            .bind(op_id)
+            .bind(provider_id)
+            .bind(serde_json::to_value(&run).unwrap_or_else(|_| json!({})))
+            .bind(ran_at)
+            .execute(&mut **tx)
+            .await?;
+        }
+        ProviderCommand::Probe(ProbeCommand::RunThinkingTest {
+            model_id, effort, compare_model_id, compare_effort, sample_count, ..
+        }) => {
+            let ran_at = receipt
+                .and_then(|r| r.get("ran_at").and_then(Value::as_str))
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now);
+            let run = ThinkingTestRun {
+                id: op_id,
+                baseline_model: model_id.clone(),
+                baseline_effort: effort.clone(),
+                compare_model: compare_model_id.clone().unwrap_or_else(|| model_id.clone()),
+                compare_effort: compare_effort.clone(),
+                sampled_turns: receipt.and_then(|r| r.get("sampled_turns").and_then(Value::as_u64)).unwrap_or(u64::from(*sample_count))
+                    as u32,
+                judge_model: receipt.and_then(|r| r.get("judge_model").and_then(Value::as_str)).map(str::to_owned),
+                equivalence_rate: receipt.and_then(|r| r.get("equivalence_rate").and_then(Value::as_f64)),
+                measured_cost_delta_pct: receipt.and_then(|r| r.get("measured_cost_delta_pct").and_then(Value::as_f64)),
+                ran_at,
+                status: receipt.and_then(|r| r.get("status").and_then(Value::as_str)).unwrap_or("completed").to_string(),
+            };
+            sqlx::query(
+                "insert into model_probe_runs (id, kind, provider_id, payload, ran_at)
+                 values ($1, 'thinking_test', $2, $3, $4)
+                 on conflict (id) do nothing",
+            )
+            .bind(op_id)
+            .bind(provider_id)
+            .bind(serde_json::to_value(&run).unwrap_or_else(|_| json!({})))
+            .bind(ran_at)
+            .execute(&mut **tx)
             .await?;
         }
         ProviderCommand::KeyGroup(KeyGroupCommand::DeleteGroup { group_id }) => {
             sqlx::query("delete from model_key_groups where provider_id = $1 and id = $2")
                 .bind(provider_id)
                 .bind(group_id)
-                .execute(&hub.db)
+                .execute(&mut **tx)
                 .await?;
         }
         ProviderCommand::KeyGroup(KeyGroupCommand::SetGroupEnabled { group_id, enabled }) => {
@@ -1295,7 +1381,7 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
                 .bind(provider_id)
                 .bind(group_id)
                 .bind(enabled)
-                .execute(&hub.db)
+                .execute(&mut **tx)
                 .await?;
         }
         ProviderCommand::KeyGroup(KeyGroupCommand::RemoveKey { group_id, key_id }) => {
@@ -1308,7 +1394,7 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
             .bind(provider_id)
             .bind(group_id)
             .bind(key_id)
-            .execute(&hub.db)
+            .execute(&mut **tx)
             .await?;
         }
         ProviderCommand::KeyGroup(KeyGroupCommand::ToggleKey { group_id, key_id, enabled }) => {
@@ -1325,19 +1411,19 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
             .bind(group_id)
             .bind(key_id)
             .bind(enabled)
-            .execute(&hub.db)
+            .execute(&mut **tx)
             .await?;
         }
         ProviderCommand::Credential(CredentialCommand::RemoveLogin { account_id }) => {
             sqlx::query("delete from model_reset_grants where provider_id = $1 and account_id = $2")
                 .bind(provider_id)
                 .bind(account_id)
-                .execute(&hub.db)
+                .execute(&mut **tx)
                 .await?;
             sqlx::query("delete from model_accounts where provider_id = $1 and id = $2")
                 .bind(provider_id)
                 .bind(account_id)
-                .execute(&hub.db)
+                .execute(&mut **tx)
                 .await?;
         }
         _ => {}
@@ -1345,20 +1431,23 @@ async fn apply_hub_side_effects(hub: &Hub, provider_id: &str, command: &Provider
     Ok(())
 }
 
-async fn update_operation_state(
-    db: &sqlx::PgPool,
+async fn update_operation_state<'e, E>(
+    exec: E,
     op_id: Uuid,
     status: OperationStatus,
     receipt: Option<Value>,
     error: Option<String>,
-) -> DResult<()> {
+) -> DResult<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let status_str = serde_json::to_value(status).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "failed".into());
     sqlx::query("update model_operations set status = $2, receipt = coalesce($3, receipt), error = $4, updated_at = now() where id = $1")
         .bind(op_id)
         .bind(&status_str)
         .bind(&receipt)
         .bind(&error)
-        .execute(db)
+        .execute(exec)
         .await?;
     Ok(())
 }
@@ -1469,23 +1558,31 @@ async fn enforce_collector_claim_scope(
 
 pub async fn report_operation_receipt(hub: &Hub, actor: &Actor, op_id: Uuid, input: OperationReceiptIn) -> DResult<ProviderOperation> {
     actor.require(OPERATOR_OR_COLLECTOR)?;
-    let op = get_operation(hub, actor, op_id).await?;
-    if actor.principal.role != contracts::Role::Operator {
-        let claimed_by: Option<String> = sqlx::query_scalar("select claimed_by from model_operations where id = $1")
+    let mut tx = hub.db.begin().await?;
+    let locked: Option<(String, String, Value, Option<String>)> =
+        sqlx::query_as("select provider_id, status, command, claimed_by from model_operations where id = $1 for update")
             .bind(op_id)
-            .fetch_optional(&hub.db)
-            .await?
-            .flatten();
-        if claimed_by.as_deref() != Some(actor.name().as_str()) {
-            return Err(DomainError::Forbidden(format!("collector {} did not claim operation {op_id}", actor.principal.name)));
-        }
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((provider_id, current_status, command_json, claimed_by)) = locked else {
+        return Err(DomainError::NotFound("provider operation"));
+    };
+    if actor.principal.role != contracts::Role::Operator && claimed_by.as_deref() != Some(actor.name().as_str()) {
+        return Err(DomainError::Forbidden(format!("collector {} did not claim operation {op_id}", actor.principal.name)));
     }
+    // Terminal operations are idempotent: duplicate receipt retries return the existing result without reapplying side effects.
+    if matches!(current_status.as_str(), "succeeded" | "failed" | "rejected" | "cancelled") {
+        tx.commit().await?;
+        return get_operation(hub, actor, op_id).await;
+    }
+    let command: ProviderCommand = crate::decode_one(command_json)?;
     let safe_receipt = input.receipt.map(|r| capture::redact_json(&r).0);
     let safe_err = input.error.map(|e| capture::redact_text(&e).0);
     if input.status == OperationStatus::Succeeded {
-        apply_hub_side_effects(hub, &op.provider_id, &op.command).await?;
+        apply_hub_side_effects(&mut tx, op_id, &provider_id, &command, safe_receipt.as_ref()).await?;
     }
-    update_operation_state(&hub.db, op_id, input.status, safe_receipt, safe_err).await?;
+    update_operation_state(&mut *tx, op_id, input.status, safe_receipt, safe_err).await?;
+    tx.commit().await?;
     get_operation(hub, actor, op_id).await
 }
 

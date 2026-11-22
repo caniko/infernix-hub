@@ -25,6 +25,9 @@ pub async fn poll_quota(proxy: Arc<Proxy>) {
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         ticks.tick().await;
+        if proxy.config.discover_local {
+            proxy.state.write().await.pool.reload_local(&proxy.config);
+        }
         let _ = management::refresh_selected(&proxy, None, None).await;
     }
 }

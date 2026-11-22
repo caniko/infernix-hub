@@ -525,10 +525,24 @@ async fn act(action: Action, client: &HubClient, desktop: &mut Desktop, state: &
             state.mask_emails = mask;
         }
         Action::UseProviderAccount { provider_id, account_id, pool_override } => {
+            let provider = state.providers.iter().find(|p| p.descriptor.id == provider_id);
+            let target = provider.and_then(|p| {
+                account_id
+                    .as_deref()
+                    .and_then(|aid| p.accounts.iter().find(|a| a.id == aid))
+                    .or_else(|| p.accounts.iter().find(|a| a.is_preferred))
+                    .or_else(|| p.accounts.first())
+            });
+            let target_host = target.and_then(|a| a.host.clone());
+            let target_user = target.and_then(|a| a.unix_user.clone());
             let command = if pool_override {
                 ProviderCommand::Routing(RoutingCommand::SetPoolOverride { account_id: account_id.clone() })
             } else if let Some(aid) = account_id.clone() {
-                ProviderCommand::Account(AccountCommand::SelectLocalAccount { account_id: aid, host: None, unix_user: None })
+                ProviderCommand::Account(AccountCommand::SelectLocalAccount {
+                    account_id: aid,
+                    host: target_host.clone(),
+                    unix_user: target_user.clone(),
+                })
             } else {
                 return false;
             };
@@ -536,8 +550,8 @@ async fn act(action: Action, client: &HubClient, desktop: &mut Desktop, state: &
                 idempotency_key: format!("tray-use-{provider_id}-{}", uuid::Uuid::new_v4()),
                 expected_revision: None,
                 target_account_id: account_id,
-                target_host: None,
-                target_user: None,
+                target_host,
+                target_user,
                 command,
             };
             let _ = tokio::time::timeout(ACK_TIMEOUT, client.submit_provider_operation(&provider_id, &body)).await;
