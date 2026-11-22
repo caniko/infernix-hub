@@ -26,6 +26,8 @@ use crate::{
 struct PanelState {
     settings: Signal<ProviderPanelSettings>,
     saved_settings: Signal<Option<ProviderPanelSettings>>,
+    toolbar_save_pending: Signal<bool>,
+    toolbar_saving: Signal<bool>,
     epoch: Signal<u64>,
     busy: Signal<bool>,
     notice: Signal<Option<(bool, String)>>,
@@ -246,6 +248,8 @@ pub fn ProvidersView() -> Element {
     let mut panel = use_context_provider(|| PanelState {
         settings: Signal::new(ProviderPanelSettings::default()),
         saved_settings: Signal::new(None),
+        toolbar_save_pending: Signal::new(false),
+        toolbar_saving: Signal::new(false),
         epoch: Signal::new(0),
         busy: Signal::new(false),
         notice: Signal::new(None),
@@ -319,16 +323,7 @@ pub fn ProvidersView() -> Element {
                         change: move |value| {
                             panel.settings.write().mask_emails = value;
                             if panel.operator() && settings_ready() {
-                                let mut updated = panel.saved_settings.peek().clone().unwrap_or_else(|| panel.settings.peek().clone());
-                                updated.mask_emails = value;
-                                panel.saved_settings.set(Some(updated.clone()));
-                                let client = mask_client.clone();
-                                spawn(async move {
-                                    match timed(client.set_provider_settings(&updated)).await {
-                                        Ok(saved) => panel.saved_settings.set(Some(saved)),
-                                        Err(error) => panel.report(Err(error)),
-                                    }
-                                });
+                                schedule_toolbar_settings_save(panel, mask_client.clone());
                             }
                         } }
                     Choice { label: "Account sort", value: sort_key(settings.account_sort), options: pairs(SORTS),
@@ -336,16 +331,7 @@ pub fn ProvidersView() -> Element {
                             let order = sort_order(&value);
                             panel.settings.write().account_sort = order;
                             if panel.operator() && settings_ready() {
-                                let mut updated = panel.saved_settings.peek().clone().unwrap_or_else(|| panel.settings.peek().clone());
-                                updated.account_sort = order;
-                                panel.saved_settings.set(Some(updated.clone()));
-                                let client = sort_client.clone();
-                                spawn(async move {
-                                    match timed(client.set_provider_settings(&updated)).await {
-                                        Ok(saved) => panel.saved_settings.set(Some(saved)),
-                                        Err(error) => panel.report(Err(error)),
-                                    }
-                                });
+                                schedule_toolbar_settings_save(panel, sort_client.clone());
                             }
                         } }
                     button { class: "btn btn-glass", onclick: move |_| panel.changed(), "Reload provider data" }
@@ -449,6 +435,41 @@ pub fn ProvidersView() -> Element {
             } }}
         }
     }
+}
+
+fn schedule_toolbar_settings_save(mut panel: PanelState, client: HubClient) {
+    panel.toolbar_save_pending.set(true);
+    let Ok(mut saving) = panel.toolbar_saving.try_write() else {
+        return;
+    };
+    if *saving {
+        return;
+    }
+    *saving = true;
+    drop(saving);
+    Runtime::current().spawn(panel.scope, async move {
+        let _guard = Busy(panel.toolbar_saving);
+        while *panel.toolbar_save_pending.peek() {
+            while *panel.busy.peek() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !*panel.toolbar_save_pending.peek() {
+                break;
+            }
+            panel.toolbar_save_pending.set(false);
+            let current = panel.settings.peek().clone();
+            let mut updated = panel.saved_settings.peek().clone().unwrap_or_else(|| current.clone());
+            updated.mask_emails = current.mask_emails;
+            updated.account_sort = current.account_sort;
+            match timed(client.set_provider_settings(&updated)).await {
+                Ok(saved) => panel.saved_settings.set(Some(saved)),
+                Err(error) => {
+                    panel.report(Err(error));
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn supports(provider: &ProviderSummary, account: Option<&ModelAccount>, cap: ProviderCapability) -> bool {
@@ -714,6 +735,8 @@ mod tests {
                 PanelState {
                     settings: Signal::new(ProviderPanelSettings::default()),
                     saved_settings: Signal::new(None),
+                    toolbar_save_pending: Signal::new(false),
+                    toolbar_saving: Signal::new(false),
                     epoch: Signal::new(0),
                     busy: Signal::new(false),
                     notice: Signal::new(None),

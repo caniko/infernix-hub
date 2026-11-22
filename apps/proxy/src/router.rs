@@ -158,7 +158,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             let reset = if account.is_none() && tried.is_empty() { pool.next_reset(lane, model) } else { None };
             (account, reset)
         };
-        let Some(account) = account else {
+        let Some(mut account) = account else {
             if let Some(reset) = reset {
                 exchange.finish(Some(StatusCode::TOO_MANY_REQUESTS), "rate_limited", Usage::default(), None, None).await;
                 return pool_limit(lane, reset);
@@ -171,9 +171,10 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         let started = Utc::now();
         let timeout = Duration::from_secs(policy.first_byte_timeout_secs.clamp(1, 600));
         let incoming = async {
+            let token = proxy.token_mut(&mut account, false).await.map_err(|_| ())?;
             let url = upstream(&proxy, &account, &parts.uri).ok_or(())?;
             let payload = request_body(&body, &raw, lane, &account);
-            let build = |token: String| {
+            let build = |account: &Account, token: String| {
                 let mut req = proxy.http.request(parts.method.clone(), url.clone()).body(payload.clone());
                 let connection = connection_headers(&parts.headers);
                 for (key, value) in &parts.headers {
@@ -197,20 +198,19 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                         };
                         req.header("anthropic-beta", beta).bearer_auth(token)
                     }
-                    Lane::Codex => openai_account(req.bearer_auth(token), &account),
+                    Lane::Codex => openai_account(req.bearer_auth(token), account),
                     Lane::Google if account.api_key => req.header("x-goog-api-key", token),
                     _ => req.bearer_auth(token),
                 }
             };
-            let token = proxy.token(&account, false).await.map_err(|_| ())?;
-            let mut res = build(token).send().await.map_err(|_| ())?;
+            let mut res = build(&account, token).send().await.map_err(|_| ())?;
             if res.status() == StatusCode::UNAUTHORIZED
                 && lane == Lane::Google
                 && !account.api_key
                 && account.refresh.is_some()
-                && let Ok(fresh) = proxy.token(&account, true).await
+                && let Ok(fresh) = proxy.token_mut(&mut account, true).await
             {
-                res = build(fresh).send().await.map_err(|_| ())?;
+                res = build(&account, fresh).send().await.map_err(|_| ())?;
             }
             let first = res.chunk().await.map_err(|_| ())?;
             Ok::<_, ()>((res, first))

@@ -418,6 +418,11 @@ impl Proxy {
     }
 
     async fn token(&self, a: &Account, force: bool) -> Result<String> {
+        let mut snapshot = a.clone();
+        self.token_mut(&mut snapshot, force).await
+    }
+
+    async fn token_mut(&self, a: &mut Account, force: bool) -> Result<String> {
         if a.api_key {
             return if force { Err(anyhow!("credential renewal is unavailable for API keys")) } else { Ok(a.access.clone()) };
         }
@@ -445,7 +450,9 @@ impl Proxy {
                 .cloned()
                 .ok_or_else(|| anyhow!("credential changed or was disabled"))?;
             if valid(&current) {
-                return Ok(current.access);
+                let token = current.access.clone();
+                *a = current;
+                return Ok(token);
             }
             return Err(anyhow!("credential expired and no fresher token was found on reload"));
         }
@@ -459,7 +466,9 @@ impl Proxy {
             .cloned()
             .ok_or_else(|| anyhow!("credential changed or was disabled"))?;
         if !force && valid(&current) {
-            return Ok(current.access);
+            let token = current.access.clone();
+            *a = current;
+            return Ok(token);
         }
         let (Some(refresh), Some(id), Some(secret)) = (&current.refresh, &current.google_client, &current.google_secret) else {
             return Err(anyhow!("Google OAuth refresh fields unavailable"));
@@ -485,6 +494,7 @@ impl Proxy {
         if let Some(next) = state.pool.accounts.get_mut(&a.id).filter(|n| n.refresh == a.refresh && !n.disabled) {
             next.access.clone_from(&access);
             next.expires = Some(Utc::now() + TimeDelta::seconds(body["expires_in"].as_i64().unwrap_or(3600).clamp(60, 86400)));
+            *a = next.clone();
         } else {
             return Err(anyhow!("credential changed or was disabled"));
         }
@@ -493,8 +503,10 @@ impl Proxy {
 
     async fn refresh_usage(&self, account: &Account) -> Result<(), &'static str> {
         use integrations::providers::{antigravity, claude, opencode};
+        let mut account = account.clone();
         let result = async {
-            let token = self.token(account, false).await.map_err(|_| "credential unavailable")?;
+            let token = self.token_mut(&mut account, false).await.map_err(|_| "credential unavailable")?;
+            let account = &account;
             match account.lane {
                 Lane::Claude => {
                     let mut url = self.config.anthropic.clone();

@@ -325,11 +325,15 @@ fn Settings(providers: Vec<ProviderSummary>) -> Element {
                     id: Uuid::new_v4().to_string(), provider_id: String::new(), account_id: None, window_key: String::new(),
                     show_remaining: true, warn_threshold_pct: 25.0, critical_threshold_pct: 10.0, shape: "circle".into(), accent_color: None,
                 }), "Add metric slot" }
-                button { class: "btn btn-primary", disabled: parsed.is_none() || !valid_slots || (panel.busy)() || !panel.operator(), onclick: move |_| {
+                button { class: "btn btn-primary", disabled: parsed.is_none() || !valid_slots || (panel.busy)() || (panel.toolbar_saving)() || !panel.operator(), onclick: move |_| {
                     let Some(refresh_interval_secs) = parsed else { return; };
+                    if *panel.toolbar_saving.peek() {
+                        return;
+                    }
                     let value = ProviderPanelSettings { refresh_interval_secs, ..panel.settings.cloned() };
                     let client = client.clone();
                     let Some(busy) = panel.begin() else { return; };
+                    panel.toolbar_save_pending.set(false);
                     spawn(async move {
                         let _busy = busy;
                         let result = timed(client.set_provider_settings(&value)).await;
