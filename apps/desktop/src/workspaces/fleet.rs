@@ -205,7 +205,7 @@ fn CommandBody(status: FleetStatus, stale: bool) -> Element {
                     label: "PENDING REVIEWS".to_string(),
                     value: today.as_ref().map(|today| today.pending_reviews.len().to_string()).unwrap_or_else(|| "—".to_string()),
                     detail: Some("awaiting operator".to_string()),
-                    tone: Some("warn".to_string()),
+                    tone: today.as_ref().map(|today| if today.pending_reviews.is_empty() { "ok" } else { "warn" }.to_string()),
                     on_activate: move |_| store.set_workspace(Workspace::Studio),
                 }
                 FleetTile {
@@ -219,7 +219,7 @@ fn CommandBody(status: FleetStatus, stale: bool) -> Element {
                     label: "FAILED WORK".to_string(),
                     value: today.as_ref().map(|today| today.failed_operations.len().to_string()).unwrap_or_else(|| "—".to_string()),
                     detail: Some("generation or publish".to_string()),
-                    tone: Some("bad".to_string()),
+                    tone: today.as_ref().map(|today| if today.failed_operations.is_empty() { "ok" } else { "bad" }.to_string()),
                     on_activate: move |_| store.set_workspace(Workspace::Studio),
                 }
             }

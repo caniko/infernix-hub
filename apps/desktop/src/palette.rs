@@ -74,11 +74,13 @@ pub fn CommandPalette(on_action: EventHandler<Action>, on_close: EventHandler<()
                     oninput: move |e| on_input(e.value()),
                     onkeydown: move |e| match e.key() {
                         Key::Named(NamedKey::ArrowDown) => {
+                            e.prevent_default();
                             if !key_entries.is_empty() {
                                 active.set((selected + 1) % key_entries.len());
                             }
                         }
                         Key::Named(NamedKey::ArrowUp) => {
+                            e.prevent_default();
                             if !key_entries.is_empty() {
                                 active.set((selected + key_entries.len() - 1) % key_entries.len());
                             }

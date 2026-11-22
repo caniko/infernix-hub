@@ -336,6 +336,7 @@ fn Settings(providers: Vec<ProviderSummary>) -> Element {
                         if let Ok(saved) = &result {
                             cadence.set(saved.refresh_interval_secs.to_string());
                             panel.settings.set(saved.clone());
+                            panel.saved_settings.set(Some(saved.clone()));
                             panel.changed();
                         }
                         panel.report(result.map(|_| "Panel settings saved.".into()));

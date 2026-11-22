@@ -162,7 +162,7 @@ fn EvalActions(case: EvalCase, provider: Option<ProviderSummary>) -> Element {
         details { summary { "Expected outcome and predicates" }
             p { "Expected outcome: {case.expected_outcome}" }
             Table { label: "Expected predicates", headers: &["Predicate", "Expected text", "Case sensitive"],
-                rows: case.predicates.iter().map(|p| vec![format!("{:?}", p.kind), p.value.clone(), p.case_sensitive.to_string()]).collect() }
+                rows: case.predicates.iter().map(|p| vec![eval_predicate_label(p.kind).into(), p.value.clone(), p.case_sensitive.to_string()]).collect() }
         }
         if panel.operator() { div { class: "row",
             if can_replay {
@@ -206,7 +206,7 @@ fn EvalActions(case: EvalCase, provider: Option<ProviderSummary>) -> Element {
                 p { "{fmt_dt(result.replayed_at)} · {result.model_id} · expected {case.expected_outcome} / observed {result.actual_outcome}" }
                 Table { label: "Predicate comparison", headers: &["Expected predicate", "Expected text", "Case sensitive", "Replay result"],
                     rows: result.predicate_results.iter().map(|p| vec![
-                        format!("{:?}", p.predicate.kind), p.predicate.value.clone(), p.predicate.case_sensitive.to_string(),
+                        eval_predicate_label(p.predicate.kind).into(), p.predicate.value.clone(), p.predicate.case_sensitive.to_string(),
                         if p.passed { "Pass" } else { "Fail" }.into()
                     ]).collect() }
                 pre { class: "raw-json", "{result.response_preview}" }

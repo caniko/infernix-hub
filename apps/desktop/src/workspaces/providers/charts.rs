@@ -39,13 +39,18 @@ pub(super) fn reset_label(at: Option<DateTime<Utc>>) -> String {
 pub(super) fn QuotaLimitBar(window: QuotaWindow) -> Element {
     let (remaining, used) = quota_values(window.observation_state, window.remaining_percent, window.used_percent);
     let (label, tone) = freshness(&window);
+    let status_label = quota_status_label(window.status);
+    let meta = match reset_cadence_label(window.cadence) {
+        Some(cadence) => format!("{} · {cadence} · observed {}", reset_label(window.resets_at), date(window.observed_at)),
+        None => format!("{} · observed {}", reset_label(window.resets_at), date(window.observed_at)),
+    };
     rsx! {
         div { class: "quota-window",
             div { class: "row",
                 strong { "{window.label}" }
                 if let Some(model) = &window.scope_model { span { class: "muted", "{model}" } }
                 Chip { label: label.to_string(), tone: Some(tone.to_string()) }
-                span { class: "muted", "{window.status:?}" }
+                if let Some(status) = status_label { span { class: "muted", "{status}" } }
             }
             if let (Some(left), Some(used)) = (remaining, used) {
                 Meter { left, used }
@@ -54,9 +59,9 @@ pub(super) fn QuotaLimitBar(window: QuotaWindow) -> Element {
             }
             if matches!(window.observation_state, QuotaObservationState::Measured | QuotaObservationState::StaleLastGood)
                 && let Some(amount) = window.used_amount {
-                p { {format!("{} / {} {}", number(Some(amount)), number(window.limit_amount), window.currency.clone().unwrap_or_else(|| format!("{:?}", window.unit)))} }
+                p { {format!("{} / {} {}", number(Some(amount)), number(window.limit_amount), window.currency.as_deref().unwrap_or_else(|| quota_unit_label(window.unit)))} }
             }
-            p { class: "muted", "{reset_label(window.resets_at)} · {window.cadence:?} · observed {date(window.observed_at)}" }
+            p { class: "muted", "{meta}" }
             if let Some(reason) = &window.error_reason { p { class: "muted", "{reason}" } }
         }
     }
@@ -65,10 +70,17 @@ pub(super) fn QuotaLimitBar(window: QuotaWindow) -> Element {
 #[component]
 pub(super) fn Meter(left: f64, used: f64) -> Element {
     let width = left.clamp(0.0, 100.0);
+    let fill_class = if width < 10.0 {
+        "quota-left bad"
+    } else if width <= 30.0 {
+        "quota-left warn"
+    } else {
+        "quota-left"
+    };
     rsx! {
         svg { class: "quota-meter", view_box: "0 0 100 6", preserve_aspect_ratio: "none", "aria-hidden": "true",
             rect { width: "100", height: "6", class: "quota-track" }
-            rect { width: "{width}", height: "6", class: "quota-left" }
+            rect { width: "{width}", height: "6", class: "{fill_class}" }
         }
         span { class: "mono", "{left:.1}% left · {used:.1}% used" }
     }

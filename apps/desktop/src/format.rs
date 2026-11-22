@@ -117,6 +117,25 @@ pub fn is_video(mime: &str) -> bool {
     mime.trim().to_ascii_lowercase().starts_with("video/")
 }
 
+/// Format a non-negative integer with thousands separators (e.g. `14,829,310`).
+pub fn fmt_count(value: u64) -> String {
+    let digits = value.to_string();
+    let len = digits.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Format a signed integer with thousands separators.
+pub fn fmt_signed_count(value: i64) -> String {
+    if value < 0 { format!("-{}", fmt_count(value.unsigned_abs())) } else { fmt_count(value as u64) }
+}
+
 /// Download filename for an asset's data URI: `<sha12>.<ext>`.
 pub fn media_name(mime: &str, sha256: &str) -> String {
     let subtype = mime.split(';').next().unwrap_or(mime).rsplit('/').next().unwrap_or("");
@@ -185,5 +204,15 @@ mod tests {
         assert!(!is_video("image/png"));
         assert_eq!(media_name("video/mp4", "0123456789abcdef"), "0123456789ab.mp4");
         assert_eq!(media_name("application/octet-stream", "abc"), "abc.bin");
+    }
+
+    #[test]
+    fn count_formatting_groups_thousands() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1_000), "1,000");
+        assert_eq!(fmt_count(14_829_310), "14,829,310");
+        assert_eq!(fmt_signed_count(-12_345), "-12,345");
+        assert_eq!(fmt_signed_count(42_000), "42,000");
     }
 }

@@ -169,13 +169,24 @@ pub fn ContextItem(title: String, meta: String, active: bool, on_select: EventHa
     }
 }
 
-/// Persistent warning when any adapter runs on fixtures.
+/// Persistent warning when adapters run on fixtures. Uses the full high-contrast
+/// banner when every integration is simulated, and a quieter strip naming the
+/// simulated adapters when live integrations are active.
 #[component]
-pub fn FixtureBanner() -> Element {
+pub fn FixtureBanner(all_fixture: bool, simulated: Vec<String>) -> Element {
+    let class = if all_fixture { "fixture-banner" } else { "fixture-banner partial" };
+    let role = if all_fixture { "alert" } else { "status" };
+    let detail = if all_fixture {
+        "— integrations are simulated".to_string()
+    } else if simulated.is_empty() {
+        "— some integrations are simulated (live integrations active)".to_string()
+    } else {
+        format!("— simulated: {} (live integrations active)", simulated.join(", "))
+    };
     rsx! {
-        div { class: "fixture-banner", role: "alert",
-            strong { "FIXTURE MODE" }
-            span { "— integrations are simulated" }
+        div { class: "{class}", role: "{role}",
+            strong { if all_fixture { "FIXTURE MODE" } else { "PARTIAL FIXTURE" } }
+            span { "{detail}" }
         }
     }
 }

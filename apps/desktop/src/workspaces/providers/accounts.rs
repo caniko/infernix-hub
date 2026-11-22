@@ -175,7 +175,7 @@ fn KeyGroupView(provider: ProviderSummary, group: KeyGroup) -> Element {
     rsx! {
         article { class: "provider-inset stack",
             h3 { "{group.name}" }
-            p { class: "muted", {format!("{} · {} · {:?} · {}", group.family, group.base_url.as_deref().unwrap_or("default endpoint"), group.request_identity, if group.enabled { "Enabled" } else { "Disabled" })} }
+            p { class: "muted", {format!("{} · {} · {} · {}", group.family, group.base_url.as_deref().unwrap_or("default endpoint"), request_identity_label(group.request_identity), if group.enabled { "Enabled" } else { "Disabled" })} }
             div { class: "row",
                 OperationButton { provider: provider.clone(), label: group_action,
                     command: ProviderCommand::KeyGroup(enabled_cmd) }
