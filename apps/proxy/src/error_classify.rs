@@ -83,7 +83,7 @@ pub(crate) fn classify_upstream_http_error(
     let body = String::from_utf8_lossy(body);
     let html = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/html"))
         || body.trim_start().starts_with('<');
-    classify(lane, Some(status), &raw, &body, html, source, secrets)
+    classify(lane, Some(status.as_u16()), &raw, &body, html, source, secrets)
 }
 
 pub(crate) fn classify_oauth_error(lane: Lane, status: StatusCode, body: &[u8], secrets: &[&str]) -> AccountError {
@@ -105,20 +105,36 @@ pub(crate) fn classify_sse_error(lane: Lane, event_name: &str, data: &[u8], secr
     classify(lane, None, &raw, &body, body.trim_start().starts_with('<'), Stream, secrets)
 }
 
+fn error_payload(raw: &Value) -> &Value {
+    raw.get("error").or_else(|| raw.pointer("/response/error")).unwrap_or(raw)
+}
+
+fn numeric_code(error: &Value) -> Option<u16> {
+    error.get("code").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok())
+}
+
 fn classify(
     lane: Lane,
-    status: Option<StatusCode>,
+    status: Option<u16>,
     raw: &Value,
     body: &str,
     html: bool,
     source: AccountErrorSource,
     secrets: &[&str],
 ) -> Option<AccountError> {
-    let error = raw.get("error").or_else(|| raw.pointer("/response/error")).unwrap_or(raw);
+    if lane == Lane::Google
+        && let Some(items) = raw.as_array()
+    {
+        // A quota entry must not hide an account-level rejection in the same response.
+        return items
+            .iter()
+            .filter(|item| item.is_object() || item.is_array())
+            .filter_map(|item| classify(lane, numeric_code(error_payload(item)).or(status), item, "", html, source, secrets))
+            .min_by_key(|error| !error.kind.is_blocking());
+    }
+    let error = error_payload(raw);
     let rpc_status = (lane == Lane::Google).then(|| text(error, &["status"])).flatten();
-    let status = status.or_else(|| {
-        error.get("code").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok()).and_then(|n| StatusCode::from_u16(n).ok())
-    });
+    let status = status.or_else(|| numeric_code(error)).and_then(|n| StatusCode::from_u16(n).ok());
     let http = status.map(|s| s.as_u16());
     let mut reasons = Vec::new();
     let mut validation = false;

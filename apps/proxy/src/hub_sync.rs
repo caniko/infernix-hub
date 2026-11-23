@@ -154,7 +154,7 @@ pub(crate) async fn observations(proxy: &Proxy, host: &str, user: &str) -> Vec<O
                 .map(|a| {
                     if !a.disabled {
                         enabled += 1;
-                        unavailable += usize::from(a.quarantined(at) || a.cooldown.is_some_and(|until| until > at));
+                        unavailable += usize::from(a.quarantined(at) || a.cooldown_until().is_some_and(|until| until > at));
                         errors += usize::from(a.last_error.as_ref().map_or(a.probe_failed, AccountError::is_notification_worthy));
                     }
                     let mut account_caps = capabilities.clone();
@@ -174,7 +174,7 @@ pub(crate) async fn observations(proxy: &Proxy, host: &str, user: &str) -> Vec<O
                         tier_multiplier: a.multiplier,
                         status: AccountStatus::resolve_with_error(
                             !a.disabled,
-                            a.cooldown,
+                            a.cooldown_until(),
                             at,
                             is_next,
                             a.probe_failed && a.last_error.is_none(),
@@ -183,7 +183,7 @@ pub(crate) async fn observations(proxy: &Proxy, host: &str, user: &str) -> Vec<O
                         enabled: !a.disabled,
                         priority: a.priority,
                         weight: a.weight,
-                        cooldown_until: a.cooldown,
+                        cooldown_until: a.cooldown_until(),
                         status_message: a
                             .last_error
                             .as_ref()

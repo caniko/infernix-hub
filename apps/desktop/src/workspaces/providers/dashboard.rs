@@ -102,6 +102,7 @@ fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
             }
             p { class: "muted", "{provider.descriptor.family} · observed {date(provider.descriptor.last_observed_at)}" }
             if let Some(message) = &provider.descriptor.status_message { p { "{message}" } }
+            if has_quota { p { class: "muted", "Cached quota and pool readings · not evaluated for a specific model." } }
             if provider.pools.is_empty() { p { class: "muted", if has_quota { "No pool readings yet." } else { "Quota windows not reported." } } }
             for pool in provider.pools.iter().filter(|p| !is_extra(p.kind)) {
                 PoolWindow { key: "{pool.window_key}", pool: pool.clone() }
@@ -165,7 +166,7 @@ pub(super) fn AccountIdentity(provider: ProviderSummary, account: ModelAccount, 
     let (label, tone) = match status(&provider, &account) {
         AccountStatus::Disabled => ("Disabled", "muted"),
         AccountStatus::Limited => ("Limited", "warn"),
-        AccountStatus::NextPick => ("Next pick", "info"),
+        AccountStatus::NextPick => ("Next pick (cached; not model-scoped)", "info"),
         AccountStatus::Error => ("Error", "bad"),
         AccountStatus::Ready => ("Ready", "ok"),
     };

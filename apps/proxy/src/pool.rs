@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env, fs,
     path::{Path, PathBuf},
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -9,6 +10,7 @@ use anyhow::{Result, anyhow, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use contracts::providers::*;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -115,6 +117,41 @@ pub(crate) fn quota_window_active(lane: Lane, w: &QuotaWindow, now: DateTime<Utc
         .map_or_else(|| lane != Lane::Google || w.observed_at.is_some_and(|at| now - at < chrono::TimeDelta::hours(1)), |at| at > now)
 }
 
+pub(crate) const MAX_COOLDOWN_SECS: i64 = 604_800;
+
+pub(crate) fn bounded_identifier(model: &str) -> bool {
+    !model.is_empty() && model.len() <= 192 && model.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-:/".contains(&b))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cooldown {
+    pub until: DateTime<Utc>,
+    pub verified_reset: bool,
+}
+
+impl Cooldown {
+    pub(crate) fn merge(self, other: Self) -> Self {
+        // A local or clamped blocker wins ties: it cannot vouch for a reset.
+        if (other.until, !other.verified_reset) > (self.until, !self.verified_reset) { other } else { self }
+    }
+}
+
+pub(crate) struct QuotaReader(Arc<()>);
+
+#[derive(Clone)]
+struct PendingQuota {
+    reader: Weak<()>,
+    scope: Option<String>,
+    provisional: Option<Cooldown>,
+    unverified_until: Option<DateTime<Utc>>,
+}
+
+impl PendingQuota {
+    fn blocks_verification(&self, now: DateTime<Utc>) -> bool {
+        self.reader.strong_count() != 0 || self.unverified_until.or(self.provisional.map(|c| c.until)).is_some_and(|until| until > now)
+    }
+}
+
 #[derive(Clone)]
 pub struct Account {
     pub id: String,
@@ -141,16 +178,19 @@ pub struct Account {
     pub organization: Option<String>,
     pub google_client: Option<String>,
     pub google_secret: Option<String>,
+    provenance_enrollment: Option<String>,
+    provenance_project: Option<String>,
     pub project: Option<String>,
     pub api_key: bool,
     pub base: Option<reqwest::Url>,
     pub local: bool,
     pub models: Vec<String>,
-    pub cooldown: Option<DateTime<Utc>>,
+    pub cooldown: Option<Cooldown>,
+    pub scoped_cooldowns: BTreeMap<String, Cooldown>,
+    pending_quota: Vec<PendingQuota>,
     pub last_error: Option<AccountError>,
     pub error_generation: u64,
     pub source_fingerprint: Option<String>,
-    pub scoped_cooldowns: BTreeMap<String, DateTime<Utc>>,
     pub windows: Vec<QuotaWindow>,
     pub google_fallback_keys: BTreeSet<String>,
     pub grants: Vec<ResetGrant>,
@@ -210,8 +250,44 @@ impl Account {
         self.lane == other.lane
             && self.api_key == other.api_key
             && (self.lane != Lane::Codex || (self.chatgpt_id == other.chatgpt_id && self.chatgpt_user == other.chatgpt_user))
-            && (self.refresh.is_none() || other.refresh.is_none() || self.refresh == other.refresh)
+            && (self.lane != Lane::Google || (self.project == other.project && self.base == other.base))
+            && self.compatible_refresh(other)
             && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
+    }
+
+    fn compatible_refresh(&self, other: &Self) -> bool {
+        self.refresh.is_none() || other.refresh.is_none() || self.refresh == other.refresh
+    }
+
+    fn shares_discovery_token(&self, other: &Self) -> bool {
+        self.lane == other.lane
+            && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
+    }
+
+    pub(crate) fn set_google_project(&mut self, project: Option<String>) -> bool {
+        if self.project == project {
+            return false;
+        }
+        self.project = project;
+        self.provenance_project = None;
+        self.clear_google_route_evidence();
+        true
+    }
+
+    fn clear_google_route_evidence(&mut self) {
+        self.cooldown = None;
+        self.scoped_cooldowns.clear();
+        self.pending_quota.clear();
+        self.windows.clear();
+        self.google_fallback_keys.clear();
+        self.observed = None;
+        self.probe_failed = false;
+        self.probe_generation = self.probe_generation.saturating_add(1);
+        // Inference and probe errors describe the old route; OAuth errors describe the credential.
+        if self.last_error.as_ref().is_some_and(|err| err.source != AccountErrorSource::OAuthRefresh) {
+            self.clear_account_error();
+        }
+        self.error_generation = self.error_generation.saturating_add(1);
     }
 
     pub(crate) fn same_secret(&self, other: &Self) -> bool {
@@ -264,7 +340,11 @@ impl Account {
     }
 
     pub(crate) fn quarantined(&self, now: DateTime<Utc>) -> bool {
-        self.last_error.as_ref().is_some_and(|error| error.blocks_routing(now))
+        self.active_quarantine(now).is_some()
+    }
+
+    fn active_quarantine(&self, now: DateTime<Utc>) -> Option<&AccountError> {
+        self.last_error.as_ref().filter(|error| error.blocks_routing(now))
     }
 
     pub(crate) fn has_account_error(&self) -> bool {
@@ -278,14 +358,95 @@ impl Account {
     }
 
     fn supports(&self, model: &str) -> bool {
-        !self.disabled && self.weight > 0 && (model.is_empty() || self.models.is_empty() || self.models.iter().any(|id| id == model))
+        self.support_exclusion(model).is_none()
+    }
+
+    fn support_exclusion(&self, model: &str) -> Option<&'static str> {
+        if self.disabled {
+            Some("disabled")
+        } else if self.weight == 0 {
+            Some("zero_weight")
+        } else if !model.is_empty() && !self.models.is_empty() && !self.models.iter().any(|id| id == model) {
+            Some("unsupported_model")
+        } else {
+            None
+        }
+    }
+
+    pub fn cooldown_until(&self) -> Option<DateTime<Utc>> {
+        self.quota_cooldown(None).map(|cooldown| cooldown.until)
+    }
+
+    fn scoped_cooldown(&self, model: &str) -> Option<Cooldown> {
+        model_cooldown_scope(self.lane, model).and_then(|scope| self.quota_cooldown(Some(&scope)))
+    }
+
+    fn quota_cooldown(&self, scope: Option<&str>) -> Option<Cooldown> {
+        let settled = scope.map_or(self.cooldown, |scope| self.scoped_cooldowns.get(scope).copied());
+        settled
+            .into_iter()
+            .chain(self.pending_quota.iter().filter(|pending| pending.scope.as_deref() == scope).filter_map(|pending| pending.provisional))
+            .reduce(Cooldown::merge)
+    }
+
+    pub(crate) fn begin_google_quota_read(
+        &mut self,
+        model: &str,
+        provisional: Option<Cooldown>,
+        unverified_until: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> QuotaReader {
+        self.pending_quota.retain(|pending| pending.blocks_verification(now));
+        let reader = Arc::new(());
+        self.pending_quota.push(PendingQuota {
+            reader: Arc::downgrade(&reader),
+            scope: model_cooldown_scope(self.lane, model),
+            provisional: provisional.map(|cooldown| Cooldown { verified_reset: false, ..cooldown }),
+            // A headerless fallback outlives a dropped reader for verification only.
+            unverified_until,
+        });
+        QuotaReader(reader)
+    }
+
+    pub(crate) fn finish_google_quota_read(&mut self, reader: &QuotaReader, unverified_until: Option<DateTime<Utc>>) -> bool {
+        let identity = Arc::downgrade(&reader.0);
+        let Some(index) = self.pending_quota.iter().position(|pending| pending.reader.ptr_eq(&identity)) else { return false };
+        if unverified_until.is_some() {
+            let pending = &mut self.pending_quota[index];
+            pending.reader = Weak::new();
+            pending.provisional = None;
+            pending.unverified_until = unverified_until;
+        } else {
+            self.pending_quota.swap_remove(index);
+        }
+        true
+    }
+
+    pub(crate) fn clear_quota_cooldowns(&mut self) {
+        self.cooldown = None;
+        self.scoped_cooldowns.clear();
+        self.pending_quota.retain_mut(|pending| {
+            pending.provisional = None;
+            pending.unverified_until = None;
+            pending.reader.strong_count() != 0
+        });
+    }
+
+    pub(super) fn has_unverified_google_quota_read(&self, model: &str, now: DateTime<Utc>) -> bool {
+        let scope = model_cooldown_scope(self.lane, model);
+        // An unread or failed body still blocks verification until its own backoff expires,
+        // even if a longer cooldown wins the legacy routing decision.
+        self.pending_quota.iter().any(|pending| (pending.scope.is_none() || pending.scope == scope) && pending.blocks_verification(now))
+    }
+
+    fn active_quota_windows<'a>(&'a self, now: DateTime<Utc>, model: &'a str) -> impl Iterator<Item = &'a QuotaWindow> {
+        self.windows
+            .iter()
+            .filter(move |w| window_applies_to_model(w, model) && enforces_quota(w) && quota_window_active(self.lane, w, now))
     }
 
     pub fn quota_limited_until(&self, now: DateTime<Utc>, model: &str) -> Option<DateTime<Utc>> {
-        let scoped = model_cooldown_scope(self.lane, model).and_then(|scope| self.scoped_cooldowns.get(&scope).copied());
-        self.windows
-            .iter()
-            .filter(|w| window_applies_to_model(w, model) && enforces_quota(w) && quota_window_active(self.lane, w, now))
+        self.active_quota_windows(now, model)
             .map(|w| {
                 w.resets_at.unwrap_or_else(|| {
                     if self.lane == Lane::Google {
@@ -295,7 +456,7 @@ impl Account {
                     }
                 })
             })
-            .chain(self.cooldown.into_iter().chain(scoped).filter(|until| *until > now))
+            .chain(self.quota_cooldown(None).into_iter().chain(self.scoped_cooldown(model)).map(|c| c.until).filter(|until| *until > now))
             .max()
     }
 
@@ -312,7 +473,7 @@ impl Account {
             "id": self.id, "name": self.name, "auth_index": self.auth_index, "provider": self.provider,
             "type": self.provider, "label": crate::error_classify::safe_label(self), "disabled": self.disabled, "note": self.note, "priority": self.priority,
             "weight": self.weight, "status": if self.disabled { "disabled" } else if self.has_account_error() { "error" } else { "active" },
-            "cooldown_until": self.cooldown, "observed_at": self.observed, "last_used_at": self.last_used,
+            "cooldown_until": self.cooldown_until(), "observed_at": self.observed, "last_used_at": self.last_used,
             "last_error": self.last_error,
             "preferred": pool.preferred(self.lane) == Some(self.id.as_str()),
             "plan": self.plan.as_ref().map(|p| json!({"tier":p,"label":p,"multiplier":self.multiplier})),
@@ -512,6 +673,8 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             organization,
             google_client,
             google_secret,
+            provenance_enrollment: None,
+            provenance_project: None,
             project: text(entry, &["project_id", "projectId", "project"]).map(str::to_owned),
             api_key,
             base: (api_key || lane == Lane::Go).then(|| base.clone()).flatten(),
@@ -522,6 +685,7 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             error_generation: 0,
             source_fingerprint: None,
             scoped_cooldowns: BTreeMap::new(),
+            pending_quota: Vec::new(),
             windows: vec![],
             google_fallback_keys: BTreeSet::new(),
             grants: vec![],
@@ -559,6 +723,23 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
 }
 
 type Session = (Lane, String);
+
+#[derive(Serialize)]
+pub(crate) struct ModelEligibility<'a> {
+    snapshot_at: DateTime<Utc>,
+    lane: &'static str,
+    wire_model: &'a str,
+    supported_accounts: usize,
+    eligible_accounts: usize,
+    verified_next_reset_at: Option<DateTime<Utc>>,
+    accounts: Vec<AccountEligibility<'a>>,
+}
+
+#[derive(Serialize)]
+struct AccountEligibility<'a> {
+    auth_index: &'a str,
+    exclusion_reasons: Vec<&'static str>,
+}
 
 #[derive(Default)]
 pub struct Pool {
@@ -631,6 +812,7 @@ impl Pool {
 
     pub fn insert(&mut self, accounts: Vec<Account>) {
         for mut a in accounts {
+            a.pending_quota.clear();
             if let Some(old) = self.accounts.get_mut(&a.id) {
                 a.redacted_labels.extend(std::mem::take(&mut old.redacted_labels));
                 // Scrub before preserving any live credentials on an unchanged reload.
@@ -644,8 +826,8 @@ impl Pool {
                 let unchanged = a.lane == old.lane
                     && a.api_key == old.api_key
                     && a.base == old.base
+                    && (a.lane != Lane::Google || a.project.is_none() || a.project == old.project)
                     && if a.source_fingerprint.is_some() { a.source_fingerprint == old.source_fingerprint } else { old.same_secret(&a) };
-                a.error_generation = old.error_generation.saturating_add(u64::from(!unchanged));
                 if unchanged {
                     a.access.clone_from(&old.access);
                     a.refresh.clone_from(&old.refresh);
@@ -653,6 +835,7 @@ impl Pool {
                     a.google_client.clone_from(&old.google_client);
                     a.google_secret.clone_from(&old.google_secret);
                     a.project.clone_from(&old.project);
+                    a.provenance_project.clone_from(&old.provenance_project);
                     if a.email.is_none() {
                         a.email.clone_from(&old.email);
                     }
@@ -662,6 +845,7 @@ impl Pool {
                     a.cooldown = old.cooldown;
                     a.last_error.clone_from(&old.last_error);
                     a.scoped_cooldowns.clone_from(&old.scoped_cooldowns);
+                    a.pending_quota.clone_from(&old.pending_quota);
                     a.windows.clone_from(&old.windows);
                     a.google_fallback_keys.clone_from(&old.google_fallback_keys);
                     a.grants.clone_from(&old.grants);
@@ -673,7 +857,10 @@ impl Pool {
                     a.provenance_token_fp = old.provenance_token_fp;
                     a.success = old.success;
                     a.failure = old.failure;
+                } else if a.lane == Lane::Google && (a.project != old.project || a.base != old.base) {
+                    a.clear_google_route_evidence();
                 }
+                a.error_generation = old.error_generation.saturating_add(u64::from(!unchanged));
             } else {
                 a.scrub_label(&[]);
             }
@@ -685,41 +872,129 @@ impl Pool {
         self.accounts.get(id).or_else(|| self.accounts.values().find(|a| a.auth_index == id || self.hub_id(a) == id || a.hub_id() == id))
     }
 
+    fn support_exclusion(&self, account: &Account, model: &str, required_project: Option<&str>) -> Option<&'static str> {
+        if required_project.is_some_and(|project| account.project.as_deref() != Some(project)) {
+            return Some("project_mismatch");
+        }
+        account
+            .support_exclusion(model)
+            .or_else(|| (account.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly).then_some("subscriptions_only"))
+    }
+
     pub(crate) fn supports(&self, a: &Account, lane: Lane, model: &str, required_project: Option<&str>) -> bool {
-        a.lane == lane
-            && required_project.is_none_or(|project| a.project.as_deref() == Some(project))
-            && a.supports(model)
-            && !(a.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly)
+        a.lane == lane && self.support_exclusion(a, model, required_project).is_none()
     }
 
     fn supported<'a>(&'a self, lane: Lane, model: &'a str, required_project: Option<&'a str>) -> impl Iterator<Item = &'a Account> {
         self.accounts.values().filter(move |a| self.supports(a, lane, model, required_project))
     }
 
-    pub fn next_reset(&self, lane: Lane, model: &str, required_project: Option<&str>) -> Option<DateTime<Utc>> {
-        let now = Utc::now();
+    pub(crate) fn evaluate_model_eligibility<'a>(
+        &'a self,
+        lane: Lane,
+        model: &'a str,
+        required_project: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Option<ModelEligibility<'a>> {
+        if !bounded_identifier(model) {
+            return None;
+        }
+        let horizon = chrono::TimeDelta::seconds(MAX_COOLDOWN_SECS);
+        let mut evaluation = ModelEligibility {
+            snapshot_at: now,
+            lane: lane.name(),
+            wire_model: model,
+            supported_accounts: 0,
+            eligible_accounts: 0,
+            verified_next_reset_at: None,
+            accounts: Vec::new(),
+        };
+        for account in self.accounts.values().filter(|a| a.lane == lane) {
+            let mut reasons = Vec::new();
+            if let Some(reason) = self.support_exclusion(account, model, required_project) {
+                reasons.push(reason);
+            } else {
+                evaluation.supported_accounts += 1;
+                let mut account_reset = None;
+                let mut complete = true;
+                let mut block = |reason, reset_at: Option<DateTime<Utc>>| {
+                    reasons.push(reason);
+                    if let Some(at) = reset_at.filter(|at| *at > now && *at - now <= horizon) {
+                        account_reset = account_reset.max(Some(at));
+                    } else {
+                        complete = false;
+                    }
+                };
+                if let Some(error) = account.active_quarantine(now) {
+                    let reason = if error.kind == AccountErrorKind::AuthExpired { "auth_cooldown" } else { "quarantined" };
+                    block(reason, None);
+                }
+                for (reason, cooldown) in
+                    [("global_cooldown", account.quota_cooldown(None)), ("scoped_cooldown", account.scoped_cooldown(model))]
+                {
+                    if let Some(c) = cooldown.filter(|c| c.until > now) {
+                        block(reason, c.verified_reset.then_some(c.until));
+                    }
+                }
+                let mut windows = account.active_quota_windows(now, model).peekable();
+                if windows.peek().is_some() {
+                    // A cached reset must have been credible when observed, not just when read.
+                    let reset = windows.try_fold(now, |latest, w| {
+                        let (observed, at) = (w.observed_at?, w.resets_at?);
+                        (observed <= now && observed < at && at - observed <= horizon).then_some(latest.max(at))
+                    });
+                    block("quota_window", reset);
+                }
+                if reasons.is_empty() {
+                    evaluation.eligible_accounts += 1;
+                } else if complete
+                    && !account.has_unverified_google_quota_read(model, now)
+                    && let Some(reset) = account_reset
+                {
+                    evaluation.verified_next_reset_at = Some(evaluation.verified_next_reset_at.map_or(reset, |old| old.min(reset)));
+                }
+            }
+            evaluation.accounts.push(AccountEligibility { auth_index: &account.auth_index, exclusion_reasons: reasons });
+        }
+        if evaluation.eligible_accounts > 0 {
+            evaluation.verified_next_reset_at = None;
+        }
+        Some(evaluation)
+    }
+
+    pub(crate) fn verified_google_reset_at(
+        &self,
+        model: &str,
+        required_project: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        self.evaluate_model_eligibility(Lane::Google, model, required_project, now)?.verified_next_reset_at
+    }
+
+    pub fn next_reset(&self, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.supported(lane, model, required_project)
             .filter(|a| !a.quarantined(now))
             .filter_map(|a| a.quota_limited_until(now, model))
             .min()
     }
 
-    pub fn all_quota_limited(&self, lane: Lane, model: &str, required_project: Option<&str>) -> bool {
-        let now = Utc::now();
+    pub fn all_quota_limited(&self, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> bool {
         let mut accounts = self.supported(lane, model, required_project).peekable();
         accounts.peek().is_some() && accounts.all(|a| !a.quarantined(now) && a.quota_limited_until(now, model).is_some())
     }
 
-    pub(crate) fn has_eligible_account(&self, lane: Lane, model: &str, required_project: Option<&str>) -> bool {
-        let now = Utc::now();
+    pub(crate) fn has_eligible_account(&self, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> bool {
         self.supported(lane, model, required_project).any(|a| a.eligible(now, model))
     }
 
-    pub(crate) fn uniform_quarantine_kind(&self, lane: Lane, model: &str, required_project: Option<&str>) -> Option<AccountErrorKind> {
-        let now = Utc::now();
-        let mut kinds = self
-            .supported(lane, model, required_project)
-            .map(|a| a.last_error.as_ref().filter(|err| err.blocks_routing(now)).map(|err| err.kind));
+    pub(crate) fn uniform_quarantine_kind(
+        &self,
+        lane: Lane,
+        model: &str,
+        required_project: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Option<AccountErrorKind> {
+        let mut kinds = self.supported(lane, model, required_project).map(|a| a.active_quarantine(now).map(|err| err.kind));
         let kind = kinds.next()??;
         kinds.all(|other| other == Some(kind)).then_some(kind)
     }
@@ -737,13 +1012,12 @@ impl Pool {
     pub fn pick(
         &mut self,
         lane: Lane,
-        session: Option<&str>,
-        parent: Option<&str>,
+        (session, parent): (Option<&str>, Option<&str>),
         model: &str,
         required_project: Option<&str>,
         tried: &[String],
+        now: DateTime<Utc>,
     ) -> Option<Account> {
-        let now = Utc::now();
         let eligible = |a: &&Account| self.supports(a, lane, model, required_project) && a.eligible(now, model) && !tried.contains(&a.id);
         if let Some(a) = self.preferred(lane).and_then(|id| self.accounts.get(id)).filter(eligible) {
             return Some(a.clone());
@@ -830,7 +1104,7 @@ impl Pool {
             cursors: self.cursors.clone(),
             ..Self::default()
         };
-        copy.pick(lane, None, None, "", None, &[]).map(|a| a.id)
+        copy.pick(lane, (None, None), "", None, &[], Utc::now()).map(|a| a.id)
     }
 
     pub fn bound(&self, lane: Lane, id: &str) -> Option<&str> {
@@ -911,24 +1185,23 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
+fn local_credential_name(lane: Lane, label: &str) -> String {
+    format!("local-{}-{}.json", lane.name(), hex::encode(&Sha256::digest(label)[..8]))
+}
+
 fn add(pool: &mut Pool, lane: Lane, label: &str, mut raw: Value) {
     let Some(fields) = raw.as_object_mut() else { return };
     fields.insert("type".into(), json!(lane.name()));
     fields.remove("provider");
     fields.remove("family");
-    let name = format!("local-{}-{}.json", lane.name(), hex::encode(&Sha256::digest(label)[..8]));
+    let name = local_credential_name(lane, label);
     if let Ok(mut found) = parse_credentials(&name, &raw, true) {
         let cutoff = Utc::now() + chrono::TimeDelta::seconds(30);
         found.retain(|a| {
             if !a.api_key && matches!(a.lane, Lane::Claude | Lane::Codex) && a.expires.is_some_and(|e| e <= cutoff) {
                 return false;
             }
-            !pool.accounts.values().any(|old| {
-                old.id != a.id
-                    && old.lane == a.lane
-                    && ((!a.access.is_empty() && old.access == a.access)
-                        || a.refresh.as_ref().is_some_and(|r| old.refresh.as_ref() == Some(r)))
-            })
+            !pool.accounts.values().any(|old| old.id != a.id && old.shares_discovery_token(a))
         });
         pool.insert(found);
     }
@@ -958,35 +1231,109 @@ pub(crate) fn provenance_google_manifests(config: &Config, user: &str) -> Vec<(S
         .collect()
 }
 
+fn merge_google_duplicate(survivor: &mut Account, replacement: Account, explicit_client: bool, explicit_secret: bool) {
+    if survivor.api_key || replacement.api_key || survivor.access.is_empty() || survivor.access != replacement.access {
+        return;
+    }
+    let adopting_refresh = survivor.refresh.is_none() && replacement.refresh.is_some();
+    // Adoption also makes the refresh tokens match. Otherwise an access-token
+    // match alone does not establish that the OAuth client is the same.
+    if adopting_refresh || survivor.refresh == replacement.refresh {
+        if adopting_refresh {
+            survivor.refresh = replacement.refresh;
+        }
+        let fresher = replacement.expires.zip(survivor.expires).is_some_and(|(new, old)| new > old);
+        if adopting_refresh || survivor.google_client.is_none() || (fresher && explicit_client) {
+            survivor.google_client = replacement.google_client;
+        }
+        if adopting_refresh || survivor.google_secret.is_none() || (fresher && explicit_secret) {
+            survivor.google_secret = replacement.google_secret;
+        }
+    }
+    survivor.expires = survivor.expires.max(replacement.expires);
+    survivor.scrub_label(&[]);
+}
+
 pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value) {
     let Some(fields) = raw.as_object_mut() else { return };
     fields.entry("label").or_insert_with(|| json!(label));
+    fields.insert("type".into(), json!(Lane::Google.name()));
+    fields.remove("provider");
+    fields.remove("family");
     let refresh = text(&raw, &["refresh_token", "refreshToken", "refresh"]).map(str::to_owned);
     let client = text(&raw, &["client_id", "clientId"]).map(str::to_owned);
     let secret = text(&raw, &["client_secret", "clientSecret"]).map(str::to_owned);
     let project = text(&raw, &["project_id", "projectId", "project"]).map(str::to_owned);
     let email = text(&raw, &["email"]).map(str::to_owned);
-    if let Some(refresh) = refresh.as_deref()
-        && let Some(existing) = pool.accounts.values_mut().find(|a| a.lane == Lane::Google && a.refresh.as_deref() == Some(refresh))
-    {
+    let enrolled = pool.accounts.values().find(|a| a.provenance_enrollment.as_deref() == Some(label));
+    let existing = enrolled.or_else(|| {
+        let refresh = refresh.as_ref()?;
+        pool.accounts.values().find(|a| a.lane == Lane::Google && a.refresh.as_ref() == Some(refresh))
+    });
+    if let Some(existing) = existing {
+        let mut id = existing.id.clone();
+        if enrolled.is_some() && (existing.refresh != refresh || refresh.is_none()) {
+            let Ok(mut replacements) = parse_credentials(&existing.name, &raw, true) else { return };
+            let Some(mut replacement) = replacements.pop().filter(|a| a.id == existing.id) else { return };
+            // An access-only reread of the same token must not erase an enriched refresh token.
+            if (replacement.refresh.is_some() && existing.refresh != replacement.refresh)
+                || existing.access != replacement.access
+                || existing.api_key != replacement.api_key
+                || existing.base != replacement.base
+            {
+                let duplicate = pool.accounts.values().find(|other| other.id != id && other.shares_discovery_token(&replacement));
+                pool.revision += 1;
+                if let Some(survivor) = duplicate.filter(|other| other.compatible_refresh(&replacement)) {
+                    // Keep the account that already holds the credential and its route evidence.
+                    let duplicate_id = survivor.id.clone();
+                    pool.accounts.remove(&id);
+                    id = duplicate_id;
+                    if let Some(survivor) = pool.accounts.get_mut(&id) {
+                        merge_google_duplicate(survivor, replacement, client.is_some(), secret.is_some());
+                    }
+                } else {
+                    if duplicate.is_some() {
+                        // Remember the disk token without making it available for routing.
+                        replacement.provenance_token_fp = Some(Sha256::digest(&replacement.access).into());
+                        replacement.replace_access(String::new());
+                        replacement.expires = None;
+                    }
+                    replacement.provenance_enrollment = existing.provenance_enrollment.clone();
+                    replacement.probe_generation = existing.probe_generation.saturating_add(1);
+                    pool.insert(vec![replacement]);
+                    return;
+                }
+            }
+        }
+        let Some(existing) = pool.accounts.get_mut(&id) else { return };
         let relabel = existing.local
+            && existing.provenance_enrollment.as_deref().is_none_or(|enrollment| enrollment == label)
             && existing.label != label
             && (existing.label == existing.name || existing.label.starts_with("local-") || existing.label.len() == 64);
-        let enriched = (existing.google_client.is_none() && client.is_some())
-            || (existing.google_secret.is_none() && secret.is_some())
-            || (existing.project.is_none() && project.is_some())
+        // An access-only reread must not fill in stale credentials for an adopted refresh token.
+        let same_refresh = existing.refresh == refresh;
+        let enriched = (same_refresh
+            && ((existing.google_client.is_none() && client.is_some()) || (existing.google_secret.is_none() && secret.is_some())))
             || (existing.email.is_none() && email.is_some());
         if relabel {
             existing.label = label.to_owned();
         }
-        if existing.google_client.is_none() {
+        if same_refresh && existing.google_client.is_none() {
             existing.google_client = client;
         }
-        if existing.google_secret.is_none() {
+        if same_refresh && existing.google_secret.is_none() {
             existing.google_secret = secret;
         }
-        if existing.project.is_none() {
-            existing.project = project;
+        if existing.local && existing.provenance_enrollment.is_none() {
+            existing.provenance_enrollment = Some(label.to_owned());
+        }
+        let project_changed = (existing.provenance_enrollment.as_deref() == Some(label)
+            || existing.provenance_project.as_deref() == Some(label)
+            || existing.project.is_none())
+            && project.is_some()
+            && existing.set_google_project(project);
+        if project_changed {
+            existing.provenance_project = Some(label.to_owned());
         }
         if existing.email.is_none() {
             existing.email = email;
@@ -996,6 +1343,8 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         // proxy refreshed in memory; an unchanged disk snapshot is not a renewal.
         let mut rotated = false;
         if existing.local
+            && same_refresh
+            && existing.provenance_enrollment.as_deref() == Some(label)
             && let Some(access) = text(&raw, &["access_token", "accessToken", "access", "token"])
                 .filter(|s| s.len() <= 32_768 && s.bytes().all(|b| b.is_ascii_graphic()))
         {
@@ -1015,13 +1364,37 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         if rotated {
             existing.clear_account_error();
             existing.probe_failed = false;
-            existing.probe_generation = 0;
+            existing.probe_generation = existing.probe_generation.saturating_add(1);
             existing.error_generation = existing.error_generation.saturating_add(1);
         }
-        pool.revision += i64::from(relabel || enriched || rotated);
+        pool.revision += i64::from(relabel || enriched || project_changed || rotated);
+        if rotated && let Some(rotated_account) = pool.accounts.get(&id) {
+            let duplicate =
+                pool.accounts.values().find(|other| other.id != id && other.lane == Lane::Google && other.access == rotated_account.access);
+            if let Some(other) = duplicate {
+                if other.compatible_refresh(rotated_account) {
+                    let duplicate_id = other.id.clone();
+                    if let Some(replacement) = pool.accounts.remove(&id)
+                        && let Some(survivor) = pool.accounts.get_mut(&duplicate_id)
+                    {
+                        // Keep the surviving route's OAuth client unless it needs to adopt the refresh token.
+                        merge_google_duplicate(survivor, replacement, false, false);
+                    }
+                } else if let Some(account) = pool.accounts.get_mut(&id) {
+                    // Use this enrollment's own refresh token instead of retrying the shared access token.
+                    account.replace_access(String::new());
+                    account.expires = None;
+                }
+            }
+        }
         return;
     }
-    add(pool, Lane::Google, &format!("provenance:{label}"), raw);
+    let source = format!("provenance:{label}");
+    add(pool, Lane::Google, &source, raw);
+    if let Some(account) = pool.accounts.get_mut(&local_credential_name(Lane::Google, &source)) {
+        account.provenance_enrollment = Some(label.to_owned());
+        account.provenance_token_fp = (!account.access.is_empty()).then(|| Sha256::digest(&account.access).into());
+    }
 }
 
 pub(crate) fn add_opencode(pool: &mut Pool, raw: &Value, excluded: &BTreeSet<Lane>) {

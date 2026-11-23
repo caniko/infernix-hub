@@ -289,12 +289,9 @@ impl Proxy {
             return false;
         }
         let mut last = self.local_discovery.lock().await;
-        if self.local_discovery_generation.load(Ordering::Acquire) != seen {
-            // Another caller finished a discovery pass since our observation.
-            return true;
-        }
         if last.is_some_and(|at| at.elapsed() < min_interval) {
-            return false;
+            // Reuse a pass completed since the caller's snapshot only while it is fresh.
+            return self.local_discovery_generation.load(Ordering::Acquire) != seen;
         }
         self.discover_local_commands_locked().await;
         *last = Some(Instant::now());
@@ -407,9 +404,10 @@ impl Proxy {
         }
         let resolved = futures_util::future::join_all(missing.into_iter().map(|account| async move {
             let mut account = self.token_account(&account, false).await.ok()?;
+            let base = account.base.clone();
             let lookup = async |access: &str, email, project| {
                 tokio::join!(async { if email { self.google_token_email(access).await } else { None } }, async {
-                    if project { self.google_project_id(access).await } else { None }
+                    if project { self.google_project_id(base.as_ref(), access).await } else { None }
                 },)
             };
             let need_email = account.email.is_none();
@@ -436,8 +434,7 @@ impl Proxy {
                 if current.email.is_none() {
                     current.email = email;
                 }
-                if current.project.is_none() && project.is_some() {
-                    current.project = project;
+                if project.is_some() && current.set_google_project(project) {
                     state.pool.revision += 1;
                 }
             }
@@ -706,7 +703,10 @@ impl Proxy {
         quota_response_json(account, Ok(response)).await
     }
 
-    fn antigravity_hosts(&self) -> Vec<reqwest::Url> {
+    fn antigravity_hosts(&self, base: Option<&reqwest::Url>) -> Vec<reqwest::Url> {
+        if let Some(base) = base {
+            return vec![base.clone()];
+        }
         let mut hosts = vec![self.config.antigravity.clone()];
         if hosts[0].host_str() == Some("daily-cloudcode-pa.googleapis.com") {
             let mut standard = hosts[0].clone();
@@ -717,9 +717,9 @@ impl Proxy {
         hosts
     }
 
-    async fn google_project_id(&self, token: &str) -> Option<String> {
-        for mut url in self.antigravity_hosts() {
-            url.set_path("/v1internal:loadCodeAssist");
+    async fn google_project_id(&self, base: Option<&reqwest::Url>, token: &str) -> Option<String> {
+        for mut url in self.antigravity_hosts(base) {
+            url.set_path(&format!("{}/v1internal:loadCodeAssist", url.path().trim_end_matches('/')));
             let request = self
                 .http
                 .post(url)
@@ -735,9 +735,13 @@ impl Proxy {
         None
     }
 
-    async fn google_quota_windows(&self, account: &mut Account) -> Result<(Vec<QuotaWindow>, bool), Box<AccountError>> {
+    async fn google_quota_windows(
+        &self,
+        account: &mut Account,
+        project: &mut Option<String>,
+    ) -> Result<(Vec<QuotaWindow>, bool), Box<AccountError>> {
         use integrations::providers::antigravity;
-        let hosts = self.antigravity_hosts();
+        let hosts = self.antigravity_hosts(account.base.as_ref());
         let request = |url, access: &str, project: Option<&str>| {
             let body = project.map_or_else(|| serde_json::json!({}), |id| serde_json::json!({"project":id}));
             self.http
@@ -758,16 +762,16 @@ impl Proxy {
                 .iter()
                 .cloned()
                 .map(|mut url| {
-                    url.set_path(&format!("/v1internal:{op}"));
+                    url.set_path(&format!("{}/v1internal:{op}", url.path().trim_end_matches('/')));
                     url
                 })
                 .collect();
             let mut windows = Vec::new();
-            let mut pending = urls;
+            let mut pending = urls.clone();
             loop {
                 let at = Utc::now();
                 let reads = futures_util::future::join_all(pending.iter().map(|url| async {
-                    quota_response_json(account, request(url.clone(), &account.access, account.project.as_deref()).send().await).await
+                    quota_response_json(account, request(url.clone(), &account.access, project.as_deref()).send().await).await
                 }))
                 .await;
                 let mut retry = Vec::new();
@@ -805,7 +809,7 @@ impl Proxy {
                         }
                     }
                 }
-                if windows.iter().any(quota_evidence) {
+                if (project.is_some() || retry.is_empty()) && windows.iter().any(quota_evidence) {
                     return Ok((antigravity::merge_antigravity_windows(windows), op == "retrieveUserQuotaSummary"));
                 }
                 if retry.is_empty() {
@@ -823,12 +827,15 @@ impl Proxy {
                     }
                     Ok(_) => return Err(unchanged_quota_credential()),
                 };
-                let project = account.project.take().or(fresh.project.clone());
                 *account = fresh;
-                account.project = match project {
-                    Some(project) => Some(project),
-                    None => self.google_project_id(&account.access).await,
-                };
+                if project.is_none()
+                    && let Some(discovered) = self.google_project_id(account.base.as_ref(), &account.access).await
+                {
+                    // Do not mix results from before and after discovering the project.
+                    *project = Some(discovered);
+                    windows.clear();
+                    retry.clone_from(&urls);
+                }
                 pending = retry;
             }
         }
@@ -842,13 +849,17 @@ impl Proxy {
         let mut account = {
             let mut state = self.state.write().await;
             // Allocate from one sequence so removing and re-enrolling an ID cannot reuse an in-flight generation.
-            let generation = state.probe_generation.checked_add(1).ok_or_else(|| probe_error("quota probe generation exhausted"))?;
+            let last_generation = state.probe_generation;
             let current = state
                 .pool
                 .accounts
                 .get_mut(&account.id)
                 .filter(|c| !c.disabled && c.same_credential(account))
                 .ok_or_else(|| probe_error("credential changed before quota refresh"))?;
+            let generation = last_generation
+                .max(current.probe_generation)
+                .checked_add(1)
+                .ok_or_else(|| probe_error("quota probe generation exhausted"))?;
             current.probe_generation = generation;
             let current = current.clone();
             state.probe_generation = generation;
@@ -857,6 +868,7 @@ impl Proxy {
         let generation = account.probe_generation;
         let error_generation = account.error_generation;
         let mut google_summary = false;
+        let mut probed_project = None;
         let result = async {
             account = self.token_account(&account, false).await?;
             match account.lane {
@@ -895,7 +907,7 @@ impl Proxy {
                         usable.sort_unstable();
                         let applicable = grant.as_ref().is_some_and(|g| g.applicable)
                             || windows.iter().any(|w| w.status == QuotaStatus::Rejected || w.used_percent.is_some_and(|n| n >= 100.0))
-                            || account.cooldown.is_some_and(|t| t > at);
+                            || account.cooldown_until().is_some_and(|t| t > at);
                         grants = usable
                             .into_iter()
                             .map(|(expiry, id)| ResetGrant {
@@ -925,10 +937,12 @@ impl Proxy {
                     Ok((None, None, opencode::parse_opencode_go_usage(&raw, Utc::now()), vec![], None))
                 }
                 Lane::Google => {
-                    if account.project.is_none() {
-                        account.project = self.google_project_id(&account.access).await;
-                    }
-                    let (windows, summary) = self.google_quota_windows(&mut account).await?;
+                    // A project discovered by this probe is not yet part of the enrolled route.
+                    probed_project = match &account.project {
+                        Some(project) => Some(project.clone()),
+                        None => self.google_project_id(account.base.as_ref(), &account.access).await,
+                    };
+                    let (windows, summary) = self.google_quota_windows(&mut account, &mut probed_project).await?;
                     google_summary = summary;
                     let email = if account.email.is_none() { self.google_token_email(&account.access).await } else { None };
                     Ok((None, email, windows, vec![], None))
@@ -946,11 +960,9 @@ impl Proxy {
             .get_mut(&account.id)
             .filter(|c| !c.disabled && c.probe_generation == generation && c.same_secret(&account))
             .ok_or_else(|| probe_error("quota refresh was superseded"))?;
-        let project_added = current.lane == Lane::Google && current.project.is_none() && account.project.is_some();
-        if project_added {
-            current.project.clone_from(&account.project);
-        }
+        let error_is_current = current.error_generation == error_generation;
         let was_probe_failed = current.probe_failed;
+        let project_changed = probed_project.is_some() && current.set_google_project(probed_project);
         let changed;
         let result = match result {
             Ok((plan, email, windows, grants, next)) => {
@@ -966,12 +978,12 @@ impl Proxy {
                 current.next_grant = next;
                 current.observed = Some(now);
                 current.probe_failed = false;
-                changed = current.error_generation == error_generation && current.clear_account_error();
+                changed = error_is_current && current.clear_account_error();
                 Ok(())
             }
             Err(e) => {
                 current.probe_failed = true;
-                changed = current.error_generation == error_generation && current.record_error_once(&e);
+                changed = error_is_current && current.record_error_once(&e);
                 if current.lane == Lane::Google {
                     let now = Utc::now();
                     current.windows.retain(|w| {
@@ -990,9 +1002,9 @@ impl Proxy {
                 Err(e)
             }
         };
-        state.pool.revision += i64::from(project_added);
+        state.pool.revision += i64::from(project_changed);
         drop(state);
-        if changed || was_probe_failed != result.is_err() {
+        if project_changed || changed || was_probe_failed != result.is_err() {
             self.notify_hub_sync();
         }
         if let Err(error) = &result {

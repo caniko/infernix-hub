@@ -37,29 +37,29 @@ fn routing_strategies_and_session_tree() {
         pool.policy.strategy = strategy;
         pool.cursors.clear();
         for id in expected {
-            assert_eq!(pool.pick(pool::Lane::Claude, None, None, "", None, &[]).unwrap().id, id);
+            assert_eq!(pool.pick(Lane::Claude, (None, None), "", None, &[], Utc::now()).unwrap().id, id);
         }
     }
     pool.bind(pool::Lane::Claude, "root", "a.json");
     pool.bind(pool::Lane::Claude, "child", "a.json");
     pool.link(pool::Lane::Claude, "child", "root");
-    assert_eq!(pool.pick(Lane::Claude, Some("root"), None, "", None, &[]).unwrap().id, "a.json");
+    assert_eq!(pool.pick(Lane::Claude, (Some("root"), None), "", None, &[], Utc::now()).unwrap().id, "a.json");
     assert_eq!(pool.move_session("root", "b.json", false).unwrap(), 1);
     assert_eq!(pool.bound(Lane::Claude, "child"), Some("a.json"));
     assert_eq!(pool.move_session("root", "b.json", true).unwrap(), 2);
-    assert_eq!(pool.pick(pool::Lane::Claude, Some("child"), None, "", None, &[]).unwrap().id, "b.json");
+    assert_eq!(pool.pick(Lane::Claude, (Some("child"), None), "", None, &[], Utc::now()).unwrap().id, "b.json");
     let now = Utc::now();
     for (id, hours) in [("a.json", 2), ("b.json", 5)] {
         let raw = json!({"seven_day":{"utilization": 40, "resets_at": now + TimeDelta::hours(hours)}});
         pool.accounts.get_mut(id).unwrap().windows = integrations::providers::claude::parse_claude_oauth_usage(&raw, now);
     }
     pool.policy.strategy = SoonestReset;
-    assert_eq!(pool.pick(Lane::Claude, None, None, "", None, &[]).unwrap().id, "a.json");
+    assert_eq!(pool.pick(Lane::Claude, (None, None), "", None, &[], now).unwrap().id, "a.json");
     pool.insert(pool::parse_credentials("key.json", &json!({"type":"api_key","family":"claude","api_key":"test-key"}), false).unwrap());
     pool.policy.api_key_order = contracts::providers::ApiKeyOrder::KeysFirst;
-    assert_eq!(pool.pick(Lane::Claude, Some("root"), None, "", None, &[]).unwrap().id, "key.json");
+    assert_eq!(pool.pick(Lane::Claude, (Some("root"), None), "", None, &[], now).unwrap().id, "key.json");
     pool.policy.api_key_order = contracts::providers::ApiKeyOrder::SubscriptionsOnly;
-    assert_eq!(pool.pick(Lane::Claude, Some("root"), None, "", None, &[]).unwrap().id, "b.json");
+    assert_eq!(pool.pick(Lane::Claude, (Some("root"), None), "", None, &[], now).unwrap().id, "b.json");
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn quota_ranking_is_model_specific_and_breaks_weekly_ties_with_session_resets() 
     }
     const NEON: &str = "gemini-4-neon-high";
     const ARGON: &str = "gemini-4-argon-high";
-    let pick = |pool: &mut Pool, model| pool.pick(Lane::Google, None, None, model, None, &[]).unwrap().id;
+    let pick = |pool: &mut Pool, model| pool.pick(Lane::Google, (None, None), model, None, &[], now).unwrap().id;
     pool.policy.strategy = SoonestReset;
     assert_eq!(pick(&mut pool, NEON), "google-filiz.json");
     assert_eq!(pick(&mut pool, ARGON), "google.json");
@@ -130,7 +130,7 @@ fn round_robin_cursors_follow_eligible_accounts() {
                     pool::parse_credentials(name, &json!({"type":lane.name(),"access_token":name,"models":models}), false).unwrap(),
                 );
             }
-            let picks = [first, second, first, second].map(|model| pool.pick(lane, None, None, model, None, &[]).unwrap().id);
+            let picks = [first, second, first, second].map(|model| pool.pick(lane, (None, None), model, None, &[], Utc::now()).unwrap().id);
             assert_eq!(picks, ["a.json", "b.json", "b.json", "c.json"]);
         }
     }
@@ -144,7 +144,7 @@ fn distinct_eligible_sets_keep_round_robin_cursors_bounded() {
         let name = format!("account-{n}.json");
         let model = format!("model-{n}");
         pool.insert(pool::parse_credentials(&name, &json!({"type":"claude","access_token":name,"models":[model]}), false).unwrap());
-        assert_eq!(pool.pick(Lane::Claude, None, None, &model, None, &[]).unwrap().id, name);
+        assert_eq!(pool.pick(Lane::Claude, (None, None), &model, None, &[], Utc::now()).unwrap().id, name);
     }
     assert_eq!(pool.cursors.len(), 256);
 }
@@ -450,7 +450,7 @@ async fn cooldown_failover_stream_usage_and_capture() {
         assert!(text.ends_with("\n\n"));
     }
     let state = proxy.state.read().await;
-    assert!(state.pool.accounts["a.json"].cooldown.is_some_and(|t| t > Utc::now() + TimeDelta::seconds(50)));
+    assert!(state.pool.accounts["a.json"].cooldown_until().is_some_and(|t| t > Utc::now() + TimeDelta::seconds(50)));
     assert_eq!(state.pool.bound(Lane::Claude, "session-1"), Some("b.json"));
     assert_eq!(state.activity.len(), 2);
     assert_eq!(state.activity[0].attempts.iter().map(|a| a.status_code).collect::<Vec<_>>(), [Some(429), Some(200)]);
@@ -481,10 +481,125 @@ async fn cooldown_failover_stream_usage_and_capture() {
     assert_eq!(http.management("DELETE", "/v8/management/observability/captures", None).await.status(), 200);
     let page: Value = http.management("GET", "/v8/management/observability/captures", None).await.json().await.unwrap();
     assert_eq!(page["records"], json!([]));
-    proxy.state.write().await.pool.accounts.get_mut("b.json").unwrap().cooldown = Some(Utc::now() + TimeDelta::seconds(30));
+    proxy.state.write().await.pool.accounts.get_mut("b.json").unwrap().cooldown =
+        Some(pool::Cooldown { until: Utc::now() + TimeDelta::seconds(30), verified_reset: false });
     let limited = send().send().await.unwrap();
     assert_eq!(limited.status(), 429);
     assert_eq!(limited.headers()["anthropic-ratelimit-unified-status"], "rejected");
+    assert_eq!(limited.headers()["x-should-retry"], "false");
+    assert!(!limited.headers().contains_key("x-fleetix-pool-quota"));
+    assert_eq!(
+        limited.json::<Value>().await.unwrap(),
+        json!({"type":"error","error":{"type":"usage_limit_reached","message":"all eligible accounts are rate limited"}})
+    );
+}
+
+#[tokio::test]
+async fn usage_windows_validates_model_diagnostics_and_does_not_change_the_pool() {
+    use contracts::providers::ApiKeyOrder;
+    use integrations::providers::antigravity::parse_antigravity_summary;
+    use pool::Cooldown;
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mock = serve(Router::new().fallback({
+        let probes = probes.clone();
+        move || async move {
+            probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            StatusCode::NOT_FOUND
+        }
+    }))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let now = Utc::now();
+    let reset = now + TimeDelta::minutes(20);
+    let model = "gemini-neon";
+    let (accounts, cursors, revision) = {
+        let mut state = proxy.state.write().await;
+        let pool = &mut state.pool;
+        assert!(pool.pick(Lane::Google, (None, None), model, None, &[], now).is_some());
+        pool.bind(Lane::Google, "test-session", "google-b.json");
+        pool.policy.api_key_order = ApiKeyOrder::SubscriptionsOnly;
+        for (name, data) in [
+            ("disabled.json", json!({"access_token":"private-token","disabled":true})),
+            ("unsupported.json", json!({"access_token":"private-token","models":["different-model"]})),
+            ("zero-weight.json", json!({"access_token":"private-token","weight":0})),
+            ("key.json", json!({"api_key":"private-token"})),
+        ] {
+            let mut data = data;
+            data["type"] = json!("google");
+            pool.insert(pool::parse_credentials(name, &data, false).unwrap());
+        }
+        let a = pool.accounts.get_mut("google-a.json").unwrap();
+        a.scoped_cooldowns.insert("gemini".into(), Cooldown { until: reset, verified_reset: true });
+        a.windows =
+            parse_antigravity_summary(&json!({"buckets":[{"bucketId":"gemini-weekly","remainingFraction":0.0,"resetTime":reset}]}), now);
+        pool.accounts.get_mut("google-b.json").unwrap().last_error = Some(route_auth_error(now + TimeDelta::minutes(2)));
+        let rows = [
+            ("disabled.json", json!(["disabled"])),
+            ("google-a.json", json!(["scoped_cooldown", "quota_window"])),
+            ("google-b.json", json!(["auth_cooldown"])),
+            ("key.json", json!(["subscriptions_only"])),
+            ("unsupported.json", json!(["unsupported_model"])),
+            ("zero-weight.json", json!(["zero_weight"])),
+        ]
+        .map(|(id, reasons)| json!({"auth_index":pool.accounts[id].auth_index,"exclusion_reasons":reasons}));
+        (rows, pool.cursors.clone(), pool.revision)
+    };
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let path = "/v8/management/usage/windows";
+    let scoped = format!("{path}?lane=google&model={model}");
+    assert_eq!(http.request("GET", &scoped).bearer_auth("inference-fixture").send().await.unwrap().status(), 401);
+    assert_eq!(http.request("GET", &format!("{path}?lane=bad")).send().await.unwrap().status(), 401);
+    for query in [
+        "lane=google",
+        "model=gemini-neon",
+        "lane=unknown&model=gemini-neon",
+        "lane=&model=gemini-neon",
+        "lane=google&model=",
+        "lane=google&model=%20",
+        "lane=google&model=gemini%20neon",
+        "lane=google&model=%0A",
+        "lane=google&model=%3B",
+        "lane=google&model=%C3%A9",
+        "lane=google&lane=google&model=gemini-neon",
+        "lane=google&model=gemini-neon&unknown=1",
+        "unknown=1",
+    ] {
+        assert_eq!(http.management("GET", &format!("{path}?{query}"), None).await.status(), 400, "{query}");
+    }
+    let legacy: Value = http.management("GET", path, None).await.json().await.unwrap();
+    assert_eq!(legacy.as_object().unwrap().keys().collect::<Vec<_>>(), ["credentials", "hub_sync_configured", "strategy"]);
+    assert_eq!(legacy["strategy"], "round-robin");
+    assert_eq!(legacy["credentials"].as_array().unwrap().len(), 8);
+    assert!(legacy["credentials"].as_array().unwrap().iter().all(|row| row["next_pick"].is_boolean()));
+
+    let response = http.management("GET", &scoped, None).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let mut response: Value = response.json().await.unwrap();
+    let at: DateTime<Utc> =
+        serde_json::from_value(response["model_eligibility"].as_object_mut().unwrap().remove("snapshot_at").unwrap()).unwrap();
+    assert!(at >= now && at <= Utc::now());
+    assert_eq!(
+        response,
+        json!({"model_eligibility":{"lane":"antigravity","wire_model":model,"supported_accounts":2,"eligible_accounts":0,
+            "verified_next_reset_at":reset,"accounts":accounts}})
+    );
+    let other: Value = http.management("GET", &format!("{path}?lane=antigravity&model=gemini-argon"), None).await.json().await.unwrap();
+    assert_eq!(other["model_eligibility"]["eligible_accounts"], 1);
+    assert_eq!(other["model_eligibility"]["verified_next_reset_at"], Value::Null);
+    assert_eq!(http.management("GET", path, None).await.json::<Value>().await.unwrap(), legacy);
+
+    let state = proxy.state.read().await;
+    assert_eq!(state.pool.cursors, cursors);
+    assert_eq!(state.pool.revision, revision);
+    assert_eq!(state.pool.bound(Lane::Google, "test-session"), Some("google-b.json"));
+    assert_eq!(state.pool.accounts["google-a.json"].scoped_cooldowns["gemini"], Cooldown { until: reset, verified_reset: true });
+    assert_eq!(state.pool.accounts["google-b.json"].last_error.as_ref().unwrap().backoff_until, Some(now + TimeDelta::minutes(2)));
+    assert!(state.usage_refreshes.is_empty());
+    assert!(state.activity.is_empty());
+    assert_eq!(probes.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -535,7 +650,8 @@ async fn management_wire_contracts_reject_cross_origin_and_manage_pool() {
     assert_eq!(refresh["errors"], json!({}));
     assert_eq!(refresh["credentials"][0]["windows"][0]["duration_seconds"], 18000);
     assert_eq!(refresh["credentials"][0]["windows"][0]["used_percent"], 42.0);
-    proxy.state.write().await.pool.accounts.get_mut("a.json").unwrap().cooldown = Some(Utc::now() + TimeDelta::seconds(120));
+    proxy.state.write().await.pool.accounts.get_mut("a.json").unwrap().cooldown =
+        Some(pool::Cooldown { until: Utc::now() + TimeDelta::seconds(120), verified_reset: true });
     let reset: Value =
         http.management("POST", "/v0/management/reset-quota", Some(json!({"auth_index": index}))).await.json().await.unwrap();
     assert_eq!(reset["windows_reset"], 1);
@@ -1565,7 +1681,9 @@ async fn google_inspection_timeout_keeps_partial_array_error_rewritable() {
     prefix.extend(res.bytes().await.unwrap());
     let body: Value = serde_json::from_slice(&prefix).unwrap();
     assert_eq!(body[1]["error"]["code"], 429);
-    assert!(body[1]["error"]["details"][1]["retryDelay"].is_string());
+    let details = body[1]["error"]["details"].as_array().unwrap();
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0]["reason"], "QUOTA_EXHAUSTED");
     assert_eq!(proxy.state.read().await.activity.back().unwrap().attempts.len(), 1);
 }
 
@@ -1737,11 +1855,10 @@ async fn google_midstream_quota_normalizes_stale_resets_and_inspects_after_overs
         assert_eq!(details.len(), 2);
         assert!(details[0]["metadata"].get("quotaResetTimeStamp").is_none(), "{details:?}");
         assert_eq!(details[0]["metadata"]["model"], "gemini");
-        for delay in [&details[0]["metadata"]["quotaResetDelay"], &details[1]["retryDelay"]] {
-            assert!(delay.as_str().unwrap().trim_end_matches('s').parse::<u64>().unwrap() >= 5);
-        }
+        assert!(details[0]["metadata"].get("quotaResetDelay").is_none());
+        assert!(details[1].get("retryDelay").is_none());
         let state = proxy.state.read().await;
-        assert!(state.pool.accounts["google-a.json"].scoped_cooldowns.contains_key("gemini"));
+        assert!(!state.pool.accounts["google-a.json"].scoped_cooldowns["gemini"].verified_reset);
         let row = state.activity.back().unwrap();
         assert_eq!(row.status_code, Some(429));
         assert_eq!(row.attempts.len(), 1);
@@ -1749,7 +1866,7 @@ async fn google_midstream_quota_normalizes_stale_resets_and_inspects_after_overs
 }
 
 #[tokio::test]
-async fn google_midstream_quota_rewrites_parseable_reset_to_longer_account_cooldown() {
+async fn google_midstream_quota_keeps_native_delay_without_exporting_the_longer_account_cooldown() {
     let release = Arc::new(Notify::new());
     let mock = serve(Router::new().route(
         "/v1internal:generateContent",
@@ -1787,19 +1904,28 @@ async fn google_midstream_quota_rewrites_parseable_reset_to_longer_account_coold
     let first = res.chunk().await.unwrap().unwrap();
     assert!(first.starts_with(b"data: {\"candidates\""));
     let reset = DateTime::from_timestamp(Utc::now().timestamp() + 120, 500_000_000).unwrap();
-    proxy.state.write().await.pool.accounts.get_mut("google-a.json").unwrap().scoped_cooldowns.insert("gemini".into(), reset);
+    proxy
+        .state
+        .write()
+        .await
+        .pool
+        .accounts
+        .get_mut("google-a.json")
+        .unwrap()
+        .scoped_cooldowns
+        .insert("gemini".into(), pool::Cooldown { until: reset, verified_reset: true });
     release.notify_one();
     let body = res.text().await.unwrap();
     let raw: Value = serde_json::from_str(body.lines().find_map(|line| line.strip_prefix("data: ")).unwrap()).unwrap();
     let details = &raw["error"]["details"];
     let metadata = &details[0]["metadata"];
-    let stamp = metadata["quotaResetTimeStamp"].as_str().unwrap().parse::<DateTime<Utc>>().unwrap();
-    assert_eq!(stamp, DateTime::from_timestamp(reset.timestamp() + 1, 0).unwrap());
-    assert_eq!(metadata["quotaResetDelay"], details[1]["retryDelay"]);
-    let delay: u64 = details[1]["retryDelay"].as_str().unwrap().trim_end_matches('s').parse().unwrap();
-    assert!((117..=122).contains(&delay));
+    assert!(metadata.get("quotaResetTimeStamp").is_none());
+    assert_eq!(metadata["quotaResetDelay"], "30s");
+    assert_eq!(details[1]["retryDelay"], "30s");
     assert_eq!(details[2]["keep"], true);
-    assert_eq!(proxy.state.read().await.activity.back().unwrap().attempts.len(), 1);
+    let state = proxy.state.read().await;
+    assert_eq!(state.pool.accounts["google-a.json"].scoped_cooldowns["gemini"].until, reset);
+    assert_eq!(state.activity.back().unwrap().attempts.len(), 1);
 }
 
 #[tokio::test]
@@ -1867,7 +1993,9 @@ async fn google_terminal_429_waits_past_short_header_budget_until_error_object_c
         .unwrap();
     assert_eq!(res.status(), 429);
     assert!(res.headers()["retry-after"].to_str().unwrap().parse::<u64>().unwrap() >= 115);
-    assert!(proxy.state.read().await.pool.accounts["google-a.json"].scoped_cooldowns["gemini"] > Utc::now() + TimeDelta::seconds(115));
+    assert!(
+        proxy.state.read().await.pool.accounts["google-a.json"].scoped_cooldowns["gemini"].until > Utc::now() + TimeDelta::seconds(115)
+    );
 }
 
 #[tokio::test]
@@ -1887,7 +2015,7 @@ async fn google_terminal_429_keeps_an_expired_header_reset_when_the_body_stalls(
         state.pool.accounts.remove("google-b.json");
         state.pool.policy.first_byte_timeout_secs = 2;
     }
-    let server = serve(proxy.app()).await;
+    let server = serve(proxy.clone().app()).await;
     let res = Http::new(&server)
         .request("POST", "/v1internal:generateContent")
         .bearer_auth("inference-fixture")
@@ -1898,11 +2026,9 @@ async fn google_terminal_429_keeps_an_expired_header_reset_when_the_body_stalls(
     assert_eq!(res.status(), 429);
     assert_eq!(res.headers()["x-should-retry"], "false");
     assert_eq!(res.headers()["retry-after"], "5");
-    let body: Value = res.json().await.unwrap();
-    let metadata = &body["error"]["details"][0]["metadata"];
-    assert!(metadata.get("quotaResetTimeStamp").is_none());
-    let delay: u64 = metadata["quotaResetDelay"].as_str().unwrap().trim_end_matches('s').parse().unwrap();
-    assert!(delay >= 5);
+    assert!(!res.headers().contains_key(router::POOL_QUOTA_HEADER));
+    assert_google_pool_body(&res.json().await.unwrap(), "");
+    assert!(!proxy.state.read().await.pool.accounts["google-a.json"].cooldown.unwrap().verified_reset);
 }
 
 #[tokio::test]
@@ -1932,10 +2058,8 @@ async fn google_terminal_429_prefers_expired_header_over_later_peer_reset() {
         .unwrap();
     assert_eq!(response.status(), 429);
     assert_eq!(response.headers()["retry-after"], "5");
-    let body: Value = response.json().await.unwrap();
-    let metadata = &body["error"]["details"][0]["metadata"];
-    assert_eq!(metadata["quotaResetDelay"], "5s");
-    assert!(metadata.get("quotaResetTimeStamp").is_none());
+    assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER));
+    assert_google_pool_body(&response.json().await.unwrap(), "");
     assert_eq!(proxy.state.read().await.activity.back().unwrap().attempts.len(), 2);
 }
 
@@ -1966,13 +2090,395 @@ async fn google_terminal_429_retains_an_expired_earlier_attempt_reset() {
         .unwrap();
     assert_eq!(response.status(), 429);
     assert_eq!(response.headers()["retry-after"], "5");
-    let body: Value = response.json().await.unwrap();
-    let metadata = &body["error"]["details"][0]["metadata"];
-    assert_eq!(metadata["quotaResetDelay"], "5s");
-    assert!(metadata.get("quotaResetTimeStamp").is_none());
+    assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER));
+    assert_google_pool_body(&response.json().await.unwrap(), "");
     let state = proxy.state.read().await;
     assert_eq!(state.activity.back().unwrap().attempts.len(), 2);
     assert!(state.pool.accounts["google-a.json"].quota_limited_until(Utc::now(), "").is_none());
+}
+
+#[tokio::test]
+async fn google_terminal_429_retries_an_alternate_that_recovers_during_the_body_read() {
+    let release = Arc::new(Notify::new());
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post({
+            let release = release.clone();
+            move |headers: HeaderMap| async move {
+                if router::bearer(&headers) == Some("google-b.json") {
+                    return "alternate".into_response();
+                }
+                let body = Body::from_stream(futures_util::stream::once(async move {
+                    release.notified().await;
+                    Ok::<_, std::io::Error>("{}")
+                }));
+                (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "30")], body).into_response()
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let until = Utc::now() + TimeDelta::milliseconds(500);
+    proxy.state.write().await.pool.accounts.get_mut("google-b.json").unwrap().cooldown =
+        Some(pool::Cooldown { until, verified_reset: true });
+    let send = http.request("POST", "/v1internal:generateContent").bearer_auth("inference-fixture").timeout(Duration::from_secs(3)).send();
+    let recover = async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while proxy.state.read().await.pool.accounts["google-a.json"].cooldown_until().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first account must record its header cooldown");
+        assert!(Utc::now() < until, "alternate must still be cooling down when failover starts");
+        while Utc::now() < until {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        release.notify_one();
+    };
+    let (response, ()) = tokio::join!(send, recover);
+    let response = response.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "alternate");
+}
+
+#[tokio::test]
+async fn google_pending_429_body_does_not_publish_a_header_witness_to_concurrent_requests() {
+    let release = Arc::new(Notify::new());
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post({
+            let release = release.clone();
+            move || async move {
+                let body = Body::from_stream(futures_util::stream::once(async move {
+                    release.notified().await;
+                    Ok::<_, std::io::Error>(r#"{"error":{"code":429,"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#)
+                }));
+                (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "10")], body)
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    proxy.state.write().await.pool.accounts.remove("google-b.json");
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let model = "gemini-4-neon-high";
+    let request = || {
+        http.request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model":model}))
+            .timeout(Duration::from_secs(3))
+            .send()
+    };
+    let concurrent = async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while proxy.state.read().await.pool.accounts["google-a.json"].quota_limited_until(Utc::now(), model).is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first account must record its header cooldown");
+        let response = request().await.unwrap();
+        release.notify_one();
+        response
+    };
+    let (settled, pending) = tokio::join!(request(), concurrent);
+    assert_eq!(pending.status(), 429);
+    assert!(matches!(pending.headers()["retry-after"].to_str().unwrap(), "9" | "10"));
+    assert_eq!(google_witness(pending.headers(), model), None);
+    let settled = settled.unwrap();
+    assert_eq!(settled.status(), 429);
+    let witness = google_witness(settled.headers(), model).unwrap();
+    assert!((88..=90).contains(&(witness - Utc::now()).num_seconds()));
+    assert_eq!(google_witness(request().await.unwrap().headers(), model), Some(witness));
+}
+
+#[tokio::test]
+async fn google_cancelled_429_body_blocks_a_longer_same_scope_witness() {
+    let arrived = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post({
+            let (arrived, release) = (arrived.clone(), release.clone());
+            move || {
+                let (arrived, release) = (arrived.clone(), release.clone());
+                async move {
+                    arrived.notify_one();
+                    release.notified().await;
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "10")],
+                        r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#,
+                    )
+                }
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    proxy.state.write().await.pool.accounts.remove("google-b.json");
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let model = "gemini-4-neon-high";
+    let request = || {
+        http.request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model": model}))
+            .timeout(Duration::from_secs(3))
+            .send()
+    };
+    let second = async {
+        arrived.notified().await;
+        let now = Utc::now();
+        let header = pool::Cooldown { until: now + TimeDelta::seconds(10), verified_reset: true };
+        let reader = proxy.state.write().await.pool.accounts.get_mut("google-a.json").unwrap().begin_google_quota_read(
+            model,
+            Some(header),
+            None,
+            now,
+        );
+        release.notify_one();
+        (reader, header.until)
+    };
+    let (first, (reader, blocker_until)) =
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(request(), second) }).await.unwrap();
+    assert!(!first.unwrap().headers().contains_key(router::POOL_QUOTA_HEADER));
+    drop(reader);
+
+    let response = request().await.unwrap();
+    assert_eq!(response.status(), 429);
+    let retry: u64 = response.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!((85..=90).contains(&retry), "legacy Retry-After must still use the 90s reset");
+    assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER));
+    assert!(proxy.state.read().await.pool.verified_google_reset_at(model, None, blocker_until).is_some());
+}
+
+#[tokio::test]
+async fn google_cancelled_headerless_429_body_blocks_a_longer_same_scope_witness() {
+    check_cancelled_headerless_429_body(false).await;
+}
+
+#[tokio::test]
+async fn google_cancelled_headerless_window_starter_blocks_a_longer_same_scope_witness() {
+    check_cancelled_headerless_429_body(true).await;
+}
+
+async fn check_cancelled_headerless_429_body(window_starter: bool) {
+    let arrived = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post({
+            let (arrived, release) = (arrived.clone(), release.clone());
+            let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            move || {
+                let first = first.swap(false, std::sync::atomic::Ordering::Relaxed);
+                let (arrived, release) = (arrived.clone(), release.clone());
+                async move {
+                    if first {
+                        arrived.notify_one();
+                        release.notified().await;
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "10")],
+                            r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#,
+                        )
+                            .into_response()
+                    } else {
+                        let body = Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+                        (StatusCode::TOO_MANY_REQUESTS, body).into_response()
+                    }
+                }
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    {
+        let mut state = proxy.state.write().await;
+        state.pool.accounts.remove("google-b.json");
+        state.pool.policy.failover_cooldown_secs = 30;
+    }
+    let model = "gemini-4-neon-high";
+    let request = |proxy| {
+        let request = axum::http::Request::post("/v1internal:generateContent")
+            .header("authorization", "Bearer inference-fixture")
+            .body(Body::from(json!({"model": model}).to_string()))
+            .unwrap();
+        router::forward(axum::extract::State(proxy), request)
+    };
+    let first = tokio::spawn(request(proxy.clone()));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        arrived.notified().await;
+        let mut second = Box::pin(async {
+            if window_starter {
+                let account = proxy.state.read().await.pool.accounts["google-a.json"].clone();
+                let request = proxy.http.post(mock.0.join("/v1internal:generateContent").unwrap());
+                let _ = router::run_window_start(proxy.clone(), &account, model, request).await;
+            } else {
+                drop(request(proxy.clone()).await);
+            }
+        });
+        tokio::select! {
+            _ = &mut second => panic!("headerless 429 body should still be pending"),
+            () = async {
+                while !proxy.state.read().await.pool.accounts["google-a.json"].has_unverified_google_quota_read(model, Utc::now()) {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        assert!(proxy.state.read().await.pool.accounts["google-a.json"].eligible(Utc::now(), model));
+        drop(second);
+        {
+            let state = proxy.state.read().await;
+            let account = &state.pool.accounts["google-a.json"];
+            let now = Utc::now();
+            assert!(account.eligible(now, model));
+            assert!(account.has_unverified_google_quota_read(model, now));
+        }
+        release.notify_one();
+        let first = first.await.unwrap();
+        assert_eq!(first.status(), 429);
+        assert!(!first.headers().contains_key(router::POOL_QUOTA_HEADER));
+    })
+    .await
+    .unwrap();
+
+    let response = request(proxy.clone()).await;
+    assert_eq!(response.status(), 429);
+    let retry: u64 = response.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!((85..=90).contains(&retry), "legacy Retry-After must still use the 90s reset");
+    assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER));
+    assert!(proxy.state.read().await.pool.verified_google_reset_at(model, None, Utc::now() + TimeDelta::seconds(30)).is_some());
+}
+
+#[tokio::test]
+async fn google_concurrent_429_bodies_with_the_same_deadline_must_both_settle_before_witnessing() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    let arrived = Arc::new(Notify::new());
+    let respond = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let release_second = Arc::new(Notify::new());
+    // An HTTP-date ten seconds out makes the two parsed deadlines exactly equal.
+    let retry_after = (Utc::now() + TimeDelta::seconds(10)).format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post({
+            let release_second = release_second.clone();
+            let release_first = release_first.clone();
+            let (arrived, respond) = (arrived.clone(), respond.clone());
+            let calls = Arc::new(AtomicUsize::new(0));
+            move || {
+                let first = calls.fetch_add(1, Relaxed) == 0;
+                let (arrived, respond) = (arrived.clone(), respond.clone());
+                let (release_first, release_second) = (release_first.clone(), release_second.clone());
+                let retry_after = retry_after.clone();
+                async move {
+                    if first {
+                        let respond = respond.notified();
+                        arrived.notify_one();
+                        respond.await;
+                    } else {
+                        respond.notify_one();
+                    }
+                    let body = Body::from_stream(futures_util::stream::once(async move {
+                        let body = if first {
+                            release_first.notified().await;
+                            "{}"
+                        } else {
+                            release_second.notified().await;
+                            r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#
+                        };
+                        Ok::<_, std::io::Error>(body)
+                    }));
+                    (StatusCode::TOO_MANY_REQUESTS, [("retry-after", retry_after)], body)
+                }
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    {
+        let mut state = proxy.state.write().await;
+        state.pool.accounts.remove("google-b.json");
+        state.pool.policy.first_byte_timeout_secs = 5;
+    }
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let model = "gemini-4-neon-high";
+    let request = || {
+        http.request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model": model}))
+            .timeout(Duration::from_secs(4))
+            .send()
+    };
+    let first = request();
+    let second = async {
+        arrived.notified().await;
+        request().await
+    };
+    let probe = async {
+        while proxy.state.read().await.pool.accounts["google-a.json"].failure != 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        release_first.notify_one();
+    };
+    let run = async {
+        let (first, ()) = tokio::join!(first, probe);
+        assert_eq!(first.unwrap().status(), 429);
+        let concurrent = request().await.unwrap();
+        assert_eq!(concurrent.status(), 429);
+        assert!(!concurrent.headers().contains_key(router::POOL_QUOTA_HEADER));
+        release_second.notify_one();
+    };
+    let ((), second) = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(run, second) }).await.unwrap();
+    let second = second.unwrap();
+    assert_eq!(second.status(), 429);
+    let witness = google_witness(second.headers(), model).unwrap();
+    assert!((88..=90).contains(&(witness - Utc::now()).num_seconds()));
+    assert_eq!(google_witness(request().await.unwrap().headers(), model), Some(witness));
+}
+
+#[tokio::test]
+async fn google_terminal_429_cannot_witness_retry_info_from_a_non_quota_array_item() {
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(json!([
+                    {"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}},
+                    {"error":{"code":503,"status":"UNAVAILABLE","details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}
+                ])),
+            )
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let server = serve(proxy.app()).await;
+    let model = "gemini-4-neon-high";
+    let response = Http::new(&server)
+        .request("POST", "/v1internal:generateContent")
+        .bearer_auth("inference-fixture")
+        .json(&json!({"model":model}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+    assert!(response.headers().contains_key("retry-after"));
+    assert_eq!(google_witness(response.headers(), model), None);
 }
 
 #[tokio::test]
@@ -2006,7 +2512,8 @@ async fn google_terminal_429_prefers_live_cooldown_over_retained_reset_for_the_s
         seen = tokio::time::timeout(Duration::from_secs(2), dispatched.notified()) => seen.expect("alternate must dispatch"),
         reply = &mut send => panic!("reply before alternate dispatch: {reply:?}"),
     }
-    proxy.state.write().await.pool.accounts.get_mut("google-a.json").unwrap().cooldown = Some(Utc::now() + TimeDelta::seconds(120));
+    proxy.state.write().await.pool.accounts.get_mut("google-a.json").unwrap().cooldown =
+        Some(pool::Cooldown { until: Utc::now() + TimeDelta::seconds(120), verified_reset: false });
     release.notify_one();
     let response = send.await.unwrap();
     assert_eq!(response.status(), 429);
@@ -2022,6 +2529,27 @@ async fn google_in_band_quota_normalizes_when_accounts_are_disabled_during_join(
 #[tokio::test]
 async fn google_in_band_quota_keeps_retry_after_when_accounts_are_disabled_during_join() {
     assert_google_in_band_quota_after_accounts_disabled(Some("120"), 120).await;
+}
+
+fn assert_google_pool_body(body: &Value, model: &str) {
+    let mut detail =
+        json!({"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","domain":"cloudcode-pa.googleapis.com"});
+    if !model.is_empty() {
+        detail["metadata"] = json!({"model":model});
+    }
+    assert_eq!(
+        *body,
+        json!({"error":{"code":429,"message":"all eligible accounts are rate limited","status":"RESOURCE_EXHAUSTED",
+            "details":[detail]}})
+    );
+}
+
+fn google_witness(headers: &HeaderMap, model: &str) -> Option<DateTime<Utc>> {
+    let header = headers.get(router::POOL_QUOTA_HEADER)?.to_str().unwrap();
+    let (retry_at, wire_model) = header.strip_prefix("v1;retry_at=").unwrap().split_once(";wire_model=").unwrap();
+    assert_eq!(wire_model, model);
+    assert!(retry_at.ends_with('Z') && !retry_at.contains('.'));
+    Some(retry_at.parse().unwrap())
 }
 
 async fn assert_google_in_band_quota_after_accounts_disabled(retry_after: Option<&'static str>, expected_delay: u64) {
@@ -2086,17 +2614,8 @@ async fn assert_google_in_band_quota_after_accounts_disabled(retry_after: Option
     assert_eq!(response.status(), 429);
     let delay: u64 = response.headers()["retry-after"].to_str().unwrap().parse().unwrap();
     assert!((expected_delay.saturating_sub(1)..=expected_delay).contains(&delay), "{delay}");
-    let body: Value = response.json().await.unwrap();
-    assert_eq!(body["error"]["code"], 429);
-    assert_eq!(body["error"]["status"], "RESOURCE_EXHAUSTED");
-    assert_eq!(body["error"]["message"], "Quota exhausted for model gemini-4-neon-high. All eligible accounts are rate limited.");
-    assert_eq!(body["error"]["details"][0]["reason"], "QUOTA_EXHAUSTED");
-    let metadata = &body["error"]["details"][0]["metadata"];
-    assert_eq!(metadata.get("quotaResetTimeStamp").is_some(), retry_after.is_some());
-    assert_eq!(metadata["quotaResetDelay"], body["error"]["details"][1]["retryDelay"]);
-    if retry_after.is_none() {
-        assert_eq!(metadata["quotaResetDelay"], "5s");
-    }
+    assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER));
+    assert_google_pool_body(&response.json().await.unwrap(), "gemini-4-neon-high");
 }
 
 #[tokio::test]
@@ -2137,18 +2656,12 @@ async fn google_in_band_quota_survives_accounts_disabled_after_failover_preview(
             .unwrap();
         assert_eq!(response.status(), 429, "upstream Retry-After: {retry_after:?}");
         let delay: u64 = response.headers()["retry-after"].to_str().unwrap().parse().unwrap();
-        let body: Value = response.json().await.unwrap();
-        assert_eq!(body["error"]["code"], 429);
-        assert_eq!(body["error"]["status"], "RESOURCE_EXHAUSTED");
-        assert_eq!(body["error"]["details"][0]["reason"], "QUOTA_EXHAUSTED");
-        let metadata = &body["error"]["details"][0]["metadata"];
+        assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER));
+        assert_google_pool_body(&response.json().await.unwrap(), "gemini-4-neon-high");
         if retry_after.is_some() {
             assert!((119..=120).contains(&delay), "{delay}");
-            assert!(metadata.get("quotaResetTimeStamp").is_some());
         } else {
             assert_eq!(delay, 5);
-            assert_eq!(metadata["quotaResetDelay"], "5s");
-            assert!(metadata.get("quotaResetTimeStamp").is_none());
         }
     }
 }
@@ -2184,17 +2697,12 @@ async fn google_in_band_quota_normalizes_after_pending_reader_outlasts_its_deadl
         .await
         .unwrap();
     assert_eq!(response.status(), 429);
-    let body: Value = response.json().await.unwrap();
-    assert_eq!(body["error"]["code"], 429);
-    assert_eq!(body["error"]["status"], "RESOURCE_EXHAUSTED");
-    assert_eq!(body["error"]["message"], "Quota exhausted for model gemini-4-neon-high. All eligible accounts are rate limited.");
-    assert_eq!(body["error"]["details"][0]["reason"], "QUOTA_EXHAUSTED");
-    let metadata = &body["error"]["details"][0]["metadata"];
-    assert_eq!(metadata["quotaResetDelay"], "5s");
-    assert!(metadata.get("quotaResetTimeStamp").is_none());
+    assert_eq!(response.headers()["retry-after"], "5");
+    assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER));
+    assert_google_pool_body(&response.json().await.unwrap(), "gemini-4-neon-high");
     let state = proxy.state.read().await;
     assert_eq!(state.activity.back().unwrap().attempts.len(), 2);
-    assert!(state.pool.next_reset(Lane::Google, "gemini-4-neon-high", None).is_none());
+    assert!(state.pool.next_reset(Lane::Google, "gemini-4-neon-high", None, Utc::now()).is_none());
 }
 
 #[tokio::test]
@@ -2256,9 +2764,11 @@ async fn google_terminal_429_does_not_wait_for_a_stalled_reader_with_a_later_res
     let proxy = google_routing_fixture(&dir, &mock).await;
     proxy.state.write().await.pool.policy.first_byte_timeout_secs = 6;
     let server = serve(proxy.app()).await;
+    let model = "gemini-4-neon-high";
     let res = Http::new(&server)
         .request("POST", "/v1internal:generateContent")
         .bearer_auth("inference-fixture")
+        .json(&json!({"model":model}))
         .timeout(Duration::from_secs(3))
         .send()
         .await
@@ -2266,10 +2776,116 @@ async fn google_terminal_429_does_not_wait_for_a_stalled_reader_with_a_later_res
     assert_eq!(res.status(), 429);
     let delay: u64 = res.headers()["retry-after"].to_str().unwrap().parse().unwrap();
     assert!((35..=40).contains(&delay), "{delay}");
+    let witness = google_witness(res.headers(), model).unwrap();
+    assert!((37..=40).contains(&(witness - Utc::now()).num_seconds()));
 }
 
 #[tokio::test]
 async fn google_failover_reads_delayed_429_body_and_extends_cooldown_once() {
+    check_delayed_google_429(false).await;
+}
+
+#[tokio::test]
+async fn google_failover_does_not_attest_a_delayed_billing_error() {
+    check_delayed_google_429(true).await;
+}
+
+#[tokio::test]
+async fn google_unusable_reset_header_rejects_immediate_and_delayed_body_proof() {
+    for (reset, retry_after, delayed) in [("0", false, true), ("0", false, false), ("invalid", false, false), ("0", true, false)] {
+        let mock = serve(Router::new().route(
+            "/v1internal:generateContent",
+            post(move || async move {
+                let json = r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"60s"}]}}"#;
+                let body = if delayed {
+                    Body::from_stream(futures_util::stream::once(async move {
+                        tokio::time::sleep(Duration::from_millis(450)).await;
+                        Ok::<_, std::io::Error>(json)
+                    }))
+                } else {
+                    Body::from(json)
+                };
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, [("x-ratelimit-reset", reset)], body).into_response();
+                if retry_after {
+                    response.headers_mut().insert("retry-after", axum::http::HeaderValue::from_static("30"));
+                }
+                response
+            }),
+        ))
+        .await;
+        let dir = Scratch::new();
+        let proxy = google_routing_fixture(&dir, &mock).await;
+        proxy.state.write().await.pool.accounts.remove("google-b.json");
+        let server = serve(proxy.clone().app()).await;
+        let response = Http::new(&server)
+            .request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model":"gemini-neon"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER), "reset={reset}, retry_after={retry_after}, delayed={delayed}");
+        let delay: u64 = response.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((55..=60).contains(&delay), "{delay}");
+        let state = proxy.state.read().await;
+        assert!(!state.pool.accounts["google-a.json"].scoped_cooldowns["gemini"].verified_reset);
+    }
+}
+
+#[tokio::test]
+async fn google_billing_error_array_quarantines_without_quota_proof() {
+    check_google_error_array_quarantine(
+        json!([{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
+            {"@type":"google.rpc.ErrorInfo","reason":"BILLING_DISABLED"},
+            {"@type":"google.rpc.RetryInfo","retryDelay":"60s"}
+        ]}}]),
+        AccountErrorKind::BillingRequired,
+        "BILLING_DISABLED",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn google_permission_error_array_quarantines_without_quota_proof() {
+    check_google_error_array_quarantine(
+        json!([{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Permission denied"}}]),
+        AccountErrorKind::PermissionDenied,
+        "PERMISSION_DENIED",
+    )
+    .await;
+}
+
+async fn check_google_error_array_quarantine(body: Value, kind: AccountErrorKind, provider_code: &str) {
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post(move || async move { (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "60")], axum::Json(body)) }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    proxy.state.write().await.pool.accounts.remove("google-b.json");
+    let server = serve(proxy.clone().app()).await;
+    let response = Http::new(&server)
+        .request("POST", "/v1internal:generateContent")
+        .bearer_auth("inference-fixture")
+        .json(&json!({"model":"gemini-neon"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER));
+    let state = proxy.state.read().await;
+    let account = &state.pool.accounts["google-a.json"];
+    let error = account.last_error.as_ref().unwrap();
+    assert_eq!(error.kind, kind);
+    assert_eq!(error.provider_code.as_deref(), Some(provider_code));
+    assert!(account.quarantined(Utc::now()));
+    assert!(account.scoped_cooldowns.is_empty() && account.cooldown.is_none());
+    drop(state);
+    tokio::time::timeout(Duration::from_secs(1), proxy.hub_sync_notify.notified()).await.unwrap();
+}
+
+async fn check_delayed_google_429(billing: bool) {
     let release = Arc::new(Notify::new());
     let mock = serve(Router::new().route(
         "/v1internal:generateContent",
@@ -2283,7 +2899,12 @@ async fn google_failover_reads_delayed_429_body_and_extends_cooldown_once() {
                     }
                     let body = futures_util::stream::once(async move {
                         release.notified().await;
-                        Ok::<_, std::io::Error>(r#"{"error":{"details":[{"@type":"google.rpc.RetryInfo","retryDelay":"120s"}]}}"#)
+                        let body = if billing {
+                            r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"google.rpc.ErrorInfo","reason":"BILLING_DISABLED"},{"@type":"google.rpc.RetryInfo","retryDelay":"120s"}]}}"#
+                        } else {
+                            r#"{"error":{"details":[{"@type":"google.rpc.RetryInfo","retryDelay":"120s"}]}}"#
+                        };
+                        Ok::<_, std::io::Error>(body)
                     });
                     (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "1")], Body::from_stream(body)).into_response()
                 }
@@ -2310,7 +2931,15 @@ async fn google_failover_reads_delayed_429_body_and_extends_cooldown_once() {
             {
                 let state = proxy.state.read().await;
                 let failed = &state.pool.accounts["google-a.json"];
-                if failed.scoped_cooldowns["gemini"] > Utc::now() + TimeDelta::seconds(115) {
+                if billing && failed.last_error.as_ref().is_some_and(|err| err.kind == AccountErrorKind::BillingRequired) {
+                    assert!(failed.quarantined(Utc::now()));
+                    assert!(failed.scoped_cooldowns.is_empty());
+                    assert_eq!(failed.failure, 1);
+                    break;
+                }
+                if let Some(cooldown) = failed.scoped_cooldowns.get("gemini").filter(|c| c.until > Utc::now() + TimeDelta::seconds(115)) {
+                    assert!(!billing, "a billing error must not establish quota timing");
+                    assert!(cooldown.verified_reset);
                     assert_eq!(failed.failure, 1);
                     break;
                 }
@@ -2319,7 +2948,7 @@ async fn google_failover_reads_delayed_429_body_and_extends_cooldown_once() {
         }
     })
     .await
-    .expect("the delayed 429 body must extend the failed account's cooldown");
+    .expect("the delayed 429 body must settle");
 }
 
 #[tokio::test]
@@ -2622,7 +3251,7 @@ async fn google_ignores_shared_numeric_sessions_and_rebinds_explicit_affinity_on
     let state = proxy.state.read().await;
     let a = &state.pool.accounts["google-a.json"];
     assert!(a.cooldown.is_none());
-    assert!(a.scoped_cooldowns["gemini"] > Utc::now() + TimeDelta::seconds(118));
+    assert!(a.scoped_cooldowns["gemini"].until > Utc::now() + TimeDelta::seconds(118));
     assert_eq!(state.pool.bound(Lane::Google, "-3750763034362895579"), None);
     assert_eq!(state.pool.bound(Lane::Google, HUGE_NUMERIC), None);
     assert_eq!(state.pool.bound(Lane::Google, "explicit-b"), Some("google-b.json"));
@@ -2655,35 +3284,587 @@ async fn google_terminal_429_uses_the_earliest_pool_reset_from_chunked_upstream_
     let dir = Scratch::new();
     let proxy = google_routing_fixture(&dir, &mock).await;
     let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let model = "gemini-4-neon-high";
+    let mut witness = None;
+    // The first call exhausts the pool on failover; the second cannot pick an account.
+    for _ in 0..2 {
+        let response = http
+            .request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model":model}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 429);
+        assert_eq!(response.headers()["x-should-retry"], "false");
+        let retry_after: u64 = response.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((34..=37).contains(&retry_after), "{retry_after}");
+        let retry_at = google_witness(response.headers(), model).unwrap();
+        assert!((34..=37).contains(&(retry_at - Utc::now()).num_seconds()));
+        assert_eq!(*witness.get_or_insert(retry_at), retry_at);
+        assert_google_pool_body(&response.json::<Value>().await.unwrap(), model);
+    }
+    let state = proxy.state.read().await;
+    let final_exchange = state.activity.back().unwrap();
+    assert_eq!(final_exchange.outcome, "rate_limited");
+    assert!(final_exchange.attempts.is_empty());
+    assert_eq!(state.activity[0].attempts.iter().map(|a| a.status_code).collect::<Vec<_>>(), [Some(429), Some(429)]);
+    assert!(witness.unwrap() >= state.pool.accounts["google-a.json"].scoped_cooldowns["gemini"].until);
+    assert!(state.pool.accounts["google-b.json"].scoped_cooldowns["gemini"].until > Utc::now() + TimeDelta::hours(2));
+}
+
+#[tokio::test]
+async fn google_terminal_429_omits_unverified_witness_but_keeps_retry_after() {
+    let oversized = " ".repeat(65 * 1024);
+    for (header, values, body, delay) in [
+        ("retry-after", &["9999999"][..], "{}", 604_800),
+        ("retry-after", &["+60"][..], r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#, 90),
+        ("retry-after", &["invalid"][..], r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#, 90),
+        ("retry-after", &["30", "60"][..], r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#, 90),
+        ("x-ratelimit-reset-unknown", &["90"][..], "{}", 90),
+        ("retry-after", &["60"][..], r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"0s"}]}}"#, 60),
+        ("retry-after", &["60"][..], r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"invalid"}]}}"#, 60),
+        ("retry-after", &["60"][..], "{\"error\":", 60),
+        ("retry-after", &["60"][..], oversized.as_str(), 60),
+    ] {
+        let body = Bytes::copy_from_slice(body.as_bytes());
+        let mock = serve(Router::new().route(
+            "/v1internal:generateContent",
+            post(move || {
+                let body = body.clone();
+                async move {
+                    let mut response = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+                    for value in values {
+                        response.headers_mut().append(header, axum::http::HeaderValue::from_static(value));
+                    }
+                    response
+                }
+            }),
+        ))
+        .await;
+        let dir = Scratch::new();
+        let proxy = google_routing_fixture(&dir, &mock).await;
+        let http_server = serve(proxy.app()).await;
+        let http = Http::new(&http_server);
+        let response = http
+            .request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model":"gemini-neon"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 429);
+        assert_eq!(response.headers()["x-should-retry"], "false");
+        assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER), "{header}: {values:?}");
+        let retry_after: u64 = response.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((delay - 5..=delay).contains(&retry_after), "{retry_after}");
+        let body = response.json::<Value>().await.unwrap();
+        assert_eq!(body["error"]["status"], "RESOURCE_EXHAUSTED");
+        assert_eq!(body["error"]["details"][0]["reason"], "QUOTA_EXHAUSTED");
+    }
+}
+
+#[tokio::test]
+async fn google_routing_witness_and_usage_windows_share_model_validation() {
+    let mock = serve(Router::new()).await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let until = Utc::now() + TimeDelta::minutes(2);
+    for account in proxy.state.write().await.pool.accounts.values_mut().filter(|a| a.lane == Lane::Google) {
+        account.cooldown = Some(pool::Cooldown { until, verified_reset: true });
+    }
+    let server = serve(proxy.app()).await;
+    let http = Http::new(&server);
+    for (model, query, valid) in [
+        ("x?y", "x%3Fy", false),
+        ("x;y", "x%3By", false),
+        ("x y", "x%20y", false),
+        ("x\ny", "x%0Ay", false),
+        (&"x".repeat(193), &"x".repeat(193), false),
+        (&"x".repeat(192), &"x".repeat(192), true),
+    ] {
+        let response = http
+            .request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model":model}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 429);
+        assert_eq!(response.headers().contains_key("x-fleetix-pool-quota"), valid, "{model:?}");
+        let diagnostic = format!("/v8/management/usage/windows?lane=google&model={query}");
+        assert_eq!(http.management("GET", &diagnostic, None).await.status(), if valid { 200 } else { 400 }, "{model:?}");
+    }
+}
+
+#[test]
+fn cached_quota_reset_cannot_be_verified_before_it_was_observed() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+    let mut pool = Pool::default();
+    let mut accounts = pool::parse_credentials("a.json", &json!({"type":"google","access_token":"fixture"}), false).unwrap();
+    let now = Utc::now();
+    let observed = now + TimeDelta::seconds(60);
+    let reset = now + TimeDelta::minutes(10);
+    accounts[0].windows =
+        parse_antigravity_summary(&json!({"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.0,"resetTime":reset}]}), observed);
+    pool.insert(accounts);
+    assert_eq!(pool.next_reset(Lane::Google, "gemini-neon", None, now), Some(reset));
+    assert_eq!(pool.verified_google_reset_at("gemini-neon", None, now), None);
+    assert_eq!(pool.verified_google_reset_at("gemini-neon", None, observed), Some(reset));
+}
+
+#[test]
+fn duplicate_quota_reset_headers_only_set_legacy_backoff() {
+    let now = Utc::now();
+    let epoch = |seconds: i64| (now.timestamp() + seconds).to_string();
+    for (lane, name, first, second, until) in [
+        (Lane::Google, "retry-after", "60".into(), "600".into(), now + TimeDelta::seconds(60)),
+        (Lane::Google, "x-ratelimit-reset", "60".into(), "600".into(), now + TimeDelta::seconds(600)),
+        (Lane::Codex, "x-codex-primary-reset-at", epoch(60), epoch(600), DateTime::from_timestamp(now.timestamp() + 60, 0).unwrap()),
+        (
+            Lane::Claude,
+            "anthropic-ratelimit-unified-reset",
+            epoch(60),
+            epoch(600),
+            DateTime::from_timestamp(now.timestamp() + 600, 0).unwrap(),
+        ),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.append(name, first.parse().unwrap());
+        assert!(router::header_cooldown(lane, &headers, now).unwrap().verified_reset);
+        headers.append(name, second.parse().unwrap());
+        let cooldown = router::header_cooldown(lane, &headers, now).unwrap();
+        assert_eq!(cooldown.until, until);
+        assert!(!cooldown.verified_reset, "{name}");
+    }
+}
+
+#[test]
+fn cached_quota_reset_must_be_in_range_when_observed() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+    let mut pool = Pool::default();
+    pool.insert(pool::parse_credentials("a.json", &json!({"type":"google","access_token":"fixture"}), false).unwrap());
+    let observed_at = Utc::now();
+    let resets_at = observed_at + TimeDelta::days(8);
+    let now = observed_at + TimeDelta::days(1);
+    let model = "gemini-neon";
+    let a = pool.accounts.get_mut("a.json").unwrap();
+    a.windows = parse_antigravity_summary(
+        &json!({"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.0,"resetTime":resets_at}]}),
+        observed_at,
+    );
+    assert_eq!(a.quota_limited_until(now, model), Some(resets_at));
+    assert_eq!(pool.verified_google_reset_at(model, None, now), None);
+
+    pool.accounts.get_mut("a.json").unwrap().windows[0].observed_at = Some(now);
+    assert_eq!(pool.verified_google_reset_at(model, None, now), Some(resets_at));
+}
+
+#[test]
+fn quota_decisions_agree_at_the_expiration_boundary() {
+    let mut pool = Pool::default();
+    pool.insert(pool::parse_credentials("a.json", &json!({"type":"google","access_token":"fixture"}), false).unwrap());
+    let until = "2026-11-23T12:00:01Z".parse::<DateTime<Utc>>().unwrap();
+    pool.accounts.get_mut("a.json").unwrap().cooldown = Some(pool::Cooldown { until, verified_reset: true });
+    let model = "gemini-neon";
+    for (now, reset) in [(until - TimeDelta::nanoseconds(1), Some(until)), (until, None)] {
+        assert_eq!(pool.pick(Lane::Google, (None, None), model, None, &[], now).is_none(), reset.is_some());
+        assert_eq!(pool.next_reset(Lane::Google, model, None, now), reset);
+        assert_eq!(pool.all_quota_limited(Lane::Google, model, None, now), reset.is_some());
+        assert_eq!(pool.verified_google_reset_at(model, None, now), reset);
+    }
+}
+
+#[test]
+fn dropped_google_quota_readers_release_only_their_own_scope() {
+    let mut pool = Pool::default();
+    pool.insert(pool::parse_credentials("a.json", &json!({"type":"google","access_token":"fixture"}), false).unwrap());
+    let now = Utc::now();
+    let until = now + TimeDelta::seconds(90);
+    let header = pool::Cooldown { until: now + TimeDelta::seconds(10), verified_reset: true };
+    let model = "gemini-neon";
+    let other = "gemini-argon";
+    let a = pool.accounts.get_mut("a.json").unwrap();
+    a.cooldown = Some(pool::Cooldown { until, verified_reset: true });
+    let scoped = a.begin_google_quota_read(model, Some(header), None, now);
+    let global = a.begin_google_quota_read("", None, None, now);
+
+    assert_eq!(pool.verified_google_reset_at(other, None, now), None);
+    drop(global);
+    assert_eq!(pool.verified_google_reset_at(other, None, now), Some(until));
+    assert_eq!(pool.verified_google_reset_at(model, None, header.until), None);
+    drop(scoped);
+    assert_eq!(pool.verified_google_reset_at(model, None, now), None, "cancelled header stays unverified until expiry");
+    assert_eq!(pool.verified_google_reset_at(model, None, header.until), Some(until));
+}
+
+#[test]
+fn failed_google_quota_read_blocks_witness_until_its_own_deadline() {
+    let mut pool = Pool::default();
+    pool.insert(pool::parse_credentials("a.json", &json!({"type":"google","access_token":"fixture"}), false).unwrap());
+    let now = Utc::now();
+    let model = "gemini-neon";
+    let reset = now + TimeDelta::seconds(90);
+    let failed_until = now + TimeDelta::seconds(10);
+    let account = pool.accounts.get_mut("a.json").unwrap();
+    account.scoped_cooldowns.insert("gemini".into(), pool::Cooldown { until: reset, verified_reset: true });
+    let reader = account.begin_google_quota_read(model, None, None, now);
+    assert!(account.finish_google_quota_read(&reader, Some(failed_until)));
+
+    assert_eq!(pool.next_reset(Lane::Google, model, None, now), Some(reset));
+    assert_eq!(pool.verified_google_reset_at(model, None, now), None);
+    // The reader is still in scope, but it must no longer count as running.
+    assert_eq!(pool.verified_google_reset_at(model, None, failed_until), Some(reset));
+
+    let account = pool.accounts.get_mut("a.json").unwrap();
+    account.clear_quota_cooldowns();
+    account.scoped_cooldowns.insert("gemini".into(), pool::Cooldown { until: reset, verified_reset: true });
+    assert_eq!(pool.verified_google_reset_at(model, None, now), Some(reset));
+}
+
+#[test]
+fn verified_google_resets_require_complete_model_scoped_timing() {
+    use contracts::providers::{ApiKeyOrder, QuotaUnit, QuotaWindowKind};
+    use integrations::providers::antigravity::parse_antigravity_summary;
+    use pool::Cooldown;
+    let mut pool = Pool::default();
+    let now = Utc::now();
+    let at = |mins| now + TimeDelta::minutes(mins);
+    let verified = |mins| Cooldown { until: at(mins), verified_reset: true };
+    let accounts = |name| pool::parse_credentials(name, &json!({"type":"google","access_token":name}), false).unwrap();
+    for name in ["a.json", "b.json", "disabled.json", "zero.json", "unsupported.json"] {
+        pool.insert(accounts(name));
+    }
+    pool.insert(pool::parse_credentials("key.json", &json!({"type":"google","key":"fixture-key"}), false).unwrap());
+    pool.policy.api_key_order = ApiKeyOrder::SubscriptionsOnly;
+    pool.accounts.get_mut("disabled.json").unwrap().disabled = true;
+    pool.accounts.get_mut("zero.json").unwrap().weight = 0;
+    pool.accounts.get_mut("unsupported.json").unwrap().models = vec!["other".into()];
+    let a = pool.accounts.get_mut("a.json").unwrap();
+    a.cooldown = Some(verified(10));
+    a.scoped_cooldowns = [("gemini", 30), ("gemini-argon", 15), ("3p", 40)].map(|(scope, mins)| (scope.into(), verified(mins))).into();
+    let b = pool.accounts.get_mut("b.json").unwrap();
+    b.cooldown = Some(verified(20));
+    let mut transient = route_auth_error(now);
+    transient.kind = AccountErrorKind::UpstreamUnavailable;
+    b.last_error = Some(transient); // Expired transient backoff is not a blocker.
+
+    let next = |pool: &Pool, model| pool.verified_google_reset_at(model, None, now);
+    const MODEL: &str = "gemini-neon";
+    assert_eq!(next(&pool, MODEL), Some(at(20)));
+    assert_eq!(next(&pool, "gemini-argon"), Some(at(15)));
+    assert_eq!(next(&pool, "gpt-fixture"), Some(at(20)));
+    for invalid in ["", " ", " model", "x\tmodel", "x;model", "x\u{7f}", "modèle"] {
+        assert_eq!(next(&pool, invalid), None, "{invalid:?}");
+    }
+    let b = pool.accounts.get_mut("b.json").unwrap();
+    b.last_error = Some(route_auth_error(at(1)));
+    assert_eq!(next(&pool, MODEL), Some(at(30)));
+    assert_eq!(next(&pool, "claude-fixture"), Some(at(40)));
+
+    let windows = |reset: Option<DateTime<Utc>>| {
+        parse_antigravity_summary(&json!({"buckets":[{"bucketId":"gemini-5h", "remainingFraction":0.0, "resetTime":reset}]}), now)
+    };
+    for (reset, expected) in [(Some(at(35)), Some(at(35))), (None, None), (Some(now + TimeDelta::days(8)), None), (Some(now), Some(at(30)))]
+    {
+        let a = pool.accounts.get_mut("a.json").unwrap();
+        a.windows = windows(reset);
+        assert_eq!(a.windows.len(), 1);
+        assert_eq!(next(&pool, MODEL), expected, "{reset:?}");
+    }
+    let a = pool.accounts.get_mut("a.json").unwrap();
+    a.windows = windows(None);
+    let mut spend = a.windows[0].clone();
+    spend.kind = QuotaWindowKind::Spend;
+    a.windows[0].unit = QuotaUnit::Credits;
+    a.windows.push(spend);
+    assert_eq!(next(&pool, MODEL), Some(at(30)));
+    let a = pool.accounts.get_mut("a.json").unwrap();
+    a.windows.clear();
+    a.cooldown = Some(Cooldown { verified_reset: false, ..verified(10) });
+    let b = pool.accounts.get_mut("b.json").unwrap();
+    b.last_error = None;
+    assert_eq!(next(&pool, MODEL), Some(at(20)));
+    let b = pool.accounts.get_mut("b.json").unwrap();
+    b.cooldown = None;
+    assert_eq!(next(&pool, MODEL), None); // B already usable.
+}
+
+#[tokio::test]
+async fn google_quarantine_excludes_eligibility_and_quota_witnesses() {
+    let mock = serve(Router::new()).await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let now = Utc::now();
+    let model = "gemini-neon";
+    let cooldown = |minutes| pool::Cooldown { until: now + TimeDelta::minutes(minutes), verified_reset: true };
+    for kind in [AccountErrorKind::VerificationRequired, AccountErrorKind::UpstreamUnavailable] {
+        let mut error = local_error(kind, AccountErrorSource::Inference, "private fixture error");
+        error.backoff_until = Some(now + TimeDelta::minutes(1));
+        for (a_quota, b_quota, expected) in [
+            (None, Some(cooldown(10)), Some(cooldown(10).until)),
+            (Some(cooldown(5)), Some(cooldown(10)), Some(cooldown(10).until)),
+            (Some(cooldown(5)), None, None),
+        ] {
+            let (auth_index, eligible) = {
+                let mut state = proxy.state.write().await;
+                let pool = &mut state.pool;
+                let a = pool.accounts.get_mut("google-a.json").unwrap();
+                a.last_error = Some(error.clone());
+                a.cooldown = a_quota;
+                assert!(!a.eligible(now, model));
+                let index = a.auth_index.clone();
+                pool.accounts.get_mut("google-b.json").unwrap().cooldown = b_quota;
+                assert_eq!(pool.verified_google_reset_at(model, None, now), expected, "{kind:?}");
+                (index, usize::from(b_quota.is_none()))
+            };
+            let path = format!("/v8/management/usage/windows?lane=google&model={model}");
+            let response: Value = http.management("GET", &path, None).await.json().await.unwrap();
+            let diagnostic = &response["model_eligibility"];
+            assert_eq!(diagnostic["verified_next_reset_at"], json!(expected), "{kind:?}");
+            assert_eq!(diagnostic["eligible_accounts"], eligible, "{kind:?}");
+            let a = diagnostic["accounts"].as_array().unwrap().iter().find(|a| a["auth_index"] == auth_index).unwrap();
+            let reasons = if a_quota.is_some() { json!(["quarantined", "global_cooldown"]) } else { json!(["quarantined"]) };
+            assert_eq!(a["exclusion_reasons"], reasons, "{kind:?}");
+        }
+    }
+}
+
+#[test]
+fn invalid_duplicate_retry_after_preserves_fallback_delay_without_proof() {
+    let now = Utc::now();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.append("retry-after", "invalid".parse().unwrap());
+    headers.append("retry-after", "600".parse().unwrap());
+    headers.insert("x-ratelimit-reset", "60".parse().unwrap());
+    assert_eq!(
+        router::header_cooldown(Lane::Google, &headers, now),
+        Some(pool::Cooldown { until: now + TimeDelta::seconds(60), verified_reset: false }),
+    );
+}
+
+#[test]
+fn cooldown_provenance_rejects_fallback_clamped_and_invalid_hints_and_survives_only_same_credential() {
+    use pool::Cooldown;
+    let now = DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap();
+    let hint = |name, value: &str| {
+        let headers = HeaderMap::from_iter([(axum::http::HeaderName::from_static(name), value.parse().unwrap())]);
+        router::header_cooldown(Lane::Google, &headers, now)
+    };
+    let second = TimeDelta::seconds(1);
+    for (value, until, expected) in [
+        ("1s", now + second, true),
+        ("7d", now + TimeDelta::days(7), true),
+        ("7d1ms", now + TimeDelta::days(7), false),
+        ("999ms", now + second, false),
+        ("0", now + second, false),
+        (&(now - second).to_rfc3339(), now + second, false),
+        (&(now + TimeDelta::days(8)).to_rfc3339(), now + TimeDelta::days(7), false),
+    ] {
+        assert_eq!(hint("x-ratelimit-reset", value), Some(Cooldown { until, verified_reset: expected }), "{value}");
+    }
+    assert_eq!(hint("x-ratelimit-reset", "invalid"), None);
+    let until = now + TimeDelta::minutes(1);
+    for (name, value, verified_reset) in [
+        ("x-ratelimit-reset-requests", "60s", true),
+        ("x-ratelimit-reset-requests", "60", false),
+        ("x-ratelimit-reset", "60.s", false),
+        ("retry-after", &until.format("%a, %d %b %Y %H:%M:%S GMT").to_string(), true),
+        ("retry-after", &until.to_rfc2822(), false),
+    ] {
+        assert_eq!(hint(name, value), Some(Cooldown { until, verified_reset }), "{name}: {value}");
+    }
+    let body = |delay| json!({"error":{"details":[{"@type":"RetryInfo","retryDelay":delay}]}}).to_string();
+    let parse = |body: &str| router::body_cooldown(Lane::Google, body.as_bytes(), 25, now);
+    let valid = parse(&body("25s"));
+    let fallback = parse(&body("invalid"));
+    assert!(valid.verified_reset);
+    assert_eq!(fallback, Cooldown { until: valid.until, verified_reset: false });
+    assert_eq!(valid.merge(fallback), fallback);
+    assert_eq!(fallback.merge(valid), fallback);
+    assert_eq!(valid.merge(parse(&body("0s"))), valid);
+    assert_eq!(valid.merge(parse(&body("8d"))), Cooldown { until: now + TimeDelta::days(7), verified_reset: false });
+    assert!(!parse(&body("0.99s")).verified_reset);
+
+    let mut pool = Pool::default();
+    let accounts = |token| pool::parse_credentials("a.json", &json!({"type":"google","access_token":token}), false).unwrap();
+    pool.insert(accounts("initial"));
+    let a = pool.accounts.get_mut("a.json").unwrap();
+    a.cooldown = Some(valid);
+    a.scoped_cooldowns.insert("gemini".into(), fallback);
+    pool.insert(accounts("initial"));
+    let a = &pool.accounts["a.json"];
+    assert_eq!(a.cooldown, Some(valid));
+    assert_eq!(a.scoped_cooldowns["gemini"], fallback);
+    assert_eq!(pool.verified_google_reset_at("gemini-neon", None, now), None);
+    assert_eq!(pool.verified_google_reset_at("gemini-neon", None, valid.until), None);
+    pool.insert(accounts("rotated"));
+    assert!(pool.accounts["a.json"].cooldown.is_none());
+    assert!(pool.accounts["a.json"].scoped_cooldowns.is_empty());
+}
+
+#[test]
+fn google_route_replacement_drops_cached_quota_and_cooldowns() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+    let now = Utc::now();
+    let until = now + TimeDelta::minutes(5);
+    let cooldown = pool::Cooldown { until, verified_reset: true };
+    for (credential, field, before, after) in
+        [("access_token", "project_id", "project-a", "project-b"), ("key", "base_url", "https://a.example.test", "https://b.example.test")]
+    {
+        let mut pool = Pool::default();
+        let accounts = |route| {
+            let mut raw = json!({"type":"google"});
+            raw[credential] = json!("same-token");
+            raw[field] = json!(route);
+            pool::parse_credentials("a.json", &raw, false).unwrap()
+        };
+        pool.insert(accounts(before));
+        let a = pool.accounts.get_mut("a.json").unwrap();
+        a.cooldown = Some(cooldown);
+        a.last_error = Some(route_auth_error(until));
+        a.scoped_cooldowns.insert("gemini".into(), cooldown);
+        a.windows =
+            parse_antigravity_summary(&json!({"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.0,"resetTime":until}]}), now);
+        pool.insert(accounts(after));
+        let a = &pool.accounts["a.json"];
+        assert!(a.cooldown.is_none() && a.last_error.is_none(), "{field}");
+        assert!(a.scoped_cooldowns.is_empty() && a.windows.is_empty(), "{field}");
+    }
+}
+
+#[test]
+fn google_route_replacement_drops_quarantine_from_reused_account() {
+    let mut pool = Pool::default();
+    pool.insert(
+        pool::parse_credentials("a.json", &json!({"type":"google","access_token":"fixture","project_id":"project-a"}), false).unwrap(),
+    );
+    let a = pool.accounts.get_mut("a.json").unwrap();
+    seed_old_google_route(a);
+    a.last_error.as_mut().unwrap().kind = AccountErrorKind::VerificationRequired;
+    let mut replacement = a.clone();
+    pool.insert(vec![replacement.clone()]);
+    assert!(pool.accounts["a.json"].quarantined(Utc::now()));
+
+    replacement.project = Some("project-b".into());
+    pool.insert(vec![replacement]);
+    let a = &pool.accounts["a.json"];
+    assert_eq!(a.project.as_deref(), Some("project-b"));
+    assert_google_route_cleared(a);
+    assert!(a.eligible(Utc::now(), "gemini-neon"));
+}
+
+#[tokio::test]
+async fn google_in_flight_429_does_not_write_to_a_replaced_route() {
+    for replace_project in [true, false] {
+        let source = Arc::new(std::sync::OnceLock::<Arc<Proxy>>::new());
+        let mock = serve(Router::new().route(
+            "/v1internal:generateContent",
+            post({
+                let source = source.clone();
+                move || {
+                    let source = source.clone();
+                    async move {
+                        let mut state = source.get().unwrap().state.write().await;
+                        let mut replacement = state.pool.accounts["google-a.json"].clone();
+                        if replace_project {
+                            replacement.project = Some("new-project".into());
+                        } else {
+                            replacement.base = Some(replacement.base.unwrap().join("new").unwrap());
+                        }
+                        state.pool.insert(vec![replacement]);
+                        (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "60")])
+                    }
+                }
+            }),
+        ))
+        .await;
+        let dir = Scratch::new();
+        let proxy = google_routing_fixture(&dir, &mock).await;
+        {
+            let mut state = proxy.state.write().await;
+            state.pool.accounts.remove("google-b.json");
+            if !replace_project {
+                let a = state.pool.accounts.get_mut("google-a.json").unwrap();
+                a.api_key = true;
+                a.base = Some(mock.0.clone());
+            }
+        }
+        assert!(source.set(proxy.clone()).is_ok());
+        let server = serve(proxy.clone().app()).await;
+        let response = Http::new(&server)
+            .request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model":"gemini-neon"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 429);
+        assert!(!response.headers().contains_key("x-fleetix-pool-quota"), "replace_project={replace_project}");
+        let state = proxy.state.read().await;
+        let a = &state.pool.accounts["google-a.json"];
+        assert!(a.scoped_cooldowns.is_empty() && a.cooldown.is_none());
+        assert_eq!(a.failure, 0);
+    }
+}
+
+#[tokio::test]
+async fn google_window_starter_preserves_provenance_and_quota_clear_removes_it() {
+    use pool::Cooldown;
+    let mock = serve(
+        Router::new().route("/v1internal:generateContent", post(|| async { (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "300")]) })),
+    )
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let account = {
+        let mut state = proxy.state.write().await;
+        let a = state.pool.accounts.get_mut("google-a.json").unwrap();
+        a.scoped_cooldowns.insert("3p".into(), Cooldown { until: Utc::now(), verified_reset: true });
+        a.clone()
+    };
+    let model = "gemini-neon";
+    let request = proxy.http.post(mock.0.join("/v1internal:generateContent").unwrap());
+    assert!(router::run_window_start(proxy.clone(), &account, model, request).await.is_err());
+    {
+        let state = proxy.state.read().await;
+        let a = &state.pool.accounts["google-a.json"];
+        assert!(!a.scoped_cooldowns.contains_key("3p"));
+        assert!(a.scoped_cooldowns["gemini"].verified_reset);
+    }
+    let server = serve(proxy.clone().app()).await;
+    let response =
+        Http::new(&server).management("POST", "/v0/management/reset-quota", Some(json!({"auth_index":account.auth_index}))).await;
+    assert_eq!(response.status(), 200);
+    assert!(proxy.state.read().await.pool.accounts["google-a.json"].scoped_cooldowns.is_empty());
+}
+
+#[tokio::test]
+async fn google_terminal_429_does_not_attest_cached_window_ttl() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+    let mock = serve(Router::new()).await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let now = Utc::now();
+    for a in proxy.state.write().await.pool.accounts.values_mut().filter(|a| a.lane == Lane::Google) {
+        a.windows = parse_antigravity_summary(&json!({"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.0}]}), now);
+    }
+    let server = serve(proxy.app()).await;
     let response = Http::new(&server)
         .request("POST", "/v1internal:generateContent")
         .bearer_auth("inference-fixture")
-        .json(&json!({"model":"gemini-4-neon-high"}))
+        .json(&json!({"model":"gemini-neon"}))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 429);
-    assert_eq!(response.headers()["x-should-retry"], "false");
+    assert!(!response.headers().contains_key("x-fleetix-pool-quota"));
     let retry_after: u64 = response.headers()["retry-after"].to_str().unwrap().parse().unwrap();
-    assert!((34..=37).contains(&retry_after), "{retry_after}");
-    let body = response.json::<Value>().await.unwrap();
-    assert_eq!(body["error"]["code"], 429);
-    assert_eq!(body["error"]["status"], "RESOURCE_EXHAUSTED");
-    let details = body["error"]["details"].as_array().expect("google error details array");
-    let error_info =
-        details.iter().find(|d| d["@type"] == "type.googleapis.com/google.rpc.ErrorInfo").expect("google.rpc.ErrorInfo detail");
-    assert_eq!(error_info["reason"], "QUOTA_EXHAUSTED");
-    assert_eq!(error_info["metadata"]["model"], "gemini-4-neon-high");
-    assert!(error_info["metadata"]["quotaResetTimeStamp"].as_str().is_some());
-    assert!(error_info["metadata"]["quotaResetDelay"].as_str().is_some_and(|s| s.ends_with('s')));
-    let retry_info =
-        details.iter().find(|d| d["@type"] == "type.googleapis.com/google.rpc.RetryInfo").expect("google.rpc.RetryInfo detail");
-    assert!(retry_info["retryDelay"].as_str().is_some_and(|s| s.ends_with('s')));
-    let state = proxy.state.read().await;
-    let final_exchange = state.activity.back().unwrap();
-    assert_eq!(final_exchange.outcome, "rate_limited");
-    assert_eq!(final_exchange.attempts.iter().map(|a| a.status_code).collect::<Vec<_>>(), [Some(429), Some(429)]);
-    assert!(state.pool.accounts["google-b.json"].scoped_cooldowns["gemini"] > Utc::now() + TimeDelta::hours(2));
+    assert!((3595..=3600).contains(&retry_after), "{retry_after}");
+    assert_google_pool_body(&response.json().await.unwrap(), "gemini-neon");
 }
 
 #[tokio::test]
@@ -2702,7 +3883,7 @@ async fn a_passthrough_429_preserves_bytes_beyond_the_parse_limit() {
                     // The credential disappeared while the request was in flight; there is no pool reset.
                     let proxy = source.get().unwrap();
                     proxy.state.write().await.pool.accounts.retain(|_, account| account.lane != Lane::Google);
-                    (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "37")], body)
+                    (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "37"), ("x-fleetix-pool-quota", "spoofed")], body)
                 }
             }
         }),
@@ -2715,6 +3896,7 @@ async fn a_passthrough_429_preserves_bytes_beyond_the_parse_limit() {
     let response = Http::new(&server).request("POST", "/v1internal:generateContent").bearer_auth("inference-fixture").send().await.unwrap();
     assert_eq!(response.status(), 429);
     assert_eq!(response.headers()["retry-after"], "37");
+    assert!(!response.headers().contains_key("x-fleetix-pool-quota"));
     assert_eq!(response.bytes().await.unwrap(), body);
 }
 
@@ -2846,7 +4028,7 @@ async fn oauth_file_reload_on_401_retries_once_and_fails_over_to_an_expired_toke
         assert!(until > at + TimeDelta::minutes(14) && until <= Utc::now() + TimeDelta::minutes(15));
         assert_eq!(a.last_error.as_ref().unwrap().kind, AccountErrorKind::AuthExpired);
         assert!(a.cooldown.is_none());
-        assert!(state.pool.next_reset(lane, "fixture", None).is_none());
+        assert!(state.pool.next_reset(lane, "fixture", None, Utc::now()).is_none());
         assert_eq!(a.priority, 10);
         assert_eq!(a.access, "a-refreshed");
         assert_eq!(state.pool.accounts["b.json"].access, "b-fresh");
@@ -2976,8 +4158,9 @@ async fn google_exhausted_failover_uses_quota_but_nonretryable_errors_keep_upstr
     assert!(!response.headers().contains_key("x-should-retry"));
     let state = proxy.state.read().await;
     assert!(state.pool.accounts["a.json"].last_error.as_ref().unwrap().backoff_until.is_some());
-    assert!(state.pool.next_reset(Lane::Claude, "claude-fixture", None).is_none());
-    assert!(!state.pool.all_quota_limited(Lane::Google, "", None));
+    let now = Utc::now();
+    assert!(state.pool.next_reset(Lane::Claude, "claude-fixture", None, now).is_none());
+    assert!(!state.pool.all_quota_limited(Lane::Google, "", None, now));
 }
 
 #[tokio::test]
@@ -3036,17 +4219,18 @@ async fn google_in_band_auth_exhaustion_uses_the_same_project_reset_on_repeat() 
     .await;
     let dir = Scratch::new();
     let proxy = google_routing_fixture(&dir, &mock).await;
+    let expected = DateTime::from_timestamp(Utc::now().timestamp() + 120, 0).unwrap();
     {
         let mut state = proxy.state.write().await;
         for id in ["google-a.json", "google-b.json"] {
             state.pool.accounts.get_mut(id).unwrap().project = Some("alpha".into());
         }
         let b = state.pool.accounts.get_mut("google-b.json").unwrap();
-        b.cooldown = Some(Utc::now() + TimeDelta::seconds(120));
+        b.cooldown = Some(pool::Cooldown { until: expected, verified_reset: true });
         let mut other = b.clone();
         other.id = "other-project.json".into();
         other.project = Some("beta".into());
-        other.cooldown = Some(Utc::now() + TimeDelta::seconds(30));
+        other.cooldown = Some(pool::Cooldown { until: Utc::now() + TimeDelta::seconds(30), verified_reset: true });
         state.pool.accounts.insert(other.id.clone(), other);
     }
     let server = serve(proxy.clone().app()).await;
@@ -3055,14 +4239,16 @@ async fn google_in_band_auth_exhaustion_uses_the_same_project_reset_on_repeat() 
         let res = http
             .request("POST", "/v1internal:generateContent")
             .bearer_auth("inference-fixture")
-            .json(&json!({"cachedContent":"projects/alpha/cachedContents/cache"}))
+            .json(&json!({"model":"gemini-4-neon-high","cachedContent":"projects/alpha/cachedContents/cache"}))
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), 429);
         let retry: u64 = res.headers()["retry-after"].to_str().unwrap().parse().unwrap();
         assert!((115..=120).contains(&retry), "{retry}");
-        assert_eq!(res.json::<Value>().await.unwrap()["error"]["status"], "RESOURCE_EXHAUSTED");
+        // A cached request cannot witness the shorter reset of another project.
+        assert_eq!(google_witness(res.headers(), "gemini-4-neon-high"), Some(expected));
+        assert_google_pool_body(&res.json::<Value>().await.unwrap(), "gemini-4-neon-high");
         let state = proxy.state.read().await;
         let attempts = &state.activity.back().unwrap().attempts;
         if first {
@@ -3154,7 +4340,7 @@ async fn assert_broken_429_preserves_prefix(clear_accounts: bool) {
 }
 
 #[tokio::test]
-async fn google_usage_probe_renews_then_retains_rejected_buckets_omitted_from_a_partial_response() {
+async fn google_usage_probe_renews_then_retains_rejected_buckets_only_on_the_same_route() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
     let usable = Arc::new(AtomicBool::new(true));
     let probes = Arc::new(AtomicUsize::new(0));
@@ -3234,17 +4420,33 @@ async fn google_usage_probe_renews_then_retains_rejected_buckets_omitted_from_a_
         assert!(!next.probe_failed);
         assert_eq!(next.access, "google-fresh");
         assert_eq!(next.project.as_deref(), Some("fresh-project"));
+        assert_eq!(next.windows.iter().map(|w| w.window_key.as_str()).collect::<Vec<_>>(), ["gemini-argon-quota"]);
+        assert!(next.eligible(Utc::now(), "gemini-4-neon-high"));
+    }
+    let current = {
+        let mut state = proxy.state.write().await;
+        let next = state.pool.accounts.get_mut("google.json").unwrap();
+        // A blocker observed for the newly enrolled route survives a partial probe of that route.
+        next.windows.extend(account.windows.clone());
+        next.clone()
+    };
+    proxy.refresh_usage(&current).await.unwrap();
+    {
+        let state = proxy.state.read().await;
+        let next = &state.pool.accounts["google.json"];
         assert_eq!(next.windows.iter().map(|w| w.window_key.as_str()).collect::<Vec<_>>(), ["gemini-5h", "gemini-argon-quota"]);
         assert!(!next.eligible(Utc::now(), "gemini-4-neon-high"));
         assert!(next.eligible(Utc::now(), "gemini-4-argon-high"));
     }
     usable.store(false, Relaxed);
-    {
+    assert_eq!(proxy.refresh_usage(&account).await.unwrap_err().message, "credential changed before quota refresh");
+    let current = {
         let mut state = proxy.state.write().await;
         let next = state.pool.accounts.get_mut("google.json").unwrap();
         next.windows.iter_mut().find(|w| w.window_key == "gemini-argon-quota").unwrap().observed_at = Some(at - TimeDelta::hours(2));
-    }
-    assert_eq!(proxy.refresh_usage(&account).await.unwrap_err().message, "provider returned no quota evidence");
+        next.clone()
+    };
+    assert_eq!(proxy.refresh_usage(&current).await.unwrap_err().message, "provider returned no quota evidence");
     let state = proxy.state.read().await;
     let next = &state.pool.accounts["google.json"];
     assert!(next.probe_failed);
@@ -3342,6 +4544,57 @@ async fn google_summary_retires_only_superseded_fallbacks_and_manual_reset_clear
     assert!(current.eligible(Utc::now(), "gemini-neon"));
     assert!(current.last_error.is_none());
     assert!(current.eligible(Utc::now(), "claude-opus-4"));
+}
+
+#[tokio::test]
+async fn google_probe_rechecks_the_enrolled_route_before_merging() {
+    let began = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mock = serve(Router::new().route(
+        "/v1internal:retrieveUserQuotaSummary",
+        post({
+            let (began, release) = (began.clone(), release.clone());
+            move || {
+                let (began, release) = (began.clone(), release.clone());
+                async move {
+                    began.notify_one();
+                    release.notified().await;
+                    axum::Json(json!({"buckets":[{"bucketId":"gemini-5h","window":"5h","remainingFraction":0.0}]}))
+                }
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    for changed in ["project", "base", "access"] {
+        let accounts = pool::parse_credentials(
+            "google.json",
+            &json!({"type":"google","access_token":"fixture","project_id":"original","email":"person@example.test"}),
+            false,
+        )
+        .unwrap();
+        let account = accounts[0].clone();
+        proxy.state.write().await.pool.insert(accounts);
+        let replace_route = async {
+            began.notified().await;
+            let mut state = proxy.state.write().await;
+            let current = state.pool.accounts.get_mut(&account.id).unwrap();
+            // Leave the generation unchanged to exercise the independent route check.
+            match changed {
+                "project" => current.project = Some("replacement".into()),
+                "base" => current.base = Some("https://replacement.example.test".parse().unwrap()),
+                _ => current.access = "replacement".into(),
+            }
+            release.notify_one();
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(proxy.refresh_usage(&account), replace_route) })
+                .await
+                .unwrap();
+        assert_eq!(result.unwrap_err().message, "quota refresh was superseded", "{changed}");
+        assert!(proxy.state.read().await.pool.accounts[&account.id].windows.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -3455,7 +4708,7 @@ async fn editing_credential_metadata_preserves_renewed_token_and_quarantine() {
         account.google_client = Some("provenance-id".into());
         account.google_secret = Some("provenance-secret".into());
         account.expires = Some(Utc::now() + TimeDelta::hours(1));
-        account.cooldown = Some(Utc::now() + TimeDelta::minutes(5));
+        account.cooldown = Some(pool::Cooldown { until: Utc::now() + TimeDelta::minutes(5), verified_reset: false });
         account.record_error_once(&local_error(AccountErrorKind::VerificationRequired, AccountErrorSource::Inference, "Verify"));
         (account.source_fingerprint.clone(), account.last_error.clone(), account.cooldown, account.expires)
     };
@@ -3490,7 +4743,7 @@ async fn correcting_credential_email_preserves_renewed_token_and_quarantine() {
     let mut state = proxy.state.write().await;
     let account = state.pool.accounts.get_mut("a.json").unwrap();
     account.access = "renewed-in-memory".into();
-    account.cooldown = Some(Utc::now() + TimeDelta::minutes(5));
+    account.cooldown = Some(pool::Cooldown { until: Utc::now() + TimeDelta::minutes(5), verified_reset: false });
     account.record_error_once(&local_error(AccountErrorKind::VerificationRequired, AccountErrorSource::Inference, "Verify"));
     let (cooldown, error) = (account.cooldown, account.last_error.clone());
     let raw = json!({
@@ -3988,7 +5241,7 @@ async fn provenance_oauth_discovers_all_antigravity_enrollments_and_deduplicates
 
 #[tokio::test]
 async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttles() {
-    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
     let dir = Scratch::new();
     let oauth_dir = dir.join("provenance-oauth");
@@ -4023,10 +5276,10 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
     .unwrap();
     fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o700)).unwrap();
 
-    let overlapping_lookup = Arc::new(Notify::new());
+    let second_client_waiting = Arc::new(Notify::new());
     let hydration_started = Arc::new(Notify::new());
-    let finish_hydration = Arc::new(Notify::new());
-    let hydrating = Arc::new(AtomicBool::new(false));
+    let second_client_done = Arc::new(Notify::new());
+    let pool_lookups = Arc::new(AtomicUsize::new(0));
     let mock = serve(
         Router::new()
             .route(
@@ -4044,44 +5297,53 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
             )
             .route(
                 "/test/google-tokeninfo",
-                post(move |body: String| {
-                    let overlapping_lookup = overlapping_lookup.clone();
-                    let hydration_started = hydration_started.clone();
-                    let finish_hydration = finish_hydration.clone();
-                    let hydrating = hydrating.clone();
-                    async move {
-                        // Overlap the auth lookups, but return the second result after discovery
-                        // and before the first caller can finish hydrating the new account.
-                        let email = match body.as_str() {
-                            "access_token=ya29.pool-1" => "one@example.test",
-                            "access_token=ya29.client-new" => {
-                                overlapping_lookup.notified().await;
-                                "new@example.test"
-                            }
-                            "access_token=ya29.client-overlap" => {
-                                overlapping_lookup.notify_one();
-                                hydration_started.notified().await;
-                                "new@example.test"
-                            }
-                            "access_token=ya29.pool-new" => {
-                                if hydrating.swap(true, Relaxed) {
-                                    finish_hydration.notify_one();
-                                } else {
-                                    hydration_started.notify_one();
-                                    finish_hydration.notified().await;
+                post({
+                    let second_client_done = second_client_done.clone();
+                    move |body: String| {
+                        let second_client_waiting = second_client_waiting.clone();
+                        let hydration_started = hydration_started.clone();
+                        let second_client_done = second_client_done.clone();
+                        let pool_lookups = pool_lookups.clone();
+                        async move {
+                            match body.as_str() {
+                                "access_token=ya29.pool-1" => axum::Json(json!({
+                                    "aud": "agy-client",
+                                    "email": "one@example.test",
+                                    "email_verified": "true",
+                                    "expires_in": "3599"
+                                }))
+                                .into_response(),
+                                "access_token=ya29.client-new" | "access_token=ya29.client-new-second" | "access_token=ya29.pool-new" => {
+                                    match body.as_str() {
+                                        "access_token=ya29.client-new" => second_client_waiting.notified().await,
+                                        "access_token=ya29.client-new-second" => {
+                                            second_client_waiting.notify_one();
+                                            hydration_started.notified().await;
+                                        }
+                                        _ if pool_lookups.fetch_add(1, Relaxed) == 0 => {
+                                            hydration_started.notify_one();
+                                            second_client_done.notified().await;
+                                        }
+                                        _ => {}
+                                    }
+                                    axum::Json(json!({
+                                        "aud": "agy-client",
+                                        "email": "new@example.test",
+                                        "email_verified": "true",
+                                        "expires_in": "3599"
+                                    }))
+                                    .into_response()
                                 }
-                                "new@example.test"
+                                "access_token=ya29.client-unknown" => axum::Json(json!({
+                                    "aud": "agy-client",
+                                    "email": "unknown@example.test",
+                                    "email_verified": "true",
+                                    "expires_in": "3599"
+                                }))
+                                .into_response(),
+                                _ => StatusCode::BAD_REQUEST.into_response(),
                             }
-                            "access_token=ya29.client-unknown" => "unknown@example.test",
-                            _ => return StatusCode::BAD_REQUEST.into_response(),
-                        };
-                        axum::Json(json!({
-                            "aud": "agy-client",
-                            "email": email,
-                            "email_verified": "true",
-                            "expires_in": "3599"
-                        }))
-                        .into_response()
+                        }
                     }
                 }),
             ),
@@ -4123,13 +5385,18 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
         true,
     )
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(async { assert!(proxy.authorize_google("ya29.client-new").await, "the caller that reloads must authorize") }, async {
-            assert!(proxy.authorize_google("ya29.client-overlap").await, "a concurrent caller must reuse the completed reload")
-        },);
-    })
-    .await
-    .expect("overlapping authorization did not finish");
+    // The second caller sees the new enrollment after discovery starts the throttle,
+    // but before the first caller has written its verified email.
+    let second = async {
+        let ok = proxy.authorize_google("ya29.client-new-second").await;
+        second_client_done.notify_one();
+        ok
+    };
+    let (first_ok, second_ok) =
+        tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(proxy.authorize_google("ya29.client-new"), second) })
+            .await
+            .unwrap();
+    assert!(first_ok && second_ok, "first: {first_ok}, second: {second_ok}");
     assert_eq!(google_count(&proxy).await, 2);
     assert!(proxy.state.read().await.pool.revision > rev_before);
 
@@ -4168,6 +5435,76 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
     assert_eq!(rotated.priority, 7);
     assert_eq!(rotated.weight, 3);
     assert_eq!(rotated.note.as_deref(), Some("paused by operator"));
+}
+
+#[tokio::test]
+async fn google_auth_miss_reloads_after_concurrent_discovery_expires() {
+    let inspection_started = Arc::new(Notify::new());
+    let enrollment_ready = Arc::new(Notify::new());
+    let mock = serve(
+        Router::new()
+            .route("/test/google-token", post(|| async { axum::Json(json!({"access_token":"ya29.pool-new","expires_in":3600})) }))
+            .route(
+                "/test/google-tokeninfo",
+                post({
+                    let inspection_started = inspection_started.clone();
+                    let enrollment_ready = enrollment_ready.clone();
+                    move |body: String| {
+                        let inspection_started = inspection_started.clone();
+                        let enrollment_ready = enrollment_ready.clone();
+                        async move {
+                            if body == "access_token=ya29.client-new" {
+                                inspection_started.notify_one();
+                                enrollment_ready.notified().await;
+                            }
+                            axum::Json(json!({"aud":"agy-client","email":"new@example.test","email_verified":true,"expires_in":3599}))
+                        }
+                    }
+                }),
+            ),
+    )
+    .await;
+    let dir = Scratch::new();
+    let mut config = fixture_config(&dir, &mock);
+    config.discover_local = true;
+    let fake_bin = dir.join("fake-provenance-oauth");
+    fs::write(
+        &fake_bin,
+        b"#!/bin/sh\nprintf '%s' '{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"refresh_token\":\"refresh-new\"}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o700)).unwrap();
+    config.provenance_oauth_bin = Some(fake_bin);
+    let mut proxy = Proxy::new(config).unwrap();
+    proxy.management_mock = Some(mock.0.clone());
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials(
+            "google-existing.json",
+            &json!({"type":"antigravity","client_id":"agy-client","email":"existing@example.test","access_token":"ya29.pool-existing"}),
+            true,
+        )
+        .unwrap(),
+    );
+
+    let enroll = async {
+        inspection_started.notified().await;
+        assert!(proxy.refresh_local_commands(Duration::from_secs(15)).await);
+        // Age that completed pass without making the test wait out the throttle.
+        *proxy.local_discovery.lock().await = Some(Instant::now() - Duration::from_secs(16));
+        let user = &proxy.source_user;
+        config::write_private(
+            &proxy.config.provenance_oauth_dir.join(format!("{user}-google-new.json")),
+            &serde_json::to_vec(&json!({"target":{"provider":"google","profile":"antigravity","user":user}})).unwrap(),
+            true,
+        )
+        .unwrap();
+        enrollment_ready.notify_one();
+    };
+    let (authorized, ()) =
+        tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(proxy.authorize_google("ya29.client-new"), enroll) })
+            .await
+            .unwrap();
+    assert!(authorized, "the auth miss must reload the enrollment added after the expired pass");
 }
 
 #[tokio::test]
@@ -4317,23 +5654,401 @@ async fn google_project_discovery_hydrates_uploads_and_supplies_quota_requests()
     assert_eq!(uploaded["email"], "google@example.test");
     assert_eq!(uploaded["status"], "active");
 
-    let account = pool::parse_credentials(
+    let mut account = pool::parse_credentials(
         "probe.json",
         &json!({"type":"google","access_token":"google-probe","email":"existing@example.test"}),
         false,
     )
     .unwrap()
     .remove(0);
+    seed_old_google_route(&mut account);
     let revision = {
         let mut state = proxy.state.write().await;
         state.pool.insert(vec![account.clone()]);
         state.pool.revision
     };
     proxy.refresh_usage(&account).await.unwrap();
-    assert_eq!(proxy.state.read().await.pool.revision, revision + 1);
+    {
+        let state = proxy.state.read().await;
+        let current = &state.pool.accounts["probe.json"];
+        assert_eq!(state.pool.revision, revision + 1);
+        assert!(current.eligible(Utc::now(), "gemini-neon"));
+        assert!(current.cooldown.is_none());
+        assert!(current.scoped_cooldowns.is_empty());
+        assert!(current.last_error.is_none());
+        assert_eq!(current.windows.len(), 1);
+        assert_eq!(current.windows[0].used_percent, Some(25.0));
+    }
     let rows: Value = http.management("GET", inventory, None).await.json().await.unwrap();
     let probe = rows["files"].as_array().unwrap().iter().find(|row| row["id"] == "probe.json").unwrap();
     assert_eq!(probe["project_id"], "probe-project");
+}
+
+#[test]
+fn provenance_reload_replaces_the_enrolled_google_project() {
+    let mut pool = Pool::default();
+    let enrollment = |project, refresh| json!({"access_token":"fixture","refresh_token":refresh,"project_id":project});
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("project-a", "old-refresh"));
+    let old = pool.accounts.values_mut().next().unwrap();
+    let id = old.id.clone();
+    seed_old_google_route(old);
+    let old_generation = old.probe_generation;
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("project-b", "old-refresh"));
+    let account = &pool.accounts[&id];
+    assert_eq!(account.project.as_deref(), Some("project-b"));
+    assert!(account.probe_generation > old_generation);
+    assert_google_route_cleared(account);
+
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("project-c", "new-refresh"));
+    assert_eq!(pool.accounts.len(), 1);
+    assert_eq!(pool.accounts[&id].project.as_deref(), Some("project-c"));
+    assert_eq!(pool.accounts[&id].refresh.as_deref(), Some("new-refresh"));
+}
+
+#[test]
+fn provenance_reload_replaces_an_access_token_without_a_refresh_token() {
+    let mut pool = Pool::default();
+    let enrollment = |access| json!({"access_token":access,"project_id":"project"});
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("old-token"));
+    let old = pool.accounts.values_mut().next().unwrap();
+    let id = old.id.clone();
+    seed_old_google_route(old);
+    let old_generation = old.probe_generation;
+
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("old-token"));
+    assert_eq!(pool.accounts[&id].probe_generation, old_generation);
+    assert!(pool.accounts[&id].cooldown.is_some());
+
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("new-token"));
+    let account = &pool.accounts[&id];
+    assert_eq!(pool.accounts.len(), 1);
+    assert_eq!(account.access, "new-token");
+    assert!(account.refresh.is_none());
+    assert!(account.probe_generation > old_generation);
+    assert_google_route_cleared(account);
+}
+
+#[test]
+fn provenance_reload_deduplicates_access_token_without_clearing_cooldown() {
+    let mut pool = Pool::default();
+    let enrollment = |access| json!({"access_token":access,"project_id":"project"});
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-a"));
+    pool::add_provenance_google(&mut pool, "b", enrollment("token-b"));
+    assert_eq!(pool.accounts.len(), 2);
+    let b = pool.accounts.values_mut().find(|a| a.label == "b").unwrap();
+    seed_old_google_route(b);
+    let b_id = b.id.clone();
+    let cooldown_until = b.cooldown.unwrap().until;
+    let generation = b.probe_generation;
+    let revision = pool.revision;
+
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-b"));
+
+    assert_eq!(pool.accounts.len(), 1);
+    assert!(pool.revision > revision);
+    let b = &pool.accounts[&b_id];
+    assert_eq!(b.label, "b");
+    assert_eq!(b.access, "token-b");
+    assert_eq!(b.cooldown.unwrap().until, cooldown_until);
+    assert_eq!(b.probe_generation, generation);
+    assert!(!b.eligible(Utc::now(), "gemini-neon"));
+}
+
+#[test]
+fn provenance_reload_deduplicates_access_rotation_with_unchanged_refresh_token() {
+    let mut pool = Pool::default();
+    let enrollment = |access| {
+        json!({
+            "access_token":access,"refresh_token":"refresh-a","client_id":"client-a",
+            "client_secret":"secret-a","project_id":"project-a"
+        })
+    };
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-a"));
+    pool::add_provenance_google(
+        &mut pool,
+        "b",
+        json!({
+            "access_token":"token-b","client_id":"client-b",
+            "client_secret":"secret-b","project_id":"project-b"
+        }),
+    );
+    assert_eq!(pool.accounts.len(), 2);
+    let b = pool.accounts.values_mut().find(|a| a.label == "b").unwrap();
+    seed_old_google_route(b);
+    let b = b.clone();
+
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-b"));
+    assert_eq!(pool.accounts.len(), 1);
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-b"));
+
+    assert_eq!(pool.accounts.len(), 1);
+    let survivor = &pool.accounts[&b.id];
+    assert_eq!(survivor.access, b.access);
+    assert_eq!(survivor.refresh.as_deref(), Some("refresh-a"));
+    assert_eq!(survivor.google_client.as_deref(), Some("client-a"));
+    assert_eq!(survivor.google_secret.as_deref(), Some("secret-a"));
+    assert_eq!(survivor.project, b.project);
+    assert_eq!(survivor.cooldown, b.cooldown);
+    assert_eq!(survivor.scoped_cooldowns, b.scoped_cooldowns);
+    assert_eq!(survivor.last_error, b.last_error);
+    assert_eq!(survivor.probe_generation, b.probe_generation);
+    assert!(survivor.quarantined(Utc::now()));
+    assert!(!survivor.eligible(Utc::now(), "gemini-neon"));
+}
+
+#[test]
+fn provenance_reload_keeps_distinct_refresh_tokens_without_reusing_quarantined_access() {
+    for prior_refresh in ["refresh-a", "old-refresh-a"] {
+        let mut pool = Pool::default();
+        let enrollment = |access, refresh| {
+            json!({
+                "access_token":access,"refresh_token":refresh,"client_id":"client",
+                "client_secret":"secret","project_id":"project"
+            })
+        };
+        pool::add_provenance_google(&mut pool, "a", enrollment("token-a", prior_refresh));
+        pool::add_provenance_google(&mut pool, "b", enrollment("token-b", "refresh-b"));
+        let a_id = pool.accounts.values().find(|a| a.label == "a").unwrap().id.clone();
+        let b = pool.accounts.values_mut().find(|a| a.label == "b").unwrap();
+        seed_old_google_route(b);
+        let b = b.clone();
+
+        // The unchanged snapshot must not reinstall the rejected access token on a later reload.
+        for _ in 0..2 {
+            pool::add_provenance_google(&mut pool, "a", enrollment("token-b", "refresh-a"));
+            assert_eq!(pool.accounts.len(), 2);
+            let a = &pool.accounts[&a_id];
+            assert_eq!(a.refresh.as_deref(), Some("refresh-a"));
+            assert!(a.access.is_empty());
+            assert!(a.eligible(Utc::now(), "gemini-neon"));
+            let survivor = &pool.accounts[&b.id];
+            assert_eq!(survivor.refresh.as_deref(), Some("refresh-b"));
+            assert_eq!(survivor.access, b.access);
+            assert_eq!(survivor.cooldown, b.cooldown);
+            assert_eq!(survivor.scoped_cooldowns, b.scoped_cooldowns);
+            assert_eq!(survivor.last_error, b.last_error);
+            assert!(survivor.quarantined(Utc::now()));
+        }
+    }
+}
+
+#[test]
+fn provenance_reload_keeps_the_refresh_token_and_surviving_route_evidence() {
+    for (offset, client, secret) in [
+        (-600, Some("new-client"), Some("new-secret")),
+        (0, Some("new-client"), Some("new-secret")),
+        (600, Some("new-client"), None),
+        (600, None, Some("new-secret")),
+        (600, None, None),
+    ] {
+        let mut pool = Pool::default();
+        let expires = Utc::now().timestamp() + 3600;
+        pool::add_provenance_google(&mut pool, "a", json!({"access_token":"old-access","refresh_token":"old-refresh"}));
+        let access_only = json!({
+            "access_token":"shared-access","expires_at":expires + offset,
+            "client_id":"old-client","client_secret":"old-secret","project_id":"project"
+        });
+        pool::add_provenance_google(&mut pool, "b", access_only.clone());
+        assert_eq!(pool.accounts.len(), 2);
+        let b = pool.accounts.values_mut().find(|a| a.label == "b").unwrap();
+        assert!(b.refresh.is_none());
+        seed_old_google_route(b);
+        let b_id = b.id.clone();
+        let (cooldown, auth, scoped, reset, generation) =
+            (b.cooldown, b.last_error.clone(), b.scoped_cooldowns.clone(), b.windows[0].resets_at, b.probe_generation);
+
+        pool::add_provenance_google(
+            &mut pool,
+            "a",
+            json!({
+                "access_token":"shared-access","refresh_token":"new-refresh","expires_at":expires,
+                "client_id":client,"client_secret":secret,"project_id":"project"
+            }),
+        );
+        // Discovery may reread the survivor's access-only enrollment in the same pass.
+        pool::add_provenance_google(&mut pool, "b", access_only);
+
+        assert_eq!(pool.accounts.len(), 1);
+        let b = &pool.accounts[&b_id];
+        assert_eq!(b.refresh.as_deref(), Some("new-refresh"));
+        assert_eq!(b.expires.map(|at| at.timestamp()), Some(expires.max(expires + offset)));
+        assert_eq!(b.google_client, client.map(str::to_owned).or_else(|| std::env::var("PROXY_GOOGLE_CLIENT_ID").ok()));
+        assert_eq!(b.google_secret, secret.map(str::to_owned).or_else(|| std::env::var("PROXY_GOOGLE_CLIENT_SECRET").ok()));
+        assert_eq!(b.cooldown, cooldown);
+        assert_eq!(b.last_error, auth);
+        assert_eq!(b.scoped_cooldowns, scoped);
+        assert_eq!(b.windows[0].resets_at, reset);
+        assert_eq!(b.probe_generation, generation);
+        assert!(!b.eligible(Utc::now(), "gemini-neon"));
+    }
+}
+
+#[test]
+fn provenance_reload_does_not_mix_oauth_clients_across_refresh_tokens() {
+    let mut pool = Pool::default();
+    pool::add_provenance_google(&mut pool, "a", json!({"access_token":"old-access"}));
+    pool::add_provenance_google(&mut pool, "b", json!({"access_token":"shared-access"}));
+    let b_id = pool.accounts.values().find(|a| a.label == "b").unwrap().id.clone();
+    pool::add_provenance_google(&mut pool, "a", json!({"access_token":"shared-access","refresh_token":"adopted-refresh"}));
+    assert_eq!(pool.accounts.len(), 1);
+    let b = pool.accounts.get_mut(&b_id).unwrap();
+    assert_eq!(b.refresh.as_deref(), Some("adopted-refresh"));
+    // Keep this fixture independent of ambient Google OAuth defaults.
+    b.google_client = None;
+    b.google_secret = None;
+
+    for refresh in [None, Some("unrelated-refresh")] {
+        pool::add_provenance_google(&mut pool, "a", json!({"access_token":"other-access"}));
+        assert_eq!(pool.accounts.len(), 2);
+        pool::add_provenance_google(
+            &mut pool,
+            "a",
+            json!({"access_token":"shared-access","refresh_token":refresh,"client_id":"wrong-client","client_secret":"wrong-secret"}),
+        );
+        assert_eq!(pool.accounts.len(), if refresh.is_some() { 2 } else { 1 });
+        let b = &pool.accounts[&b_id];
+        assert_eq!(b.refresh.as_deref(), Some("adopted-refresh"));
+        assert_eq!(b.google_client, None);
+        assert_eq!(b.google_secret, None);
+    }
+}
+
+#[test]
+fn provenance_reload_deduplicates_refresh_token_and_enriches_the_retained_route() {
+    let mut pool = Pool::default();
+    let enrollment = |access, refresh| json!({"access_token":access,"refresh_token":refresh});
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-a", "refresh-a"));
+    pool::add_provenance_google(&mut pool, "b", enrollment("token-b", "refresh-b"));
+    assert_eq!(pool.accounts.len(), 2);
+    let b = pool.accounts.values_mut().find(|a| a.label == "b").unwrap();
+    seed_old_google_route(b);
+    let b_id = b.id.clone();
+    let generation = b.probe_generation;
+
+    let mut updated = enrollment("new-token", "refresh-b");
+    updated["project_id"] = json!("project");
+    pool::add_provenance_google(&mut pool, "a", updated);
+
+    assert_eq!(pool.accounts.len(), 1);
+    let b = &pool.accounts[&b_id];
+    assert_eq!(b.access, "token-b");
+    assert_eq!(b.project.as_deref(), Some("project"));
+    assert!(b.probe_generation > generation);
+    assert_google_route_cleared(b);
+}
+
+#[test]
+fn provenance_reload_updates_inherited_but_not_explicit_uploaded_projects() {
+    let mut pool = Pool::default();
+    let enrollment = |refresh, project| json!({"refresh_token":refresh,"project_id":project});
+    for (id, refresh, project) in [("inherited.json", "inherited-refresh", None), ("explicit.json", "explicit-refresh", Some("project-a"))]
+    {
+        let mut raw = enrollment(refresh, project);
+        raw["type"] = json!("google");
+        raw["access_token"] = json!("uploaded-token");
+        pool.insert(pool::parse_credentials(id, &raw, false).unwrap());
+        pool::add_provenance_google(&mut pool, id, enrollment(refresh, Some("project-a")));
+        assert_eq!(pool.accounts[id].project.as_deref(), Some("project-a"));
+        let old = pool.accounts.get_mut(id).unwrap();
+        seed_old_google_route(old);
+        old.last_error.as_mut().unwrap().kind = AccountErrorKind::VerificationRequired;
+        let old_generation = old.probe_generation;
+
+        pool::add_provenance_google(&mut pool, id, enrollment(refresh, Some("project-b")));
+        let account = &pool.accounts[id];
+        assert!(!account.local);
+        assert_eq!(account.access, "uploaded-token");
+        if project.is_none() {
+            assert_eq!(account.project.as_deref(), Some("project-b"));
+            assert!(account.probe_generation > old_generation);
+            assert_google_route_cleared(account);
+        } else {
+            assert_eq!(account.project.as_deref(), project);
+            assert_eq!(account.probe_generation, old_generation);
+            assert!(account.cooldown.is_some());
+            assert!(account.quarantined(Utc::now()));
+        }
+    }
+    assert_eq!(pool.accounts.len(), 2);
+}
+
+#[test]
+fn uploaded_google_note_edit_preserves_inherited_project_provenance() {
+    let mut pool = Pool::default();
+    let id = "upload.json";
+    let mut raw = json!({"type":"google","access_token":"uploaded-token","refresh_token":"uploaded-refresh"});
+    let enrollment = |project| json!({"refresh_token":"uploaded-refresh","project_id":project});
+    pool.insert(pool::parse_credentials(id, &raw, false).unwrap());
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("project-a"));
+    let account = pool.accounts.get_mut(id).unwrap();
+    seed_old_google_route(account);
+    let cooldown = account.cooldown;
+
+    raw["note"] = json!("updated note");
+    pool.insert(pool::parse_credentials(id, &raw, false).unwrap());
+    let account = &pool.accounts[id];
+    assert_eq!(account.note.as_deref(), Some("updated note"));
+    assert_eq!(account.project.as_deref(), Some("project-a"));
+    assert_eq!(account.cooldown, cooldown);
+
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("project-b"));
+    let account = &pool.accounts[id];
+    assert_eq!(account.project.as_deref(), Some("project-b"));
+    assert_eq!(account.note.as_deref(), Some("updated note"));
+    assert_google_route_cleared(account);
+}
+
+fn route_auth_error(until: DateTime<Utc>) -> AccountError {
+    let mut error = local_error(AccountErrorKind::AuthExpired, AccountErrorSource::Inference, "test route authentication error");
+    error.backoff_until = Some(until);
+    error
+}
+
+fn seed_old_google_route(account: &mut Account) {
+    let now = Utc::now();
+    let until = now + TimeDelta::minutes(10);
+    let cooldown = pool::Cooldown { until, verified_reset: true };
+    account.cooldown = Some(cooldown);
+    account.scoped_cooldowns.insert("gemini".into(), cooldown);
+    account.last_error = Some(route_auth_error(until));
+    account.windows = integrations::providers::antigravity::parse_antigravity_summary(
+        &json!({"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.0,"resetTime":until}]}),
+        now,
+    );
+    account.google_fallback_keys.insert(account.windows[0].window_key.clone());
+    account.observed = Some(now);
+}
+
+fn assert_google_route_cleared(account: &Account) {
+    assert!(account.cooldown.is_none());
+    assert!(account.scoped_cooldowns.is_empty());
+    assert!(account.last_error.is_none());
+    assert!(account.windows.is_empty());
+    assert!(account.google_fallback_keys.is_empty());
+    assert!(account.observed.is_none());
+}
+
+#[tokio::test]
+async fn google_hydration_discards_evidence_from_the_projectless_route() {
+    let mock = serve(
+        Router::new().route("/v1internal:loadCodeAssist", post(|| async { axum::Json(json!({"cloudaicompanionProject":"discovered"})) })),
+    )
+    .await;
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    let mut accounts =
+        pool::parse_credentials("google.json", &json!({"type":"google","access_token":"fixture","email":"person@example.test"}), false)
+            .unwrap();
+    seed_old_google_route(&mut accounts[0]);
+    accounts[0].last_error.as_mut().unwrap().kind = AccountErrorKind::VerificationRequired;
+    let old_generation = accounts[0].probe_generation;
+    proxy.state.write().await.pool.insert(accounts);
+    proxy.hydrate_google_metadata().await;
+    let state = proxy.state.read().await;
+    let account = &state.pool.accounts["google.json"];
+    assert_eq!(account.project.as_deref(), Some("discovered"));
+    assert_google_route_cleared(account);
+    assert!(account.probe_generation > old_generation);
 }
 
 #[test]
@@ -4519,19 +6234,6 @@ fn google_project_rewrite_preserves_nested_request_bytes_and_key_order() {
     acct.project = Some("old-proj".into());
     let unchanged = router::request_body(&Bytes::from_static(original), &fields, &acct);
     assert_eq!(unchanged.as_ref(), original);
-}
-
-#[test]
-fn google_near_expiry_reset_is_relative_to_turn_completion() {
-    let now = DateTime::from_timestamp_millis(1_800_000_000_999).unwrap();
-    let completed = now + TimeDelta::milliseconds(2);
-    let body = router::google_quota_error_body("gemini", now + TimeDelta::milliseconds(1), now);
-    let details = &body["error"]["details"];
-    assert!(details[0]["metadata"].get("quotaResetTimeStamp").is_none());
-    for delay in [&details[0]["metadata"]["quotaResetDelay"], &details[1]["retryDelay"]] {
-        let seconds: i64 = delay.as_str().unwrap().trim_end_matches('s').parse().unwrap();
-        assert!(completed + TimeDelta::seconds(seconds) >= completed + TimeDelta::seconds(5));
-    }
 }
 
 #[tokio::test]
