@@ -101,7 +101,7 @@ tokio::task_local! {
     pub(super) static AFTER_FAILOVER_PREVIEW: fn(&mut crate::pool::Pool);
 }
 
-async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response {
+pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let path = parts.uri.path();
     let native = path.starts_with("/backend-api/codex/");
@@ -414,17 +414,18 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             .map(|(error, _)| quota_hint(lane, &headers, error.reset, received_at).map_or(received_at, |hint| hint.until));
         let mut pending_quota_body = None;
         let mut quota_reader = None;
-        let mut unverified_quota_read = false;
+        let mut quota_body_verified = None;
         let cooldown = if let Some((error, _)) = &prelude.error {
             error.backoff(&headers, policy.failover_cooldown_secs, received_at)
         } else if limited {
             let header = header_cooldown(lane, &headers, received_at);
             if lane == Lane::Google {
-                quota_reader = begin_google_quota_read(&proxy, &account, model, header, received_at).await;
+                let provisional = quota_deadline(header, policy.failover_cooldown_secs, received_at);
+                quota_reader = begin_google_quota_read(&proxy, &account, model, Some(provisional), received_at).await;
             }
             let body_reset = if lane == Lane::Google && header.is_none() {
                 let body = read_google_quota_body(&mut response, deadline).await;
-                unverified_quota_read = !body.verified;
+                quota_body_verified = Some(body.verified);
                 prelude.first = body.chunks;
                 prelude.stream_error = body.error;
                 body.reset
@@ -458,8 +459,8 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             },
         );
         if !status.is_success() {
-            let unverified_reader = quota_reader.as_ref().filter(|_| unverified_quota_read);
-            result(&proxy, &account, model, cooldown.filter(|_| pending_quota_body.is_none()), false, unverified_reader).await;
+            let body_read = quota_reader.as_ref().zip(quota_body_verified);
+            result(&proxy, &account, model, cooldown.filter(|_| pending_quota_body.is_none()), false, body_read).await;
         }
         if pending_quota_body.is_none() {
             drop(quota_reader.take());
@@ -749,7 +750,7 @@ pub(crate) async fn run_window_start(
     let response = request.timeout(Duration::from_secs(45)).send().await;
     let mut usage = Usage::default();
     let mut quota_reader = None;
-    let mut unverified_quota_read = false;
+    let mut quota_body_verified = None;
     let (status, outcome, limited) = if let Ok(mut response) = response {
         let status = response.status();
         let limited = if status == StatusCode::TOO_MANY_REQUESTS {
@@ -757,10 +758,11 @@ pub(crate) async fn run_window_start(
             let now = Utc::now();
             let header = header_cooldown(account.lane, response.headers(), now);
             let body = if account.lane == Lane::Google {
-                quota_reader = begin_google_quota_read(&proxy, account, model, None, now).await;
+                let provisional = header.is_none().then(|| quota_deadline(None, fallback, now));
+                quota_reader = begin_google_quota_read(&proxy, account, model, provisional, now).await;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
                 let body = read_google_quota_body(&mut response, deadline).await;
-                unverified_quota_read = !body.verified;
+                quota_body_verified = Some(body.verified);
                 body.reset
             } else {
                 None
@@ -790,7 +792,7 @@ pub(crate) async fn run_window_start(
     };
     exchange.attempt(account, None, started, began, status, outcome);
     let success = outcome == "success";
-    result(&proxy, account, model, limited, success, quota_reader.as_ref().filter(|_| unverified_quota_read)).await;
+    result(&proxy, account, model, limited, success, quota_reader.as_ref().zip(quota_body_verified)).await;
     drop(quota_reader);
     if limited.is_some() {
         proxy.schedule_usage_refresh(account.id.clone()).await;
@@ -1397,7 +1399,7 @@ async fn result(
     model: &str,
     cooldown: Option<Backoff>,
     success: bool,
-    unverified_reader: Option<&QuotaReader>,
+    body_read: Option<(&QuotaReader, bool)>,
 ) {
     let mut state = proxy.state.write().await;
     let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account)) else { return };
@@ -1413,8 +1415,8 @@ async fn result(
             current.auth_cooldown = current.auth_cooldown.max(Some(until));
         }
         Some(Backoff::Quota(until)) => {
-            if let Some(reader) = unverified_reader {
-                current.finish_google_quota_read(reader, Some(until.until));
+            if let Some((reader, verified)) = body_read {
+                current.finish_google_quota_read(reader, (!verified).then_some(until.until));
             }
             apply_quota(current, model, until, now);
         }
@@ -1426,7 +1428,7 @@ async fn begin_google_quota_read(
     proxy: &Proxy,
     account: &Account,
     model: &str,
-    header: Option<Cooldown>,
+    provisional: Option<Cooldown>,
     now: DateTime<Utc>,
 ) -> Option<QuotaReader> {
     proxy
@@ -1437,7 +1439,7 @@ async fn begin_google_quota_read(
         .accounts
         .get_mut(&account.id)
         .filter(|a| a.same_credential(account))
-        .map(|current| current.begin_google_quota_read(model, header, now))
+        .map(|current| current.begin_google_quota_read(model, provisional, now))
 }
 
 async fn extend_quota(proxy: &Proxy, account: &Account, model: &str, until: Cooldown) {

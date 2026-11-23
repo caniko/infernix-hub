@@ -275,13 +275,13 @@ impl Account {
             .reduce(Cooldown::merge)
     }
 
-    pub(crate) fn begin_google_quota_read(&mut self, model: &str, header: Option<Cooldown>, now: DateTime<Utc>) -> QuotaReader {
+    pub(crate) fn begin_google_quota_read(&mut self, model: &str, provisional: Option<Cooldown>, now: DateTime<Utc>) -> QuotaReader {
         self.pending_quota.retain(|pending| pending.blocks_verification(now));
         let reader = Arc::new(());
         self.pending_quota.push(PendingQuota {
             reader: Arc::downgrade(&reader),
             scope: model_cooldown_scope(self.lane, model),
-            provisional: header.map(|header| Cooldown { verified_reset: false, ..header }),
+            provisional: provisional.map(|cooldown| Cooldown { verified_reset: false, ..cooldown }),
             unverified_until: None,
         });
         QuotaReader(reader)
@@ -311,7 +311,7 @@ impl Account {
         });
     }
 
-    fn has_unverified_google_quota_read(&self, model: &str, now: DateTime<Utc>) -> bool {
+    pub(super) fn has_unverified_google_quota_read(&self, model: &str, now: DateTime<Utc>) -> bool {
         let scope = model_cooldown_scope(self.lane, model);
         // An unread or failed body still blocks verification until its own backoff expires,
         // even if a longer cooldown wins the legacy routing decision.

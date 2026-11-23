@@ -2054,6 +2054,81 @@ async fn google_cancelled_429_body_blocks_a_longer_same_scope_witness() {
 }
 
 #[tokio::test]
+async fn google_cancelled_headerless_429_body_blocks_a_longer_same_scope_witness() {
+    let arrived = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post({
+            let (arrived, release) = (arrived.clone(), release.clone());
+            let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            move || {
+                let first = first.swap(false, std::sync::atomic::Ordering::Relaxed);
+                let (arrived, release) = (arrived.clone(), release.clone());
+                async move {
+                    if first {
+                        arrived.notify_one();
+                        release.notified().await;
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "10")],
+                            r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#,
+                        )
+                            .into_response()
+                    } else {
+                        let body = Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+                        (StatusCode::TOO_MANY_REQUESTS, body).into_response()
+                    }
+                }
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    {
+        let mut state = proxy.state.write().await;
+        state.pool.accounts.remove("google-b.json");
+        state.pool.policy.failover_cooldown_secs = 30;
+    }
+    let model = "gemini-4-neon-high";
+    let request = |proxy| {
+        let request = axum::http::Request::post("/v1internal:generateContent")
+            .header("authorization", "Bearer inference-fixture")
+            .body(Body::from(json!({"model": model}).to_string()))
+            .unwrap();
+        router::forward(axum::extract::State(proxy), request)
+    };
+    let first = tokio::spawn(request(proxy.clone()));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        arrived.notified().await;
+        let mut second = Box::pin(request(proxy.clone()));
+        tokio::select! {
+            _ = &mut second => panic!("headerless 429 body should still be pending"),
+            () = async {
+                while !proxy.state.read().await.pool.accounts["google-a.json"].has_unverified_google_quota_read(model, Utc::now()) {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        release.notify_one();
+        let first = first.await.unwrap();
+        assert_eq!(first.status(), 429);
+        assert!(!first.headers().contains_key(router::POOL_QUOTA_HEADER));
+        drop(second);
+    })
+    .await
+    .unwrap();
+
+    let response = request(proxy.clone()).await;
+    assert_eq!(response.status(), 429);
+    let retry: u64 = response.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!((85..=90).contains(&retry), "legacy Retry-After must still use the 90s reset");
+    assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER));
+    assert!(proxy.state.read().await.pool.verified_google_reset_at(model, None, Utc::now() + TimeDelta::seconds(30)).is_some());
+}
+
+#[tokio::test]
 async fn google_concurrent_429_bodies_with_the_same_deadline_must_both_settle_before_witnessing() {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
