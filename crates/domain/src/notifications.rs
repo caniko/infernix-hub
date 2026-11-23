@@ -54,6 +54,23 @@ fn secret_raises_follow_the_contract() {
 
 #[cfg(test)]
 #[test]
+fn unassigned_root_secrets_parse_and_notify_the_operator() {
+    let inventory: contracts::SecretInventory = serde_json::from_value(json!({
+        "schemaVersion": 1, "generatedAt": "2026-11-10T03:10:00Z",
+        "secrets": [
+            {"id":"root-null","tree":"root","scope":"host-a","category":"oauth","kind":"external","custodian":null,
+             "expiry":{"type":"at","date":"2026-11-09"},"consumers":[]},
+            {"id":"root-absent","tree":"root","scope":"host-a","category":"oauth","kind":"external",
+             "expiry":{"type":"at","date":"2026-11-09"},"consumers":[]}
+        ]
+    }))
+    .unwrap();
+    let raises = secret_raises(&inventory, "2026-11-10T03:10:00Z".parse().unwrap(), &Default::default()).unwrap();
+    assert_eq!(raises.len(), 2);
+    assert!(raises.iter().all(|(owner, raise)| owner.is_none() && raise.body.contains("custodian: unassigned")));
+}
+
+#[test]
 fn secret_custodian_requires_a_member_principal() {
     let now = Utc::now();
     let value = json!({"schemaVersion":1,"generatedAt":now.to_rfc3339(),"secrets":[
@@ -324,7 +341,7 @@ pub fn secret_raises(
     let mut unknown = std::collections::BTreeMap::<Option<String>, Vec<&str>>::new();
     for secret in &inventory.secrets {
         let state = secret_state(secret, now);
-        let owner = members.contains(&secret.custodian).then_some(secret.custodian.clone());
+        let owner = secret.custodian.as_ref().filter(|custodian| members.contains(*custodian)).cloned();
         let severity = match state {
             "expired" => Severity::Critical,
             "expiring" => Severity::Warning,
@@ -352,7 +369,7 @@ pub fn secret_raises(
             body: format!(
                 "{}; date: {date}; custodian: {}; rotation: {}",
                 secret.id,
-                secret.custodian,
+                secret.custodian.as_deref().unwrap_or("unassigned"),
                 secret.rotation.as_ref().map_or("not documented".to_string(), |r| format!("{} — {}", r.method, r.command)),
             ),
             subject_type: None,
@@ -589,12 +606,10 @@ pub fn fleet_raises(status: &FleetStatus, now: DateTime<Utc>) -> Vec<Raise> {
         });
     };
     for host in &status.hosts {
-        if host.health == Health::Healthy {
-            continue;
-        }
         let health = match host.health {
-            Health::Healthy => "healthy",
+            Health::Healthy => continue,
             Health::Degraded => "degraded",
+            Health::Unreachable if status.expected_offline_hosts.contains(&host.name) => continue,
             Health::Unreachable => "unreachable",
         };
         let body = if host.failures.is_empty() { health.to_string() } else { host.failures.join("; ") };
@@ -1073,6 +1088,25 @@ mod tests {
     }
 
     #[test]
+    fn fleet_expected_offline_hosts_do_not_alert_but_unexpected_failures_do() {
+        let status: FleetStatus = serde_json::from_value(json!({
+            "schemaVersion": 1, "generatedAt": "2026-11-10T03:10:00Z",
+            "expectedOfflineHosts": ["desktop-1", "laptop-1", "awake"],
+            "hosts": [
+                {"name":"desktop-1","health":"unreachable","checkedAt":"2026-11-10T03:10:00Z"},
+                {"name":"awake","health":"degraded","checkedAt":"2026-11-10T03:10:00Z"},
+                {"name":"server-1","health":"unreachable","checkedAt":"2026-11-10T03:10:00Z"}
+            ],
+            "monitoring": {}
+        }))
+        .unwrap();
+        let raises = fleet_raises(&status, "2026-11-10T03:10:00Z".parse().unwrap());
+        assert_eq!(raises.len(), 2);
+        assert!(raises.iter().any(|r| r.dedupe_key == "fleet:host:server-1"));
+        assert!(raises.iter().any(|r| r.dedupe_key == "fleet:host:awake"));
+    }
+
+    #[test]
     fn failure_details_and_nightly_hosts_are_visible() {
         let mut item = today_item("generation", "content", Uuid::from_u128(1), "failed");
         item.detail = Some("abc failed at 2026-11-15T12:00:00Z: expired".into());
@@ -1080,7 +1114,7 @@ mod tests {
         today.failed_operations.push(item);
         assert_eq!(today_raises(&today)[0].body, "failed — abc failed at 2026-11-15T12:00:00Z: expired");
         let mut status: FleetStatus = serde_json::from_str(FLEET_SNAPSHOT).unwrap();
-        status.nightly.as_mut().unwrap().error = Some("update failed".into());
+        status.snapshot.nightly.as_mut().unwrap().error = Some("update failed".into());
         let now = DateTime::parse_from_rfc3339("2026-11-10T03:10:00Z").unwrap().with_timezone(&Utc);
         let raises = fleet_raises(&status, now);
         assert_eq!(raises.iter().find(|r| r.dedupe_key.starts_with("fleet:nightly:")).unwrap().body, "update failed; failed on nomad");
@@ -1168,7 +1202,7 @@ mod tests {
     fn producer_raises_are_stable_and_key_safe() {
         // The production nightly stamp carries fractional seconds and `+00:00`.
         let mut status: FleetStatus = serde_json::from_str(FLEET_SNAPSHOT).unwrap();
-        status.nightly.as_mut().unwrap().started_at = "2026-11-15T02:00:00.766434605+00:00".into();
+        status.snapshot.nightly.as_mut().unwrap().started_at = "2026-11-15T02:00:00.766434605+00:00".into();
         let generated = DateTime::parse_from_rfc3339("2026-11-10T03:10:00Z").unwrap().with_timezone(&Utc);
         let pass = |minutes| fleet_raises(&status, generated + chrono::Duration::minutes(minutes));
         for raise in pass(20) {

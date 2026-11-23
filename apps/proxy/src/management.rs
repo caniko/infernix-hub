@@ -328,7 +328,9 @@ fn usage(pool: &Pool) -> Value {
 }
 
 async fn windows(State(proxy): State<Arc<Proxy>>) -> Reply {
-    ok(usage(&proxy.state.read().await.pool))
+    let mut response = usage(&proxy.state.read().await.pool);
+    response["hub_sync_configured"] = json!(proxy.hub_sync_configured);
+    ok(response)
 }
 
 pub(crate) async fn refresh_selected(proxy: &Proxy, id: Option<&str>, family: Option<&str>) -> Result<Map<String, Value>, Failure> {

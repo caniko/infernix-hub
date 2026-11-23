@@ -332,7 +332,9 @@ pub async fn ingest_observations(hub: &Hub, actor: &Actor, provider_id: &str, ba
     tx.commit().await?;
 
     // Best-effort quota notification sync into the hub's long-polled notification feed.
-    let _ = sync_quota_notifications(hub, provider_id).await;
+    if let Err(error) = sync_quota_notifications(hub, provider_id).await {
+        tracing::warn!(%provider_id, %error, "provider quota notification sync failed");
+    }
 
     Ok(ObservationAck {
         provider_id: provider_id.to_string(),
@@ -1621,16 +1623,35 @@ pub async fn set_settings(hub: &Hub, actor: &Actor, settings: ProviderPanelSetti
     Ok(settings)
 }
 
-/// Translate observed quota exhaustion / cooldown / probe failures into Hub notifications
-/// (respecting `mask_emails` and notification toggle settings).
+/// Refresh alert sources even if their collectors have stopped pushing.
+pub async fn reconcile_quota_notifications(hub: &Hub) -> DResult<()> {
+    let provider_ids: Vec<String> = sqlx::query_scalar("select id from model_provider_instances").fetch_all(&hub.db).await?;
+    for provider_id in provider_ids {
+        if let Err(error) = sync_quota_notifications(hub, &provider_id).await {
+            tracing::warn!(%provider_id, %error, "provider quota notification reconciliation failed");
+        }
+    }
+    Ok(())
+}
+
 pub async fn sync_quota_notifications(hub: &Hub, provider_id: &str) -> DResult<()> {
-    let settings = get_settings(hub, &internal_operator("provider-notify")).await.unwrap_or_default();
+    let settings = get_settings(hub, &internal_operator("provider-notify")).await?;
     let accounts = load_accounts_with_latest_windows(&hub.db, provider_id).await?;
     let source = format!("providers:{provider_id}");
-    let mut items = Vec::new();
-    let now = Utc::now();
+    crate::notifications::sync(hub, &source, quota_raises(provider_id, &settings, &accounts, Utc::now())).await?;
+    Ok(())
+}
 
-    for acct in &accounts {
+fn quota_raises(
+    provider_id: &str,
+    settings: &ProviderPanelSettings,
+    accounts: &[ModelAccount],
+    now: DateTime<Utc>,
+) -> Vec<crate::notifications::Raise> {
+    let source = format!("providers:{provider_id}");
+    let mut items = Vec::new();
+
+    for acct in accounts {
         if !acct.enabled {
             continue;
         }
@@ -1653,7 +1674,10 @@ pub async fn sync_quota_notifications(hub: &Hub, provider_id: &str) -> DResult<(
                 });
             }
             for win in &acct.windows {
-                if win.observation_state == QuotaObservationState::Measured && win.remaining_percent.is_some_and(|rem| rem <= 5.0) {
+                if win.observation_state == QuotaObservationState::Measured
+                    && win.resets_at.is_none_or(|reset| reset > now)
+                    && win.remaining_percent.is_some_and(|rem| rem <= 5.0)
+                {
                     items.push(crate::notifications::Raise {
                         source: source.clone(),
                         dedupe_key: format!("provider:{provider_id}:{}:{}:low", acct.id, win.window_key),
@@ -1672,8 +1696,7 @@ pub async fn sync_quota_notifications(hub: &Hub, provider_id: &str) -> DResult<(
         }
     }
 
-    let _ = crate::notifications::sync(hub, &source, items).await;
-    Ok(())
+    items
 }
 
 #[cfg(test)]
@@ -1735,6 +1758,26 @@ mod tests {
             windows: vec![win],
             reset_grant: None,
             rolling_starter: None,
+        }
+    }
+
+    #[test]
+    fn quota_alerts_clear_at_reset_without_clearing_the_future_weekly_window() {
+        let reset: DateTime<Utc> = "2026-11-10T03:10:00Z".parse().unwrap();
+        let mut session = sample_window("five_hour", Some(100.0), QuotaObservationState::Measured);
+        session.resets_at = Some(reset);
+        let mut weekly = sample_window("weekly", Some(98.0), QuotaObservationState::Measured);
+        weekly.kind = QuotaWindowKind::Weekly;
+        weekly.resets_at = Some(reset + Duration::days(5));
+        let mut account = acct("google-primary", true, None, None, session);
+        account.windows.push(weekly);
+        let settings = ProviderPanelSettings { notify_limit_hit: true, ..Default::default() };
+        let raises = |now| quota_raises("antigravity", &settings, std::slice::from_ref(&account), now);
+        assert_eq!(raises(reset - Duration::seconds(1)).len(), 2);
+        for now in [reset, reset + Duration::seconds(1)] {
+            let items = raises(now);
+            assert_eq!(items.len(), 1);
+            assert!(items[0].dedupe_key.ends_with(":weekly:low"));
         }
     }
 

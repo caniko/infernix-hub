@@ -365,6 +365,9 @@ pub async fn notify_pass(
     if let Err(error) = domain::notifications::sync_member_renewals(hub).await {
         tracing::warn!(%error, "notifications: member renewals source skipped");
     }
+    if let Err(error) = domain::providers::reconcile_quota_notifications(hub).await {
+        tracing::warn!(%error, "notifications: provider quota reconciliation skipped");
+    }
     if let Some(path) = fleet_status_file {
         let raises = match read_fleet_status(Some(path)).await {
             Ok(status) => domain::notifications::fleet_raises(&status, chrono::Utc::now()),

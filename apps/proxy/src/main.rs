@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
                 register_t3code(&config.t3code_home, SOURCE_ID, SOURCE_LABEL, &config.url, &config.management_key)?;
             }
             let addr = config.bind;
-            let proxy = Arc::new(Proxy::new(config)?);
+            let proxy = Arc::new(Proxy::new(config)?.with_hub_sync_configured(hub.is_some()));
             proxy.discover_local_commands().await;
             let quota = tokio::spawn(hub_sync::poll_quota(proxy.clone()));
             let sync = hub.map(|(url, token)| tokio::spawn(hub_sync::run(proxy.clone(), url, token)));
