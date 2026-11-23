@@ -52,18 +52,26 @@ pub async fn run(proxy: Arc<Proxy>, url: String, token: String) {
     let mut observation_due = true;
     let mut count = 0_u8;
     loop {
-        tick.tick().await;
-        count = (count + 1) % 10;
+        tokio::select! {
+            _ = tick.tick() => count = (count + 1) % 10,
+            _ = proxy.hub_sync_notify.notified() => {
+                // One fixed debounce window, even if notifications keep arriving.
+                let _ = timeout(Duration::from_secs(1), async {
+                    loop { proxy.hub_sync_notify.notified().await; }
+                }).await;
+                observation_due = true;
+            }
+        }
         if observation_due || count == 0 {
             let batches = observations(&proxy, &host, &user).await;
             let results = futures_util::future::join_all(
                 batches.iter().map(|batch| timeout(DEADLINE, hub.ingest_provider_observations(&batch.provider_id, batch))),
             )
             .await;
-            if results.iter().any(|r| !matches!(r, Ok(Ok(_)))) {
+            observation_due = results.iter().any(|r| !matches!(r, Ok(Ok(_))));
+            if observation_due {
                 proxy.log("warn", "hub observation delivery failed").await;
             }
-            observation_due = false;
         }
 
         let exchanges = proxy.state.read().await.activity.iter().take(64).cloned().collect::<Vec<_>>();
@@ -136,11 +144,19 @@ pub(crate) async fn observations(proxy: &Proxy, host: &str, user: &str) -> Vec<O
             let lanes =
                 [Lane::Claude, Lane::Codex, Lane::Google, Lane::Go].into_iter().filter(|lane| lane.family() == family).collect::<Vec<_>>();
             let picks: BTreeSet<_> = lanes.iter().filter_map(|lane| pool.preview(*lane)).collect();
+            let mut enabled = 0;
+            let mut unavailable = 0;
+            let mut errors = 0;
             let accounts: Vec<_> = pool
                 .accounts
                 .values()
                 .filter(|a| a.lane.family() == family)
                 .map(|a| {
+                    if !a.disabled {
+                        enabled += 1;
+                        unavailable += usize::from(a.quarantined(at) || a.cooldown_until().is_some_and(|until| until > at));
+                        errors += usize::from(a.last_error.as_ref().map_or(a.probe_failed, AccountError::is_notification_worthy));
+                    }
                     let mut account_caps = capabilities.clone();
                     if a.api_key {
                         account_caps.remove(&RefreshQuota);
@@ -150,18 +166,31 @@ pub(crate) async fn observations(proxy: &Proxy, host: &str, user: &str) -> Vec<O
                         id: a.hub_id_for(host, user),
                         provider_id: family.into(),
                         source_account_id: a.id.clone(),
-                        display_name: a.label.clone(),
+                        display_name: crate::error_classify::safe_label(a),
                         email: None,
                         masked_email: a.email.as_deref().map(mask_email),
                         note: a.note.clone(),
                         plan: a.plan.clone(),
                         tier_multiplier: a.multiplier,
-                        status: AccountStatus::resolve(!a.disabled, a.cooldown_until(), at, is_next, a.probe_failed),
+                        status: AccountStatus::resolve_with_error(
+                            !a.disabled,
+                            a.cooldown_until(),
+                            at,
+                            is_next,
+                            a.probe_failed && a.last_error.is_none(),
+                            a.last_error.as_ref(),
+                        ),
                         enabled: !a.disabled,
                         priority: a.priority,
                         weight: a.weight,
                         cooldown_until: a.cooldown_until(),
-                        status_message: a.probe_failed.then(|| "quota probe failed".into()),
+                        status_message: a
+                            .last_error
+                            .as_ref()
+                            .map(AccountError::summary)
+                            .or_else(|| a.probe_failed.then(|| "quota probe failed".into())),
+                        last_error: a.last_error.clone(),
+                        last_error_observed: true,
                         is_active: false,
                         is_preferred: pool.preferred(a.lane) == Some(a.id.as_str()),
                         is_next_pick: is_next,
@@ -183,6 +212,13 @@ pub(crate) async fn observations(proxy: &Proxy, host: &str, user: &str) -> Vec<O
             let models: BTreeSet<_> = pool.accounts.values().filter(|a| a.lane.family() == family).flat_map(|a| a.models.iter()).collect();
             let mut policy = pool.policy.clone();
             policy.preferred_account_id = accounts.iter().find(|a| a.is_preferred).map(|a| a.id.clone());
+            let (health, status_message) = if enabled > 0 && unavailable == enabled {
+                (ProviderHealth::Degraded, Some(format!("All {enabled} enabled accounts are unavailable.")))
+            } else if errors > 0 {
+                (ProviderHealth::Degraded, Some(format!("{errors} of {enabled} enabled accounts reported errors.")))
+            } else {
+                (ProviderHealth::Healthy, None)
+            };
             ObservationBatch {
                 provider_id: family.into(),
                 provider_label: match family {
@@ -194,13 +230,11 @@ pub(crate) async fn observations(proxy: &Proxy, host: &str, user: &str) -> Vec<O
                 provider_family: family.into(),
                 source_host: host.into(),
                 source_user: user.into(),
+                source_publisher: Some("fleetix-agent-proxy".into()),
                 collected_at: at,
-                health: if accounts.iter().any(|a| a.status == AccountStatus::Error) {
-                    ProviderHealth::Degraded
-                } else {
-                    ProviderHealth::Healthy
-                },
-                status_message: None,
+                account_inventory_complete: true,
+                health,
+                status_message,
                 router_id: Some(ROUTER_ID.into()),
                 capabilities,
                 evidence_kinds: [

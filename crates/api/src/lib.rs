@@ -368,8 +368,20 @@ pub async fn notify_pass(
     if let Err(error) = domain::providers::reconcile_quota_notifications(hub).await {
         tracing::warn!(%error, "notifications: provider quota reconciliation skipped");
     }
-    if let Some(path) = fleet_status_file {
-        let raises = match read_fleet_status(Some(path)).await {
+    let fleet = match fleet_status_file {
+        Some(path) => Some(read_fleet_status(Some(path)).await),
+        None => None,
+    };
+    if let Some(Ok(status)) = &fleet
+        && let Ok(mut offline) = hub.expected_offline_hosts.write()
+    {
+        offline.clone_from(&status.expected_offline_hosts);
+    }
+    if let Err(error) = domain::providers::reconcile_provider_health_notifications(hub).await {
+        tracing::warn!(%error, "notifications: provider health reconciliation skipped");
+    }
+    if let Some(fleet) = fleet {
+        let raises = match fleet {
             Ok(status) => domain::notifications::fleet_raises(&status, chrono::Utc::now()),
             Err(error) => vec![domain::notifications::fleet_unreadable(&error.to_string())],
         };

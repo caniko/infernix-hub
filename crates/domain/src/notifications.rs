@@ -91,7 +91,11 @@ fn secret_custodian_requires_a_member_principal() {
 /// Producer keys belong to the loop; an HTTP caller that could write them would
 /// fake a source's state, and the next pass would resolve it away.
 const RESERVED_SOURCES: &[&str] = &["today", "fleet", "hub", "secrets", "monitor"];
-const RESERVED_PREFIXES: &[&str] = &["today:", "fleet:", "hub:", "secrets:", "monitor:"];
+const RESERVED_PREFIXES: &[&str] = &["today:", "fleet:", "hub:", "secrets:", "monitor:", "provider:"];
+
+fn reserved_source(source: &str) -> bool {
+    RESERVED_SOURCES.contains(&source) || ["providers:", "providers-health:", "providers-poller:"].iter().any(|p| source.starts_with(p))
+}
 
 /// Agents and procedures raise their own rows; only the operator dismisses.
 const RAISERS: &[Role] = &[Role::Operator, Role::Agent, Role::Procedure, Role::Member];
@@ -148,7 +152,7 @@ async fn lock_writers(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> DResult
 pub async fn raise(hub: &Hub, raise: &Raise) -> DResult<bool> {
     let mut tx = hub.db.begin().await?;
     lock_writers(&mut tx).await?;
-    let changed = upsert(&mut *tx, &hub.config.company_id, None, raise).await?;
+    let changed = upsert(&mut tx, &hub.config.company_id, None, raise, false).await?;
     tx.commit().await?;
     if changed {
         hub.notified.notify_waiters();
@@ -156,18 +160,48 @@ pub async fn raise(hub: &Hub, raise: &Raise) -> DResult<bool> {
     Ok(changed)
 }
 
-async fn upsert<'e, E>(db: E, company_id: &str, owner: Option<&str>, raise: &Raise) -> DResult<bool>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
+async fn upsert(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    company_id: &str,
+    owner: Option<&str>,
+    raise: &Raise,
+    hide_foreign_owner: bool,
+) -> DResult<bool> {
+    // All callers hold the writer lock through commit.
+    let collision: Option<bool> = sqlx::query_scalar(
+        "select owner is distinct from $3 from notifications
+          where company_id = $1 and dedupe_key = $2 and (owner is distinct from $3 or source <> $4)",
+    )
+    .bind(company_id)
+    .bind(&raise.dedupe_key)
+    .bind(owner)
+    .bind(&raise.source)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(foreign_owner) = collision {
+        if foreign_owner && hide_foreign_owner {
+            return Err(DomainError::NotFound("notification"));
+        }
+        return Err(invalid("invalid_dedupe_key", "key belongs to another notification owner or source"));
+    }
+    // Refresh the display text of an open provider incident without notifying
+    // again. A severity change or recurrence starts a new notification.
     let rows = sqlx::query(
         "insert into notifications (id, company_id, source, dedupe_key, severity, title, body, subject_type, subject_id, url, owner)
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          on conflict (company_id, dedupe_key) do update set
            severity = excluded.severity, title = excluded.title, body = excluded.body,
            subject_type = excluded.subject_type, subject_id = excluded.subject_id, url = excluded.url,
-           read_at = null, resolved_at = null, seq = nextval('notifications_seq'), updated_at = now()
-          where notifications.owner is not distinct from excluded.owner and
+           (read_at, seq) = (
+               select case when preserve_ack then notifications.read_at end,
+                      case when preserve_ack then notifications.seq else nextval('notifications_seq') end
+               from (select notifications.resolved_at is null
+                            and starts_with(excluded.source, 'providers-health:')
+                            and notifications.severity = excluded.severity
+                     as preserve_ack) incident
+           ),
+           resolved_at = null, updated_at = now()
+          where notifications.owner is not distinct from excluded.owner and notifications.source = excluded.source and
             (notifications.resolved_at is not null
              or (notifications.severity, notifications.title, notifications.body)
                 is distinct from (excluded.severity, excluded.title, excluded.body))",
@@ -183,7 +217,7 @@ where
     .bind(&raise.subject_id)
     .bind(&raise.url)
     .bind(owner)
-    .execute(db)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     Ok(rows > 0)
@@ -207,20 +241,10 @@ async fn sync_owned(hub: &Hub, owner: Option<&str>, source: &str, current: Vec<R
     lock_writers(&mut tx).await?;
     let mut changed = 0;
     for raise in &current {
-        let collision: bool = sqlx::query_scalar(
-            "select exists(select 1 from notifications where company_id = $1 and dedupe_key = $2
-                and (owner is distinct from $3 or ($3 is not null and $4 = 'member:' || $3 || ':renewals' and source <> $4)))",
-        )
-        .bind(&hub.config.company_id)
-        .bind(&raise.dedupe_key)
-        .bind(owner)
-        .bind(source)
-        .fetch_one(&mut *tx)
-        .await?;
-        if collision {
-            return Err(invalid("invalid_dedupe_key", "key belongs to another notification owner or source"));
+        if raise.source != source {
+            return Err(invalid("invalid_source", "notification must belong to the syncing source"));
         }
-        changed += usize::from(upsert(&mut *tx, &hub.config.company_id, owner, raise).await?);
+        changed += usize::from(upsert(&mut tx, &hub.config.company_id, owner, raise, false).await?);
         // Degradations only: a pending op is an approval for the operator.
         if hub.config.fleet_issues.is_some() && source == "fleet" && !raise.dedupe_key.starts_with("fleet:op:") {
             file_fleet_issue(&mut tx, hub, raise).await?;
@@ -405,12 +429,10 @@ pub async fn sync_secrets(hub: &Hub, current: Vec<(Option<String>, Raise)>) -> D
     lock_writers(&mut tx).await?;
     let mut changed = 0;
     for (owner, raise) in &current {
-        let collision: bool = sqlx::query_scalar("select exists(select 1 from notifications where company_id = $1 and dedupe_key = $2 and (owner is distinct from $3 or source <> 'secrets'))")
-            .bind(&hub.config.company_id).bind(&raise.dedupe_key).bind(owner).fetch_one(&mut *tx).await?;
-        if collision {
-            return Err(invalid("invalid_dedupe_key", "key belongs to another notification owner or source"));
+        if raise.source != "secrets" {
+            return Err(invalid("invalid_source", "notification must belong to the secrets source"));
         }
-        changed += usize::from(upsert(&mut *tx, &hub.config.company_id, owner.as_deref(), raise).await?);
+        changed += usize::from(upsert(&mut tx, &hub.config.company_id, owner.as_deref(), raise, false).await?);
     }
     let keys: Vec<&str> = current.iter().map(|(_, r)| r.dedupe_key.as_str()).collect();
     changed += sqlx::query("update notifications set resolved_at = now(), seq = nextval('notifications_seq'), updated_at = now() where company_id = $1 and source = 'secrets' and resolved_at is null and dedupe_key <> all($2)")
@@ -914,7 +936,7 @@ pub async fn post(hub: &Hub, actor: &Actor, input: RaiseNotificationIn) -> DResu
     let entry = api_raise(owner, input)?;
     let mut tx = hub.db.begin().await?;
     lock_writers(&mut tx).await?;
-    let changed = upsert(&mut *tx, &hub.config.company_id, owner, &entry).await?;
+    let changed = upsert(&mut tx, &hub.config.company_id, owner, &entry, true).await?;
     let row: Option<Value> = sqlx::query_scalar(&select("company_id = $1 and dedupe_key = $2 and owner is not distinct from $3"))
         .bind(&hub.config.company_id)
         .bind(&entry.dedupe_key)
@@ -950,15 +972,12 @@ fn api_raise(owner: Option<&str>, input: RaiseNotificationIn) -> DResult<Raise> 
     if source.is_empty() || source.len() > MAX_SOURCE {
         return Err(invalid("invalid_source", format!("source must be 1..={MAX_SOURCE} bytes")));
     }
-    if RESERVED_SOURCES.contains(&source.as_str())
+    if reserved_source(&source)
         || (owner.is_some() && (source == "renewals" || input.dedupe_key.starts_with("renewal:")))
         || (owner.is_none() && (source.starts_with("member:") || input.dedupe_key.starts_with("member:")))
         || RESERVED_PREFIXES.iter().any(|p| input.dedupe_key.starts_with(p))
     {
-        return Err(invalid(
-            "reserved_key",
-            "the producer sources (today, fleet, hub, secrets, monitor) and their key prefixes belong to the producer loop",
-        ));
+        return Err(invalid("reserved_key", "the source or key belongs to a notification producer"));
     }
     let key = stored_key(owner, &input.dedupe_key)?;
     if input.title.trim().is_empty() || input.title.chars().count() > MAX_TITLE {
@@ -986,8 +1005,7 @@ pub async fn sync_api(hub: &Hub, actor: &Actor, input: SyncNotificationsIn) -> D
     if source.is_empty() || source.len() > MAX_SOURCE {
         return Err(invalid("invalid_source", format!("source must be 1..={MAX_SOURCE} bytes")));
     }
-    if RESERVED_SOURCES.contains(&source) || (owner.is_some() && source == "renewals") || (owner.is_none() && source.starts_with("member:"))
-    {
+    if reserved_source(source) || (owner.is_some() && source == "renewals") || (owner.is_none() && source.starts_with("member:")) {
         return Err(invalid("reserved_key", "reserved source"));
     }
     let current = input
@@ -1026,6 +1044,28 @@ fn valid_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_writers_cannot_claim_provider_namespaces() {
+        let entry = |source: &str, dedupe_key: &str| RaiseNotificationIn {
+            source: Some(source.into()),
+            dedupe_key: dedupe_key.into(),
+            severity: Severity::Warning,
+            title: "Fixture".into(),
+            body: String::new(),
+            subject_type: None,
+            subject_id: None,
+            url: None,
+        };
+        for owner in [None, Some("member-name")] {
+            for source in ["providers:test", "providers-health:test", "providers-poller:test"] {
+                assert!(reserved_source(source));
+                assert!(api_raise(owner, entry(source, "normal-key")).is_err());
+            }
+            assert!(api_raise(owner, entry("ordinary", "provider:test:pool:unavailable")).is_err());
+            assert!(api_raise(owner, entry("ordinary", "normal-key")).is_ok());
+        }
+    }
 
     #[test]
     fn dedupe_keys_follow_the_database_constraint() {
