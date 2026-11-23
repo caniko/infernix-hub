@@ -336,7 +336,11 @@ impl Account {
     }
 
     pub(crate) fn quarantined(&self, now: DateTime<Utc>) -> bool {
-        self.last_error.as_ref().is_some_and(|error| error.blocks_routing(now))
+        self.active_quarantine(now).is_some()
+    }
+
+    fn active_quarantine(&self, now: DateTime<Utc>) -> Option<&AccountError> {
+        self.last_error.as_ref().filter(|error| error.blocks_routing(now))
     }
 
     pub(crate) fn has_account_error(&self) -> bool {
@@ -820,7 +824,6 @@ impl Pool {
                     && a.base == old.base
                     && (a.lane != Lane::Google || a.project.is_none() || a.project == old.project)
                     && if a.source_fingerprint.is_some() { a.source_fingerprint == old.source_fingerprint } else { old.same_secret(&a) };
-                a.error_generation = old.error_generation.saturating_add(u64::from(!unchanged));
                 if unchanged {
                     a.access.clone_from(&old.access);
                     a.refresh.clone_from(&old.refresh);
@@ -849,7 +852,10 @@ impl Pool {
                     a.provenance_token_fp = old.provenance_token_fp;
                     a.success = old.success;
                     a.failure = old.failure;
+                } else if a.lane == Lane::Google && (a.project != old.project || a.base != old.base) {
+                    a.clear_google_route_evidence();
                 }
+                a.error_generation = old.error_generation.saturating_add(u64::from(!unchanged));
             } else {
                 a.scrub_label(&[]);
             }
@@ -914,8 +920,8 @@ impl Pool {
                         complete = false;
                     }
                 };
-                if let Some(error) = account.last_error.as_ref().filter(|err| err.blocks_routing(now)) {
-                    let reason = if error.kind == AccountErrorKind::AuthExpired { "auth_cooldown" } else { "account_error" };
+                if let Some(error) = account.active_quarantine(now) {
+                    let reason = if error.kind == AccountErrorKind::AuthExpired { "auth_cooldown" } else { "quarantined" };
                     block(reason, None);
                 }
                 for (reason, cooldown) in
@@ -983,9 +989,7 @@ impl Pool {
         required_project: Option<&str>,
         now: DateTime<Utc>,
     ) -> Option<AccountErrorKind> {
-        let mut kinds = self
-            .supported(lane, model, required_project)
-            .map(|a| a.last_error.as_ref().filter(|err| err.blocks_routing(now)).map(|err| err.kind));
+        let mut kinds = self.supported(lane, model, required_project).map(|a| a.active_quarantine(now).map(|err| err.kind));
         let kind = kinds.next()??;
         kinds.all(|other| other == Some(kind)).then_some(kind)
     }

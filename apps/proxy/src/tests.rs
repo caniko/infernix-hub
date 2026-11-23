@@ -3496,6 +3496,48 @@ fn verified_google_resets_require_complete_model_scoped_timing() {
     assert_eq!(next(&pool, MODEL), None); // B already usable.
 }
 
+#[tokio::test]
+async fn google_quarantine_excludes_eligibility_and_quota_witnesses() {
+    let mock = serve(Router::new()).await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let now = Utc::now();
+    let model = "gemini-neon";
+    let cooldown = |minutes| pool::Cooldown { until: now + TimeDelta::minutes(minutes), verified_reset: true };
+    for kind in [AccountErrorKind::VerificationRequired, AccountErrorKind::UpstreamUnavailable] {
+        let mut error = local_error(kind, AccountErrorSource::Inference, "private fixture error");
+        error.backoff_until = Some(now + TimeDelta::minutes(1));
+        for (a_quota, b_quota, expected) in [
+            (None, Some(cooldown(10)), Some(cooldown(10).until)),
+            (Some(cooldown(5)), Some(cooldown(10)), Some(cooldown(10).until)),
+            (Some(cooldown(5)), None, None),
+        ] {
+            let (auth_index, eligible) = {
+                let mut state = proxy.state.write().await;
+                let pool = &mut state.pool;
+                let a = pool.accounts.get_mut("google-a.json").unwrap();
+                a.last_error = Some(error.clone());
+                a.cooldown = a_quota;
+                assert!(!a.eligible(now, model));
+                let index = a.auth_index.clone();
+                pool.accounts.get_mut("google-b.json").unwrap().cooldown = b_quota;
+                assert_eq!(pool.verified_google_reset_at(model, None, now), expected, "{kind:?}");
+                (index, usize::from(b_quota.is_none()))
+            };
+            let path = format!("/v8/management/usage/windows?lane=google&model={model}");
+            let response: Value = http.management("GET", &path, None).await.json().await.unwrap();
+            let diagnostic = &response["model_eligibility"];
+            assert_eq!(diagnostic["verified_next_reset_at"], json!(expected), "{kind:?}");
+            assert_eq!(diagnostic["eligible_accounts"], eligible, "{kind:?}");
+            let a = diagnostic["accounts"].as_array().unwrap().iter().find(|a| a["auth_index"] == auth_index).unwrap();
+            let reasons = if a_quota.is_some() { json!(["quarantined", "global_cooldown"]) } else { json!(["quarantined"]) };
+            assert_eq!(a["exclusion_reasons"], reasons, "{kind:?}");
+        }
+    }
+}
+
 #[test]
 fn invalid_duplicate_retry_after_preserves_fallback_delay_without_proof() {
     let now = Utc::now();
@@ -3597,6 +3639,27 @@ fn google_route_replacement_drops_cached_quota_and_cooldowns() {
         assert!(a.cooldown.is_none() && a.last_error.is_none(), "{field}");
         assert!(a.scoped_cooldowns.is_empty() && a.windows.is_empty(), "{field}");
     }
+}
+
+#[test]
+fn google_route_replacement_drops_quarantine_from_reused_account() {
+    let mut pool = Pool::default();
+    pool.insert(
+        pool::parse_credentials("a.json", &json!({"type":"google","access_token":"fixture","project_id":"project-a"}), false).unwrap(),
+    );
+    let a = pool.accounts.get_mut("a.json").unwrap();
+    seed_old_google_route(a);
+    a.last_error.as_mut().unwrap().kind = AccountErrorKind::VerificationRequired;
+    let mut replacement = a.clone();
+    pool.insert(vec![replacement.clone()]);
+    assert!(pool.accounts["a.json"].quarantined(Utc::now()));
+
+    replacement.project = Some("project-b".into());
+    pool.insert(vec![replacement]);
+    let a = &pool.accounts["a.json"];
+    assert_eq!(a.project.as_deref(), Some("project-b"));
+    assert_google_route_cleared(a);
+    assert!(a.eligible(Utc::now(), "gemini-neon"));
 }
 
 #[tokio::test]
@@ -5715,6 +5778,7 @@ fn provenance_reload_updates_inherited_but_not_explicit_uploaded_projects() {
         assert_eq!(pool.accounts[id].project.as_deref(), Some("project-a"));
         let old = pool.accounts.get_mut(id).unwrap();
         seed_old_google_route(old);
+        old.last_error.as_mut().unwrap().kind = AccountErrorKind::VerificationRequired;
         let old_generation = old.probe_generation;
 
         pool::add_provenance_google(&mut pool, id, enrollment(refresh, Some("project-b")));
@@ -5729,6 +5793,7 @@ fn provenance_reload_updates_inherited_but_not_explicit_uploaded_projects() {
             assert_eq!(account.project.as_deref(), project);
             assert_eq!(account.probe_generation, old_generation);
             assert!(account.cooldown.is_some());
+            assert!(account.quarantined(Utc::now()));
         }
     }
     assert_eq!(pool.accounts.len(), 2);
@@ -5776,6 +5841,7 @@ async fn google_hydration_discards_evidence_from_the_projectless_route() {
         pool::parse_credentials("google.json", &json!({"type":"google","access_token":"fixture","email":"person@example.test"}), false)
             .unwrap();
     seed_old_google_route(&mut accounts[0]);
+    accounts[0].last_error.as_mut().unwrap().kind = AccountErrorKind::VerificationRequired;
     let old_generation = accounts[0].probe_generation;
     proxy.state.write().await.pool.insert(accounts);
     proxy.hydrate_google_metadata().await;
