@@ -673,8 +673,10 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
     let epoch =
         |n| clamp(DateTime::from_timestamp(n, 0).unwrap_or(if n < 0 { DateTime::<Utc>::MIN_UTC } else { DateTime::<Utc>::MAX_UTC }));
     let get = |name: &str| headers.get(name)?.to_str().ok();
+    let single = |name: &str| headers.get_all(name).iter().count() == 1;
     // Preserve the legacy interpretation, but only attest known header/format pairs.
     let parse_reset = |name: &str, raw: &str| {
+        let single = single(name);
         if let Ok(at) = raw.parse::<DateTime<Utc>>() {
             let known = matches!(
                 name,
@@ -685,7 +687,7 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
                     | "anthropic-ratelimit-output-tokens-reset"
             );
             let strict = matches!(raw.as_bytes().get(10), Some(&b'T' | &b't')) && DateTime::parse_from_rfc3339(raw).is_ok();
-            return Some(verify(clamp(at), known && strict));
+            return Some(verify(clamp(at), single && known && strict));
         }
         if let Ok(n) = raw.parse::<i64>() {
             let is_epoch = n > 1_000_000_000;
@@ -698,10 +700,10 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
                             | "anthropic-ratelimit-unified-7d-reset"
                     ));
             let cooldown = if is_epoch { epoch(n) } else { upstream_delay(now, n as f64) };
-            return Some(verify(cooldown, known && digits(raw)));
+            return Some(verify(cooldown, single && known && digits(raw)));
         }
         let known = matches!(name, "x-ratelimit-reset" | "x-ratelimit-reset-requests" | "x-ratelimit-reset-tokens");
-        duration_seconds(raw).map(|(n, strict)| verify(upstream_delay(now, n), known && strict))
+        duration_seconds(raw).map(|(n, strict)| verify(upstream_delay(now, n), single && known && strict))
     };
     if let Some(at) = get("retry-after").and_then(|raw| {
         raw.parse::<i64>().ok().filter(|n| *n >= 0).map(|n| verify(upstream_delay(now, n as f64), digits(raw))).or_else(|| {
@@ -710,12 +712,15 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
             Some(verify(clamp(at), strict))
         })
     }) {
-        return Some(at);
+        return Some(verify(at, single("retry-after")));
     }
     if lane == Lane::Codex {
         let windows = ["x-codex-primary", "x-codex-secondary"].map(|prefix| {
-            let exhausted = get(&format!("{prefix}-used-percent")).and_then(|s| s.parse::<f64>().ok()).is_some_and(|n| n >= 100.0);
-            let reset = get(&format!("{prefix}-reset-at")).and_then(|s| Some(verify(epoch(s.parse::<i64>().ok()?), digits(s))));
+            let percent = format!("{prefix}-used-percent");
+            let name = format!("{prefix}-reset-at");
+            let exhausted = get(&percent).and_then(|s| s.parse::<f64>().ok()).is_some_and(|n| n >= 100.0);
+            let reset = get(&name)
+                .and_then(|s| Some(verify(epoch(s.parse::<i64>().ok()?), single(&name) && (!exhausted || single(&percent)) && digits(s))));
             (exhausted, reset)
         });
         if windows.iter().any(|(exhausted, _)| *exhausted) {
@@ -733,18 +738,19 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
                 if !name.starts_with("anthropic-ratelimit-") {
                     return None;
                 }
-                match value.to_str().ok()? {
+                let window = match value.to_str().ok()? {
                     "rejected" => name.strip_suffix("-status"),
                     "0" => name.strip_suffix("-remaining"),
                     _ => None,
-                }
+                }?;
+                Some((window, single(name)))
             })
             .peekable();
         if exhausted.peek().is_some() {
             return exhausted
-                .filter_map(|window| {
+                .filter_map(|(window, unique)| {
                     let name = format!("{window}-reset");
-                    parse_reset(&name, get(&name)?)
+                    parse_reset(&name, get(&name)?).map(|at| verify(at, unique))
                 })
                 .reduce(Cooldown::merge);
         }

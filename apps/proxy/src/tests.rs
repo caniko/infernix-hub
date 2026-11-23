@@ -1488,6 +1488,48 @@ async fn google_routing_witness_and_usage_windows_share_model_validation() {
 }
 
 #[test]
+fn cached_quota_reset_cannot_be_verified_before_it_was_observed() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+    let mut pool = Pool::default();
+    let mut accounts = pool::parse_credentials("a.json", &json!({"type":"google","access_token":"fixture"}), false).unwrap();
+    let now = Utc::now();
+    let observed = now + TimeDelta::seconds(60);
+    let reset = now + TimeDelta::minutes(10);
+    accounts[0].windows =
+        parse_antigravity_summary(&json!({"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.0,"resetTime":reset}]}), observed);
+    pool.insert(accounts);
+    assert_eq!(pool.next_reset(Lane::Google, "gemini-neon", now), Some(reset));
+    assert_eq!(pool.verified_google_reset_at("gemini-neon", now), None);
+    assert_eq!(pool.verified_google_reset_at("gemini-neon", observed), Some(reset));
+}
+
+#[test]
+fn duplicate_quota_reset_headers_only_set_legacy_backoff() {
+    let now = Utc::now();
+    let epoch = |seconds: i64| (now.timestamp() + seconds).to_string();
+    for (lane, name, first, second, until) in [
+        (Lane::Google, "retry-after", "60".into(), "600".into(), now + TimeDelta::seconds(60)),
+        (Lane::Google, "x-ratelimit-reset", "60".into(), "600".into(), now + TimeDelta::seconds(600)),
+        (Lane::Codex, "x-codex-primary-reset-at", epoch(60), epoch(600), DateTime::from_timestamp(now.timestamp() + 60, 0).unwrap()),
+        (
+            Lane::Claude,
+            "anthropic-ratelimit-unified-reset",
+            epoch(60),
+            epoch(600),
+            DateTime::from_timestamp(now.timestamp() + 600, 0).unwrap(),
+        ),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.append(name, first.parse().unwrap());
+        assert!(router::header_cooldown(lane, &headers, now).unwrap().verified_reset);
+        headers.append(name, second.parse().unwrap());
+        let cooldown = router::header_cooldown(lane, &headers, now).unwrap();
+        assert_eq!(cooldown.until, until);
+        assert!(!cooldown.verified_reset, "{name}");
+    }
+}
+
+#[test]
 fn cached_quota_reset_must_be_in_range_when_observed() {
     use integrations::providers::antigravity::parse_antigravity_summary;
     let mut pool = Pool::default();
@@ -2125,7 +2167,7 @@ async fn a_passthrough_429_reports_a_broken_stream_after_its_prefix() {
 }
 
 #[tokio::test]
-async fn google_usage_probe_renews_then_retains_rejected_buckets_omitted_from_a_partial_response() {
+async fn google_usage_probe_renews_then_retains_rejected_buckets_only_on_the_same_route() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
     let usable = Arc::new(AtomicBool::new(true));
     let probes = Arc::new(AtomicUsize::new(0));
@@ -2205,6 +2247,20 @@ async fn google_usage_probe_renews_then_retains_rejected_buckets_omitted_from_a_
         assert!(!next.probe_failed);
         assert_eq!(next.access, "google-fresh");
         assert_eq!(next.project.as_deref(), Some("fresh-project"));
+        assert_eq!(next.windows.iter().map(|w| w.window_key.as_str()).collect::<Vec<_>>(), ["gemini-argon-quota"]);
+        assert!(next.eligible(Utc::now(), "gemini-4-neon-high"));
+    }
+    let current = {
+        let mut state = proxy.state.write().await;
+        let next = state.pool.accounts.get_mut("google.json").unwrap();
+        // A blocker observed for the newly enrolled route survives a partial probe of that route.
+        next.windows.extend(account.windows.clone());
+        next.clone()
+    };
+    proxy.refresh_usage(&current).await.unwrap();
+    {
+        let state = proxy.state.read().await;
+        let next = &state.pool.accounts["google.json"];
         assert_eq!(next.windows.iter().map(|w| w.window_key.as_str()).collect::<Vec<_>>(), ["gemini-5h", "gemini-argon-quota"]);
         assert!(!next.eligible(Utc::now(), "gemini-4-neon-high"));
         assert!(next.eligible(Utc::now(), "gemini-4-argon-high"));
@@ -2311,6 +2367,57 @@ async fn google_summary_retires_only_superseded_fallbacks_and_manual_reset_clear
     assert!(current.eligible(Utc::now(), "gemini-neon"));
     assert!(current.auth_cooldown.is_none());
     assert!(current.eligible(Utc::now(), "claude-opus-4"));
+}
+
+#[tokio::test]
+async fn google_probe_rechecks_the_enrolled_route_before_merging() {
+    let began = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mock = serve(Router::new().route(
+        "/v1internal:retrieveUserQuotaSummary",
+        post({
+            let (began, release) = (began.clone(), release.clone());
+            move || {
+                let (began, release) = (began.clone(), release.clone());
+                async move {
+                    began.notify_one();
+                    release.notified().await;
+                    axum::Json(json!({"buckets":[{"bucketId":"gemini-5h","window":"5h","remainingFraction":0.0}]}))
+                }
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    for changed in ["project", "base", "access"] {
+        let accounts = pool::parse_credentials(
+            "google.json",
+            &json!({"type":"google","access_token":"fixture","project_id":"original","email":"person@example.test"}),
+            false,
+        )
+        .unwrap();
+        let account = accounts[0].clone();
+        proxy.state.write().await.pool.insert(accounts);
+        let replace_route = async {
+            began.notified().await;
+            let mut state = proxy.state.write().await;
+            let current = state.pool.accounts.get_mut(&account.id).unwrap();
+            // Leave the generation unchanged to exercise the independent route check.
+            match changed {
+                "project" => current.project = Some("replacement".into()),
+                "base" => current.base = Some("https://replacement.example.test".parse().unwrap()),
+                _ => current.access = "replacement".into(),
+            }
+            release.notify_one();
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(proxy.refresh_usage(&account), replace_route) })
+                .await
+                .unwrap();
+        assert_eq!(result, Err("quota refresh was superseded"), "{changed}");
+        assert!(proxy.state.read().await.pool.accounts[&account.id].windows.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -2738,23 +2845,101 @@ async fn google_project_discovery_hydrates_uploads_and_supplies_quota_requests()
     assert_eq!(uploaded["email"], "google@example.test");
     assert_eq!(uploaded["status"], "active");
 
-    let account = pool::parse_credentials(
+    let mut account = pool::parse_credentials(
         "probe.json",
         &json!({"type":"google","access_token":"google-probe","email":"existing@example.test"}),
         false,
     )
     .unwrap()
     .remove(0);
+    seed_old_google_route(&mut account);
     let revision = {
         let mut state = proxy.state.write().await;
         state.pool.insert(vec![account.clone()]);
         state.pool.revision
     };
     proxy.refresh_usage(&account).await.unwrap();
-    assert_eq!(proxy.state.read().await.pool.revision, revision + 1);
+    {
+        let state = proxy.state.read().await;
+        let current = &state.pool.accounts["probe.json"];
+        assert_eq!(state.pool.revision, revision + 1);
+        assert!(current.eligible(Utc::now(), "gemini-neon"));
+        assert!(current.cooldown.is_none());
+        assert!(current.scoped_cooldowns.is_empty());
+        assert!(current.auth_cooldown.is_none());
+        assert_eq!(current.windows.len(), 1);
+        assert_eq!(current.windows[0].used_percent, Some(25.0));
+    }
     let rows: Value = http.management("GET", inventory, None).await.json().await.unwrap();
     let probe = rows["files"].as_array().unwrap().iter().find(|row| row["id"] == "probe.json").unwrap();
     assert_eq!(probe["project_id"], "probe-project");
+}
+
+#[test]
+fn provenance_reload_replaces_the_enrolled_google_project() {
+    let mut pool = Pool::default();
+    let enrollment = |project, refresh| json!({"access_token":"fixture","refresh_token":refresh,"project_id":project});
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("project-a", "old-refresh"));
+    let old = pool.accounts.values_mut().next().unwrap();
+    let id = old.id.clone();
+    seed_old_google_route(old);
+    let old_generation = old.probe_generation;
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("project-b", "old-refresh"));
+    let account = &pool.accounts[&id];
+    assert_eq!(account.project.as_deref(), Some("project-b"));
+    assert!(account.probe_generation > old_generation);
+    assert_google_route_cleared(account);
+
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("project-c", "new-refresh"));
+    assert_eq!(pool.accounts.len(), 1);
+    assert_eq!(pool.accounts[&id].project.as_deref(), Some("project-c"));
+    assert_eq!(pool.accounts[&id].refresh.as_deref(), Some("new-refresh"));
+}
+
+fn seed_old_google_route(account: &mut Account) {
+    let now = Utc::now();
+    let until = now + TimeDelta::minutes(10);
+    let cooldown = pool::Cooldown { until, verified_reset: true };
+    account.cooldown = Some(cooldown);
+    account.scoped_cooldowns.insert("gemini".into(), cooldown);
+    account.auth_cooldown = Some(until);
+    account.windows = integrations::providers::antigravity::parse_antigravity_summary(
+        &json!({"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.0,"resetTime":until}]}),
+        now,
+    );
+    account.google_fallback_keys.insert(account.windows[0].window_key.clone());
+    account.observed = Some(now);
+}
+
+fn assert_google_route_cleared(account: &Account) {
+    assert!(account.cooldown.is_none());
+    assert!(account.scoped_cooldowns.is_empty());
+    assert!(account.auth_cooldown.is_none());
+    assert!(account.windows.is_empty());
+    assert!(account.google_fallback_keys.is_empty());
+    assert!(account.observed.is_none());
+}
+
+#[tokio::test]
+async fn google_hydration_discards_evidence_from_the_projectless_route() {
+    let mock = serve(
+        Router::new().route("/v1internal:loadCodeAssist", post(|| async { axum::Json(json!({"cloudaicompanionProject":"discovered"})) })),
+    )
+    .await;
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    let mut accounts =
+        pool::parse_credentials("google.json", &json!({"type":"google","access_token":"fixture","email":"person@example.test"}), false)
+            .unwrap();
+    seed_old_google_route(&mut accounts[0]);
+    let old_generation = accounts[0].probe_generation;
+    proxy.state.write().await.pool.insert(accounts);
+    proxy.hydrate_google_metadata().await;
+    let state = proxy.state.read().await;
+    let account = &state.pool.accounts["google.json"];
+    assert_eq!(account.project.as_deref(), Some("discovered"));
+    assert_google_route_cleared(account);
+    assert!(account.probe_generation > old_generation);
 }
 
 #[test]

@@ -158,6 +158,7 @@ pub struct Account {
     pub organization: Option<String>,
     pub google_client: Option<String>,
     pub google_secret: Option<String>,
+    provenance_enrollment: Option<String>,
     pub project: Option<String>,
     pub api_key: bool,
     pub base: Option<reqwest::Url>,
@@ -190,6 +191,26 @@ impl Account {
             && (self.lane != Lane::Google || (self.project == other.project && self.base == other.base))
             && (self.refresh.is_none() || other.refresh.is_none() || self.refresh == other.refresh)
             && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
+    }
+
+    pub(crate) fn set_google_project(&mut self, project: Option<String>) -> bool {
+        if self.project == project {
+            return false;
+        }
+        self.project = project;
+        self.clear_google_route_evidence();
+        true
+    }
+
+    fn clear_google_route_evidence(&mut self) {
+        self.cooldown = None;
+        self.auth_cooldown = None;
+        self.scoped_cooldowns.clear();
+        self.windows.clear();
+        self.google_fallback_keys.clear();
+        self.observed = None;
+        self.probe_failed = false;
+        self.probe_generation = self.probe_generation.saturating_add(1);
     }
 
     pub fn eligible(&self, now: DateTime<Utc>, model: &str) -> bool {
@@ -451,6 +472,7 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             organization,
             google_client,
             google_secret,
+            provenance_enrollment: None,
             project: text(entry, &["project_id", "projectId", "project"]).map(str::to_owned),
             api_key,
             base: (api_key || lane == Lane::Go).then(|| base.clone()).flatten(),
@@ -653,7 +675,7 @@ impl Pool {
                     // A cached reset must have been credible when observed, not just when read.
                     let reset = windows.try_fold(now, |latest, w| {
                         let (observed, at) = (w.observed_at?, w.resets_at?);
-                        (observed < at && at - observed <= horizon).then_some(latest.max(at))
+                        (observed <= now && observed < at && at - observed <= horizon).then_some(latest.max(at))
                     });
                     block("quota_window", reset);
                 }
@@ -871,12 +893,16 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
+fn local_credential_name(lane: Lane, label: &str) -> String {
+    format!("local-{}-{}.json", lane.name(), hex::encode(&Sha256::digest(label)[..8]))
+}
+
 fn add(pool: &mut Pool, lane: Lane, label: &str, mut raw: Value) {
     let Some(fields) = raw.as_object_mut() else { return };
     fields.insert("type".into(), json!(lane.name()));
     fields.remove("provider");
     fields.remove("family");
-    let name = format!("local-{}-{}.json", lane.name(), hex::encode(&Sha256::digest(label)[..8]));
+    let name = local_credential_name(lane, label);
     if let Ok(mut found) = parse_credentials(&name, &raw, true) {
         let cutoff = Utc::now() + chrono::TimeDelta::seconds(30);
         found.retain(|a| {
@@ -920,20 +946,34 @@ pub(crate) fn provenance_google_manifests(config: &Config, user: &str) -> Vec<(S
 pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value) {
     let Some(fields) = raw.as_object_mut() else { return };
     fields.entry("label").or_insert_with(|| json!(label));
+    fields.insert("type".into(), json!(Lane::Google.name()));
+    fields.remove("provider");
+    fields.remove("family");
     let refresh = text(&raw, &["refresh_token", "refreshToken", "refresh"]).map(str::to_owned);
     let client = text(&raw, &["client_id", "clientId"]).map(str::to_owned);
     let secret = text(&raw, &["client_secret", "clientSecret"]).map(str::to_owned);
     let project = text(&raw, &["project_id", "projectId", "project"]).map(str::to_owned);
     let email = text(&raw, &["email"]).map(str::to_owned);
-    if let Some(refresh) = refresh.as_deref()
-        && let Some(existing) = pool.accounts.values_mut().find(|a| a.lane == Lane::Google && a.refresh.as_deref() == Some(refresh))
-    {
+    let enrolled = pool.accounts.values().find(|a| a.provenance_enrollment.as_deref() == Some(label));
+    let existing = enrolled.or_else(|| {
+        let refresh = refresh.as_ref()?;
+        pool.accounts.values().find(|a| a.lane == Lane::Google && a.refresh.as_ref() == Some(refresh))
+    });
+    if let Some(existing) = existing.map(|a| a.id.clone()).and_then(|id| pool.accounts.get_mut(&id)) {
+        if existing.provenance_enrollment.as_deref() == Some(label) && existing.refresh != refresh {
+            let Ok(mut replacements) = parse_credentials(&existing.name, &raw, true) else { return };
+            let Some(mut replacement) = replacements.pop().filter(|a| a.id == existing.id) else { return };
+            replacement.provenance_enrollment = existing.provenance_enrollment.clone();
+            replacement.probe_generation = existing.probe_generation.saturating_add(1);
+            pool.insert(vec![replacement]);
+            pool.revision += 1;
+            return;
+        }
         let relabel = existing.local
             && existing.label != label
             && (existing.label == existing.name || existing.label.starts_with("local-") || existing.label.len() == 64);
         let enriched = (existing.google_client.is_none() && client.is_some())
             || (existing.google_secret.is_none() && secret.is_some())
-            || (existing.project.is_none() && project.is_some())
             || (existing.email.is_none() && email.is_some());
         if relabel {
             existing.label = label.to_owned();
@@ -944,16 +984,23 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         if existing.google_secret.is_none() {
             existing.google_secret = secret;
         }
-        if existing.project.is_none() {
-            existing.project = project;
+        if existing.local && existing.provenance_enrollment.is_none() {
+            existing.provenance_enrollment = Some(label.to_owned());
         }
+        let project_changed = (existing.provenance_enrollment.as_deref() == Some(label) || existing.project.is_none())
+            && project.is_some()
+            && existing.set_google_project(project);
         if existing.email.is_none() {
             existing.email = email;
         }
-        pool.revision += i64::from(relabel || enriched);
+        pool.revision += i64::from(relabel || enriched || project_changed);
         return;
     }
-    add(pool, Lane::Google, &format!("provenance:{label}"), raw);
+    let source = format!("provenance:{label}");
+    add(pool, Lane::Google, &source, raw);
+    if let Some(account) = pool.accounts.get_mut(&local_credential_name(Lane::Google, &source)) {
+        account.provenance_enrollment = Some(label.to_owned());
+    }
 }
 
 pub(crate) fn add_opencode(pool: &mut Pool, raw: &Value, excluded: &BTreeSet<Lane>) {
