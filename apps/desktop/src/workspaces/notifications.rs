@@ -61,6 +61,25 @@ pub fn renewal_for<'a>(renewals: &'a [Renewal], subject_id: Option<&str>) -> Opt
     renewals.iter().find(|renewal| renewal.key == subject || renewal.id.to_string() == subject)
 }
 
+fn openable_subject<'a>(kind: Option<&'a str>, raw_id: Option<&str>) -> Option<(&'a str, Uuid)> {
+    // Match the actions that actually select an item, not workspace-only fallbacks.
+    let kind = kind?;
+    match kind {
+        "content" | "content_item" | "news" | "news_item" | "persona" | "relationship" => Some((kind, Uuid::parse_str(raw_id?).ok()?)),
+        _ => None,
+    }
+}
+
+fn renewal_link_label(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    (matches!(scheme, "https" | "http")
+        && !authority.is_empty()
+        && !authority.contains(['@', '\\'])
+        && !url.chars().any(char::is_whitespace))
+    .then_some(authority)
+}
+
 #[component]
 pub fn NotificationsView() -> Element {
     let store = use_context::<Store>();
@@ -76,11 +95,9 @@ pub fn NotificationsView() -> Element {
         async move { api::refresh_renewals(store, client).await }
     });
 
-    let list = rows(&feed.items, filter.cloned());
     let current = filter.cloned();
+    let list = rows(&feed.items, current);
     let open = feed.open.max(0);
-    let open_tone = (if open > 0 { "warn" } else { "muted" }).to_string();
-    let empty_title = (if current == Filter::Open { "Nothing open." } else { "No notifications yet." }).to_string();
     let client_ack_all = client.clone();
     let ack_all = move |_| {
         let client = client_ack_all.clone();
@@ -92,23 +109,30 @@ pub fn NotificationsView() -> Element {
             div { class: "work-head",
                 div {
                     h1 { "Notifications" }
-                    p { class: "hint", "Conditions the hub wants you to see; the feed wakes on change, it does not poll." }
+                    p { class: "hint", "Review what needs your attention and revisit past notifications." }
                 }
                 div { class: "spacer" }
-                Chip { label: format!("{open} open"), tone: Some(open_tone) }
-                if feed.critical > 0 {
-                    Chip { label: format!("{} critical", feed.critical), tone: Some("bad".to_string()) }
+                if open > 0 {
+                    Chip { label: format!("{open} open"), tone: Some("warn".to_string()) }
+                    if feed.critical > 0 {
+                        Chip { label: format!("{} critical", feed.critical), tone: Some("bad".to_string()) }
+                    }
+                    button { class: "btn secondary", onclick: ack_all, "Acknowledge all" }
+                } else if !list.is_empty() {
+                    Chip { label: format!("{} total", list.len()), tone: None }
                 }
-                button { class: "btn btn-glass", disabled: open == 0, onclick: ack_all, "Acknowledge all" }
             }
-            div { class: "row",
+            div { class: "toolbar", role: "group", aria_label: "Notification filter",
                 button {
-                    class: if current == Filter::Open { "btn btn-primary btn-xs" } else { "btn btn-glass btn-xs" },
+                    class: "filter-chip",
+                    aria_pressed: if current == Filter::Open { "true" } else { "false" },
                     onclick: move |_| filter.set(Filter::Open),
                     "Open"
                 }
                 button {
-                    class: if current == Filter::All { "btn btn-primary btn-xs" } else { "btn btn-glass btn-xs" },
+                    id: "notification-filter-all",
+                    class: "filter-chip",
+                    aria_pressed: if current == Filter::All { "true" } else { "false" },
                     onclick: move |_| filter.set(Filter::All),
                     "All"
                 }
@@ -119,13 +143,33 @@ pub fn NotificationsView() -> Element {
             if let Some(error) = feed.feed_error.clone() {
                 ErrorCard { code: error.code, message: error.message }
             }
-            Panel { title: "Feed".to_string(), caption: Some(format!("{} shown", list.len())),
+            Panel { title: "Feed".to_string(), caption: None,
                 if !feed.loaded && feed.feed_error.is_none() {
-                    Loading { text: "Connecting to the notification feed…".to_string() }
+                    Loading { text: "Loading notifications…".to_string() }
                 } else if list.is_empty() {
-                    EmptyState {
-                        title: empty_title,
-                        hint: Some("Producers and agents raise rows here; a change wakes the feed at once.".to_string()),
+                    if feed.feed_error.is_none() {
+                        if current == Filter::Open {
+                            EmptyState {
+                                title: "No open notifications".to_string(),
+                                hint: Some("Inbox notifications are separate from live Fleet status. Check Command Center for active host or service issues.".to_string()),
+                                actions: Some(rsx! {
+                                    button {
+                                        class: "btn secondary",
+                                        onclick: move |_| {
+                                            filter.set(Filter::All);
+                                            let _ = document::eval("document.getElementById('notification-filter-all')?.focus()");
+                                        },
+                                        "Browse notification history"
+                                    }
+                                }),
+                            }
+                        } else {
+                            EmptyState {
+                                icon: Some("◷".to_string()),
+                                title: "No notifications yet".to_string(),
+                                hint: Some("Notifications will appear here when the hub receives them.".to_string()),
+                            }
+                        }
                     }
                 } else {
                     div { class: "stack",
@@ -170,10 +214,8 @@ fn NotificationRow(notification: Notification) -> Element {
         spawn(api::snooze_notification(store, client, id, 7));
     };
 
-    let subject = notification.subject_type.clone().zip(notification.subject_id.clone());
-    // A renewal or opportunity has no workspace of its own; the renewal expands
-    // below and `hubctl` covers the rest (same rule as Today's rows).
-    let subject = subject.filter(|(kind, _)| kind != "renewal" && kind != "opportunity");
+    let subject =
+        openable_subject(notification.subject_type.as_deref(), notification.subject_id.as_deref()).map(|(kind, id)| (kind.to_string(), id));
 
     let needs_due = renewal.as_ref().is_some_and(|renewal| renewal.cadence_days.is_none());
     let mut due = use_signal(String::new);
@@ -215,17 +257,14 @@ fn NotificationRow(notification: Notification) -> Element {
             }
             div { class: "row",
                 if notification.open {
-                    button { class: "btn btn-glass btn-xs", onclick: ack, "Acknowledge" }
-                    button { class: "btn btn-glass btn-xs", onclick: snooze_day, "Snooze 1 d" }
-                    button { class: "btn btn-glass btn-xs", onclick: snooze_week, "Snooze 1 w" }
+                    button { class: "btn secondary btn-xs", onclick: ack, "Acknowledge" }
+                    button { class: "btn secondary btn-xs", onclick: snooze_day, "Snooze 1 d" }
+                    button { class: "btn secondary btn-xs", onclick: snooze_week, "Snooze 1 w" }
                 }
-                if let Some((subject_type, raw_id)) = subject {
+                if let Some((subject_type, subject_id)) = subject {
                     button {
-                        class: "btn btn-glass btn-xs",
-                        onclick: move |_| match Uuid::parse_str(&raw_id) {
-                            Ok(id) => actions::open_subject(store, &subject_type, id),
-                            Err(_) => store.notify(false, "This notification's subject is not an id."),
-                        },
+                        class: "btn secondary btn-xs",
+                        onclick: move |_| actions::open_subject(store, &subject_type, subject_id),
                         "Open"
                     }
                 }
@@ -250,29 +289,31 @@ fn NotificationRow(notification: Notification) -> Element {
                     }
                     p { class: "line", "{renewal.procedure}" }
                     div { class: "row",
-                        for (index, url) in renewal.urls.iter().enumerate() {
-                            {
-                                let url = url.clone();
-                                rsx! {
-                                    button {
-                                        class: "btn btn-glass btn-xs",
-                                        title: "{url}",
-                                        onclick: move |_| api::open_external(&url),
-                                        "Open page {index + 1}"
-                                    }
+                        for (index, url) in renewal.urls.iter().cloned().enumerate() {
+                            if let Some(label) = renewal_link_label(&url).map(str::to_owned) {
+                                button {
+                                    key: "{index}-{url}",
+                                    class: "btn secondary btn-xs",
+                                    title: "{url}",
+                                    onclick: move |_| api::open_external(&url),
+                                    "Open {label}"
                                 }
                             }
                         }
+                    }
+                    div { class: "row",
                         if needs_due {
-                            input {
-                                class: "input",
-                                r#type: "datetime-local",
-                                aria_label: "New due date (UTC)",
-                                value: "{due}",
-                                oninput: move |event| due.set(event.value()),
+                            label { class: "form-field",
+                                "New due date (UTC)"
+                                input {
+                                    class: "input",
+                                    r#type: "datetime-local",
+                                    value: "{due}",
+                                    oninput: move |event| due.set(event.value()),
+                                }
                             }
                         }
-                        button { class: "btn btn-primary btn-xs", onclick: mark_renewed, "Mark renewed" }
+                        button { class: "btn primary btn-xs", onclick: mark_renewed, "Mark renewed" }
                     }
                 }
             }
@@ -339,6 +380,14 @@ mod tests {
     }
 
     #[test]
+    fn all_shows_history_when_the_open_inbox_is_empty() {
+        let id = Uuid::new_v4();
+        let items = set(vec![notification(id, "today", 1, false)]);
+        assert!(rows(&items, Filter::Open).is_empty());
+        assert_eq!(rows(&items, Filter::All).first().map(|row| row.id), Some(id));
+    }
+
+    #[test]
     fn pinning_follows_the_summary_day_and_labels_name_the_reason() {
         let today = Uuid::new_v4();
         let yesterday = Uuid::new_v4();
@@ -390,5 +439,25 @@ mod tests {
         assert_eq!(renewal_for(&list, Some(&id)).map(|r| r.id), Some(renewal.id));
         assert!(renewal_for(&list, Some("other")).is_none());
         assert!(renewal_for(&list, None).is_none());
+    }
+
+    #[test]
+    fn only_selectable_subjects_with_valid_ids_can_be_opened() {
+        let id = Uuid::new_v4();
+        let raw = id.to_string();
+        assert_eq!(openable_subject(Some("content_item"), Some(&raw)), Some(("content_item", id)));
+        assert_eq!(openable_subject(Some("news"), Some("not-an-id")), None);
+        assert_eq!(openable_subject(Some("renewal"), Some(&raw)), None);
+        assert_eq!(openable_subject(Some("unknown"), Some(&raw)), None);
+        assert_eq!(openable_subject(Some("release"), Some(&raw)), None);
+        assert_eq!(openable_subject(Some("persona"), None), None);
+    }
+
+    #[test]
+    fn renewal_links_show_the_destination_and_skip_non_web_urls() {
+        assert_eq!(renewal_link_label("https://github.com/settings/tokens?type=beta"), Some("github.com"));
+        assert_eq!(renewal_link_label("javascript:alert(1)"), None);
+        assert_eq!(renewal_link_label("https:///settings"), None);
+        assert_eq!(renewal_link_label("https://example.org@other.test/"), None);
     }
 }

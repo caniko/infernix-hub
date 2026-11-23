@@ -494,7 +494,11 @@ pub fn IndividualWizard(persona_id: Option<Uuid>, project_id: Option<Uuid>, on_c
                             div { class: "field-row", label { r#for: "individual-bio", "Bio (kept verbatim)" } textarea { id: "individual-bio", class: "input", value: "{bio}", oninput: move |e| bio.set(e.value()) } }
                             div { class: "field-row", label { r#for: "individual-look", "Look description" } textarea { id: "individual-look", class: "input", value: "{look}", oninput: move |e| look.set(e.value()) } }
                             ListEditor { title: "Palette".to_string(), hint: "Hex colours".to_string(), items: palette, placeholder: "#ffffff".to_string() }
-                            div { class: "field-row", label { r#for: "individual-voice", "Kokoro voice id" } input { id: "individual-voice", class: "input", value: "{voice}", oninput: move |e| voice.set(e.value()) } }
+                            div { class: "form-field",
+                                label { r#for: "individual-voice", "Voice preset" }
+                                input { id: "individual-voice", class: "input", aria_describedby: "individual-voice-help", value: "{voice}", oninput: move |e| voice.set(e.value()) }
+                                p { class: "form-help", id: "individual-voice-help", "Optional Kokoro preset, such as af_heart." }
+                            }
                             button { class: "btn btn-glass", disabled: busy() || id().is_none(), onclick: move |_| {
                                 let Some(persona) = id() else { return }; busy.set(true); error.set(None); let client = client.clone(); let input = CanonDraftIn { bio: bio() };
                                 spawn(async move { match api::draft_canon(&client, persona, &input).await {
@@ -607,8 +611,9 @@ pub fn IndividualWizard(persona_id: Option<Uuid>, project_id: Option<Uuid>, on_c
                                 let running = look.passes.iter().any(|p| matches!(p.generation.state, contracts::GenerationState::Running | contracts::GenerationState::Dispatched | contracts::GenerationState::Cancelling));
                                 let workflow = workflows().iter().find(|w| w.id == generation.workflow_id).map(|w| w.name.clone());
                                 let retry = workflow.as_deref().and_then(|name| retry_input(&generation, name));
-                                rsx! { div {
-                                button { class: "btn btn-glass", style: "margin-left: {node.depth * 16}px", onclick: move |_| refine_pass.set(Some(node.generation_id)), "{node.label} · {node.state.as_str()}" }
+                                 let indent = node.depth.min(3) * 16;
+                                 rsx! { div { style: "padding-inline-start: min({indent}px, 20%);",
+                                 button { class: "btn secondary", onclick: move |_| refine_pass.set(Some(node.generation_id)), "{node.label} · {node.state.as_str()}" }
                                 if !terminal(generation.state) {
                                     if let Some(previous) = previous { p { "Queued behind P{previous + 1}" } }
                                     else if generation.state == contracts::GenerationState::Requested && !running { p { "Waiting for the GPU" } }

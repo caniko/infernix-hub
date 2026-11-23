@@ -7,6 +7,8 @@ use dioxus::prelude::*;
 pub mod chat;
 pub mod history;
 pub mod proposal;
+pub mod states;
+pub use states::EmptyState;
 
 /// A single headline number with a required text label (never colour-only).
 #[component]
@@ -34,19 +36,6 @@ pub fn Panel(title: String, caption: Option<String>, children: Element) -> Eleme
                 }
             }
             {children}
-        }
-    }
-}
-
-/// Explicit empty state — every list gets one.
-#[component]
-pub fn EmptyState(title: String, hint: Option<String>) -> Element {
-    rsx! {
-        div { class: "empty glass-card",
-            p { "{title}" }
-            if let Some(h) = hint {
-                p { class: "label-tech", "{h}" }
-            }
         }
     }
 }

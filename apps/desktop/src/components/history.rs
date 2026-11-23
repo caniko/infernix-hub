@@ -15,18 +15,18 @@ pub struct HistoryLine {
 #[component]
 pub fn HistoryFeed(entries: Vec<HistoryLine>) -> Element {
     rsx! {
-        div { class: "audit-feed",
+        div { class: "audit-feed hairline-list",
             if entries.is_empty() {
-                p { class: "label-tech empty", "No history yet." }
+                p { class: "empty", "No history yet." }
             } else {
                 for e in entries.iter() {
-                    div { class: "audit-row", key: "{e.seq}-{e.event}",
+                    div { class: "history-row hairline-row", key: "{e.seq}-{e.event}",
                         span { class: "ev", "{e.event}" }
+                        span { class: "when", "{e.when}" }
                         if !e.detail.is_empty() {
                             span { class: "detail", "{e.detail}" }
                         }
-                        span { class: "when label-tech", "{e.when}" }
-                        span { class: "seq label-tech", "#{e.seq}" }
+                        span { class: "seq mono", "#{e.seq}" }
                     }
                 }
             }

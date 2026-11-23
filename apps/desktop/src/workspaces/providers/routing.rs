@@ -1,17 +1,28 @@
+use std::collections::BTreeMap;
+
 use super::{dashboard::account_name, *};
 
 #[component]
 pub(super) fn Routing(providers: Vec<ProviderSummary>) -> Element {
-    rsx! { for provider in providers {
-        RouterCard { key: "{provider.descriptor.id}", provider }
-    } }
+    let running = use_signal(BTreeMap::<String, bool>::new);
+    let (mut capable, unsupported): (Vec<_>, Vec<_>) = providers.into_iter().partition(has_routing);
+    capable.sort_by_key(|p| !running.read().get(&p.descriptor.id).copied().unwrap_or_default());
+    let unsupported = unsupported.into_iter().map(|p| p.descriptor.label).collect::<Vec<_>>().join(", ");
+    rsx! {
+        for provider in capable {
+            RouterCard { key: "{provider.descriptor.id}", provider, running }
+        }
+        if !unsupported.is_empty() {
+            aside { class: "severity-row form-help",
+                strong { "No proxy or routing controls: " }
+                "{unsupported}"
+            }
+        }
+    }
 }
 
-#[component]
-fn RouterCard(provider: ProviderSummary) -> Element {
-    let client = use_context::<HubClient>();
-    let panel = use_context::<PanelState>();
-    let has_controls = provider.descriptor.router_id.is_some()
+fn has_routing(provider: &ProviderSummary) -> bool {
+    provider.descriptor.router_id.is_some()
         || provider.descriptor.capabilities.iter().any(|cap| {
             matches!(
                 cap,
@@ -24,32 +35,44 @@ fn RouterCard(provider: ProviderSummary) -> Element {
                     | ProviderCapability::ConfigureProxy
                     | ProviderCapability::SetPoolOverride
                     | ProviderCapability::MoveConversation
+                    | ProviderCapability::ManageClientKey
+                    | ProviderCapability::ApplyClientWiring
+                    | ProviderCapability::UndoClientWiring
             )
-        });
+        })
+}
+
+#[component]
+fn RouterCard(provider: ProviderSummary, mut running: Signal<BTreeMap<String, bool>>) -> Element {
+    let client = use_context::<HubClient>();
+    let panel = use_context::<PanelState>();
     let id = segment(&provider.descriptor.id);
+    let provider_id = provider.descriptor.id.clone();
     let data = use_resource(move || {
         let (id, client) = (id.clone(), client.clone());
+        let provider_id = provider_id.clone();
         let _ = (panel.epoch)();
-        async move { if has_controls { timed(client.provider_routing(&path_id(id)?)).await.map(Some) } else { Ok(None) } }
+        async move {
+            let view = timed(client.provider_routing(&path_id(id)?)).await?;
+            let is_running = view.runtime.as_ref().is_some_and(|runtime| runtime.running);
+            if running.peek().get(&provider_id).copied() != Some(is_running) {
+                running.write().insert(provider_id, is_running);
+            }
+            Ok(view)
+        }
     });
     let result = data.read();
     rsx! {
         section { class: "glass-card stack",
             h2 { "{provider.descriptor.label} · Routing & Proxy" }
-            if has_controls {
-                {read_view(result.as_ref(), |view| rsx! {
-                    if let Some(view) = view {
-                        RouterDetails { key: "{view.revision}", provider: provider.clone(), view: view.clone() }
-                    }
-                })}
-                if panel.operator() && provider.descriptor.capabilities.contains(&ProviderCapability::ReadProxyLogs) {
-                    details {
-                        summary { "Redacted proxy logs" }
-                        Logs { provider_id: provider.descriptor.id.clone() }
-                    }
+            {read_view(result.as_ref(), |view| rsx! {
+                RouterDetails { key: "{view.revision}", provider: provider.clone(), view: view.clone() }
+            })}
+            if panel.operator() && provider.descriptor.capabilities.contains(&ProviderCapability::ReadProxyLogs) {
+                details {
+                    summary { "Redacted proxy logs" }
+                    Logs { provider_id: provider.descriptor.id.clone() }
                 }
-            } else {
-                p { class: "muted", "No proxy or routing capabilities reported for this provider." }
             }
         }
     }
@@ -58,34 +81,63 @@ fn RouterCard(provider: ProviderSummary) -> Element {
 #[component]
 fn RouterDetails(provider: ProviderSummary, view: RoutingView) -> Element {
     let revision = view.revision;
+    let panel = use_context::<PanelState>();
+    let can_rotate = panel.operator() && supports(&provider, None, ProviderCapability::ManageClientKey);
+    let running = view.runtime.as_ref().map(|r| r.running);
     rsx! {
         div { class: "provider-inset stack",
             h3 { "Proxy runtime" }
             if let Some(runtime) = &view.runtime {
                 div { class: "row",
                     Chip { label: if runtime.running { "Running".to_string() } else { "Stopped".to_string() }, tone: Some(if runtime.running { "ok".into() } else { "muted".into() }) }
-                    span { "Observed {fmt_dt(runtime.updated_at)}" }
+                    span { class: "form-help", "Observed " span { class: "nowrap-unit", "{fmt_dt(runtime.updated_at)}" } }
                 }
-                p { {format!("Endpoint: {} · Port: {} · Build: {}", runtime.endpoint.as_deref().unwrap_or("—"), runtime.port.map_or_else(|| "—".to_string(), |p| p.to_string()), runtime.build_version.as_deref().unwrap_or("—"))} }
-                p { "LAN bind: {runtime.lan_bind} · Client key: " {runtime.client_key_hint.as_deref().unwrap_or("—")} " · Crash restarts: {runtime.crash_restarts}" }
-                if let Some(owner) = &runtime.shared_profile_owner { p { "Shared profile owner: {owner}" } }
-                if let Some(error) = &runtime.last_error { p { role: "status", "{error}" } }
-                if supports(&provider, None, ProviderCapability::ConfigureProxy) {
-                    ProxyConfig { provider: provider.clone(), runtime: runtime.clone(), revision }
+                dl { class: "kv-grid content-bounded", style: "max-width: 46rem;",
+                    div { class: "kv-item proxy-endpoint",
+                        dt { class: "kv-label", "Endpoint" }
+                        dd { class: "kv-value nowrap-unit",
+                            if let Some(endpoint) = &runtime.endpoint { "{endpoint}" }
+                            else if let Some(port) = runtime.port { "Port {port}" }
+                            else { "—" }
+                        }
+                    }
+                    for (label, value) in [
+                        ("LAN access", if runtime.lan_bind { "Enabled" } else { "Off" }.into()),
+                        ("Build", runtime.build_version.clone().unwrap_or_else(|| "—".into())),
+                        ("Client Key", runtime.client_key_hint.clone().unwrap_or_else(|| "—".into())),
+                        ("Crashes", runtime.crash_restarts.to_string()),
+                    ] {
+                        div { key: "{label}", class: "kv-item", dt { class: "kv-label", "{label}" } dd { class: "kv-value", "{value}" } }
+                    }
                 }
+                if let Some(owner) = &runtime.shared_profile_owner { p { class: "form-help", "Shared profile owner: {owner}" } }
+                if let Some(error) = &runtime.last_error { p { class: "severity-row severity-warn", role: "status", "{error}" } }
             } else { p { class: "muted", "Proxy runtime not observed." } }
             div { class: "row",
-                for (action, label) in [(ProxyAction::Start, "Start"), (ProxyAction::Stop, "Stop"), (ProxyAction::Restart, "Restart")] {
-                    OperationButton { key: "{label}", provider: provider.clone(), label, confirm: action != ProxyAction::Start,
-                        disabled: view.runtime.as_ref().is_some_and(|r| match action { ProxyAction::Start => r.running, ProxyAction::Stop | ProxyAction::Restart => !r.running }),
+                if running != Some(true) {
+                    OperationButton { provider: provider.clone(), label: "Start", tone: "primary",
+                        command: ProviderCommand::Routing(RoutingCommand::ControlProxy { action: ProxyAction::Start }) }
+                }
+                for (action, label, tone) in [(ProxyAction::Restart, "Restart", "secondary"), (ProxyAction::Stop, "Stop", "warning")] {
+                    OperationButton { key: "{label}", provider: provider.clone(), label, tone, confirm: true, disabled: running == Some(false),
                         command: ProviderCommand::Routing(RoutingCommand::ControlProxy { action }) }
                 }
-                OperationButton { provider: provider.clone(), label: "Regenerate Client Key", confirm: true,
-                    disabled: view.runtime.as_ref().is_some_and(|r| r.shared_profile_owner.is_some()),
-                    command: ProviderCommand::Routing(RoutingCommand::RegenerateClientKey) }
+            }
+            if can_rotate {
+                div { class: "row",
+                    OperationButton { provider: provider.clone(), label: "Regenerate client key", tone: "danger", confirm: true,
+                        disabled: view.runtime.as_ref().is_some_and(|r| r.shared_profile_owner.is_some()),
+                        command: ProviderCommand::Routing(RoutingCommand::RegenerateClientKey) }
+                    span { class: "form-help", "After regeneration, reconnect existing clients with the new key." }
+                }
             }
         }
         RoutingPolicyView { provider: provider.clone(), policy: view.policy, revision }
+        if panel.operator() && supports(&provider, None, ProviderCapability::ConfigureProxy) && let Some(runtime) = &view.runtime {
+            details { class: "provider-inset", summary { "Proxy configuration" }
+                ProxyConfig { provider: provider.clone(), runtime: runtime.clone(), revision }
+            }
+        }
         MoveConversation { provider: provider.clone(), session_id: String::new() }
         if !view.clients.is_empty() || provider.descriptor.capabilities.contains(&ProviderCapability::ReadClientWiring) {
             div { class: "provider-inset stack",
@@ -135,10 +187,14 @@ fn ProxyConfig(provider: ProviderSummary, runtime: ProxyRuntimeStatus, revision:
     let mut port = use_signal(|| runtime.port.map(|n| n.to_string()).unwrap_or_default());
     let mut lan = use_signal(|| runtime.lan_bind);
     let mut auto = use_signal(|| runtime.auto_start);
+    let lan_help = format!("proxy-lan-help-{}", use_hook(Uuid::new_v4));
     let port_num = port().parse::<u16>().ok().filter(|n| *n > 0);
-    rsx! { div { class: "row",
+    rsx! { div { class: "row content-bounded",
         Field { label: "Port", kind: "number", value: port(), change: move |v| port.set(v) }
-        Check { label: "Bind on LAN", value: lan(), change: move |v| lan.set(v) }
+        div { class: "form-field", style: "max-width: 15rem;",
+            Check { label: "Allow LAN", value: lan(), description_id: lan_help.clone(), change: move |v| lan.set(v) }
+            p { class: "form-help", id: lan_help, "Let other devices on your local network connect to the proxy." }
+        }
         Check { label: "Auto start", value: auto(), change: move |v| auto.set(v) }
         OperationButton { provider, label: "Save proxy configuration", revision, confirm: lan() && !runtime.lan_bind,
             disabled: !port().is_empty() && port_num.is_none(),
@@ -165,6 +221,11 @@ fn RoutingPolicyView(provider: ProviderSummary, policy: RoutingPolicy, revision:
     let mut near_reset = use_signal(|| policy.near_reset_wait_secs.to_string());
     let mut first_byte = use_signal(|| policy.first_byte_timeout_secs.to_string());
     let mut preferred = use_signal(|| policy.preferred_account_id.clone().unwrap_or_default());
+    let help_id = use_hook(Uuid::new_v4);
+    let key_order_help = format!("routing-key-order-help-{help_id}");
+    let near_reset_help = format!("routing-near-reset-help-{help_id}");
+    let saved_strategy = route_strategy_label(policy.strategy);
+    let saved_key_order = api_key_order_label(policy.api_key_order);
     let (a, c, n, f) = (affinity().parse(), cooldown().parse(), near_reset().parse(), first_byte().parse());
     let valid = a.is_ok() && c.is_ok() && n.is_ok() && f.is_ok();
     let policy = RoutingPolicy {
@@ -175,39 +236,59 @@ fn RoutingPolicyView(provider: ProviderSummary, policy: RoutingPolicy, revision:
         ..draft()
     };
     let current = policy.clone();
+    let key_order_caption = match current.api_key_order {
+        ApiKeyOrder::KeysLast => "Prefer subscription logins; fall back to API keys last.",
+        ApiKeyOrder::KeysFirst => "Try API keys before subscription logins.",
+        ApiKeyOrder::SubscriptionsOnly => "Use subscription logins without falling back to API keys.",
+    };
     let mask = use_context::<PanelState>().settings.read().mask_emails;
     let mut options = vec![(String::new(), "Automatic".into())];
     options.extend(
         provider.accounts.iter().filter(|a| a.enabled || preferred.read().as_str() == a.id).map(|a| (a.id.clone(), account_name(a, mask))),
     );
-    rsx! { div { class: "provider-inset stack",
-        h3 { "Routing policy" }
-        p { class: "muted", "Revision {revision} · current strategy: {route_strategy_label(current.strategy)} · key order: {api_key_order_label(current.api_key_order)}" }
-        if supports(&provider, None, ProviderCapability::SetRoutePolicy) {
-            div { class: "row",
-                Choice { label: "Strategy", value: format!("{:?}", current.strategy),
-                    options: STRATEGIES.iter().map(|(v, label)| (format!("{v:?}"), label.to_string())).collect(),
-                    change: move |key: String| if let Some((v, _)) = STRATEGIES.iter().find(|(v, _)| format!("{v:?}") == key) { draft.write().strategy = *v; } }
-                Choice { label: "API key order", value: format!("{:?}", current.api_key_order),
-                    options: ORDERS.iter().map(|(v, label)| (format!("{v:?}"), label.to_string())).collect(),
-                    change: move |key: String| if let Some((v, _)) = ORDERS.iter().find(|(v, _)| format!("{v:?}") == key) { draft.write().api_key_order = *v; } }
-                Field { label: "Session affinity (s)", kind: "number", value: affinity(), change: move |v| affinity.set(v) }
-                Field { label: "Failover cooldown (s)", kind: "number", value: cooldown(), change: move |v| cooldown.set(v) }
-                Field { label: "Near-reset wait (s)", kind: "number", value: near_reset(), change: move |v| near_reset.set(v) }
-                Field { label: "First-byte timeout (s)", kind: "number", value: first_byte(), change: move |v| first_byte.set(v) }
-                Check { label: "Switch on server error", value: current.switch_on_server_error, change: move |v| draft.write().switch_on_server_error = v }
-                OperationButton { provider: provider.clone(), label: "Save policy", revision, disabled: !valid,
-                    command: ProviderCommand::Routing(RoutingCommand::SetRoutePolicy { policy }) }
+    rsx! {
+        section { class: "provider-inset stack",
+            h3 { "Routing policy" }
+            p { class: "form-help", "Revision {revision} · current strategy: {saved_strategy} · key order: {saved_key_order}" }
+            if supports(&provider, None, ProviderCapability::SetRoutePolicy) {
+                div { class: "form-grid-2 content-bounded", style: "align-items: start;",
+                    Choice { label: "Strategy", value: format!("{:?}", current.strategy),
+                        options: STRATEGIES.iter().map(|(v, label)| (format!("{v:?}"), label.to_string())).collect(),
+                        change: move |key: String| if let Some((v, _)) = STRATEGIES.iter().find(|(v, _)| format!("{v:?}") == key) { draft.write().strategy = *v; } }
+                    div { class: "form-field",
+                        Choice { label: "Key order", value: format!("{:?}", current.api_key_order), description_id: key_order_help.clone(),
+                            options: ORDERS.iter().map(|(v, label)| (format!("{v:?}"), label.to_string())).collect(),
+                            change: move |key: String| if let Some((v, _)) = ORDERS.iter().find(|(v, _)| format!("{v:?}") == key) { draft.write().api_key_order = *v; } }
+                        p { class: "form-help", id: key_order_help, "{key_order_caption}" }
+                    }
+                    Field { label: "Session affinity (seconds)", kind: "number", value: affinity(), change: move |v| affinity.set(v) }
+                    Field { label: "Failover cooldown (seconds)", kind: "number", value: cooldown(), change: move |v| cooldown.set(v) }
+                    div { class: "form-field",
+                        Field { label: "Near-reset wait (seconds)", kind: "number", value: near_reset(), description_id: near_reset_help.clone(),
+                            change: move |v| near_reset.set(v) }
+                        p { class: "form-help", id: near_reset_help, "Maximum wait for a quota reset, where supported. 0 skips the wait." }
+                    }
+                    Field { label: "First-byte timeout (seconds)", kind: "number", value: first_byte(), change: move |v| first_byte.set(v) }
+                }
+                div { class: "row",
+                    Check { label: "Switch on server error", value: current.switch_on_server_error, change: move |v| draft.write().switch_on_server_error = v }
+                    OperationButton { provider: provider.clone(), label: "Save policy", tone: "primary", revision, disabled: !valid,
+                        command: ProviderCommand::Routing(RoutingCommand::SetRoutePolicy { policy }) }
+                }
             }
         }
         if supports(&provider, None, ProviderCapability::SetPoolOverride) {
-            div { class: "row",
-                Choice { label: "Preferred pool account", value: preferred(), options, change: move |v| preferred.set(v) }
-                OperationButton { provider, label: "Apply override", revision, confirm: true,
-                    command: ProviderCommand::Routing(RoutingCommand::SetPoolOverride { account_id: optional(&preferred()) }) }
+            section { class: "provider-inset stack",
+                h3 { "Account override" }
+                p { class: "form-help", "Choose Automatic to follow the routing policy." }
+                div { class: "row content-bounded",
+                    Choice { label: "Preferred pool account", value: preferred(), options, change: move |v| preferred.set(v) }
+                    OperationButton { provider, label: "Apply override", revision, confirm: true,
+                        command: ProviderCommand::Routing(RoutingCommand::SetPoolOverride { account_id: optional(&preferred()) }) }
+                }
             }
         }
-    } }
+    }
 }
 
 #[component]

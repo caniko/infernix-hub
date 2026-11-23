@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use contracts::{
     Account, Asset, CanonRevision, ChatMessage, ContentDetail, ContentItem, NewsItem, Notification, NotificationPage, Persona, Project,
-    PublicationIntent, Relationship, RelationshipDetail, ReleaseState, Renewal, SearchHit, SystemStatus, Today, Workflow,
+    PublicationIntent, Relationship, RelationshipDetail, ReleaseState, Renewal, SystemStatus, Today, Workflow,
 };
 use dioxus::prelude::*;
 use uuid::Uuid;
@@ -118,20 +118,24 @@ impl Workspace {
 
     pub fn hint(self) -> &'static str {
         match self {
-            Workspace::Notifications => "conditions the hub wants you to see, newest first",
-            Workspace::Command => "fleet health, attention queue and snapshot age",
-            Workspace::Hosts => "health, revision and failed checks per host",
-            Workspace::Alerts => "monitored services that are down",
-            Workspace::Approvals => "privileged operations waiting for the operator",
-            Workspace::Providers => "model provider accounts, remaining quota, activity, routing and exports",
-            Workspace::Today => "reviews, production, due releases, failed work, overdue replies",
-            Workspace::News => "coverage, evidence and brief creation",
-            Workspace::Studio => "brief, generation, assets, release freeze and scheduling",
-            Workspace::Calendar => "intents by day and account",
-            Workspace::Relationships => "threads, ownership, drafts and handoff",
-            Workspace::Projects => "influencer projects and individuals",
-            Workspace::Library => "assets",
+            Workspace::Notifications => "Conditions the hub wants you to see, newest first",
+            Workspace::Command => "Fleet health, attention queue and snapshot age",
+            Workspace::Hosts => "Health, revision and failed checks per host",
+            Workspace::Alerts => "Monitored services that are down",
+            Workspace::Approvals => "Privileged operations waiting for the operator",
+            Workspace::Providers => "Model provider accounts, remaining quota, activity, routing and exports",
+            Workspace::Today => "Reviews, production, due releases, failed work and overdue replies",
+            Workspace::News => "Coverage, evidence and brief creation",
+            Workspace::Studio => "Briefs, generation, assets, release freeze and scheduling",
+            Workspace::Calendar => "Scheduled posts by day",
+            Workspace::Relationships => "Threads, ownership, drafts and handoff",
+            Workspace::Projects => "Influencer projects and individuals",
+            Workspace::Library => "Assets",
         }
+    }
+
+    pub fn supports_inspector(self) -> bool {
+        matches!(self, Self::Hosts | Self::News | Self::Studio | Self::Relationships | Self::Projects)
     }
 
     /// Sidebar section heading.
@@ -284,7 +288,6 @@ pub struct Store {
     pub canon: Signal<Loaded<Vec<CanonRevision>>>,
     pub chat_content: Signal<Loaded<Vec<ChatMessage>>>,
     pub chat_persona: Signal<Loaded<Vec<ChatMessage>>>,
-    pub search: Signal<Loaded<Vec<SearchHit>>>,
 
     pub selected_content: Signal<Option<Uuid>>,
     pub selected_news: Signal<Option<Uuid>>,
@@ -326,8 +329,23 @@ impl Store {
     }
 
     pub fn toggle_inspector(&self) {
-        let mut open = self.inspector_open;
-        open.set(!open.cloned());
+        if (self.workspace).cloned().supports_inspector() {
+            self.set_inspector_open(!(self.inspector_open).cloned());
+        }
+    }
+
+    /// Selection identity, not the polled payload: refreshes must never reopen
+    /// an inspector the operator dismissed.
+    pub fn inspector_item(&self, workspace: Workspace) -> Option<String> {
+        let id = match workspace {
+            Workspace::Hosts => return (self.selected_host).cloned(),
+            Workspace::News => (self.selected_news).cloned(),
+            Workspace::Studio => (self.selected_content).cloned(),
+            Workspace::Relationships => (self.selected_relationship).cloned(),
+            Workspace::Projects if (self.projects_show_individual).cloned() => (self.selected_persona).cloned(),
+            _ => None,
+        };
+        id.map(|id| id.to_string())
     }
 
     pub fn insert_asset_image(&self, id: Uuid, uri: String) {
@@ -390,10 +408,6 @@ impl Store {
     }
     pub fn set_chat_persona(&self, value: Loaded<Vec<ChatMessage>>) {
         let mut signal = self.chat_persona;
-        signal.set(value);
-    }
-    pub fn set_search(&self, value: Loaded<Vec<SearchHit>>) {
-        let mut signal = self.search;
         signal.set(value);
     }
     pub fn set_selected_content(&self, value: Option<Uuid>) {

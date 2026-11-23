@@ -8,9 +8,16 @@ use crate::{
     api,
     components::{EmptyState, ErrorCard, Loading, Panel},
     format,
+    labels::news_source,
     shell::ContextItem,
     state::{Store, Workspace},
 };
+
+fn coverage_label(mentions: i64, sources: usize) -> String {
+    let mention_suffix = if mentions == 1 { "" } else { "s" };
+    let source_suffix = if sources == 1 { "" } else { "s" };
+    format!("{mentions} mention{mention_suffix} · {sources} source{source_suffix}")
+}
 
 #[component]
 pub fn NewsView() -> Element {
@@ -27,6 +34,8 @@ pub fn NewsView() -> Element {
     let mut copy = use_signal(String::new);
     let mut visual = use_signal(String::new);
     let mut form_for = use_signal(|| Option::<Uuid>::None);
+    let mut pending = use_signal(|| false);
+    let personas = (store.personas).cloned();
 
     use_effect(move || {
         if let Some(id) = (store.selected_news).cloned()
@@ -40,23 +49,30 @@ pub fn NewsView() -> Element {
             visual.set(String::new());
             form_for.set(Some(id));
         }
-        if persona.cloned().is_none() {
-            persona.set((store.personas).cloned().data.and_then(|items| items.first().map(|p| p.id)));
+        if let Some(items) = (store.personas).cloned().data {
+            let selected = persona();
+            if !items.iter().any(|item| Some(item.id) == selected) {
+                let first = items.first().map(|item| item.id);
+                if first != selected {
+                    persona.set(first);
+                }
+            }
         }
     });
 
-    let submit = move |_| {
+    let submit = move |event: FormEvent| {
+        event.prevent_default();
+        if pending() {
+            return;
+        }
         let Some(persona_id) = persona.cloned() else {
-            store.notify(false, "Select a persona before creating a brief.");
             return;
         };
-        let Some(news_item_id) = (store.selected_news).cloned() else {
-            store.notify(false, "Select a news item first.");
+        let Some(news_item_id) = (store.selected_news).cloned().filter(|id| form_for() == Some(*id)) else {
             return;
         };
         let title_value = title.cloned().trim().to_string();
         if title_value.is_empty() {
-            store.notify(false, "A brief needs a title.");
             return;
         }
         let body = CreateBriefIn {
@@ -72,15 +88,20 @@ pub fn NewsView() -> Element {
             },
         };
         let client = client.clone();
+        pending.set(true);
         spawn(async move {
             match api::timed(client.create_brief(&body)).await {
                 Ok(item) => {
                     store.notify(true, format!("Brief created: {}", item.title));
+                    api::refresh_base(store, client).await;
+                    pending.set(false);
                     store.set_selected_content(Some(item.id));
                     store.set_workspace(Workspace::Studio);
-                    api::refresh_base(store, client).await;
                 }
-                Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
+                Err(error) => {
+                    pending.set(false);
+                    store.notify(false, format!("{} — {}", error.code, error.message));
+                }
             }
         });
     };
@@ -99,7 +120,7 @@ pub fn NewsView() -> Element {
                             ContextItem {
                                 key: "{item.id}",
                                 title: item.title.clone(),
-                                meta: format!("coverage {} · {} sources", item.coverage, item.sources.len()),
+                                meta: coverage_label(item.coverage, item.sources.len()),
                                 active: Some(item.id) == selected_id,
                                 on_select: move |_| store.set_selected_news(Some(item.id)),
                             }
@@ -115,120 +136,168 @@ pub fn NewsView() -> Element {
                 ErrorCard { code: error.code, message: error.message }
             }
             match selected {
-                None if news.error.is_none() => rsx! { Loading { text: "Loading news…".to_string() } },
-                None => rsx! { EmptyState { title: "Select a news item.".to_string(), hint: None } },
+                None if news.loading => rsx! { Loading { text: "Loading news…".to_string() } },
+                None if news.data.as_ref().is_some_and(Vec::is_empty) => rsx! {
+                    EmptyState { title: "No news yet".to_string(), hint: None }
+                },
+                None => rsx! { EmptyState { title: "Select a story".to_string(), hint: None } },
                 Some(item) => rsx! {
-                    div { class: "work-head",
-                        div {
+                    header { class: "work-head", style: "flex-wrap: nowrap; align-items: start;",
+                        div { style: "min-width: 0; flex: 1; overflow-wrap: anywhere;",
                             h1 { "{item.title}" }
-                            p { class: "hint", "coverage {item.coverage} · {item.sources.len()} sources · first seen {format::fmt_dt(item.first_seen_at)}" }
+                            p { class: "hint", "{coverage_label(item.coverage, item.sources.len())} · First seen {format::fmt_dt(item.first_seen_at)}" }
                         }
-                        div { class: "spacer" }
                         button {
-                            class: "btn btn-glass",
-                            onclick: move |_| api::open_external(&item.canonical_url),
+                            class: "btn secondary",
+                            style: "flex: none;",
+                            onclick: {
+                                let url = item.canonical_url.clone();
+                                move |_| api::open_external(&url)
+                            },
                             "Open source"
                         }
                     }
-                    Panel { title: "Summary".to_string(), caption: Some("normalized event".to_string()),
-                        p { "{item.summary}" }
-                        p { class: "label-tech", "{item.canonical_url}" }
-                        div { class: "row",
-                            for source in item.sources.iter() {
-                                span { class: "chip", key: "{source}", "{source}" }
+                    p { style: "margin-bottom: 12px; overflow-wrap: anywhere;", "{item.summary}" }
+                    if let Some(content) = item.content_item_id {
+                        div { class: "toolbar",
+                            button {
+                                class: "btn secondary btn-xs",
+                                onclick: move |_| crate::actions::open_subject(store, "content", content),
+                                "Open in Studio"
                             }
-                            span { class: "chip info", "coverage {item.coverage}" }
-                            if let Some(content) = item.content_item_id {
+                        }
+                    }
+                    section { class: "panel",
+                        h2 { "Create brief" }
+                        if let Some(error) = personas.error.clone() {
+                            ErrorCard { code: error.code, message: error.message }
+                        } else if personas.loading {
+                            Loading { text: "Loading personas…".to_string() }
+                        }
+                        form { class: "form-stack", onsubmit: submit,
+                             div { class: "form-field",
+                                 label { class: "label-tech", r#for: "news-title",
+                                     "Title "
+                                     span { aria_hidden: "true", "*" }
+                                 }
+                                 input {
+                                     id: "news-title", class: "input", value: "{title}", required: true,
+                                     oninput: move |e| title.set(e.value()),
+                                 }
+                             }
+                             div { class: "form-field",
+                                 label { class: "label-tech", r#for: "news-persona",
+                                     "Persona "
+                                     span { aria_hidden: "true", "*" }
+                                 }
+                                 select {
+                                     id: "news-persona", class: "input", required: true,
+                                     aria_describedby: personas.data.as_ref().is_some_and(Vec::is_empty).then_some("news-persona-help"),
+                                     value: "{persona.cloned().map(|id| id.to_string()).unwrap_or_default()}",
+                                     onchange: move |e| persona.set(e.value().parse().ok()),
+                                     option { value: "", "Select persona" }
+                                     if let Some(items) = personas.data.as_ref() {
+                                         for p in items {
+                                             option { key: "{p.id}", value: "{p.id}", "{p.name}" }
+                                         }
+                                     }
+                                 }
+                                 if personas.data.as_ref().is_some_and(Vec::is_empty) {
+                                     p { class: "form-help", id: "news-persona-help", "Add an individual in Projects first." }
+                                 }
+                             }
+                            div { class: "form-row",
+                                div { class: "form-field",
+                                    label { class: "label-tech", r#for: "news-angle", "Angle" }
+                                    input {
+                                        id: "news-angle", class: "input",
+                                        placeholder: "What to say", value: "{angle}", oninput: move |e| angle.set(e.value()),
+                                    }
+                                }
+                                div { class: "form-field",
+                                    label { class: "label-tech", r#for: "news-audience", "Audience" }
+                                    input {
+                                        id: "news-audience", class: "input",
+                                        placeholder: "Who should read it", value: "{audience}", oninput: move |e| audience.set(e.value()),
+                                    }
+                                }
+                            }
+                            div { class: "form-row",
+                                div { class: "form-field",
+                                    label { class: "label-tech", r#for: "news-copy", "Copy direction" }
+                                    textarea {
+                                        id: "news-copy", class: "input", rows: "2", style: "min-height: 0; overflow-wrap: anywhere;",
+                                        placeholder: "Tone, structure, claims to avoid",
+                                        value: "{copy}", oninput: move |e| copy.set(e.value()),
+                                    }
+                                }
+                                div { class: "form-field",
+                                    label { class: "label-tech", r#for: "news-visual", "Visual direction" }
+                                    textarea {
+                                        id: "news-visual", class: "input", rows: "2", style: "min-height: 0; overflow-wrap: anywhere;",
+                                        placeholder: "Composition, palette, references",
+                                        value: "{visual}", oninput: move |e| visual.set(e.value()),
+                                    }
+                                }
+                            }
+                            div { class: "row",
                                 button {
-                                    class: "btn btn-glass btn-xs",
-                                    onclick: move |_| crate::actions::open_subject(store, "content", content),
-                                    "Open content"
+                                    class: "btn primary", r#type: "submit",
+                                    disabled: pending() || form_for() != Some(item.id) || persona().is_none() || title.read().trim().is_empty(),
+                                    if pending() { "Creating brief…" } else { "Create brief" }
                                 }
                             }
                         }
                     }
-                    Panel { title: "Evidence".to_string(), caption: Some("quoted sources".to_string()),
+                    Panel { title: "Sources and evidence".to_string(), caption: None,
+                        if !item.sources.is_empty() {
+                            div { class: "row",
+                                for source in item.sources.iter() {
+                                    span { class: "chip", style: "max-width: 100%; white-space: normal; overflow-wrap: anywhere;", key: "{source}",
+                                         if source == &item.canonical_url { "Primary source" } else { "{news_source(source)}" }
+                                    }
+                                }
+                            }
+                        }
                         if item.evidence.is_empty() {
-                            EmptyState { title: "No evidence quotes attached.".to_string(), hint: Some("Ingest can attach quotes to the event.".to_string()) }
+                            p { class: "muted", "No quoted evidence attached." }
                         } else {
-                            for (i, evidence) in item.evidence.iter().enumerate() {
-                                blockquote { class: "quote", key: "{i}",
-                                    "“{evidence.quote}”"
-                                    cite { "{evidence.url}" }
-                                }
-                            }
-                        }
-                    }
-                    Panel { title: "Create brief".to_string(), caption: Some("POST /v1/content".to_string()),
-                        div { class: "form-grid",
-                            div { class: "field-row",
-                                label { class: "label-tech", r#for: "news-persona", "Persona" }
-                                div {
-                                    if let Some(error) = (store.personas).cloned().error {
-                                        ErrorCard { code: error.code, message: error.message }
-                                    } else if (store.personas).cloned().data.is_none() {
-                                        Loading { text: "Loading personas…".to_string() }
-                                    }
-                                    select {
-                                    id: "news-persona",
-                                    class: "input",
-                                    value: "{persona.cloned().map(|id| id.to_string()).unwrap_or_default()}",
-                                    onchange: move |e| persona.set(e.value().parse().ok()),
-                                    option { value: "", "Select persona" }
-                                    if let Some(personas) = (store.personas).cloned().data {
-                                        for p in personas {
-                                            option { key: "{p.id}", value: "{p.id}", "{p.name}" }
-                                        }
-                                    }
-                                    }
-                                }
-                            }
-                            div { class: "field-row",
-                                label { class: "label-tech", r#for: "news-title", "Title" }
-                                input {
-                                    id: "news-title", class: "input", value: "{title}",
-                                    oninput: move |e| title.set(e.value()),
-                                }
-                            }
-                            div { class: "field-row",
-                                label { class: "label-tech", r#for: "news-angle", "Angle" }
-                                input {
-                                    id: "news-angle", class: "input",
-                                    placeholder: "what the operator wants to say",
-                                    value: "{angle}", oninput: move |e| angle.set(e.value()),
-                                }
-                            }
-                            div { class: "field-row",
-                                label { class: "label-tech", r#for: "news-audience", "Audience" }
-                                input {
-                                    id: "news-audience", class: "input",
-                                    placeholder: "who it is for",
-                                    value: "{audience}", oninput: move |e| audience.set(e.value()),
-                                }
-                            }
-                            div { class: "field-row",
-                                label { class: "label-tech", r#for: "news-copy", "Copy direction" }
-                                textarea {
-                                    id: "news-copy", class: "input",
-                                    placeholder: "tone, structure, claims to avoid",
-                                    value: "{copy}", oninput: move |e| copy.set(e.value()),
-                                }
-                            }
-                            div { class: "field-row",
-                                label { class: "label-tech", r#for: "news-visual", "Visual direction" }
-                                textarea {
-                                    id: "news-visual", class: "input",
-                                    placeholder: "composition, palette, references",
-                                    value: "{visual}", oninput: move |e| visual.set(e.value()),
-                                }
-                            }
-                            div { class: "form-actions",
-                                button { class: "btn btn-primary", onclick: submit, "Create brief" }
+                            for (index, evidence) in item.evidence.iter().enumerate() {
+                                 {
+                                     let source = if evidence.url == item.canonical_url { "Primary source" } else { news_source(&evidence.url) };
+                                     if evidence.quote.trim() == item.summary.trim() {
+                                         rsx! { p { class: "form-help", style: "overflow-wrap: anywhere;", key: "{index}", "Summary source: {source}" } }
+                                     } else {
+                                         rsx! { blockquote { class: "quote", style: "overflow-wrap: anywhere;", key: "{index}",
+                                             "“{evidence.quote}”"
+                                             cite { "{source}" }
+                                         } }
+                                     }
+                                 }
                             }
                         }
                     }
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{coverage_label, news_source};
+
+    #[test]
+    fn coverage_labels_mentions_and_sources_independently() {
+        assert_eq!(coverage_label(2, 1), "2 mentions · 1 source");
+        assert_eq!(coverage_label(1, 2), "1 mention · 2 sources");
+        assert_eq!(coverage_label(0, 0), "0 mentions · 0 sources");
+    }
+
+    #[test]
+    fn source_labels_describe_the_feed_without_hiding_unknown_sources() {
+        assert_eq!(news_source("n8n:rss-studio"), "Studio RSS feed");
+        assert_eq!(news_source("windmill:f/news/scrape"), "Windmill news scraper");
+        assert_eq!(news_source("Independent Gazette"), "Independent Gazette");
     }
 }

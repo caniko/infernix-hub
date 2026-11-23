@@ -1,10 +1,38 @@
+use std::collections::BTreeMap;
+
 use super::{
-    dashboard::{AccountIdentity, sorted_accounts},
+    dashboard::{AccountIdentity, account_name, is_next_pick, sorted_accounts},
     *,
 };
 
 #[component]
-pub(super) fn Accounts(providers: Vec<ProviderSummary>) -> Element {
+pub(super) fn Accounts(mut providers: Vec<ProviderSummary>) -> Element {
+    providers.sort_by_key(|provider| {
+        use ProviderCapability::*;
+        ![
+            BeginOAuth,
+            ImportLogin,
+            RenewLogin,
+            RemoveLogin,
+            ExportLogin,
+            SelectLocalAccount,
+            SelectPersistentAccount,
+            SetEnabled,
+            SetPriority,
+            SetWeight,
+            SetNote,
+            ManageKeyGroups,
+            ManageKeys,
+            ToggleKey,
+            SetGroupEnabled,
+            SetRequestIdentity,
+            ConfigureModels,
+            DiscoverModels,
+            SetModelAliases,
+        ]
+        .into_iter()
+        .any(|cap| supports(provider, None, cap))
+    });
     rsx! { for provider in providers {
         AccountProvider { key: "{provider.descriptor.id}", provider }
     } }
@@ -15,35 +43,47 @@ fn AccountProvider(provider: ProviderSummary) -> Element {
     let prefs = use_context::<PanelState>().settings.cloned();
     let mut hint = use_signal(String::new);
     let mut login_label = use_signal(String::new);
-    let can_import = supports(&provider, None, ProviderCapability::ImportLogin);
+    let mut import_label = use_signal(String::new);
+    let operator = use_context::<PanelState>().operator();
+    let can_import = operator && supports(&provider, None, ProviderCapability::ImportLogin);
+    let can_connect = operator && supports(&provider, None, ProviderCapability::BeginOAuth);
     rsx! {
         section { class: "glass-card stack",
-            h2 { "{provider.descriptor.label} · Logins" }
-            if provider.descriptor.capabilities.is_empty() { p { class: "muted", "Read-only provider inventory." } }
             div { class: "row",
-                if supports(&provider, None, ProviderCapability::BeginOAuth) || can_import {
-                    Field { label: "New login label (optional)", value: login_label(), change: move |v| login_label.set(v) }
-                }
-                OperationButton { provider: provider.clone(), label: "Begin OAuth", command: ProviderCommand::Credential(CredentialCommand::BeginOAuth {
-                    account_label: optional(&login_label()), host: None, unix_user: None,
-                }) }
+                h2 { "{provider.descriptor.label} · Logins" }
+                div { class: "spacer" }
                 OperationButton { provider: provider.clone(), label: "Renew all logins", confirm: true,
                     command: ProviderCommand::Credential(CredentialCommand::RenewLogin { account_id: None }) }
             }
+            if provider.descriptor.capabilities.is_empty() { p { class: "form-help", "Read-only provider inventory." } }
+            if can_connect {
+                div { class: "row", role: "group", aria_label: "Add an account",
+                    Field { label: "New login label (optional)", value: login_label(), change: move |v| login_label.set(v) }
+                    OperationButton { provider: provider.clone(), label: "Connect account", tone: "primary",
+                        command: ProviderCommand::Credential(CredentialCommand::BeginOAuth {
+                            account_label: optional(&login_label()), host: None, unix_user: None,
+                        }) }
+                }
+            }
             if can_import {
-                div { class: "row",
-                    p { class: "muted", "Use the source reference understood by the provider’s credential owner. Do not paste tokens or credential JSON." }
-                    Field { label: "Login source reference", value: hint(), change: move |v| hint.set(v) }
-                    OperationButton { provider: provider.clone(), label: "Import login", confirm: true, disabled: optional(&hint()).is_none(),
-                        command: ProviderCommand::Credential(CredentialCommand::ImportLogin { label: optional(&login_label()), source_hint: hint().trim().into() }) }
+                details { summary { "Import an existing login" }
+                    p { class: "form-help", "Use the source reference understood by the provider’s credential owner. Do not paste tokens or credential JSON." }
+                    div { class: "row",
+                        Field { label: "Login source reference", value: hint(), change: move |v| hint.set(v) }
+                        Field { label: "Imported login label (optional)", value: import_label(), change: move |v| import_label.set(v) }
+                        OperationButton { provider: provider.clone(), label: "Import login", confirm: true, disabled: optional(&hint()).is_none(),
+                            command: ProviderCommand::Credential(CredentialCommand::ImportLogin { label: optional(&import_label()), source_hint: hint().trim().into() }) }
+                    }
                 }
             }
             if provider.accounts.is_empty() { p { class: "muted", "No logins or account bindings observed." } }
-            for account in sorted_accounts(&provider, prefs.account_sort, prefs.mask_emails) {
-                AccountEditor { key: "{account.id}-{account.priority}-{account.weight}", provider: provider.clone(), account: account.clone(), mask: prefs.mask_emails }
+            div { class: "hairline-list",
+                for account in sorted_accounts(&provider, prefs.account_sort, prefs.mask_emails) {
+                    AccountEditor { key: "{account.id}-{account.priority}-{account.weight}", provider: provider.clone(), account: account.clone(), mask: prefs.mask_emails }
+                }
             }
+            KeyGroups { provider }
         }
-        KeyGroups { provider }
     }
 }
 
@@ -56,49 +96,71 @@ fn AccountEditor(provider: ProviderSummary, account: ModelAccount, mask: bool) -
     let mut scope = use_signal(|| "host".to_string());
     let mut target = use_signal(|| account.host.clone().unwrap_or_default());
     let toggle = if account.enabled { "Disable" } else { "Enable" };
-    let local =
-        AccountCommand::SelectLocalAccount { account_id: id.clone(), host: account.host.clone(), unix_user: account.unix_user.clone() };
+    let name = account_name(&account, mask);
+    let operator = use_context::<PanelState>().operator();
+    let can_edit = |cap| operator && supports(&provider, Some(&account), cap);
+    let can_switch = !account.is_active && can_edit(ProviderCapability::SelectLocalAccount);
+    let can_renew = can_edit(ProviderCapability::RenewLogin);
+    let edit_persistent = can_edit(ProviderCapability::SelectPersistentAccount);
+    let edit_priority = can_edit(ProviderCapability::SetPriority);
+    let edit_weight = can_edit(ProviderCapability::SetWeight);
+    let edit_note = can_edit(ProviderCapability::SetNote);
     rsx! {
-        article { class: "provider-inset stack",
-            AccountIdentity { provider: provider.clone(), account: account.clone(), mask }
-            p { class: "muted", "Priority {account.priority} · weight {account.weight} · last used {date(account.last_used_at)}" }
+        article { class: "hairline-row stack", style: "padding-block: 8px; gap: 4px;",
+            AccountIdentity { provider: provider.clone(), account: account.clone(), mask, show_last_used: true }
             if let Some(note) = &account.note { p { "{note}" } }
-            div { class: "row",
-                OperationButton { provider: provider.clone(), account: account.clone(), label: "Switch local account",
-                    disabled: !account.enabled || account.is_active, command: ProviderCommand::Account(local) }
-                OperationButton { provider: provider.clone(), account: account.clone(), label: toggle, confirm: account.enabled,
-                    command: ProviderCommand::Account(AccountCommand::SetEnabled { account_id: id.clone(), enabled: !account.enabled }) }
-                OperationButton { provider: provider.clone(), account: account.clone(), label: "Renew login",
-                    command: ProviderCommand::Credential(CredentialCommand::RenewLogin { account_id: Some(id.clone()) }) }
-                OperationButton { provider: provider.clone(), account: account.clone(), label: "Export login", confirm: true,
-                    command: ProviderCommand::Credential(CredentialCommand::ExportLogin { account_id: id.clone() }) }
-                OperationButton { provider: provider.clone(), account: account.clone(), label: "Remove login", confirm: true,
-                    command: ProviderCommand::Credential(CredentialCommand::RemoveLogin { account_id: id.clone() }) }
-            }
-            if supports(&provider, Some(&account), ProviderCapability::SelectPersistentAccount) {
+            if can_switch || can_renew {
                 div { class: "row",
-                    Field { label: "Persistent selection scope", value: scope(), change: move |v| scope.set(v) }
-                    Field { label: "Persistent target (optional)", value: target(), change: move |v| target.set(v) }
-                    OperationButton { provider: provider.clone(), account: account.clone(), label: "Set persistent account", confirm: true,
-                        disabled: !account.enabled || optional(&scope()).is_none(),
-                        command: ProviderCommand::Account(AccountCommand::SelectPersistentAccount { account_id: id.clone(), scope: scope().trim().into(), target: optional(&target()) }) }
+                    if can_switch {
+                        OperationButton { provider: provider.clone(), account: account.clone(),
+                            label: "Switch account", disabled: !account.enabled,
+                            command: ProviderCommand::Account(AccountCommand::SelectLocalAccount {
+                                account_id: id.clone(), host: account.host.clone(), unix_user: account.unix_user.clone(),
+                            }) }
+                    }
+                    if can_renew {
+                        OperationButton { provider: provider.clone(), account: account.clone(), label: "Renew login", tone: "secondary",
+                            command: ProviderCommand::Credential(CredentialCommand::RenewLogin { account_id: Some(id.clone()) }) }
+                    }
                 }
             }
-            div { class: "row",
-                if supports(&provider, Some(&account), ProviderCapability::SetPriority) {
-                    Field { label: "Priority", kind: "number", value: priority(), change: move |v| priority.set(v) }
-                    OperationButton { provider: provider.clone(), account: account.clone(), label: "Save priority", disabled: priority().parse::<i32>().is_err(),
-                        command: ProviderCommand::Account(AccountCommand::SetPriority { account_id: id.clone(), priority: priority().parse().unwrap_or_default() }) }
+            details {
+                summary { aria_label: "Manage {name}", "Manage" }
+                p { class: "form-help", "Routing priority: {account.priority} · Routing weight: {account.weight}" }
+                if is_next_pick(&provider, &account) { p { class: "form-help", "Next pick for routing" } }
+                div { class: "row",
+                    OperationButton { provider: provider.clone(), account: account.clone(), label: toggle, confirm: account.enabled,
+                        command: ProviderCommand::Account(AccountCommand::SetEnabled { account_id: id.clone(), enabled: !account.enabled }) }
+                    OperationButton { provider: provider.clone(), account: account.clone(), label: "Export login", confirm: true,
+                        command: ProviderCommand::Credential(CredentialCommand::ExportLogin { account_id: id.clone() }) }
+                    OperationButton { provider: provider.clone(), account: account.clone(), label: "Remove login", tone: "danger", confirm: true,
+                        command: ProviderCommand::Credential(CredentialCommand::RemoveLogin { account_id: id.clone() }) }
                 }
-                if supports(&provider, Some(&account), ProviderCapability::SetWeight) {
-                    Field { label: "Weight", kind: "number", value: weight(), change: move |v| weight.set(v) }
-                    OperationButton { provider: provider.clone(), account: account.clone(), label: "Save weight", disabled: !weight().parse::<u32>().is_ok_and(|n| n > 0),
-                        command: ProviderCommand::Account(AccountCommand::SetWeight { account_id: id.clone(), weight: weight().parse().unwrap_or_default() }) }
+                if edit_persistent {
+                    div { class: "row",
+                        Field { label: "Persistent selection scope", value: scope(), change: move |v| scope.set(v) }
+                        Field { label: "Persistent target (optional)", value: target(), change: move |v| target.set(v) }
+                        OperationButton { provider: provider.clone(), account: account.clone(), label: "Set persistent account", confirm: true,
+                            disabled: !account.enabled || optional(&scope()).is_none(),
+                            command: ProviderCommand::Account(AccountCommand::SelectPersistentAccount { account_id: id.clone(), scope: scope().trim().into(), target: optional(&target()) }) }
+                    }
                 }
-                if supports(&provider, Some(&account), ProviderCapability::SetNote) {
-                    Field { label: "Note", value: note(), change: move |v| note.set(v) }
-                    OperationButton { provider: provider.clone(), account: account.clone(), label: "Save note",
-                        command: ProviderCommand::Account(AccountCommand::SetNote { account_id: id.clone(), note: optional(&note()) }) }
+                div { class: "row",
+                    if edit_priority {
+                        Field { label: "Priority", kind: "number", value: priority(), change: move |v| priority.set(v) }
+                        OperationButton { provider: provider.clone(), account: account.clone(), label: "Save priority", disabled: priority().parse::<i32>().is_err(),
+                            command: ProviderCommand::Account(AccountCommand::SetPriority { account_id: id.clone(), priority: priority().parse().unwrap_or_default() }) }
+                    }
+                    if edit_weight {
+                        Field { label: "Weight", kind: "number", value: weight(), change: move |v| weight.set(v) }
+                        OperationButton { provider: provider.clone(), account: account.clone(), label: "Save weight", disabled: !weight().parse::<u32>().is_ok_and(|n| n > 0),
+                            command: ProviderCommand::Account(AccountCommand::SetWeight { account_id: id.clone(), weight: weight().parse().unwrap_or_default() }) }
+                    }
+                    if edit_note {
+                        Field { label: "Note", value: note(), change: move |v| note.set(v) }
+                        OperationButton { provider: provider.clone(), account: account.clone(), label: "Save note",
+                            command: ProviderCommand::Account(AccountCommand::SetNote { account_id: id.clone(), note: optional(&note()) }) }
+                    }
                 }
             }
         }
@@ -124,25 +186,41 @@ fn KeyGroups(provider: ProviderSummary) -> Element {
     });
     let groups = data.read();
     let models = models.read();
+    let can_manage = panel.operator() && supports(&provider, None, ProviderCapability::ManageKeyGroups);
+    let can_discover = panel.operator() && supports(&provider, None, ProviderCapability::DiscoverModels);
+    let model_names: BTreeMap<_, _> = models
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|model| Some((model.id.clone(), optional(model.display_name.as_deref()?)?)))
+        .collect();
+    let no_groups = groups.as_ref().is_some_and(|result| result.as_ref().is_ok_and(Vec::is_empty));
     rsx! {
-        section { class: "glass-card stack",
-            h2 { "{provider.descriptor.label} · API Key Groups" }
-            OperationButton { provider: provider.clone(), label: "Discover Models",
-                command: ProviderCommand::Model(ModelCommand::DiscoverModels { group_id: None }) }
-            {read_view(groups.as_ref(), |groups| rsx! {
-                if groups.is_empty() { p { class: "muted", "No key groups reported." } }
-                for group in groups {
-                    KeyGroupView { key: "{group.id}-{group.updated_at.timestamp_millis()}", provider: provider.clone(), group: group.clone() }
+        div { class: "stack",
+            if !no_groups || can_manage || can_discover {
+                div { class: "row",
+                    h3 { "API key groups" }
+                    OperationButton { provider: provider.clone(), label: "Discover models",
+                        command: ProviderCommand::Model(ModelCommand::DiscoverModels { group_id: None }) }
                 }
-                if supports(&provider, None, ProviderCapability::ManageKeyGroups) {
+            }
+            {read_view(groups.as_ref(), |groups| rsx! {
+                if groups.is_empty() { p { class: "form-help", "No key groups reported." } }
+                for group in groups {
+                    KeyGroupView { key: "{group.id}-{group.updated_at.timestamp_millis()}", provider: provider.clone(), group: group.clone(), model_names: model_names.clone() }
+                }
+                if can_manage {
                     details {
                         summary { "Add key group" }
                         GroupEditor { provider: provider.clone(), group: None }
                     }
                 }
             })}
-            details { summary { "Provider model inventory" }
-                {read_view(models.as_ref(), |models| rsx! { ModelList { models: models.iter().map(|m| m.id.clone()).collect() } })}
+            if !no_groups || !models.as_ref().is_some_and(|result| result.as_ref().is_ok_and(Vec::is_empty)) {
+                details { summary { "Provider model inventory" }
+                    {read_view(models.as_ref(), |models| rsx! { ModelList { models: models.iter().map(|m| m.id.clone()).collect() } })}
+                }
             }
         }
     }
@@ -157,7 +235,7 @@ fn ModelList(models: Vec<String>) -> Element {
 }
 
 #[component]
-fn KeyGroupView(provider: ProviderSummary, group: KeyGroup) -> Element {
+fn KeyGroupView(provider: ProviderSummary, group: KeyGroup, model_names: BTreeMap<String, String>) -> Element {
     let mut key_label = use_signal(String::new);
     let mut key_ref = use_signal(String::new);
     let mut models = use_signal(|| group.configured_models.join("\n"));
@@ -209,7 +287,17 @@ fn KeyGroupView(provider: ProviderSummary, group: KeyGroup) -> Element {
             }
             details { summary { "Configured models and aliases" }
                 ModelList { models: group.configured_models.clone() }
-                for alias in &group.aliases { p { "{alias.alias} → {alias.target_model_id}" } }
+                for alias in &group.aliases {
+                    {let model = group.discovered_models.iter().find(|m| m.id == alias.target_model_id)
+                        .and_then(|m| m.display_name.as_deref()).filter(|name| !name.trim().is_empty())
+                        .or_else(|| model_names.get(&alias.target_model_id).map(String::as_str));
+                    rsx! { p {
+                        "{alias.alias} → "
+                        if let Some(model) = model.filter(|name| *name != alias.target_model_id) {
+                            "{model} " code { class: "muted", "({alias.target_model_id})" }
+                        } else { code { "{alias.target_model_id}" } }
+                    } }}
+                }
                 if supports(&provider, None, ProviderCapability::ConfigureModels) {
                     label { class: "provider-field", "Configured models, one ID per line",
                         textarea { class: "input", value: models(), oninput: move |e| models.set(e.value()) }

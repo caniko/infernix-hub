@@ -193,11 +193,13 @@ pub fn ProjectsView() -> Element {
     };
 
     rsx! {
-        aside { class: "context", aria_label: "Projects and individuals",
+        aside { class: "context", aria_label: "Projects and individuals", style: "overflow-wrap: anywhere;",
             div { class: "context-head",
-                h2 { "Projects" }
-                button { class: "btn btn-glass", onclick: move |_| show_new.set(true), "New project" }
-                button { class: "btn btn-glass", onclick: move |_| wizard.set(Some((None, (store.selected_project).cloned()))), "New individual" }
+                h2 { "Directory" }
+            }
+            div { class: "row", style: "padding: 0 4px 10px;",
+                button { class: "btn secondary btn-xs", onclick: move |_| show_new.set(true), "New project" }
+                button { class: "btn secondary btn-xs", onclick: move |_| wizard.set(Some((None, None))), "Create individual" }
             }
             div { class: "context-list",
                 match projects.data.clone() {
@@ -207,9 +209,15 @@ pub fn ProjectsView() -> Element {
                             {
                                 let (status, _) = project_status(&item);
                                 let kind = match item.kind { contracts::ProjectKind::Solo => "Solo", contracts::ProjectKind::Group => "Group" };
+                                let members = item.members.len();
+                                let meta = match members {
+                                    0 => format!("{kind} · {status}"),
+                                    1 => format!("{kind} · 1 individual · {status}"),
+                                    _ => format!("{kind} · {members} individuals · {status}"),
+                                };
                                 rsx! { ContextItem {
                                     key: "{item.id}", title: item.name.clone(),
-                                    meta: format!("{} · {} individuals · {}", kind, item.members.len(), status),
+                                    meta,
                                     active: !show_individual.cloned() && Some(item.id) == selected_project_id,
                                     on_select: move |_| { let mut selected = store.selected_project; selected.set(Some(item.id)); show_individual.set(false); },
                                 } }
@@ -248,12 +256,6 @@ pub fn ProjectsView() -> Element {
             }
         }
         main { class: "work",
-            div { class: "work-head",
-                div {
-                    h1 { "Projects" }
-                    p { class: "hint", "Persona canon is proposal-only: the assistant proposes, the operator accepts." }
-                }
-            }
             if let Some(error) = projects.error.clone() { ErrorCard { code: error.code, message: error.message } }
             if let Some(error) = personas.error.clone() {
                 ErrorCard { code: error.code, message: error.message }
@@ -281,12 +283,9 @@ pub fn ProjectsView() -> Element {
                                     .collect();
                                 rsx! {
                                     div { class: "work-head",
-                                        div { h1 { "{persona.name}" } p { class: "hint", "company {persona.company_id} · {persona.pending_proposals} pending proposal(s)" } }
+                                        div { h1 { "{persona.name}" } }
                                         div { class: "spacer" }
-                                        button { class: "btn btn-glass", onclick: move |_| wizard.set(Some((Some(persona.id), None))), "Edit" }
-                                        if let Some(canon) = accepted.clone() {
-                                            Chip { label: format!("Accepted rev {}", canon.revision), tone: Some("ok".to_string()) }
-                                        }
+                                        button { class: "btn secondary", onclick: move |_| wizard.set(Some((Some(persona.id), None))), "Edit individual" }
                                     }
                                     Panel { title: "Pinned reference".to_string(), caption: None,
                                         if let Some(asset) = reference() {
@@ -294,14 +293,18 @@ pub fn ProjectsView() -> Element {
                                         } else { p { "No reference pinned yet." } }
                                         p { "Pinning another image asks first, lists the projects it affects, and marks 3D and rig for redo. The approved model stays in use until you approve a new one." }
                                     }
-                                    Panel { title: "Accepted canon".to_string(), caption: Some("read-only".to_string()),
+                                    section { class: "panel", aria_labelledby: "accepted-canon-title",
+                                        div { class: "panel-head",
+                                            h3 { id: "accepted-canon-title", "Accepted canon" }
+                                            if let Some(canon) = accepted.as_ref() {
+                                                Chip { label: format!("Revision {}", canon.revision), tone: Some("ok".to_string()) }
+                                            }
+                                        }
                                         if let Some(canon) = accepted.clone() {
                                             div { class: "glass-card",
                                                 p { class: "op-desc", "{canon.body.voice}" }
                                                 div { class: "row",
-                                                    Chip { label: "accepted".to_string(), tone: Some("ok".to_string()) }
                                                     span { class: "chip", "source {canon.source}" }
-                                                    span { class: "chip muted", "rev {canon.revision}" }
                                                     span { class: "label-tech", "by {canon.proposed_by}" }
                                                 }
                                                 if !canon.body.rules.is_empty() {
@@ -333,7 +336,11 @@ pub fn ProjectsView() -> Element {
                                             EmptyState { title: "No accepted canon yet.".to_string(), hint: Some("Accept a proposal or submit the editor below.".to_string()) }
                                         }
                                     }
-                                    Panel { title: "Pending proposals".to_string(), caption: Some(format!("{}", pending.len())),
+                                    section { class: "panel", aria_labelledby: "pending-canon-title", style: "border-top: 1px solid var(--line-subtle); padding-top: 12px;",
+                                        div { class: "panel-head",
+                                            h3 { id: "pending-canon-title", "Pending proposals" }
+                                            span { class: "badge-count", "{pending.len()}" }
+                                        }
                                         if pending.is_empty() {
                                             EmptyState { title: "No pending proposals.".to_string(), hint: None }
                                         } else {
@@ -520,7 +527,7 @@ pub fn ProjectsView() -> Element {
                     if let Some(error) = save_error.cloned() { ErrorCard { code: error.code, message: error.message } }
                     match project {
                         None if projects.data.is_none() && projects.error.is_none() => rsx! { Loading { text: "Loading projects…".to_string() } },
-                        None => rsx! { EmptyState { title: "Select an project.".to_string(), hint: None } },
+                        None => rsx! { EmptyState { title: "Select a project.".to_string(), hint: None } },
                         Some(item) => {
                             let (status, tone) = project_status(&item);
                             let client_save = client.clone();
@@ -530,24 +537,75 @@ pub fn ProjectsView() -> Element {
                             let kind = item.kind;
                             let id = item.id;
                             rsx! {
-                                div { class: "work-head", h1 { "{item.name}" } Chip { label: status.to_string(), tone: Some(tone.to_string()) } button { class: "btn btn-glass", onclick: move |_| wizard.set(Some((None, Some(id)))), "New individual" } }
-                                Panel { title: "Project".to_string(), caption: None,
-                                    div { class: "form-grid",
-                                        div { class: "field-row", label { class: "label-tech", r#for: "project-premise", "Premise" } textarea { id: "project-premise", class: "input", value: "{premise}", oninput: move |e| premise.set(e.value()) } }
-                                        div { class: "field-row", label { class: "label-tech", r#for: "project-dynamics", "Dynamics" } textarea { id: "project-dynamics", class: "input", value: "{dynamics}", oninput: move |e| dynamics.set(e.value()) } }
-                                        div { class: "form-actions", button { class: "btn btn-primary", onclick: move |_| {
+                                div { class: "work-head",
+                                    div { h1 { "{item.name}" } }
+                                    Chip { label: status.to_string(), tone: Some(tone.to_string()) }
+                                }
+                                section { class: "panel glass-card content-bounded",
+                                    h2 { style: "font-size: 15px;", "Overview" }
+                                    div { class: "form-stack content-bounded", style: "max-width: 720px;",
+                                        div { class: "form-field",
+                                            label { class: "label-tech", r#for: "project-premise", "Premise" }
+                                            textarea { id: "project-premise", class: "input", value: "{premise}", oninput: move |e| premise.set(e.value()) }
+                                        }
+                                        div { class: "form-field",
+                                            label { class: "label-tech", r#for: "project-dynamics", "Dynamics" }
+                                            textarea { id: "project-dynamics", class: "input", value: "{dynamics}", oninput: move |e| dynamics.set(e.value()) }
+                                        }
+                                        div { class: "row", button { class: "btn primary", onclick: move |_| {
                                             let input = ProjectIn { name: input_name.clone(), kind, premise: premise.cloned(), dynamics: dynamics.cloned(), models: None };
                                             let client = client_save.clone();
                                             spawn(async move { match api::timed(client.update_project(id, &input)).await {
                                                 Ok(_) => { save_error.set(None); api::refresh_projects(store, &client).await; },
                                                 Err(error) => { if (store.selected_project).cloned() == Some(id) { save_error.set(Some(error)); } },
                                             } });
-                                        }, "Save" } }
-                                        p { "Accounts: {item.account_ids.join(\", \")}" }
+                                        }, "Save overview" } }
                                     }
                                 }
-                                Panel { title: "Models".to_string(), caption: None,
-                                    div { class: "form-grid",
+                                section { class: "panel glass-card content-bounded",
+                                    div { class: "row",
+                                        h2 { style: "font-size: 15px;", "Members & Accounts" }
+                                        div { class: "spacer" }
+                                        button { class: "btn secondary", onclick: move |_| wizard.set(Some((None, Some(id)))), "Create project member" }
+                                    }
+                                    if item.members.is_empty() {
+                                        p { class: "form-help", "No members yet." }
+                                    } else {
+                                        for member in item.members {
+                                            {
+                                                let bio_done = personas.data.as_ref().and_then(|people| people.iter().find(|p| p.id == member.persona_id)).is_some_and(|p| super::individual::bio_stage_done(&p.profile));
+                                                rsx! {
+                                                    div { class: "glass-card", key: "{member.persona_id}",
+                                                        h3 { "{member.name}" }
+                                                        p { "{member.role}" }
+                                                        if let Some(reference_id) = member.reference_asset_id {
+                                                            div { class: "asset-frame", if let Some(uri) = (store.asset_images).cloned().get(&reference_id) { img { src: "{uri}", alt: "Pinned reference for {member.name}" } } else { span { class: "asset-missing", "Reference image unavailable" } } }
+                                                        }
+                                                        div { class: "row", Chip { label: status.to_string(), tone: Some(tone.to_string()) }
+                                                            Chip { label: if bio_done { "Bio · done".to_string() } else { "Bio · —".to_string() }, tone: Some(if bio_done { "ok" } else { "muted" }.to_string()) }
+                                                            Chip { label: if member.reference_asset_id.is_some() { "Look · done".to_string() } else { "Look · —".to_string() }, tone: Some(if member.reference_asset_id.is_some() { "ok" } else { "muted" }.to_string()) }
+                                                            for stage in ["3D", "Rig", "Voice"] { Chip { label: format!("{stage} · —"), tone: Some("muted".to_string()) } }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        p { class: "form-help", "Pinning another image asks first, lists the projects it affects, and marks 3D and rig for redo. The approved model stays in use until you approve a new one." }
+                                    }
+                                    section { class: "stack", style: "border-top: 1px solid var(--line-subtle); padding-top: 10px;",
+                                        h3 { style: "font-size: 13px;", "Linked accounts" }
+                                        if item.account_ids.is_empty() {
+                                            p { "No linked accounts" }
+                                            p { class: "form-help", "Ask a Hub operator to link a publishing account through the project API." }
+                                        } else {
+                                            p { class: "form-help", "{item.account_ids.join(\", \")}" }
+                                        }
+                                    }
+                                }
+                                section { class: "panel glass-card content-bounded",
+                                    h2 { style: "font-size: 15px;", "Model configuration" }
+                                    div { class: "form-stack",
+                                        div { class: "form-grid-2",
                                         for (role, label) in [("checker", "Checker"), ("image", "Image"), ("assistant", "Assistant"), ("three_d", "3D"), ("voice", "Voice")] {
                                             {
                                                 let selected = match role {
@@ -558,7 +616,7 @@ pub fn ProjectsView() -> Element {
                                                     _ => models().voice,
                                                 };
                                                 rsx! {
-                                                    div { class: "field-row", key: "{role}",
+                                                    div { class: "form-field", key: "{role}",
                                                         label { class: "label-tech", r#for: "model-{role}", "{label}" }
                                                         select { id: "model-{role}", class: "input", value: "{selected}", onchange: move |e| {
                                                             let value = e.value();
@@ -579,24 +637,28 @@ pub fn ProjectsView() -> Element {
                                                         },
                                                             for (id, _) in model_options(role) { option { value: "{id}", "{id}" } }
                                                         }
-                                                        if role == "checker" {
-                                                            p { "Runs when you keep an image, once the automated checker ships (slice 8). Until then you attest." }
+                                                    }
+                                                    if role == "checker" {
+                                                        div { class: "form-field",
                                                             label { class: "label-tech", r#for: "model-checker-effort", "Checker effort" }
-                                                            select { id: "model-checker-effort", class: "input", value: models().checker.effort.unwrap_or_default(), onchange: move |e| {
-                                                                let value = e.value();
-                                                                models.write().checker.effort = if value.is_empty() { None } else { Some(value) };
-                                                            },
+                                                            select { id: "model-checker-effort", class: "input", aria_describedby: "model-checker-help",
+                                                                value: models().checker.effort.unwrap_or_default(), onchange: move |e| {
+                                                                    let value = e.value();
+                                                                    models.write().checker.effort = (!value.is_empty()).then_some(value);
+                                                                },
                                                                 option { value: "", "Default" }
                                                                 for effort in model_options("checker").into_iter().find(|(id, _)| *id == models().checker.id).map(|(_, efforts)| efforts).unwrap_or_default().iter() {
                                                                     option { value: "{effort}", "{effort}" }
                                                                 }
                                                             }
+                                                            p { class: "form-help", id: "model-checker-help", "Controls automated image checks. Verify the results before keeping an image." }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
-                                        div { class: "form-actions", button { class: "btn btn-primary", onclick: move |_| {
+                                        }
+                                        div { class: "row", button { class: "btn primary", onclick: move |_| {
                                             let input = ProjectIn { name: models_name.clone(), kind, premise: premise.cloned(), dynamics: dynamics.cloned(), models: Some(models.cloned()) };
                                             let client = client_models.clone();
                                             spawn(async move { match api::timed(client.update_project(id, &input)).await {
@@ -608,27 +670,6 @@ pub fn ProjectsView() -> Element {
                                             } });
                                         }, "Save models" } }
                                     }
-                                }
-                                Panel { title: "Members".to_string(), caption: None,
-                                    if item.members.is_empty() { EmptyState { title: "No members yet.".to_string(), hint: None } }
-                                    for member in item.members {
-                                        { let bio_done = personas.data.as_ref().and_then(|people| people.iter().find(|p| p.id == member.persona_id)).is_some_and(|p| super::individual::bio_stage_done(&p.profile));
-                                        rsx! {
-                                        div { class: "glass-card", key: "{member.persona_id}",
-                                            h3 { "{member.name}" }
-                                            p { "{member.role}" }
-                                            if let Some(reference_id) = member.reference_asset_id {
-                                                div { class: "asset-frame", if let Some(uri) = (store.asset_images).cloned().get(&reference_id) { img { src: "{uri}", alt: "Pinned reference for {member.name}" } } else { span { class: "asset-missing", "Reference image unavailable" } } }
-                                            }
-                                            div { class: "row", Chip { label: status.to_string(), tone: Some(tone.to_string()) }
-                                                Chip { label: if bio_done { "Bio · done".to_string() } else { "Bio · —".to_string() }, tone: Some(if bio_done { "ok" } else { "muted" }.to_string()) }
-                                                Chip { label: if member.reference_asset_id.is_some() { "Look · done".to_string() } else { "Look · —".to_string() }, tone: Some(if member.reference_asset_id.is_some() { "ok" } else { "muted" }.to_string()) }
-                                                for stage in ["3D", "Rig", "Voice"] { Chip { label: format!("{stage} · —"), tone: Some("muted".to_string()) } }
-                                            }
-                                        }
-                                        } }
-                                    }
-                                    p { "Pinning another image asks first, lists the projects it affects, and marks 3D and rig for redo. The approved model stays in use until you approve a new one." }
                                 }
                             }
                         },
@@ -787,7 +828,7 @@ fn transcript(messages: &[contracts::ChatMessage]) -> Vec<TranscriptLine> {
 
 fn project_status(project: &contracts::Project) -> (&'static str, &'static str) {
     if project.members.is_empty() {
-        ("Empty", "muted")
+        ("No members", "muted")
     } else if project.members.iter().any(|member| !member.has_accepted_canon) {
         ("Draft", "warn")
     } else {
@@ -863,14 +904,14 @@ mod tests {
             company_id: "company".into(),
             name: "Test".into(),
             kind: ProjectKind::Group,
-            premise: String::new(),
+            premise: "An established premise".into(),
             dynamics: String::new(),
             models: Default::default(),
             members: Vec::new(),
             account_ids: Vec::new(),
             created_at: chrono::Utc::now(),
         };
-        assert_eq!(super::project_status(&project), ("Empty", "muted"));
+        assert_eq!(super::project_status(&project), ("No members", "muted"));
         project.members.push(ProjectMember {
             persona_id: Uuid::new_v4(),
             name: "One".into(),

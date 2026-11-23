@@ -68,7 +68,6 @@ fn App() -> Element {
         canon: use_signal(Loaded::default),
         chat_content: use_signal(Loaded::default),
         chat_persona: use_signal(Loaded::default),
-        search: use_signal(Loaded::default),
         selected_content: use_signal(|| None),
         selected_news: use_signal(|| None),
         selected_persona: use_signal(|| None),
@@ -82,17 +81,25 @@ fn App() -> Element {
         release_content: use_signal(std::collections::HashMap::new),
         release_indexed: use_signal(std::collections::HashSet::new),
         notice: use_signal(|| None),
-        // Below the 1180px breakpoint (theme.css) the inspector is an overlay; start it closed there.
-        inspector_open: use_signal(|| {
-            let w = &dioxus::desktop::window().window;
-            w.inner_size().to_logical::<f64>(w.scale_factor()).width > 1180.0
-        }),
+        inspector_open: use_signal(|| false),
         nav_open: use_signal(|| false),
         palette_open: use_signal(|| false),
         poll_busy: use_signal(|| false),
     };
     use_context_provider(|| client.clone());
     use_context_provider(|| store);
+    let mut narrow_nav = use_signal(|| false);
+    let inspector_selection = use_memo(move || {
+        let workspace = (store.workspace).cloned();
+        (workspace, store.inspector_item(workspace))
+    });
+    use_effect(move || {
+        let (_, selected) = inspector_selection.cloned();
+        let w = &dioxus::desktop::window().window;
+        // A selection opens the dock, not a narrow-screen overlay. This effect
+        // only tracks identity, so polling and manually closing the pane don't rerun it.
+        store.set_inspector_open(selected.is_some() && w.inner_size().to_logical::<f64>(w.scale_factor()).width > 1180.0);
+    });
 
     // Poll status + base lists + the selected detail on the donor cadence.
     let poll_client = client.clone();
@@ -173,8 +180,13 @@ fn App() -> Element {
     use_future(move || async move {
         let mut eval = document::eval(
             r#"
+            const narrow = window.matchMedia('(max-width: 900px)');
+            const report = () => dioxus.send(narrow.matches ? 'narrow' : 'wide');
+            narrow.addEventListener('change', report);
+            report();
             document.addEventListener('keydown', (event) => {
                 const target = event.target;
+                if (target?.closest('#command-palette')) return;
                 const editing = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA'
                     || target.tagName === 'SELECT' || target.isContentEditable);
                 if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
@@ -194,14 +206,20 @@ fn App() -> Element {
         );
         while let Ok(message) = eval.recv::<String>().await {
             match message.as_str() {
+                "narrow" => narrow_nav.set(true),
+                "wide" => {
+                    narrow_nav.set(false);
+                    store.set_nav_open(false);
+                }
                 "palette" => store.set_palette_open(true),
                 "escape" => {
                     if (store.palette_open).cloned() {
                         store.set_palette_open(false);
-                    } else if (store.inspector_open).cloned() {
-                        store.set_inspector_open(false);
-                    } else {
+                    } else if (store.nav_open).cloned() {
                         store.set_nav_open(false);
+                        shell::focus_nav_toggle();
+                    } else {
+                        store.set_inspector_open(false);
                     }
                 }
                 // The key-to-workspace mapping lives in Workspace.
@@ -218,11 +236,11 @@ fn App() -> Element {
     let status = (store.status).cloned();
     let live = status.data.is_some() && status.error.is_none();
     let status_label = if live {
-        "hub online"
+        "Hub online"
     } else if status.error.is_some() {
-        "hub offline"
+        "Hub offline"
     } else {
-        "connecting…"
+        "Connecting…"
     }
     .to_string();
     let fixture = status.data.as_ref().is_some_and(|status| status.fixture_mode);
@@ -241,7 +259,7 @@ fn App() -> Element {
             (!any_live, simulated)
         })
         .unwrap_or((false, Vec::new()));
-    let mut segments: Vec<shell::StatusSeg> = status
+    let integrations: Vec<shell::StatusSeg> = status
         .data
         .as_ref()
         .map(|status| {
@@ -263,76 +281,81 @@ fn App() -> Element {
                 .collect()
         })
         .unwrap_or_default();
-    if status.data.as_ref().is_some_and(|status| status.production_paused) {
-        segments.push(shell::StatusSeg { label: "PRODUCTION PAUSED".into(), tone: "warn".into() });
-    }
+    let production_paused = status.data.as_ref().is_some_and(|status| status.production_paused);
     // Fleet is infrastructure: it leads the bar, and a stale snapshot never
     // reads as OK.
     let fleet_loaded = (store.fleet).cloned();
     let fleet_segment = match fleet_loaded.data.as_ref() {
         // A failed refresh outranks the cached snapshot it leaves behind.
-        _ if fleet_loaded.error.is_some() => shell::StatusSeg { label: "FLEET · UNAVAILABLE".into(), tone: "bad".into() },
-        None => shell::StatusSeg { label: "FLEET · UNAVAILABLE".into(), tone: "bad".into() },
+        _ if fleet_loaded.error.is_some() => shell::StatusSeg { label: "Fleet unavailable".into(), tone: "bad".into() },
+        None => shell::StatusSeg { label: "Loading fleet…".into(), tone: String::new() },
         Some(snapshot) if fleet::stale(format::now_ms(), snapshot) => {
-            shell::StatusSeg { label: "FLEET · STALE".into(), tone: "warn".into() }
+            shell::StatusSeg { label: "Fleet snapshot stale".into(), tone: "warn".into() }
         }
         Some(snapshot) => {
             // The rows the console lists, so the bar and the list agree.
             let attention = fleet::attention_rows(snapshot).len();
             shell::StatusSeg {
-                label: if attention == 0 { "FLEET · OK".into() } else { format!("FLEET · {attention} ATTENTION") },
+                label: if attention == 0 { "Fleet OK".into() } else { format!("Fleet · {attention} need attention") },
                 tone: if attention == 0 { "live".into() } else { "warn".into() },
             }
         }
     };
-    segments.insert(0, fleet_segment);
     let api_version = status.data.as_ref().map(|status| status.api_version.clone()).unwrap_or_else(|| "v1".into());
+    let (workspace, inspector_item) = inspector_selection.cloned();
+    let inspector_key = format!("{workspace:?}:{inspector_item:?}");
+    let inspector_available = workspace.supports_inspector();
+    let inspector_open = inspector_available && (store.inspector_open).cloned();
     let stage_class = format!(
         "stage{}{}",
-        if (store.inspector_open).cloned() && (store.workspace).cloned() != Workspace::Providers { "" } else { " inspector-closed" },
-        if (store.workspace).cloned().full_width() { " no-context" } else { "" }
+        if inspector_open { "" } else { " inspector-closed" },
+        if workspace.full_width() { " no-context" } else { "" }
     );
 
-    let inspector_data: Option<inspector::InspectorData> = match (store.workspace).cloned() {
-        Workspace::Studio => (store.content_detail)
-            .cloned()
-            .data
-            .as_ref()
-            .filter(|detail| Some(detail.item.id) == (store.selected_content).cloned())
-            .map(inspector::from_content),
-        Workspace::Relationships => (store.relationship_detail)
-            .cloned()
-            .data
-            .as_ref()
-            .filter(|detail| Some(detail.relationship.id) == (store.selected_relationship).cloned())
-            .map(inspector::from_relationship),
-        Workspace::Projects if (store.projects_show_individual).cloned() => {
-            let canon = (store.canon).cloned();
-            (store.personas)
+    let inspector_data: Option<inspector::InspectorData> = if !inspector_open {
+        None
+    } else {
+        match workspace {
+            Workspace::Studio => (store.content_detail)
                 .cloned()
                 .data
                 .as_ref()
-                .and_then(|personas| personas.iter().find(|persona| Some(persona.id) == (store.selected_persona).cloned()))
-                .map(|persona| inspector::from_persona(persona, canon.data.as_deref().unwrap_or(&[])))
+                .filter(|detail| Some(detail.item.id) == (store.selected_content).cloned())
+                .map(inspector::from_content),
+            Workspace::Relationships => (store.relationship_detail)
+                .cloned()
+                .data
+                .as_ref()
+                .filter(|detail| Some(detail.relationship.id) == (store.selected_relationship).cloned())
+                .map(inspector::from_relationship),
+            Workspace::Projects if (store.projects_show_individual).cloned() => {
+                let canon = (store.canon).cloned();
+                (store.personas)
+                    .cloned()
+                    .data
+                    .as_ref()
+                    .and_then(|personas| personas.iter().find(|persona| Some(persona.id) == (store.selected_persona).cloned()))
+                    .map(|persona| inspector::from_persona(persona, canon.data.as_deref().unwrap_or(&[])))
+            }
+            Workspace::News => (store.news)
+                .cloned()
+                .data
+                .as_ref()
+                .and_then(|items| items.iter().find(|item| Some(item.id) == (store.selected_news).cloned()))
+                .map(inspector::from_news),
+            Workspace::Hosts => {
+                let loaded = (store.fleet).cloned();
+                let selected = (store.selected_host).cloned();
+                loaded.data.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .hosts
+                        .iter()
+                        .find(|host| Some(&host.name) == selected.as_ref())
+                        .map(|host| inspector::from_host(host, snapshot.target_revision.as_deref()))
+                })
+            }
+            _ => None,
         }
-        Workspace::News => (store.news)
-            .cloned()
-            .data
-            .as_ref()
-            .and_then(|items| items.iter().find(|item| Some(item.id) == (store.selected_news).cloned()))
-            .map(inspector::from_news),
-        Workspace::Hosts => {
-            let loaded = (store.fleet).cloned();
-            let selected = (store.selected_host).cloned();
-            loaded.data.as_ref().and_then(|snapshot| {
-                snapshot
-                    .hosts
-                    .iter()
-                    .find(|host| Some(&host.name) == selected.as_ref())
-                    .map(|host| inspector::from_host(host, snapshot.target_revision.as_deref()))
-            })
-        }
-        _ => None,
     };
 
     let action_client = client.clone();
@@ -360,14 +383,12 @@ fn App() -> Element {
         document::Title { "fleetix hub" }
         style { dangerous_inner_html: theme::style_sheet() }
         div { class: "app",
-            shell::Sidebar { workspace: store.workspace, nav_open: store.nav_open }
+            shell::Sidebar { workspace: store.workspace, nav_open: store.nav_open, narrow: narrow_nav }
             div { class: "main",
                 shell::Topbar {
-                    workspace: (store.workspace).cloned(),
+                    workspace,
                     inspector_open: store.inspector_open,
                     nav_open: store.nav_open,
-                    live,
-                    status_label,
                     on_palette: move |_| store.set_palette_open(true),
                 }
                 if fixture {
@@ -387,7 +408,7 @@ fn App() -> Element {
                     }
                 }
                 div { class: "{stage_class}",
-                    match (store.workspace).cloned() {
+                    match workspace {
                         Workspace::Notifications => rsx! { workspaces::notifications::NotificationsView {} },
                         Workspace::Command => rsx! { workspaces::fleet::CommandView {} },
                         Workspace::Hosts => rsx! { workspaces::fleet::HostsView {} },
@@ -402,21 +423,29 @@ fn App() -> Element {
                         Workspace::Projects => rsx! { workspaces::projects::ProjectsView {} },
                         Workspace::Library => rsx! { workspaces::library::LibraryView {} },
                     }
-                    if (store.inspector_open).cloned() && (store.workspace).cloned() != Workspace::Providers {
+                    if inspector_open {
                         inspector::Inspector {
+                            key: "{inspector_key}",
                             data: inspector_data,
+                            has_selection: inspector_item.is_some(),
                             on_close: move |_| store.set_inspector_open(false),
                         }
                     }
                 }
             }
             shell::StatusBar {
-                connected: live,
-                items: segments,
-                right: format!("API {api_version} · FLEETIX-HUB v0.1.0"),
+                connection: shell::StatusSeg {
+                    label: status_label,
+                    tone: if live { "live" } else if status.error.is_some() { "bad" } else { "" }.into(),
+                },
+                fleet: fleet_segment,
+                production_paused,
+                integrations,
+                version: format!("API {api_version} · Fleetix Hub v{}", env!("CARGO_PKG_VERSION")),
             }
             if (store.palette_open).cloned() {
                 palette::CommandPalette {
+                    inspector_available,
                     on_action,
                     on_close: move |_| store.set_palette_open(false),
                 }

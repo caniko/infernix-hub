@@ -165,7 +165,7 @@ pub fn DeltaRow(seq: String, category: String, description: String, action: Opti
 pub fn ListEditor(title: String, hint: String, items: Signal<Vec<String>>, placeholder: String) -> Element {
     let mut items = items;
     let mut draft = use_signal(String::new);
-    let add = move |_: MouseEvent| {
+    let mut add = move || {
         let v = draft.cloned().trim().to_string();
         if !v.is_empty() {
             items.write().push(v);
@@ -179,9 +179,11 @@ pub fn ListEditor(title: String, hint: String, items: Signal<Vec<String>>, place
                 h3 { "{title}" }
                 span { class: "chip", "{items.cloned().len()}" }
             }
-            p { class: "label-tech", "{hint}" }
+            if !hint.is_empty() {
+                p { class: "form-help", "{hint}" }
+            }
             if items.cloned().is_empty() {
-                p { class: "label-tech sub", "None declared." }
+                p { class: "muted", "None declared." }
             } else {
                 div { class: "list-editor",
                     for (i, entry) in items.cloned().into_iter().enumerate() {
@@ -189,7 +191,7 @@ pub fn ListEditor(title: String, hint: String, items: Signal<Vec<String>>, place
                             span { "{entry}" }
                             button {
                                 class: "chip-x",
-                                aria_label: "Remove entry",
+                                aria_label: "Remove {entry}",
                                 onclick: move |_| {
                                     items.write().remove(i);
                                 },
@@ -209,15 +211,12 @@ pub fn ListEditor(title: String, hint: String, items: Signal<Vec<String>>, place
                     oninput: move |e| draft.set(e.value()),
                     onkeydown: move |e| {
                         if e.key() == Key::Named(NamedKey::Enter) {
-                            let v = draft.cloned().trim().to_string();
-                            if !v.is_empty() {
-                                items.write().push(v);
-                                draft.set(String::new());
-                            }
+                            e.prevent_default();
+                            add();
                         }
                     },
                 }
-                button { class: "btn btn-glass", onclick: add, "Add" }
+                button { class: "btn secondary", onclick: move |_| add(), "Add" }
             }
         }
     }
