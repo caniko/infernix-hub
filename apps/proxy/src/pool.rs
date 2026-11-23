@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use contracts::providers::*;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -115,6 +116,25 @@ pub(crate) fn quota_window_active(lane: Lane, w: &QuotaWindow, now: DateTime<Utc
         .map_or_else(|| lane != Lane::Google || w.observed_at.is_some_and(|at| now - at < chrono::TimeDelta::hours(1)), |at| at > now)
 }
 
+pub(crate) const MAX_COOLDOWN_SECS: i64 = 604_800;
+
+pub(crate) fn safe_wire_model(model: &str) -> bool {
+    !model.is_empty() && model.bytes().all(|b| b.is_ascii_graphic() && b != b';')
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cooldown {
+    pub until: DateTime<Utc>,
+    pub verified_reset: bool,
+}
+
+impl Cooldown {
+    pub(crate) fn merge(self, other: Self) -> Self {
+        // A local or clamped blocker wins ties: it cannot vouch for a reset.
+        if (other.until, !other.verified_reset) > (self.until, !self.verified_reset) { other } else { self }
+    }
+}
+
 #[derive(Clone)]
 pub struct Account {
     pub id: String,
@@ -143,9 +163,9 @@ pub struct Account {
     pub base: Option<reqwest::Url>,
     pub local: bool,
     pub models: Vec<String>,
-    pub cooldown: Option<DateTime<Utc>>,
+    pub cooldown: Option<Cooldown>,
     pub auth_cooldown: Option<DateTime<Utc>>,
-    pub scoped_cooldowns: BTreeMap<String, DateTime<Utc>>,
+    pub scoped_cooldowns: BTreeMap<String, Cooldown>,
     pub windows: Vec<QuotaWindow>,
     pub google_fallback_keys: BTreeSet<String>,
     pub grants: Vec<ResetGrant>,
@@ -176,14 +196,37 @@ impl Account {
     }
 
     fn supports(&self, model: &str) -> bool {
-        !self.disabled && self.weight > 0 && (model.is_empty() || self.models.is_empty() || self.models.iter().any(|id| id == model))
+        self.support_exclusion(model).is_none()
+    }
+
+    fn support_exclusion(&self, model: &str) -> Option<&'static str> {
+        if self.disabled {
+            Some("disabled")
+        } else if self.weight == 0 {
+            Some("zero_weight")
+        } else if !model.is_empty() && !self.models.is_empty() && !self.models.iter().any(|id| id == model) {
+            Some("unsupported_model")
+        } else {
+            None
+        }
+    }
+
+    pub fn cooldown_until(&self) -> Option<DateTime<Utc>> {
+        self.cooldown.map(|cooldown| cooldown.until)
+    }
+
+    fn scoped_cooldown(&self, model: &str) -> Option<Cooldown> {
+        model_cooldown_scope(self.lane, model).and_then(|scope| self.scoped_cooldowns.get(&scope).copied())
+    }
+
+    fn active_quota_windows<'a>(&'a self, now: DateTime<Utc>, model: &'a str) -> impl Iterator<Item = &'a QuotaWindow> {
+        self.windows
+            .iter()
+            .filter(move |w| window_applies_to_model(w, model) && enforces_quota(w) && quota_window_active(self.lane, w, now))
     }
 
     pub fn quota_limited_until(&self, now: DateTime<Utc>, model: &str) -> Option<DateTime<Utc>> {
-        let scoped = model_cooldown_scope(self.lane, model).and_then(|scope| self.scoped_cooldowns.get(&scope).copied());
-        self.windows
-            .iter()
-            .filter(|w| window_applies_to_model(w, model) && enforces_quota(w) && quota_window_active(self.lane, w, now))
+        self.active_quota_windows(now, model)
             .map(|w| {
                 w.resets_at.unwrap_or_else(|| {
                     if self.lane == Lane::Google {
@@ -193,7 +236,7 @@ impl Account {
                     }
                 })
             })
-            .chain(self.cooldown.into_iter().chain(scoped).filter(|until| *until > now))
+            .chain(self.cooldown.into_iter().chain(self.scoped_cooldown(model)).map(|c| c.until).filter(|until| *until > now))
             .max()
     }
 
@@ -210,7 +253,7 @@ impl Account {
             "id": self.id, "name": self.name, "auth_index": self.auth_index, "provider": self.provider,
             "type": self.provider, "label": self.label, "disabled": self.disabled, "note": self.note, "priority": self.priority,
             "weight": self.weight, "status": if self.disabled { "disabled" } else if self.probe_failed { "error" } else { "active" },
-            "cooldown_until": self.cooldown, "observed_at": self.observed, "last_used_at": self.last_used,
+            "cooldown_until": self.cooldown_until(), "observed_at": self.observed, "last_used_at": self.last_used,
             "preferred": pool.preferred(self.lane) == Some(self.id.as_str()),
             "plan": self.plan.as_ref().map(|p| json!({"tier":p,"label":p,"multiplier":self.multiplier})),
         });
@@ -437,6 +480,23 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
 
 type Session = (Lane, String);
 
+#[derive(Serialize)]
+pub(crate) struct ModelEligibility<'a> {
+    snapshot_at: DateTime<Utc>,
+    lane: &'static str,
+    wire_model: &'a str,
+    supported_accounts: usize,
+    eligible_accounts: usize,
+    verified_next_reset_at: Option<DateTime<Utc>>,
+    accounts: Vec<AccountEligibility<'a>>,
+}
+
+#[derive(Serialize)]
+struct AccountEligibility<'a> {
+    auth_index: &'a str,
+    exclusion_reasons: Vec<&'static str>,
+}
+
 #[derive(Default)]
 pub struct Pool {
     pub accounts: BTreeMap<String, Account>,
@@ -539,10 +599,75 @@ impl Pool {
         self.accounts.get(id).or_else(|| self.accounts.values().find(|a| a.auth_index == id || self.hub_id(a) == id || a.hub_id() == id))
     }
 
+    fn support_exclusion(&self, account: &Account, model: &str) -> Option<&'static str> {
+        account
+            .support_exclusion(model)
+            .or_else(|| (account.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly).then_some("subscriptions_only"))
+    }
+
     fn supported<'a>(&'a self, lane: Lane, model: &'a str) -> impl Iterator<Item = &'a Account> {
-        self.accounts.values().filter(move |a| {
-            a.lane == lane && a.supports(model) && !(a.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly)
-        })
+        self.accounts.values().filter(move |a| a.lane == lane && self.support_exclusion(a, model).is_none())
+    }
+
+    pub(crate) fn evaluate_model_eligibility<'a>(&'a self, lane: Lane, model: &'a str, now: DateTime<Utc>) -> Option<ModelEligibility<'a>> {
+        if !safe_wire_model(model) {
+            return None;
+        }
+        let mut evaluation = ModelEligibility {
+            snapshot_at: now,
+            lane: lane.name(),
+            wire_model: model,
+            supported_accounts: 0,
+            eligible_accounts: 0,
+            verified_next_reset_at: None,
+            accounts: Vec::new(),
+        };
+        for account in self.accounts.values().filter(|a| a.lane == lane) {
+            let mut reasons = Vec::new();
+            if let Some(reason) = self.support_exclusion(account, model) {
+                reasons.push(reason);
+            } else {
+                evaluation.supported_accounts += 1;
+                let mut account_reset = None;
+                let mut complete = true;
+                let mut block = |reason, reset_at: Option<DateTime<Utc>>| {
+                    reasons.push(reason);
+                    if let Some(at) = reset_at.filter(|at| *at > now && *at - now <= chrono::TimeDelta::seconds(MAX_COOLDOWN_SECS)) {
+                        account_reset = account_reset.max(Some(at));
+                    } else {
+                        complete = false;
+                    }
+                };
+                if account.auth_cooldown.is_some_and(|at| at > now) {
+                    block("auth_cooldown", None);
+                }
+                for (reason, cooldown) in [("global_cooldown", account.cooldown), ("scoped_cooldown", account.scoped_cooldown(model))] {
+                    if let Some(c) = cooldown.filter(|c| c.until > now) {
+                        block(reason, c.verified_reset.then_some(c.until));
+                    }
+                }
+                let mut windows = account.active_quota_windows(now, model).peekable();
+                if windows.peek().is_some() {
+                    // Every enforcing window must supply a reset. A cached observation's TTL is not one.
+                    let reset = windows.try_fold(now, |latest, w| Some(latest.max(w.resets_at?)));
+                    block("quota_window", reset);
+                }
+                if reasons.is_empty() {
+                    evaluation.eligible_accounts += 1;
+                } else if complete && let Some(reset) = account_reset {
+                    evaluation.verified_next_reset_at = Some(evaluation.verified_next_reset_at.map_or(reset, |old| old.min(reset)));
+                }
+            }
+            evaluation.accounts.push(AccountEligibility { auth_index: &account.auth_index, exclusion_reasons: reasons });
+        }
+        if evaluation.eligible_accounts > 0 {
+            evaluation.verified_next_reset_at = None;
+        }
+        Some(evaluation)
+    }
+
+    pub(crate) fn verified_google_reset_at(&self, model: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.evaluate_model_eligibility(Lane::Google, model, now)?.verified_next_reset_at
     }
 
     pub fn next_reset(&self, lane: Lane, model: &str) -> Option<DateTime<Utc>> {

@@ -778,7 +778,7 @@ impl Proxy {
                         usable.sort_unstable();
                         let applicable = grant.as_ref().is_some_and(|g| g.applicable)
                             || windows.iter().any(|w| w.status == QuotaStatus::Rejected || w.used_percent.is_some_and(|n| n >= 100.0))
-                            || account.cooldown.is_some_and(|t| t > at);
+                            || account.cooldown_until().is_some_and(|t| t > at);
                         grants = usable
                             .into_iter()
                             .map(|(expiry, id)| ResetGrant {

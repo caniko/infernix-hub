@@ -892,8 +892,11 @@ async fn reset_credit(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
     if refresh_error.is_none() && account.lane == Lane::Claude && matches!(code, "reset" | "already_redeemed") {
         let mut state = proxy.state.write().await;
         let now = Utc::now();
-        if let Some(current) =
-            state.pool.accounts.get_mut(&account.id).filter(|a| a.access == account.access && a.cooldown == account.cooldown)
+        if let Some(current) = state
+            .pool
+            .accounts
+            .get_mut(&account.id)
+            .filter(|a| a.access == account.access && a.cooldown_until() == account.cooldown_until())
             && current.windows.iter().any(|w| grant.cleared_windows.contains(&w.window_key) && w.used_percent.is_some())
             && current.windows.iter().all(|w| !w.used_percent.is_some_and(|p| p >= 100.0 && w.resets_at.is_none_or(|t| t > now)))
         {
