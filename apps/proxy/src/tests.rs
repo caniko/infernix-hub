@@ -3856,6 +3856,8 @@ async fn provenance_oauth_discovers_all_antigravity_enrollments_and_deduplicates
 
 #[tokio::test]
 async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttles() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
     let dir = Scratch::new();
     let oauth_dir = dir.join("provenance-oauth");
     config::private_dir(&oauth_dir).unwrap();
@@ -3889,6 +3891,10 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
     .unwrap();
     fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o700)).unwrap();
 
+    let overlapping_lookup = Arc::new(Notify::new());
+    let hydration_started = Arc::new(Notify::new());
+    let finish_hydration = Arc::new(Notify::new());
+    let hydrating = Arc::new(AtomicBool::new(false));
     let mock = serve(
         Router::new()
             .route(
@@ -3906,30 +3912,44 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
             )
             .route(
                 "/test/google-tokeninfo",
-                post(|body: String| async move {
-                    match body.as_str() {
-                        "access_token=ya29.pool-1" => axum::Json(json!({
+                post(move |body: String| {
+                    let overlapping_lookup = overlapping_lookup.clone();
+                    let hydration_started = hydration_started.clone();
+                    let finish_hydration = finish_hydration.clone();
+                    let hydrating = hydrating.clone();
+                    async move {
+                        // Overlap the auth lookups, but return the second result after discovery
+                        // and before the first caller can finish hydrating the new account.
+                        let email = match body.as_str() {
+                            "access_token=ya29.pool-1" => "one@example.test",
+                            "access_token=ya29.client-new" => {
+                                overlapping_lookup.notified().await;
+                                "new@example.test"
+                            }
+                            "access_token=ya29.client-overlap" => {
+                                overlapping_lookup.notify_one();
+                                hydration_started.notified().await;
+                                "new@example.test"
+                            }
+                            "access_token=ya29.pool-new" => {
+                                if hydrating.swap(true, Relaxed) {
+                                    finish_hydration.notify_one();
+                                } else {
+                                    hydration_started.notify_one();
+                                    finish_hydration.notified().await;
+                                }
+                                "new@example.test"
+                            }
+                            "access_token=ya29.client-unknown" => "unknown@example.test",
+                            _ => return StatusCode::BAD_REQUEST.into_response(),
+                        };
+                        axum::Json(json!({
                             "aud": "agy-client",
-                            "email": "one@example.test",
+                            "email": email,
                             "email_verified": "true",
                             "expires_in": "3599"
                         }))
-                        .into_response(),
-                        "access_token=ya29.client-new" | "access_token=ya29.pool-new" => axum::Json(json!({
-                            "aud": "agy-client",
-                            "email": "new@example.test",
-                            "email_verified": "true",
-                            "expires_in": "3599"
-                        }))
-                        .into_response(),
-                        "access_token=ya29.client-unknown" => axum::Json(json!({
-                            "aud": "agy-client",
-                            "email": "unknown@example.test",
-                            "email_verified": "true",
-                            "expires_in": "3599"
-                        }))
-                        .into_response(),
-                        _ => StatusCode::BAD_REQUEST.into_response(),
+                        .into_response()
                     }
                 }),
             ),
@@ -3962,6 +3982,7 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
     proxy.discover_local_commands().await;
     assert_eq!(google_count(&proxy).await, 1);
     let rev_before = proxy.state.read().await.pool.revision;
+    let calls_before_reload = fs::read_to_string(&calls_file).unwrap().lines().count();
 
     // A new enrollment arrives after startup; concurrent authorize_google callers both succeed.
     config::write_private(
@@ -3970,13 +3991,19 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
         true,
     )
     .unwrap();
-    let (first_ok, second_ok) = tokio::join!(proxy.authorize_google("ya29.client-new"), proxy.authorize_google("ya29.client-new"));
-    assert!(first_ok && second_ok);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(async { assert!(proxy.authorize_google("ya29.client-new").await, "the caller that reloads must authorize") }, async {
+            assert!(proxy.authorize_google("ya29.client-overlap").await, "a concurrent caller must reuse the completed reload")
+        },);
+    })
+    .await
+    .expect("overlapping authorization did not finish");
     assert_eq!(google_count(&proxy).await, 2);
     assert!(proxy.state.read().await.pool.revision > rev_before);
 
     // An immediate follow-up miss is throttled and does not re-spawn provenance-oauth.
     let calls_after_reload = fs::read_to_string(&calls_file).unwrap().lines().count();
+    assert_eq!(calls_after_reload, calls_before_reload + 2, "one discovery pass reads both manifests");
     assert!(!proxy.authorize_google("ya29.client-unknown").await);
     assert_eq!(fs::read_to_string(&calls_file).unwrap().lines().count(), calls_after_reload);
 
