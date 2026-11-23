@@ -132,6 +132,8 @@ pub struct Account {
     pub multiplier: Option<f64>,
     pub access: String,
     pub refresh: Option<String>,
+    // In-memory only: labels on disk can still contain retired credentials.
+    pub(crate) prior_secrets: Vec<String>,
     pub expires: Option<DateTime<Utc>>,
     pub chatgpt_id: Option<String>,
     pub chatgpt_user: Option<String>,
@@ -162,6 +164,35 @@ pub struct Account {
 }
 
 impl Account {
+    pub(crate) fn current_secrets(&self) -> [&str; 3] {
+        [&self.access, self.refresh.as_deref().unwrap_or_default(), self.google_secret.as_deref().unwrap_or_default()]
+    }
+
+    fn remember_secret(&mut self, secret: String) {
+        const HISTORY_LIMIT: usize = 16;
+        if secret.is_empty() || self.current_secrets().contains(&secret.as_str()) {
+            return;
+        }
+        self.prior_secrets.retain(|prior| prior != &secret);
+        if self.prior_secrets.len() == HISTORY_LIMIT {
+            self.prior_secrets.remove(0);
+        }
+        self.prior_secrets.push(secret);
+    }
+
+    pub(crate) fn replace_access(&mut self, access: String) {
+        let old = std::mem::replace(&mut self.access, access);
+        self.remember_secret(old);
+        self.label = crate::error_classify::safe_label(self);
+    }
+
+    pub(crate) fn replace_refresh(&mut self, refresh: Option<String>) {
+        if let Some(old) = std::mem::replace(&mut self.refresh, refresh) {
+            self.remember_secret(old);
+        }
+        self.label = crate::error_classify::safe_label(self);
+    }
+
     pub(crate) fn needs_google_metadata(&self) -> bool {
         self.lane == Lane::Google && !self.disabled && !self.api_key && (self.email.is_none() || self.project.is_none())
     }
@@ -462,6 +493,7 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
                 .filter(|n| *n > 0.0),
             access: access.into(),
             refresh: refresh.map(str::to_owned),
+            prior_secrets: Vec::new(),
             expires: ["expires_at", "expiresAt", "expiry", "expired", "expires", "/claudeAiOauth/expiresAt"]
                 .into_iter()
                 .find_map(|k| date(if k.starts_with('/') { entry.pointer(k).unwrap_or(&Value::Null) } else { &entry[k] }))
@@ -507,7 +539,6 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             account.project,
         ]);
         account.source_fingerprint = Some(hex::encode(Sha256::digest(material.to_string())));
-        account.label = crate::error_classify::safe_label(&account);
         Ok(account)
     };
     if let Some(keys) = group["keys"].as_array() {
@@ -631,7 +662,14 @@ impl Pool {
                     a.success = old.success;
                     a.failure = old.failure;
                 }
+                a.prior_secrets.clone_from(&old.prior_secrets);
+                for secret in old.current_secrets() {
+                    if !secret.is_empty() && !a.current_secrets().contains(&secret) {
+                        a.remember_secret(secret.to_owned());
+                    }
+                }
             }
+            // Scrub after merging history, before sanitization can shorten a secret.
             a.label = crate::error_classify::safe_label(&a);
             self.accounts.insert(a.id.clone(), a);
         }
@@ -963,7 +1001,7 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
                 && access != existing.access
                 && expiry.is_none_or(|at| at > Utc::now())
             {
-                existing.access = access.to_owned();
+                existing.replace_access(access.to_owned());
                 existing.expires = expiry;
                 rotated = true;
             }

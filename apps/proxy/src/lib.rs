@@ -596,9 +596,8 @@ impl Proxy {
                     self.notify_hub_sync();
                 }
             }
-            entry.label = safe_label(entry);
-            entry.access = updated.access;
-            entry.refresh = updated.refresh;
+            entry.replace_access(updated.access);
+            entry.replace_refresh(updated.refresh);
             entry.expires = updated.expires;
             entry.source_fingerprint = updated.source_fingerprint;
             return Ok(entry.clone());
@@ -659,8 +658,7 @@ impl Proxy {
                 self.notify_hub_sync();
             }
         }
-        next.label = safe_label(next);
-        next.access = access;
+        next.replace_access(access);
         next.expires = Some(Utc::now() + TimeDelta::seconds(expires_in));
         Ok(next.clone())
     }

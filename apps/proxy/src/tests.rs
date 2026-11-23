@@ -1438,6 +1438,92 @@ async fn google_flushes_cr_only_sse_heartbeat_before_a_stall() {
 }
 
 #[tokio::test]
+async fn sse_oversized_events_stream_before_the_delimiter_and_preserve_later_usage() {
+    let payload = Bytes::from(format!("data: {{\"delta\":{{\"text\":\"{}\"}}}}", "x".repeat(1024 * 1024)));
+    for (before, after) in [("\n", "\n"), ("\r\n", "\r\n"), ("\r\n\r", "\n"), ("\r", "\r")] {
+        let release = Arc::new(Notify::new());
+        let mock = serve(Router::new().route(
+            "/v1/messages",
+            post({
+                let (payload, release) = (payload.clone(), release.clone());
+                move || async move {
+                    let prefix = futures_util::stream::iter([Ok::<_, std::io::Error>(payload), Ok(Bytes::from_static(before.as_bytes()))]);
+                    let tail = futures_util::stream::once(async move {
+                        release.notified().await;
+                        Ok(Bytes::from(format!("{after}data: {{\"usage\":{{\"output_tokens\":4}}}}\n\n")))
+                    });
+                    ([("content-type", "text/event-stream")], Body::from_stream(futures_util::StreamExt::chain(prefix, tail)))
+                }
+            }),
+        ))
+        .await;
+        let dir = Scratch::new();
+        let proxy = fixture(&dir, &mock);
+        let server = serve(proxy.clone().app()).await;
+        let mut response = Http::new(&server)
+            .request("POST", "/v1/messages")
+            .bearer_auth("inference-fixture")
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let mut body = Vec::new();
+        while body.len() < payload.len() + before.len() {
+            body.extend_from_slice(&response.chunk().await.unwrap().expect("oversized event must stream before its delimiter"));
+        }
+        release.notify_one();
+        body.extend_from_slice(&response.bytes().await.unwrap());
+        assert_eq!(&body[..payload.len()], payload.as_ref());
+        assert_eq!(&body[payload.len()..], format!("{before}{after}data: {{\"usage\":{{\"output_tokens\":4}}}}\n\n").as_bytes());
+        let state = proxy.state.read().await;
+        let row = state.activity.back().unwrap();
+        assert_eq!(row.output_tokens, 4);
+        assert_eq!(row.attempts[0].outcome, "success");
+    }
+}
+
+#[tokio::test]
+async fn sse_cr_delimited_data_arrives_before_upstream_eof() {
+    const EVENT: &str = "data: {\"delta\":{\"text\":\"first\"}}\r\r";
+    let release = Arc::new(Notify::new());
+    let mock = serve(Router::new().route(
+        "/v1/messages",
+        post({
+            let release = release.clone();
+            move || async move {
+                let prefix = futures_util::stream::iter([Ok::<_, std::io::Error>(EVENT)]);
+                let tail = futures_util::stream::once(async move {
+                    release.notified().await;
+                    Ok("\ndata: {\"usage\":{\"output_tokens\":4}}\n\n")
+                });
+                ([("content-type", "text/event-stream")], Body::from_stream(futures_util::StreamExt::chain(prefix, tail)))
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    let server = serve(proxy.clone().app()).await;
+    let mut response = Http::new(&server)
+        .request("POST", "/v1/messages")
+        .bearer_auth("inference-fixture")
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut prefix = Vec::new();
+    while prefix.len() < EVENT.len() {
+        prefix.extend_from_slice(&response.chunk().await.unwrap().unwrap());
+    }
+    assert_eq!(prefix, EVENT.as_bytes());
+    release.notify_one();
+    assert_eq!(response.text().await.unwrap(), "\ndata: {\"usage\":{\"output_tokens\":4}}\n\n");
+    assert_eq!(proxy.state.read().await.activity.back().unwrap().output_tokens, 4);
+}
+
+#[tokio::test]
 async fn google_inspection_timeout_keeps_partial_array_error_rewritable() {
     let release = Arc::new(Notify::new());
     let mock = serve(Router::new().route(
@@ -3438,20 +3524,56 @@ async fn oauth_rotation_scrubs_the_previous_access_token_from_the_label() {
 
 #[test]
 fn inventory_and_quota_redact_opaque_credentials_in_labels() {
-    let mut account = pool::parse_credentials(
+    let accounts = pool::parse_credentials(
         "a.json",
         &json!({
             "type":"claude", "access_token":"opaque-fixture-secret", "label":"Account opaque-fixture-secret"
         }),
         false,
     )
-    .unwrap()
-    .remove(0);
-    let pool = Pool::default();
+    .unwrap();
+    let mut pool = Pool::default();
+    pool.insert(accounts);
+    let mut account = pool.accounts["a.json"].clone();
     assert_eq!(account.label, "Account [redacted]");
     assert_eq!(account.inventory(&pool)["label"], "Account [redacted]");
     account.label = format!("{} {}", account.label, account.access);
     assert_eq!(account.quota(&pool)["label"], "Account [redacted] [redacted]");
+}
+
+#[tokio::test]
+async fn credential_replacement_and_metadata_reload_keep_prior_secrets_redacted() {
+    let dir = Scratch::new();
+    let mock = serve(Router::new()).await;
+    let proxy = fixture(&dir, &mock);
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let check = async |expected| {
+        let state = proxy.state.read().await;
+        let account = &state.pool.accounts["a.json"];
+        assert_eq!(account.access, expected);
+        assert_eq!(account.inventory(&state.pool)["label"], "Account [redacted]");
+        drop(state);
+        let batches = hub_sync::observations(&proxy, "host", "user").await;
+        let observed = batches.iter().flat_map(|batch| &batch.accounts).find(|account| account.source_account_id == "a.json").unwrap();
+        assert_eq!(observed.display_name, "Account [redacted]");
+    };
+    for access in ["fixture-a", "replacement-two"] {
+        let response = http
+            .management(
+                "POST",
+                "/v8/management/credentials?name=a.json",
+                Some(json!({"type":"claude","access_token":access,"label":"Account upstream-fixture-a"})),
+            )
+            .await;
+        assert_eq!(response.status(), 200);
+        check(access).await;
+    }
+
+    let response =
+        http.management("PATCH", "/v8/management/credentials/fields", Some(json!({"account_id":"a.json","note":"metadata update"}))).await;
+    assert_eq!(response.status(), 200);
+    check("replacement-two").await;
 }
 
 #[tokio::test]

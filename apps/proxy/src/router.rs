@@ -2063,7 +2063,7 @@ impl Wire {
         }
         loop {
             let (frame, error) = match self.sse_frames.take(self.sse_eof) {
-                Ok(Some(frame)) => {
+                Some((frame, true)) => {
                     let error = SseObserver::frame(&frame, &mut self.usage, &self.account);
                     if self.google_sse && !error.as_ref().is_some_and(|e| e.kind.is_blocking()) {
                         let mut lines = GoogleFrames::new(true);
@@ -2072,13 +2072,14 @@ impl Wire {
                         while let Some(line) = lines.next(true) {
                             rewritten.extend_from_slice(&self.google_frame(line).await);
                         }
-                        (Some(rewritten.into()), error.filter(|_| self.guard.1.is_none()))
+                        (rewritten.into(), error.filter(|_| self.guard.1.is_none()))
                     } else {
-                        (Some(frame), error)
+                        (frame, error)
                     }
                 }
-                Ok(None) if self.sse_eof => return Ok(None),
-                Ok(None) => {
+                Some((bytes, false)) => return Ok(Some(bytes)),
+                None if self.sse_eof => return Ok(None),
+                None => {
                     if let Some(chunk) = self.upstream_chunk().await? {
                         self.sse_frames.push(chunk);
                     } else {
@@ -2086,18 +2087,10 @@ impl Wire {
                     }
                     continue;
                 }
-                Err(()) => (
-                    None,
-                    Some(local_error(
-                        AccountErrorKind::UpstreamUnavailable,
-                        AccountErrorSource::Stream,
-                        "Upstream SSE event exceeded the size limit.",
-                    )),
-                ),
             };
             if let Some(error) = error {
                 let kind = error.kind;
-                let terminal = kind.is_blocking() || frame.is_none();
+                let terminal = kind.is_blocking();
                 if self.status.is_success() && (!self.sse_failed || terminal) {
                     self.record_stream_error(error).await;
                 }
@@ -2107,7 +2100,7 @@ impl Wire {
                     return Ok(Some(Bytes::from(format!("event: error\ndata: {body}\n\n"))));
                 }
             }
-            return Ok(frame);
+            return Ok(Some(frame));
         }
     }
 
@@ -2210,6 +2203,8 @@ struct SseFrames {
     pending: Bytes,
     frame: Vec<u8>,
     line_has_data: bool,
+    passthrough: bool,
+    after_cr: bool,
 }
 
 fn sse_line_break(bytes: &[u8]) -> Option<(usize, usize)> {
@@ -2232,28 +2227,53 @@ impl SseFrames {
         };
     }
 
-    fn take(&mut self, eof: bool) -> Result<Option<Bytes>, ()> {
+    // The bool indicates a complete frame eligible for inspection, not raw passthrough bytes.
+    fn take(&mut self, eof: bool) -> Option<(Bytes, bool)> {
         const MAX_EVENT_BYTES: usize = 1024 * 1024;
-        while !self.pending.is_empty() {
-            let (len, end) = sse_line_break(&self.pending).unwrap_or((self.pending.len(), self.pending.len()));
-            // A complete comment heartbeat can be forwarded without waiting for
-            // an optional LF; the LF is forwarded separately if it arrives.
-            let heartbeat = len == 0 && !self.line_has_data && self.frame.starts_with(b":");
-            let partial_crlf = !eof && !heartbeat && len + 1 == self.pending.len() && self.pending[len] == b'\r';
-            let end = if partial_crlf { len } else { end };
-            if self.frame.len() + end > MAX_EVENT_BYTES {
-                return Err(());
+        if !self.pending.is_empty() && std::mem::take(&mut self.after_cr) && self.pending[0] == b'\n' {
+            return Some((self.pending.split_to(1), false));
+        }
+        let mut forwarded = 0;
+        while forwarded < self.pending.len() {
+            let rest = &self.pending[forwarded..];
+            let (len, end) = sse_line_break(rest).unwrap_or((rest.len(), rest.len()));
+            let boundary = len == 0 && !self.line_has_data;
+            let trailing_cr = !eof && len + 1 == rest.len() && rest[len] == b'\r';
+            // A blank line ending in a CR already completes the event. If its
+            // optional LF arrives later, forward it without treating it as another line.
+            let wait_for_lf = trailing_cr && !boundary && !self.passthrough;
+            if !self.passthrough && self.frame.len() + end > MAX_EVENT_BYTES {
+                self.passthrough = true;
+                if !self.frame.is_empty() {
+                    return Some((std::mem::take(&mut self.frame).into(), false));
+                }
+                continue;
             }
+            let end = if wait_for_lf { len } else { end };
             if end == 0 {
                 break;
             }
-            self.frame.extend_from_slice(&self.pending.split_to(end));
-            self.line_has_data |= len > 0;
-            if end > len && !std::mem::take(&mut self.line_has_data) {
-                return Ok(Some(std::mem::take(&mut self.frame).into()));
+            let line_ended = end > len;
+            self.line_has_data = !line_ended && (self.line_has_data || len > 0);
+            self.after_cr = trailing_cr && line_ended;
+            if self.passthrough {
+                forwarded += end;
+                if boundary {
+                    self.passthrough = false;
+                    break;
+                }
+            } else {
+                self.frame.extend_from_slice(&self.pending.split_to(end));
+                if boundary {
+                    return Some((std::mem::take(&mut self.frame).into(), true));
+                }
             }
         }
-        Ok((eof && !self.frame.is_empty()).then(|| std::mem::take(&mut self.frame).into()))
+        if forwarded > 0 {
+            Some((self.pending.split_to(forwarded), false))
+        } else {
+            (eof && !self.frame.is_empty()).then(|| (std::mem::take(&mut self.frame).into(), true))
+        }
     }
 }
 

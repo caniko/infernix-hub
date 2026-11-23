@@ -44,8 +44,8 @@ pub(crate) fn safe_label(account: &Account) -> String {
     sanitize(&redact_known_secrets(&account.label, &account_secrets(account)))
 }
 
-pub(crate) fn account_secrets(account: &Account) -> [&str; 3] {
-    [&account.access, account.refresh.as_deref().unwrap_or_default(), account.google_secret.as_deref().unwrap_or_default()]
+pub(crate) fn account_secrets(account: &Account) -> Vec<&str> {
+    account.current_secrets().into_iter().chain(account.prior_secrets.iter().map(String::as_str)).collect()
 }
 
 fn redact_known_secrets(mut text: &str, secrets: &[&str]) -> String {
