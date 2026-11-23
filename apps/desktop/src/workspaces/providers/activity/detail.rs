@@ -9,6 +9,7 @@ enum RequestSort {
     Outcome,
     Latency,
     Tokens,
+    CacheHit,
     Cost,
 }
 
@@ -18,6 +19,7 @@ const REQUEST_COLUMNS: &[(RequestSort, &str)] = &[
     (RequestSort::Outcome, "Outcome"),
     (RequestSort::Latency, "Latency (ms)"),
     (RequestSort::Tokens, "Tokens"),
+    (RequestSort::CacheHit, "Cache hit %"),
     (RequestSort::Cost, "API-equivalent USD"),
 ];
 
@@ -70,6 +72,9 @@ pub(super) fn Requests(scope: ActivityScope, providers: Vec<ProviderSummary>) ->
                             RequestSort::Outcome => a.outcome.cmp(&b.outcome),
                             RequestSort::Latency => a.latency_ms.cmp(&b.latency_ms),
                             RequestSort::Tokens => token_count(a).cmp(&token_count(b)),
+                            RequestSort::CacheHit => request_cache_hit_rate(a.input_tokens, a.cache_read_tokens)
+                                .partial_cmp(&request_cache_hit_rate(b.input_tokens, b.cache_read_tokens))
+                                .unwrap_or(std::cmp::Ordering::Equal),
                             RequestSort::Cost => a.api_equivalent_cost_usd.partial_cmp(&b.api_equivalent_cost_usd).unwrap_or(std::cmp::Ordering::Equal),
                         };
                         (if desc { ordering.reverse() } else { ordering }).then_with(|| a.id.cmp(&b.id))
@@ -101,6 +106,7 @@ pub(super) fn Requests(scope: ActivityScope, providers: Vec<ProviderSummary>) ->
                                             td { "{row.outcome}" }
                                             td { "{maybe_i64(row.latency_ms)}" }
                                             td { "{fmt_signed_count(token_count(row))}" }
+                                            td { {fmt_hit_pct(request_cache_hit_rate(row.input_tokens, row.cache_read_tokens))} }
                                             td { "{money(row.api_equivalent_cost_usd)}" }
                                             td { "{activity_source_label(row.source)} · {row.client}" }
                                             td { button { class: "btn btn-glass btn-xs", aria_pressed: selected() == Some(id), onclick: move |_| selected.set(Some(id)), "Inspect" } }
@@ -149,19 +155,21 @@ fn RequestInspector(id: Uuid, providers: Vec<ProviderSummary>, operator: bool, c
         p { class: "mono muted", "{id}" }
         {read_view(result.as_ref(), |detail| {
             let r = &detail.exchange;
+            let hit_label = fmt_hit_pct(request_cache_hit_rate(r.input_tokens, r.cache_read_tokens));
             rsx! {
                 p { "{r.client} · {activity_source_label(r.source)} · {activity_purpose_label(r.purpose)} · {text(&r.transport)} · {fmt_dt(r.occurred_at)}" }
                 p { "Provider {r.provider_id} · Account {text(&r.account_id)} · Session {text(&r.session_id)} · Moved from {text(&r.moved_from_account_id)}" }
                 p { "Requested {r.requested_model} → effective {r.effective_model} · effort {text(&r.effort)} · {r.outcome} · HTTP {maybe_i64(r.status_code.map(i64::from))}" }
                 p { "Latency {maybe_i64(r.latency_ms)} ms · TTFT {maybe_i64(r.ttft_ms)} ms · API-equivalent {money(r.api_equivalent_cost_usd)}" }
-                p { "Input {fmt_signed_count(r.input_tokens)} · Output {fmt_signed_count(r.output_tokens)} · Cache read {fmt_signed_count(r.cache_read_tokens)} · Cache write {fmt_signed_count(r.cache_write_tokens)} · Thinking {fmt_signed_count(r.thinking_tokens)}" }
+                p { "Input {fmt_signed_count(r.input_tokens)} · Output {fmt_signed_count(r.output_tokens)} · Cache read {fmt_signed_count(r.cache_read_tokens)} ({hit_label}) · Cache write {fmt_signed_count(r.cache_write_tokens)} · Thinking {fmt_signed_count(r.thinking_tokens)}" }
                 if let Some(error) = &r.error_message { p { "{error}" } }
                 h3 { "Upstream attempts ({r.attempt_count})" }
-                Table { label: "Upstream attempts", headers: &["Attempt", "Provider", "Account", "Moved from", "Requested → effective", "Effort", "Outcome", "HTTP", "Error", "Latency ms", "TTFT ms", "Input", "Output", "Cache read", "Cache write", "Thinking", "API-equivalent USD", "Capture", "Started"],
+                Table { label: "Upstream attempts", headers: &["Attempt", "Provider", "Account", "Moved from", "Requested → effective", "Effort", "Outcome", "HTTP", "Error", "Latency ms", "TTFT ms", "Input", "Output", "Cache read", "Cache hit %", "Cache write", "Thinking", "API-equivalent USD", "Capture", "Started"],
                     rows: detail.attempts.iter().map(|a| vec![a.attempt_index.to_string(), a.provider_id.clone(), text(&a.account_id), text(&a.moved_from_account_id),
                         format!("{} → {}", a.requested_model, a.effective_model), text(&a.effort), a.outcome.clone(), a.status_code.map_or_else(|| "—".into(), |v| v.to_string()),
                         text(&a.error_message), maybe_i64(a.latency_ms), maybe_i64(a.ttft_ms), fmt_signed_count(a.input_tokens), fmt_signed_count(a.output_tokens),
-                        fmt_signed_count(a.cache_read_tokens), fmt_signed_count(a.cache_write_tokens), fmt_signed_count(a.thinking_tokens), money(a.api_equivalent_cost_usd), capture_state_label(a.capture_state).into(), fmt_dt(a.started_at)
+                        fmt_signed_count(a.cache_read_tokens), fmt_hit_pct(request_cache_hit_rate(a.input_tokens, a.cache_read_tokens)),
+                        fmt_signed_count(a.cache_write_tokens), fmt_signed_count(a.thinking_tokens), money(a.api_equivalent_cost_usd), capture_state_label(a.capture_state).into(), fmt_dt(a.started_at)
                     ]).collect() }
                 if let Some(session_id) = &r.session_id && let Some(provider) = providers.iter().find(|p| p.descriptor.id == r.provider_id) {
                     MoveConversation { provider: provider.clone(), session_id: session_id.clone() }

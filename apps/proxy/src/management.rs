@@ -646,7 +646,7 @@ struct ApiCall {
     data: Option<String>,
 }
 
-fn allowed_call(account: &Account, url: &reqwest::Url, method: &str) -> bool {
+pub(crate) fn allowed_call(account: &Account, url: &reqwest::Url, method: &str) -> bool {
     if url.scheme() != "https"
         || url.port().is_some()
         || url.fragment().is_some()
@@ -676,7 +676,6 @@ async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) ->
     let account = select(&proxy, &json!({"auth_index":call.auth_index})).await?;
     let url = reqwest::Url::parse(&call.url).map_err(|_| bad("invalid upstream URL"))?;
     let method = call.method.to_ascii_uppercase();
-    #[cfg(test)]
     let mock = proxy.management_mock.as_ref().is_some_and(|m| {
         m.origin() == url.origin()
             && url.username().is_empty()
@@ -684,8 +683,6 @@ async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) ->
             && url.fragment().is_none()
             && matches!(method.as_str(), "GET" | "POST")
     });
-    #[cfg(not(test))]
-    let mock = false;
     if !mock && !allowed_call(&account, &url, &method) {
         return Err(Failure(StatusCode::FORBIDDEN, "upstream is not allowed for this credential"));
     }

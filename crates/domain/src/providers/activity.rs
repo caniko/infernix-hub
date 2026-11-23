@@ -483,8 +483,22 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
 
     let mut trend_map: BTreeMap<DateTime<Utc>, ActivityTrendPoint> = BTreeMap::new();
     let mut heatmap_map: BTreeMap<(u8, u8), HeatmapCell> = BTreeMap::new();
-    let mut rhythm_map: BTreeMap<u8, RhythmBucket> =
-        (0..24).map(|h| (h, RhythmBucket { hour: h, requests: 0, tokens: 0, api_equivalent_cost_usd: 0.0 })).collect();
+    let mut rhythm_map: BTreeMap<u8, RhythmBucket> = (0..24)
+        .map(|h| {
+            (
+                h,
+                RhythmBucket {
+                    hour: h,
+                    requests: 0,
+                    tokens: 0,
+                    input_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_hit_rate: 0.0,
+                    api_equivalent_cost_usd: 0.0,
+                },
+            )
+        })
+        .collect();
     let mut by_model: BTreeMap<String, BreakdownRow> = BTreeMap::new();
     let mut by_account: BTreeMap<String, BreakdownRow> = BTreeMap::new();
     let mut by_client: BTreeMap<String, BreakdownRow> = BTreeMap::new();
@@ -544,6 +558,8 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cache_hit_rate: 0.0,
             thinking_tokens: 0,
             api_equivalent_cost_usd: 0.0,
         });
@@ -552,6 +568,8 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
         tp.input_tokens += inp;
         tp.output_tokens += out;
         tp.cache_read_tokens += cr;
+        tp.cache_write_tokens += cw;
+        tp.cache_hit_rate = cache_hit_rate(tp.cache_read_tokens, tp.input_tokens);
         tp.thinking_tokens += th;
         tp.api_equivalent_cost_usd += row_cost;
 
@@ -563,31 +581,40 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
             hour,
             requests: 0,
             tokens: 0,
+            input_tokens: 0,
+            cache_read_tokens: 0,
+            cache_hit_rate: 0.0,
             api_equivalent_cost_usd: 0.0,
         });
         hc.requests += 1;
         hc.tokens += inp + out;
+        hc.input_tokens += inp;
+        hc.cache_read_tokens += cr;
+        hc.cache_hit_rate = cache_hit_rate(hc.cache_read_tokens, hc.input_tokens);
         hc.api_equivalent_cost_usd += row_cost;
 
         if let Some(rb) = rhythm_map.get_mut(&hour) {
             rb.requests += 1;
             rb.tokens += inp + out;
+            rb.input_tokens += inp;
+            rb.cache_read_tokens += cr;
+            rb.cache_hit_rate = cache_hit_rate(rb.cache_read_tokens, rb.input_tokens);
             rb.api_equivalent_cost_usd += row_cost;
         }
 
         let unpriced_inc = u64::from(r.api_equivalent_cost_usd.is_none());
-        add_breakdown(&mut by_model, &r.effective_model, &r.effective_model, is_fail, inp + out, out, cr, th, row_cost, unpriced_inc);
+        add_breakdown(&mut by_model, &r.effective_model, &r.effective_model, is_fail, inp, out, cr, cw, th, row_cost, unpriced_inc);
         let acct_key = format!("{}:{}", r.provider_id, r.account_id.as_deref().unwrap_or("unassigned"));
-        add_breakdown(&mut by_account, &acct_key, &acct_key, is_fail, inp + out, out, cr, th, row_cost, unpriced_inc);
-        add_breakdown(&mut by_client, &r.client, &r.client, is_fail, inp + out, out, cr, th, row_cost, unpriced_inc);
+        add_breakdown(&mut by_account, &acct_key, &acct_key, is_fail, inp, out, cr, cw, th, row_cost, unpriced_inc);
+        add_breakdown(&mut by_client, &r.client, &r.client, is_fail, inp, out, cr, cw, th, row_cost, unpriced_inc);
         let me_key = match &r.effort {
             Some(e) if !e.is_empty() => format!("{} ({e})", r.effective_model),
             _ => r.effective_model.clone(),
         };
-        add_breakdown(&mut by_model_effort, &me_key, &me_key, is_fail, inp + out, out, cr, th, row_cost, unpriced_inc);
+        add_breakdown(&mut by_model_effort, &me_key, &me_key, is_fail, inp, out, cr, cw, th, row_cost, unpriced_inc);
     }
 
-    let cache_hit_rate = if input_tokens > 0 { (cache_read_tokens as f64 / input_tokens as f64).clamp(0.0, 1.0) } else { 0.0 };
+    let overall_cache_hit_rate = cache_hit_rate(cache_read_tokens, input_tokens);
 
     Ok(ActivityOverview {
         api_equivalent_cost_usd: cost_usd,
@@ -603,7 +630,7 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
         thinking_tokens,
         requests: rows.len() as u64,
         failures,
-        cache_hit_rate,
+        cache_hit_rate: overall_cache_hit_rate,
         cache_savings_usd,
         matched_proxy_requests: matched_proxy,
         bypassed_local_requests: bypassed_local,
@@ -619,15 +646,20 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
     })
 }
 
+pub fn cache_hit_rate(cache_read_tokens: u64, input_tokens: u64) -> f64 {
+    if input_tokens > 0 { (cache_read_tokens as f64 / input_tokens as f64).clamp(0.0, 1.0) } else { 0.0 }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_breakdown(
     map: &mut BTreeMap<String, BreakdownRow>,
     key: &str,
     label: &str,
     failures: u64,
-    total_tokens: u64,
+    input_tokens: u64,
     output_tokens: u64,
     cache_read: u64,
+    cache_write: u64,
     thinking: u64,
     cost: f64,
     unpriced: u64,
@@ -638,17 +670,23 @@ fn add_breakdown(
         requests: 0,
         failures: 0,
         total_tokens: 0,
+        input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cache_hit_rate: 0.0,
         thinking_tokens: 0,
         api_equivalent_cost_usd: 0.0,
         unpriced_requests: 0,
     });
     e.requests += 1;
     e.failures += failures;
-    e.total_tokens += total_tokens;
+    e.input_tokens += input_tokens;
     e.output_tokens += output_tokens;
+    e.total_tokens += input_tokens + output_tokens;
     e.cache_read_tokens += cache_read;
+    e.cache_write_tokens += cache_write;
+    e.cache_hit_rate = cache_hit_rate(e.cache_read_tokens, e.input_tokens);
     e.thinking_tokens += thinking;
     e.api_equivalent_cost_usd += cost;
     e.unpriced_requests += unpriced;
@@ -1337,14 +1375,17 @@ pub async fn totals(hub: &Hub, actor: &Actor, granularity: TotalsGranularity, sc
     .fetch_one(&hub.db)
     .await?;
 
+    let g_inp_u64 = g_inp.max(0) as u64;
+    let g_cr_u64 = g_cr.max(0) as u64;
     let grand = TotalsBucket {
         period: "Total".into(),
         requests: g_reqs.max(0) as u64,
         failures: g_fails.max(0) as u64,
-        input_tokens: g_inp.max(0) as u64,
+        input_tokens: g_inp_u64,
         output_tokens: g_out.max(0) as u64,
-        cache_read_tokens: g_cr.max(0) as u64,
+        cache_read_tokens: g_cr_u64,
         cache_write_tokens: g_cw.max(0) as u64,
+        cache_hit_rate: cache_hit_rate(g_cr_u64, g_inp_u64),
         thinking_tokens: g_th.max(0) as u64,
         api_equivalent_cost_usd: g_cost,
         unpriced_requests: g_unp.max(0) as u64,
@@ -1353,14 +1394,17 @@ pub async fn totals(hub: &Hub, actor: &Actor, granularity: TotalsGranularity, sc
 
     let mut buckets = Vec::with_capacity(rows.len());
     for (p, reqs, fails, inp, out, cr, cw, th, cost, unp) in rows {
+        let inp_u64 = inp.max(0) as u64;
+        let cr_u64 = cr.max(0) as u64;
         buckets.push(TotalsBucket {
             period: p.format(fmt).to_string(),
             requests: reqs.max(0) as u64,
             failures: fails.max(0) as u64,
-            input_tokens: inp.max(0) as u64,
+            input_tokens: inp_u64,
             output_tokens: out.max(0) as u64,
-            cache_read_tokens: cr.max(0) as u64,
+            cache_read_tokens: cr_u64,
             cache_write_tokens: cw.max(0) as u64,
+            cache_hit_rate: cache_hit_rate(cr_u64, inp_u64),
             thinking_tokens: th.max(0) as u64,
             api_equivalent_cost_usd: cost,
             unpriced_requests: unp.max(0) as u64,
@@ -1746,6 +1790,25 @@ mod tests {
         assert!(is_success_outcome("success"));
         assert!(!is_success_outcome("failed"));
         assert!(!is_success_outcome("rate_limited"));
+    }
+
+    #[test]
+    fn cache_hit_rate_clamps_and_populates_breakdown_rows() {
+        assert_eq!(cache_hit_rate(0, 0), 0.0);
+        assert_eq!(cache_hit_rate(50, 0), 0.0);
+        assert!((cache_hit_rate(80, 100) - 0.8).abs() < 1e-9);
+        assert_eq!(cache_hit_rate(150, 100), 1.0);
+
+        let mut map = BTreeMap::new();
+        add_breakdown(&mut map, "gemini-4-neon", "gemini-4-neon", 0, 1_000, 100, 750, 50, 20, 0.05, 0);
+        add_breakdown(&mut map, "gemini-4-neon", "gemini-4-neon", 0, 1_000, 100, 950, 0, 10, 0.02, 0);
+        let row = &map["gemini-4-neon"];
+        assert_eq!(row.input_tokens, 2_000);
+        assert_eq!(row.output_tokens, 200);
+        assert_eq!(row.total_tokens, 2_200);
+        assert_eq!(row.cache_read_tokens, 1_700);
+        assert_eq!(row.cache_write_tokens, 50);
+        assert!((row.cache_hit_rate - 0.85).abs() < 1e-9);
     }
 
     #[test]

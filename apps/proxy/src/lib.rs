@@ -4,6 +4,7 @@ pub mod hub_sync;
 mod management;
 mod pool;
 mod router;
+pub mod verify;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -41,7 +42,6 @@ pub struct Proxy {
     codex_keys: Mutex<CodexKeys>,
     google_tokens: Mutex<HashMap<[u8; 32], VerifiedGoogleToken>>,
     shutdown: Notify,
-    #[cfg(test)]
     management_mock: Option<reqwest::Url>,
 }
 
@@ -141,7 +141,6 @@ impl Proxy {
             codex_keys: Mutex::new(CodexKeys::default()),
             google_tokens: Mutex::new(HashMap::new()),
             shutdown: Notify::new(),
-            #[cfg(test)]
             management_mock: None,
         })
     }
@@ -149,6 +148,10 @@ impl Proxy {
     pub fn with_hub_sync_configured(mut self, configured: bool) -> Self {
         self.hub_sync_configured = configured;
         self
+    }
+
+    pub(crate) fn set_mock_endpoints(&mut self, base: reqwest::Url) {
+        self.management_mock = Some(base);
     }
 
     pub fn app(self: Arc<Self>) -> Router {
@@ -323,13 +326,11 @@ impl Proxy {
     }
 
     async fn google_tokeninfo(&self, token: &str) -> Result<Value, &'static str> {
-        let tokeninfo_url = "https://oauth2.googleapis.com/tokeninfo".to_owned();
-        #[cfg(test)]
         let tokeninfo_url = self
             .management_mock
             .as_ref()
             .and_then(|base| base.join("/test/google-tokeninfo").ok())
-            .map_or(tokeninfo_url, |url| url.to_string());
+            .map_or_else(|| "https://oauth2.googleapis.com/tokeninfo".to_owned(), |url| url.to_string());
         provider_json(self.http.post(tokeninfo_url).form(&[("access_token", token)])).await
     }
 
@@ -550,10 +551,11 @@ impl Proxy {
         let (Some(refresh), Some(id), Some(secret)) = (&current.refresh, &current.google_client, &current.google_secret) else {
             return Err(anyhow!("Google OAuth refresh fields unavailable"));
         };
-        let token_url = "https://oauth2.googleapis.com/token".to_owned();
-        #[cfg(test)]
-        let token_url =
-            self.management_mock.as_ref().and_then(|base| base.join("/test/google-token").ok()).map_or(token_url, |url| url.to_string());
+        let token_url = self
+            .management_mock
+            .as_ref()
+            .and_then(|base| base.join("/test/google-token").ok())
+            .map_or_else(|| "https://oauth2.googleapis.com/token".to_owned(), |url| url.to_string());
         let body = provider_json(self.http.post(token_url).form(&[
             ("grant_type", "refresh_token"),
             ("client_id", id),
