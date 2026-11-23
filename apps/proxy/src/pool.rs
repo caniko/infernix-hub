@@ -118,8 +118,8 @@ pub(crate) fn quota_window_active(lane: Lane, w: &QuotaWindow, now: DateTime<Utc
 
 pub(crate) const MAX_COOLDOWN_SECS: i64 = 604_800;
 
-pub(crate) fn safe_wire_model(model: &str) -> bool {
-    !model.is_empty() && model.bytes().all(|b| b.is_ascii_graphic() && b != b';')
+pub(crate) fn bounded_identifier(model: &str) -> bool {
+    !model.is_empty() && model.len() <= 192 && model.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-:/".contains(&b))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +187,7 @@ impl Account {
         self.lane == other.lane
             && self.api_key == other.api_key
             && (self.lane != Lane::Codex || (self.chatgpt_id == other.chatgpt_id && self.chatgpt_user == other.chatgpt_user))
+            && (self.lane != Lane::Google || (self.project == other.project && self.base == other.base))
             && (self.refresh.is_none() || other.refresh.is_none() || self.refresh == other.refresh)
             && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
     }
@@ -610,9 +611,10 @@ impl Pool {
     }
 
     pub(crate) fn evaluate_model_eligibility<'a>(&'a self, lane: Lane, model: &'a str, now: DateTime<Utc>) -> Option<ModelEligibility<'a>> {
-        if !safe_wire_model(model) {
+        if !bounded_identifier(model) {
             return None;
         }
+        let horizon = chrono::TimeDelta::seconds(MAX_COOLDOWN_SECS);
         let mut evaluation = ModelEligibility {
             snapshot_at: now,
             lane: lane.name(),
@@ -632,7 +634,7 @@ impl Pool {
                 let mut complete = true;
                 let mut block = |reason, reset_at: Option<DateTime<Utc>>| {
                     reasons.push(reason);
-                    if let Some(at) = reset_at.filter(|at| *at > now && *at - now <= chrono::TimeDelta::seconds(MAX_COOLDOWN_SECS)) {
+                    if let Some(at) = reset_at.filter(|at| *at > now && *at - now <= horizon) {
                         account_reset = account_reset.max(Some(at));
                     } else {
                         complete = false;
@@ -648,8 +650,11 @@ impl Pool {
                 }
                 let mut windows = account.active_quota_windows(now, model).peekable();
                 if windows.peek().is_some() {
-                    // Every enforcing window must supply a reset. A cached observation's TTL is not one.
-                    let reset = windows.try_fold(now, |latest, w| Some(latest.max(w.resets_at?)));
+                    // A cached reset must have been credible when observed, not just when read.
+                    let reset = windows.try_fold(now, |latest, w| {
+                        let (observed, at) = (w.observed_at?, w.resets_at?);
+                        (observed < at && at - observed <= horizon).then_some(latest.max(at))
+                    });
                     block("quota_window", reset);
                 }
                 if reasons.is_empty() {
@@ -670,13 +675,11 @@ impl Pool {
         self.evaluate_model_eligibility(Lane::Google, model, now)?.verified_next_reset_at
     }
 
-    pub fn next_reset(&self, lane: Lane, model: &str) -> Option<DateTime<Utc>> {
-        let now = Utc::now();
+    pub fn next_reset(&self, lane: Lane, model: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.supported(lane, model).filter_map(|a| a.quota_limited_until(now, model)).min()
     }
 
-    pub fn all_quota_limited(&self, lane: Lane, model: &str) -> bool {
-        let now = Utc::now();
+    pub fn all_quota_limited(&self, lane: Lane, model: &str, now: DateTime<Utc>) -> bool {
         let mut accounts = self.supported(lane, model).peekable();
         accounts.peek().is_some() && accounts.all(|a| a.quota_limited_until(now, model).is_some())
     }
@@ -691,8 +694,15 @@ impl Pool {
             .map(|a| a.id.as_str())
     }
 
-    pub fn pick(&mut self, lane: Lane, session: Option<&str>, parent: Option<&str>, model: &str, tried: &[String]) -> Option<Account> {
-        let now = Utc::now();
+    pub fn pick(
+        &mut self,
+        lane: Lane,
+        session: Option<&str>,
+        parent: Option<&str>,
+        model: &str,
+        tried: &[String],
+        now: DateTime<Utc>,
+    ) -> Option<Account> {
         let eligible = |a: &&Account| {
             a.lane == lane
                 && a.eligible(now, model)
@@ -784,7 +794,7 @@ impl Pool {
             cursors: self.cursors.clone(),
             ..Self::default()
         };
-        copy.pick(lane, None, None, "", &[]).map(|a| a.id)
+        copy.pick(lane, None, None, "", &[], Utc::now()).map(|a| a.id)
     }
 
     pub fn bound(&self, lane: Lane, id: &str) -> Option<&str> {

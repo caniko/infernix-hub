@@ -23,7 +23,7 @@ use crate::{
     ACTIVITY_CAP, CAPTURE_BYTES, Proxy,
     config::matches_secret,
     openai_account,
-    pool::{Account, Cooldown, Lane, MAX_COOLDOWN_SECS, Pool, model_cooldown_scope, safe_wire_model, text},
+    pool::{Account, Cooldown, Lane, MAX_COOLDOWN_SECS, Pool, bounded_identifier, model_cooldown_scope, text},
 };
 
 const POOL_QUOTA_HEADER: &str = "x-fleetix-pool-quota";
@@ -97,14 +97,14 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         let (model, _) = path.strip_prefix("/v1beta/models/")?.split_once(':')?;
         (!model.contains('/')).then_some(model)
     };
-    let model = path_model().or_else(|| text(&raw, &["model"])).filter(|s| identifier(s)).unwrap_or_default();
+    let model = path_model().or_else(|| text(&raw, &["model"])).filter(|s| bounded_identifier(s)).unwrap_or_default();
     let effort = text(&raw, &["/reasoning/effort", "reasoning_effort", "/output_config/effort", "effort"])
-        .filter(|s| identifier(s))
+        .filter(|s| bounded_identifier(s))
         .map(str::to_owned);
     let metadata_user: Value = text(&raw, &["/metadata/user_id"]).and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
     let session_id = |s: &str| {
         let digits = s.strip_prefix('-').unwrap_or(s);
-        identifier(s) && (lane != Lane::Google || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()))
+        bounded_identifier(s) && (lane != Lane::Google || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()))
     };
     let session = if lane == Lane::Google {
         // ACP's request.session_id is a shared user hash, not a conversation ID.
@@ -173,22 +173,23 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
     }
     let mut tried = Vec::new();
     let mut last_error = StatusCode::SERVICE_UNAVAILABLE;
-    let pool_reset = |pool: &Pool| {
-        let reset = pool.next_reset(lane, model).filter(|_| pool.all_quota_limited(lane, model))?;
-        let verified_reset = if lane == Lane::Google { pool.verified_google_reset_at(model, Utc::now()) } else { None };
+    let pool_reset = |pool: &Pool, now| {
+        let reset = pool.next_reset(lane, model, now).filter(|_| pool.all_quota_limited(lane, model, now))?;
+        let verified_reset = if lane == Lane::Google { pool.verified_google_reset_at(model, now) } else { None };
         Some((reset, verified_reset))
     };
     loop {
-        let (account, reset) = {
+        let (account, reset, now) = {
             let mut state = proxy.state.write().await;
+            let now = Utc::now();
             let pool = &mut state.pool;
-            let account = pool.pick(lane, exchange.session.as_deref(), exchange.parent.as_deref(), model, &tried);
-            let reset = if account.is_none() { pool_reset(pool) } else { None };
-            (account, reset)
+            let account = pool.pick(lane, exchange.session.as_deref(), exchange.parent.as_deref(), model, &tried, now);
+            let reset = if account.is_none() { pool_reset(pool, now) } else { None };
+            (account, reset, now)
         };
         let Some(mut account) = account else {
             if let Some((reset, verified_reset)) = reset {
-                return exchange.rate_limited(reset, verified_reset, model).await;
+                return exchange.rate_limited(reset, verified_reset, model, now).await;
             }
             exchange.finish(Some(last_error), "unavailable", Usage::default(), None, None).await;
             return error(last_error, "no eligible upstream account");
@@ -295,18 +296,19 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         }
         if failover {
             let mut state = proxy.state.write().await;
+            let now = Utc::now();
             // Preview on the real scheduler; retries do not increment the round-robin cursor.
-            let next = state.pool.pick(lane, exchange.session.as_deref(), exchange.parent.as_deref(), model, &tried);
+            let next = state.pool.pick(lane, exchange.session.as_deref(), exchange.parent.as_deref(), model, &tried, now);
             if next.is_some() {
                 exchange.complete_attempt(Usage::default(), Some(millis(began.elapsed())));
                 drop(state);
                 proxy.log("warn", "upstream request failed over").await;
                 continue;
             }
-            let reset = pool_reset(&state.pool);
+            let reset = pool_reset(&state.pool, now);
             drop(state);
             if let Some((reset, verified_reset)) = reset {
-                return exchange.rate_limited(reset, verified_reset, model).await;
+                return exchange.rate_limited(reset, verified_reset, model, now).await;
             }
         }
         if status.is_success() {
@@ -367,7 +369,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
     }
 }
 
-fn pool_limit(lane: Lane, reset: DateTime<Utc>, verified_reset: Option<DateTime<Utc>>, model: &str) -> Response {
+fn pool_limit(lane: Lane, reset: DateTime<Utc>, verified_reset: Option<DateTime<Utc>>, model: &str, now: DateTime<Utc>) -> Response {
     let message = "all eligible accounts are rate limited";
     let body = if lane == Lane::Google {
         let mut detail = json!({
@@ -384,8 +386,11 @@ fn pool_limit(lane: Lane, reset: DateTime<Utc>, verified_reset: Option<DateTime<
     let headers = response.headers_mut();
     headers.insert("x-should-retry", header::HeaderValue::from_static("false"));
     if lane == Lane::Google
-        && safe_wire_model(model)
+        && bounded_identifier(model)
         && let Some(at) = verified_reset
+        && let Some(at) = DateTime::from_timestamp(at.timestamp() + i64::from(at.timestamp_subsec_nanos() > 0), 0)
+        && at > now
+        && at - now <= TimeDelta::seconds(MAX_COOLDOWN_SECS)
         && let Ok(value) =
             header::HeaderValue::from_str(&format!("v1;retry_at={};wire_model={model}", at.to_rfc3339_opts(SecondsFormat::Secs, true)))
     {
@@ -397,7 +402,7 @@ fn pool_limit(lane: Lane, reset: DateTime<Utc>, verified_reset: Option<DateTime<
         }
     };
     if reset != DateTime::<Utc>::MAX_UTC {
-        set(headers, "retry-after", (reset - Utc::now()).num_seconds().max(1));
+        set(headers, "retry-after", (reset - now).num_seconds().max(1));
         if lane == Lane::Claude {
             headers.insert("anthropic-ratelimit-unified-status", header::HeaderValue::from_static("rejected"));
             set(headers, "anthropic-ratelimit-unified-reset", reset.timestamp());
@@ -408,6 +413,22 @@ fn pool_limit(lane: Lane, reset: DateTime<Utc>, verified_reset: Option<DateTime<
         }
     }
     response
+}
+
+#[test]
+fn pool_witness_rounds_up_without_exceeding_the_horizon() {
+    let now = "2026-11-23T12:00:00.900Z".parse::<DateTime<Utc>>().unwrap();
+    let blocker = now + TimeDelta::seconds(10);
+    let model = "gemini-neon";
+    let response = pool_limit(Lane::Google, blocker, Some(blocker), model, now);
+    let expected = "2026-11-23T12:00:11Z";
+    assert_eq!(response.headers()[POOL_QUOTA_HEADER].to_str().unwrap(), format!("v1;retry_at={expected};wire_model={model}"));
+    assert!(expected.parse::<DateTime<Utc>>().unwrap() >= blocker);
+    assert_eq!(response.headers()["retry-after"], "10");
+
+    let horizon = now + TimeDelta::days(7);
+    let response = pool_limit(Lane::Google, horizon, Some(horizon), model, now);
+    assert!(!response.headers().contains_key(POOL_QUOTA_HEADER));
 }
 
 pub(crate) async fn run_window_start(
@@ -488,12 +509,8 @@ fn capture_path(path: &str) -> &str {
     }
 }
 
-fn identifier(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 192 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-:/".contains(&b))
-}
-
 fn header_id<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
-    names.iter().find_map(|name| headers.get(*name)?.to_str().ok()).filter(|s| identifier(s))
+    names.iter().find_map(|name| headers.get(*name)?.to_str().ok()).filter(|s| bounded_identifier(s))
 }
 
 fn connection_headers(headers: &HeaderMap) -> Vec<&str> {
@@ -605,11 +622,12 @@ async fn rate_limit_prefix(
     ([(!prefix.is_empty()).then(|| Bytes::from(prefix)), tail], error)
 }
 
-fn duration_seconds(mut raw: &str) -> Option<f64> {
+fn duration_seconds(mut raw: &str) -> Option<(f64, bool)> {
     if raw.is_empty() {
         return None;
     }
     let mut seconds = 0.0;
+    let mut strict = true;
     while !raw.is_empty() {
         let split = raw.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
         let (number, unit) = raw.split_at(split);
@@ -626,9 +644,10 @@ fn duration_seconds(mut raw: &str) -> Option<f64> {
             (factor, &unit[1..])
         };
         seconds += number.parse::<f64>().ok()? * factor;
+        strict &= !number.starts_with('.') && !number.ends_with('.');
         raw = rest;
     }
-    Some(seconds)
+    Some((seconds, strict))
 }
 
 fn cooldown_after(now: DateTime<Utc>, seconds: i64) -> DateTime<Utc> {
@@ -645,32 +664,58 @@ fn upstream_delay(now: DateTime<Utc>, seconds: f64) -> Cooldown {
 }
 
 pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc>) -> Option<Cooldown> {
+    let digits = |raw: &str| !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+    let verify = |mut cooldown: Cooldown, strict| {
+        cooldown.verified_reset &= strict;
+        cooldown
+    };
     let clamp = |at| clamp_cooldown(now, at);
     let epoch =
         |n| clamp(DateTime::from_timestamp(n, 0).unwrap_or(if n < 0 { DateTime::<Utc>::MIN_UTC } else { DateTime::<Utc>::MAX_UTC }));
     let get = |name: &str| headers.get(name)?.to_str().ok();
-    let parse_reset = |raw: &str| {
+    // Preserve the legacy interpretation, but only attest known header/format pairs.
+    let parse_reset = |name: &str, raw: &str| {
         if let Ok(at) = raw.parse::<DateTime<Utc>>() {
-            return Some(clamp(at));
+            let known = matches!(
+                name,
+                "x-ratelimit-reset"
+                    | "anthropic-ratelimit-requests-reset"
+                    | "anthropic-ratelimit-tokens-reset"
+                    | "anthropic-ratelimit-input-tokens-reset"
+                    | "anthropic-ratelimit-output-tokens-reset"
+            );
+            let strict = matches!(raw.as_bytes().get(10), Some(&b'T' | &b't')) && DateTime::parse_from_rfc3339(raw).is_ok();
+            return Some(verify(clamp(at), known && strict));
         }
         if let Ok(n) = raw.parse::<i64>() {
-            return Some(if n > 1_000_000_000 { epoch(n) } else { upstream_delay(now, n as f64) });
+            let is_epoch = n > 1_000_000_000;
+            let known = name == "x-ratelimit-reset"
+                || (is_epoch
+                    && matches!(
+                        name,
+                        "anthropic-ratelimit-unified-reset"
+                            | "anthropic-ratelimit-unified-5h-reset"
+                            | "anthropic-ratelimit-unified-7d-reset"
+                    ));
+            let cooldown = if is_epoch { epoch(n) } else { upstream_delay(now, n as f64) };
+            return Some(verify(cooldown, known && digits(raw)));
         }
-        duration_seconds(raw).map(|n| upstream_delay(now, n))
+        let known = matches!(name, "x-ratelimit-reset" | "x-ratelimit-reset-requests" | "x-ratelimit-reset-tokens");
+        duration_seconds(raw).map(|(n, strict)| verify(upstream_delay(now, n), known && strict))
     };
     if let Some(at) = get("retry-after").and_then(|raw| {
-        raw.parse::<i64>()
-            .ok()
-            .filter(|n| *n >= 0)
-            .map(|n| upstream_delay(now, n as f64))
-            .or_else(|| DateTime::parse_from_rfc2822(raw).ok().map(|at| clamp(at.with_timezone(&Utc))))
+        raw.parse::<i64>().ok().filter(|n| *n >= 0).map(|n| verify(upstream_delay(now, n as f64), digits(raw))).or_else(|| {
+            let at = DateTime::parse_from_rfc2822(raw).ok()?.with_timezone(&Utc);
+            let strict = raw == at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            Some(verify(clamp(at), strict))
+        })
     }) {
         return Some(at);
     }
     if lane == Lane::Codex {
         let windows = ["x-codex-primary", "x-codex-secondary"].map(|prefix| {
             let exhausted = get(&format!("{prefix}-used-percent")).and_then(|s| s.parse::<f64>().ok()).is_some_and(|n| n >= 100.0);
-            let reset = get(&format!("{prefix}-reset-at")).and_then(|s| s.parse::<i64>().ok()).map(epoch);
+            let reset = get(&format!("{prefix}-reset-at")).and_then(|s| Some(verify(epoch(s.parse::<i64>().ok()?), digits(s))));
             (exhausted, reset)
         });
         if windows.iter().any(|(exhausted, _)| *exhausted) {
@@ -696,7 +741,12 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
             })
             .peekable();
         if exhausted.peek().is_some() {
-            return exhausted.filter_map(|window| get(&format!("{window}-reset")).and_then(parse_reset)).reduce(Cooldown::merge);
+            return exhausted
+                .filter_map(|window| {
+                    let name = format!("{window}-reset");
+                    parse_reset(&name, get(&name)?)
+                })
+                .reduce(Cooldown::merge);
         }
     }
     headers
@@ -705,7 +755,7 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
             let name = name.as_str();
             ((name.starts_with("anthropic-ratelimit-") || name.starts_with("x-ratelimit-"))
                 && (name.ends_with("-reset") || name.contains("-reset-")))
-            .then(|| parse_reset(value.to_str().ok()?))
+            .then(|| parse_reset(name, value.to_str().ok()?))
             .flatten()
         })
         .reduce(Cooldown::merge)
@@ -715,7 +765,7 @@ pub(crate) fn body_cooldown(lane: Lane, body: &[u8], fallback: u64, now: DateTim
     if lane == Lane::Google
         && let Ok(raw) = serde_json::from_slice::<Value>(body)
     {
-        let delay = |v: &Value| v.as_str().and_then(duration_seconds).map(|n| upstream_delay(now, n));
+        let delay = |v: &Value| v.as_str().and_then(duration_seconds).map(|(n, _)| upstream_delay(now, n));
         let details = raw.pointer("/error/details").and_then(Value::as_array).into_iter().flatten();
         if let Some(at) = details
             .flat_map(|detail| match detail["@type"].as_str().and_then(|name| name.rsplit('/').next()) {
@@ -1075,10 +1125,10 @@ impl Exchange {
         }
     }
 
-    async fn rate_limited(self, reset: DateTime<Utc>, verified_reset: Option<DateTime<Utc>>, model: &str) -> Response {
+    async fn rate_limited(self, reset: DateTime<Utc>, verified_reset: Option<DateTime<Utc>>, model: &str, now: DateTime<Utc>) -> Response {
         let lane = self.lane;
         self.finish(Some(StatusCode::TOO_MANY_REQUESTS), "rate_limited", Usage::default(), None, None).await;
-        pool_limit(lane, reset, verified_reset, model)
+        pool_limit(lane, reset, verified_reset, model, now)
     }
 
     async fn finish(

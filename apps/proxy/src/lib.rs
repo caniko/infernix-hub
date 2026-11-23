@@ -647,7 +647,7 @@ impl Proxy {
         None
     }
 
-    async fn google_quota_windows(&self, account: &mut Account, token: &mut String) -> (Vec<QuotaWindow>, bool) {
+    async fn google_quota_windows(&self, account: &Account, token: &mut String, project: &mut Option<String>) -> (Vec<QuotaWindow>, bool) {
         use integrations::providers::antigravity;
         let hosts = self.antigravity_hosts();
         let request = |url, access: &str, project: Option<&str>| {
@@ -675,8 +675,7 @@ impl Proxy {
                 .collect();
             let at = Utc::now();
             let reads =
-                futures_util::future::join_all(urls.iter().cloned().map(|url| request(url, token, account.project.as_deref()).send()))
-                    .await;
+                futures_util::future::join_all(urls.iter().cloned().map(|url| request(url, token, project.as_deref()).send())).await;
             let mut retry = Vec::new();
             for (url, response) in urls.into_iter().zip(reads) {
                 if let Ok(response) = response {
@@ -690,15 +689,14 @@ impl Proxy {
             if !renewed && !retry.is_empty() {
                 renewed = true;
                 if let Ok(fresh) = self.token(account, true).await {
-                    if account.project.is_none() && fresh != *token {
-                        account.project = self.google_project_id(&fresh).await;
+                    if project.is_none() && fresh != *token {
+                        *project = self.google_project_id(&fresh).await;
                     }
                     *token = fresh;
                     let at = Utc::now();
-                    let reads = futures_util::future::join_all(
-                        retry.into_iter().map(|url| provider_json(request(url, token, account.project.as_deref()))),
-                    )
-                    .await;
+                    let reads =
+                        futures_util::future::join_all(retry.into_iter().map(|url| provider_json(request(url, token, project.as_deref()))))
+                            .await;
                     for raw in reads.into_iter().flatten() {
                         windows.extend(parse(&raw, at));
                     }
@@ -806,10 +804,13 @@ impl Proxy {
                     .map(|w| (None, None, w, vec![], None))
                     .map_err(|_| "OpenCode Go usage probe failed"),
                 Lane::Google => {
-                    if account.project.is_none() {
-                        account.project = self.google_project_id(&token).await;
-                    }
-                    let (windows, summary) = self.google_quota_windows(&mut account, &mut token).await;
+                    // A project discovered by this probe is not yet part of the enrolled route.
+                    let mut project = match &account.project {
+                        Some(project) => Some(project.clone()),
+                        None => self.google_project_id(&token).await,
+                    };
+                    let (windows, summary) = self.google_quota_windows(&account, &mut token, &mut project).await;
+                    account.project = project;
                     google_summary = summary;
                     account.access.clone_from(&token);
                     let email = if account.email.is_none() { self.google_token_email(&token).await } else { None };
