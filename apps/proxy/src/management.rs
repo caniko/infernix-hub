@@ -340,7 +340,8 @@ async fn windows(State(proxy): State<Arc<Proxy>>, query: Result<Query<WindowsQue
         (Some(lane), Some(model)) => {
             let lane = Lane::parse(lane).ok_or_else(|| bad("unknown lane"))?;
             let state = proxy.state.read().await;
-            let evaluation = state.pool.evaluate_model_eligibility(lane, model, Utc::now()).ok_or_else(|| bad("invalid wire model"))?;
+            let evaluation =
+                state.pool.evaluate_model_eligibility(lane, model, None, Utc::now()).ok_or_else(|| bad("invalid wire model"))?;
             return ok(json!({"model_eligibility":evaluation}));
         }
         (None, None) => {}
@@ -664,7 +665,7 @@ struct ApiCall {
     data: Option<String>,
 }
 
-fn allowed_call(account: &Account, url: &reqwest::Url, method: &str) -> bool {
+pub(crate) fn allowed_call(account: &Account, url: &reqwest::Url, method: &str) -> bool {
     if url.scheme() != "https"
         || url.port().is_some()
         || url.fragment().is_some()
@@ -694,7 +695,6 @@ async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) ->
     let account = select(&proxy, &json!({"auth_index":call.auth_index})).await?;
     let url = reqwest::Url::parse(&call.url).map_err(|_| bad("invalid upstream URL"))?;
     let method = call.method.to_ascii_uppercase();
-    #[cfg(test)]
     let mock = proxy.management_mock.as_ref().is_some_and(|m| {
         m.origin() == url.origin()
             && url.username().is_empty()
@@ -702,8 +702,6 @@ async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) ->
             && url.fragment().is_none()
             && matches!(method.as_str(), "GET" | "POST")
     });
-    #[cfg(not(test))]
-    let mock = false;
     if !mock && !allowed_call(&account, &url, &method) {
         return Err(Failure(StatusCode::FORBIDDEN, "upstream is not allowed for this credential"));
     }

@@ -630,17 +630,30 @@ impl Pool {
         self.accounts.get(id).or_else(|| self.accounts.values().find(|a| a.auth_index == id || self.hub_id(a) == id || a.hub_id() == id))
     }
 
-    fn support_exclusion(&self, account: &Account, model: &str) -> Option<&'static str> {
+    fn support_exclusion(&self, account: &Account, model: &str, required_project: Option<&str>) -> Option<&'static str> {
+        if required_project.is_some_and(|project| account.project.as_deref() != Some(project)) {
+            return Some("project_mismatch");
+        }
         account
             .support_exclusion(model)
             .or_else(|| (account.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly).then_some("subscriptions_only"))
     }
 
-    fn supported<'a>(&'a self, lane: Lane, model: &'a str) -> impl Iterator<Item = &'a Account> {
-        self.accounts.values().filter(move |a| a.lane == lane && self.support_exclusion(a, model).is_none())
+    pub(crate) fn supports(&self, a: &Account, lane: Lane, model: &str, required_project: Option<&str>) -> bool {
+        a.lane == lane && self.support_exclusion(a, model, required_project).is_none()
     }
 
-    pub(crate) fn evaluate_model_eligibility<'a>(&'a self, lane: Lane, model: &'a str, now: DateTime<Utc>) -> Option<ModelEligibility<'a>> {
+    fn supported<'a>(&'a self, lane: Lane, model: &'a str, required_project: Option<&'a str>) -> impl Iterator<Item = &'a Account> {
+        self.accounts.values().filter(move |a| self.supports(a, lane, model, required_project))
+    }
+
+    pub(crate) fn evaluate_model_eligibility<'a>(
+        &'a self,
+        lane: Lane,
+        model: &'a str,
+        required_project: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Option<ModelEligibility<'a>> {
         if !bounded_identifier(model) {
             return None;
         }
@@ -656,7 +669,7 @@ impl Pool {
         };
         for account in self.accounts.values().filter(|a| a.lane == lane) {
             let mut reasons = Vec::new();
-            if let Some(reason) = self.support_exclusion(account, model) {
+            if let Some(reason) = self.support_exclusion(account, model, required_project) {
                 reasons.push(reason);
             } else {
                 evaluation.supported_accounts += 1;
@@ -701,16 +714,21 @@ impl Pool {
         Some(evaluation)
     }
 
-    pub(crate) fn verified_google_reset_at(&self, model: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.evaluate_model_eligibility(Lane::Google, model, now)?.verified_next_reset_at
+    pub(crate) fn verified_google_reset_at(
+        &self,
+        model: &str,
+        required_project: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        self.evaluate_model_eligibility(Lane::Google, model, required_project, now)?.verified_next_reset_at
     }
 
-    pub fn next_reset(&self, lane: Lane, model: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.supported(lane, model).filter_map(|a| a.quota_limited_until(now, model)).min()
+    pub fn next_reset(&self, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.supported(lane, model, required_project).filter_map(|a| a.quota_limited_until(now, model)).min()
     }
 
-    pub fn all_quota_limited(&self, lane: Lane, model: &str, now: DateTime<Utc>) -> bool {
-        let mut accounts = self.supported(lane, model).peekable();
+    pub fn all_quota_limited(&self, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> bool {
+        let mut accounts = self.supported(lane, model, required_project).peekable();
         accounts.peek().is_some() && accounts.all(|a| a.quota_limited_until(now, model).is_some())
     }
 
@@ -727,18 +745,13 @@ impl Pool {
     pub fn pick(
         &mut self,
         lane: Lane,
-        session: Option<&str>,
-        parent: Option<&str>,
+        (session, parent): (Option<&str>, Option<&str>),
         model: &str,
+        required_project: Option<&str>,
         tried: &[String],
         now: DateTime<Utc>,
     ) -> Option<Account> {
-        let eligible = |a: &&Account| {
-            a.lane == lane
-                && a.eligible(now, model)
-                && !tried.contains(&a.id)
-                && !(a.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly)
-        };
+        let eligible = |a: &&Account| self.supports(a, lane, model, required_project) && a.eligible(now, model) && !tried.contains(&a.id);
         if let Some(a) = self.preferred(lane).and_then(|id| self.accounts.get(id)).filter(eligible) {
             return Some(a.clone());
         }
@@ -824,12 +837,16 @@ impl Pool {
             cursors: self.cursors.clone(),
             ..Self::default()
         };
-        copy.pick(lane, None, None, "", &[], Utc::now()).map(|a| a.id)
+        copy.pick(lane, (None, None), "", None, &[], Utc::now()).map(|a| a.id)
     }
 
     pub fn bound(&self, lane: Lane, id: &str) -> Option<&str> {
         let ttl = Duration::from_secs(self.policy.session_affinity_secs);
         self.affinity.get(&(lane, id.into())).filter(|(_, seen)| seen.elapsed() < ttl).map(|(id, _)| id.as_str())
+    }
+
+    pub(crate) fn clear_affinity(&mut self) {
+        self.affinity.clear();
     }
 
     pub fn bind(&mut self, lane: Lane, session: &str, account: &str) {
@@ -861,7 +878,7 @@ impl Pool {
         }
         let account = self.find(id).filter(|a| !a.disabled).ok_or("account not found")?;
         let (lane, id) = (account.lane, account.id.clone());
-        if self.bound(lane, session).is_none() {
+        if session.starts_with('#') || self.bound(lane, session).is_none() {
             return Err("session not found");
         }
         let mut moved = BTreeSet::new();

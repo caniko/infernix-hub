@@ -1307,6 +1307,10 @@ pub struct ActivityTrendPoint {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate: f64,
     pub thinking_tokens: u64,
     pub api_equivalent_cost_usd: f64,
 }
@@ -1319,6 +1323,12 @@ pub struct HeatmapCell {
     pub hour: u8,
     pub requests: u64,
     pub tokens: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate: f64,
     pub api_equivalent_cost_usd: f64,
 }
 
@@ -1327,6 +1337,12 @@ pub struct RhythmBucket {
     pub hour: u8,
     pub requests: u64,
     pub tokens: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate: f64,
     pub api_equivalent_cost_usd: f64,
 }
 
@@ -1337,8 +1353,14 @@ pub struct BreakdownRow {
     pub requests: u64,
     pub failures: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate: f64,
     pub thinking_tokens: u64,
     pub api_equivalent_cost_usd: f64,
     pub unpriced_requests: u64,
@@ -1664,6 +1686,8 @@ pub struct TotalsBucket {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate: f64,
     pub thinking_tokens: u64,
     pub api_equivalent_cost_usd: f64,
     pub unpriced_requests: u64,
