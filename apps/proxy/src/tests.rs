@@ -4093,6 +4093,8 @@ async fn provenance_oauth_discovers_all_antigravity_enrollments_and_deduplicates
 
 #[tokio::test]
 async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttles() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
     let dir = Scratch::new();
     let oauth_dir = dir.join("provenance-oauth");
     config::private_dir(&oauth_dir).unwrap();
@@ -4126,6 +4128,10 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
     .unwrap();
     fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o700)).unwrap();
 
+    let second_client_waiting = Arc::new(Notify::new());
+    let hydration_started = Arc::new(Notify::new());
+    let second_client_done = Arc::new(Notify::new());
+    let pool_lookups = Arc::new(AtomicUsize::new(0));
     let mock = serve(
         Router::new()
             .route(
@@ -4143,30 +4149,53 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
             )
             .route(
                 "/test/google-tokeninfo",
-                post(|body: String| async move {
-                    match body.as_str() {
-                        "access_token=ya29.pool-1" => axum::Json(json!({
-                            "aud": "agy-client",
-                            "email": "one@example.test",
-                            "email_verified": "true",
-                            "expires_in": "3599"
-                        }))
-                        .into_response(),
-                        "access_token=ya29.client-new" | "access_token=ya29.pool-new" => axum::Json(json!({
-                            "aud": "agy-client",
-                            "email": "new@example.test",
-                            "email_verified": "true",
-                            "expires_in": "3599"
-                        }))
-                        .into_response(),
-                        "access_token=ya29.client-unknown" => axum::Json(json!({
-                            "aud": "agy-client",
-                            "email": "unknown@example.test",
-                            "email_verified": "true",
-                            "expires_in": "3599"
-                        }))
-                        .into_response(),
-                        _ => StatusCode::BAD_REQUEST.into_response(),
+                post({
+                    let second_client_done = second_client_done.clone();
+                    move |body: String| {
+                        let second_client_waiting = second_client_waiting.clone();
+                        let hydration_started = hydration_started.clone();
+                        let second_client_done = second_client_done.clone();
+                        let pool_lookups = pool_lookups.clone();
+                        async move {
+                            match body.as_str() {
+                                "access_token=ya29.pool-1" => axum::Json(json!({
+                                    "aud": "agy-client",
+                                    "email": "one@example.test",
+                                    "email_verified": "true",
+                                    "expires_in": "3599"
+                                }))
+                                .into_response(),
+                                "access_token=ya29.client-new" | "access_token=ya29.client-new-second" | "access_token=ya29.pool-new" => {
+                                    match body.as_str() {
+                                        "access_token=ya29.client-new" => second_client_waiting.notified().await,
+                                        "access_token=ya29.client-new-second" => {
+                                            second_client_waiting.notify_one();
+                                            hydration_started.notified().await;
+                                        }
+                                        _ if pool_lookups.fetch_add(1, Relaxed) == 0 => {
+                                            hydration_started.notify_one();
+                                            second_client_done.notified().await;
+                                        }
+                                        _ => {}
+                                    }
+                                    axum::Json(json!({
+                                        "aud": "agy-client",
+                                        "email": "new@example.test",
+                                        "email_verified": "true",
+                                        "expires_in": "3599"
+                                    }))
+                                    .into_response()
+                                }
+                                "access_token=ya29.client-unknown" => axum::Json(json!({
+                                    "aud": "agy-client",
+                                    "email": "unknown@example.test",
+                                    "email_verified": "true",
+                                    "expires_in": "3599"
+                                }))
+                                .into_response(),
+                                _ => StatusCode::BAD_REQUEST.into_response(),
+                            }
+                        }
                     }
                 }),
             ),
@@ -4199,6 +4228,7 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
     proxy.discover_local_commands().await;
     assert_eq!(google_count(&proxy).await, 1);
     let rev_before = proxy.state.read().await.pool.revision;
+    let calls_before_reload = fs::read_to_string(&calls_file).unwrap().lines().count();
 
     // A new enrollment arrives after startup; concurrent authorize_google callers both succeed.
     config::write_private(
@@ -4207,13 +4237,24 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
         true,
     )
     .unwrap();
-    let (first_ok, second_ok) = tokio::join!(proxy.authorize_google("ya29.client-new"), proxy.authorize_google("ya29.client-new"));
-    assert!(first_ok && second_ok);
+    // The second caller sees the new enrollment after discovery starts the throttle,
+    // but before the first caller has written its verified email.
+    let second = async {
+        let ok = proxy.authorize_google("ya29.client-new-second").await;
+        second_client_done.notify_one();
+        ok
+    };
+    let (first_ok, second_ok) =
+        tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(proxy.authorize_google("ya29.client-new"), second) })
+            .await
+            .unwrap();
+    assert!(first_ok && second_ok, "first: {first_ok}, second: {second_ok}");
     assert_eq!(google_count(&proxy).await, 2);
     assert!(proxy.state.read().await.pool.revision > rev_before);
 
     // An immediate follow-up miss is throttled and does not re-spawn provenance-oauth.
     let calls_after_reload = fs::read_to_string(&calls_file).unwrap().lines().count();
+    assert_eq!(calls_after_reload, calls_before_reload + 2, "one discovery pass reads both manifests");
     assert!(!proxy.authorize_google("ya29.client-unknown").await);
     assert_eq!(fs::read_to_string(&calls_file).unwrap().lines().count(), calls_after_reload);
 

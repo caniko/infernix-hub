@@ -238,13 +238,16 @@ impl Proxy {
     }
 
     pub async fn refresh_local_commands(&self, min_interval: Duration) -> bool {
+        self.refresh_local_commands_since(min_interval, self.local_discovery_generation.load(Ordering::Acquire)).await
+    }
+
+    async fn refresh_local_commands_since(&self, min_interval: Duration, seen: u64) -> bool {
         if !self.config.discover_local {
             return false;
         }
-        let seen = self.local_discovery_generation.load(Ordering::Acquire);
         let mut last = self.local_discovery.lock().await;
         if self.local_discovery_generation.load(Ordering::Acquire) != seen {
-            // Another caller finished a discovery pass while we waited for the lock.
+            // Another caller finished a discovery pass since this caller's snapshot.
             return true;
         }
         if last.is_some_and(|at| at.elapsed() < min_interval) {
@@ -430,6 +433,9 @@ impl Proxy {
                 return matches_pool(&self.state.read().await.pool, &client_id, &email);
             }
         }
+        // A discovery pass may finish during token inspection, before its new
+        // accounts have verified emails. Retry hydration even if that pass started the throttle.
+        let seen = self.local_discovery_generation.load(Ordering::Acquire);
         self.hydrate_missing_google_metadata(false).await;
         let has_pool_candidates = |pool: &Pool| {
             pool.accounts
@@ -438,7 +444,7 @@ impl Proxy {
         };
         let mut has_candidates = has_pool_candidates(&self.state.read().await.pool);
         let mut refreshed = false;
-        if !has_candidates && self.refresh_local_commands(Duration::from_secs(15)).await {
+        if !has_candidates && self.refresh_local_commands_since(Duration::from_secs(15), seen).await {
             refreshed = true;
             self.hydrate_missing_google_metadata(false).await;
             has_candidates = has_pool_candidates(&self.state.read().await.pool);
@@ -463,7 +469,7 @@ impl Proxy {
             let state = self.state.read().await;
             clients.iter().copied().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned)
         };
-        if matched_client.is_none() && !refreshed && self.refresh_local_commands(Duration::from_secs(15)).await {
+        if matched_client.is_none() && !refreshed && self.refresh_local_commands_since(Duration::from_secs(15), seen).await {
             self.hydrate_missing_google_metadata(false).await;
             let state = self.state.read().await;
             matched_client = clients.iter().copied().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned);
