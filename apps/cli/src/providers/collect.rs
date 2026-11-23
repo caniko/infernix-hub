@@ -105,6 +105,8 @@ struct Proxy {
 struct ProxyInventory {
     #[serde(default)]
     hub_sync_configured: bool,
+    #[serde(skip)]
+    unavailable: bool,
     credentials: Vec<Value>,
 }
 
@@ -219,8 +221,8 @@ pub(super) async fn run(client: &HubClient, options: Options) -> Result<()> {
         meridian: options.meridian_url.as_deref().map(loopback).transpose()?,
     };
     let proxy = collector.proxy_inventory().await.unwrap_or_else(|error| {
-        eprintln!("Could not read local proxy inventory; using local provider probes: {error}");
-        ProxyInventory::default()
+        eprintln!("Could not read local proxy inventory; skipping proxy-owned Antigravity fallback: {error}");
+        ProxyInventory { unavailable: true, ..ProxyInventory::default() }
     });
     let mut supported = Vec::new();
     for (provider, label, service) in PROVIDERS {
@@ -393,7 +395,7 @@ impl Collector {
     }
 
     async fn batch(&self, provider: &str, label: &str, service: &str, proxy: &ProxyInventory) -> Option<ObservationBatch> {
-        if provider == "antigravity" && proxy.hub_sync_configured {
+        if provider == "antigravity" && (proxy.hub_sync_configured || proxy.unavailable) {
             return None;
         }
         let now = Utc::now();
@@ -676,6 +678,8 @@ mod tests {
         let credentials: Vec<_> = (1..=6).map(|i| json!({"provider":"antigravity","id":format!("google-{i}")})).collect();
         let native = ProxyInventory::from_response(json!({"credentials":credentials,"hub_sync_configured":true})).unwrap();
         assert!(collector.batch("antigravity", "Antigravity", "google", &native).await.is_none());
+        let unavailable = ProxyInventory { unavailable: true, ..ProxyInventory::default() };
+        assert!(collector.batch("antigravity", "Antigravity", "google", &unavailable).await.is_none());
         let external = ProxyInventory::from_response(json!({"credentials":credentials})).unwrap();
         let accounts = collector.batch("antigravity", "Antigravity", "google", &external).await.unwrap().accounts;
         assert_eq!(accounts.len(), 6);
