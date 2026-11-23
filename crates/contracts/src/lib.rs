@@ -17,9 +17,29 @@ pub mod client;
 /// Generic AI model provider, multi-account, quota, activity, routing and export contracts.
 pub mod providers;
 
-/// The fleet operations snapshot (`fleetix::status`), re-exported so the API,
-/// desktop and CLI never disagree about its shape.
-pub use fleetix::status as fleet;
+/// The Fleetix operations snapshot with Canix's expected-offline extension.
+pub mod fleet {
+    pub use fleetix::status::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FleetStatus {
+        #[serde(flatten)]
+        pub snapshot: fleetix::status::FleetStatus,
+        /// Host names confirmed offline by the producer, not all intermittent hosts.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub expected_offline_hosts: Vec<String>,
+    }
+
+    impl std::ops::Deref for FleetStatus {
+        type Target = fleetix::status::FleetStatus;
+
+        fn deref(&self) -> &Self::Target {
+            &self.snapshot
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,7 +73,7 @@ pub struct Secret {
     pub category: String,
     pub project: Option<String>,
     pub kind: String,
-    pub custodian: String,
+    pub custodian: Option<String>,
     pub expiry: SecretExpiry,
     pub rotated_at: Option<String>,
     /// `null` until the secret's rotation how-to is documented.

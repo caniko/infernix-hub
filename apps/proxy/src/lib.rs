@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 pub struct Proxy {
     config: Config,
+    hub_sync_configured: bool,
     pub(crate) source_host: String,
     pub(crate) source_user: String,
     state: RwLock<ProxyState>,
@@ -120,6 +121,7 @@ impl Proxy {
             .build()?;
         Ok(Self {
             config,
+            hub_sync_configured: false,
             source_host,
             source_user,
             http,
@@ -141,6 +143,11 @@ impl Proxy {
             #[cfg(test)]
             management_mock: None,
         })
+    }
+
+    pub fn with_hub_sync_configured(mut self, configured: bool) -> Self {
+        self.hub_sync_configured = configured;
+        self
     }
 
     pub fn app(self: Arc<Self>) -> Router {

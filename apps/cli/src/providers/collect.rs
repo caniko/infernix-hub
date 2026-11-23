@@ -101,6 +101,19 @@ struct Proxy {
     key: String,
 }
 
+#[derive(Default, Deserialize)]
+struct ProxyInventory {
+    #[serde(default)]
+    hub_sync_configured: bool,
+    credentials: Vec<Value>,
+}
+
+impl ProxyInventory {
+    fn from_response(response: Value) -> Result<Self> {
+        serde_json::from_value(response).map_err(|_| anyhow::anyhow!("invalid local proxy credential inventory"))
+    }
+}
+
 struct Collector {
     http: Client,
     host: String,
@@ -205,10 +218,15 @@ pub(super) async fn run(client: &HubClient, options: Options) -> Result<()> {
         proxy,
         meridian: options.meridian_url.as_deref().map(loopback).transpose()?,
     };
-    let proxy_rows = collector.proxy_rows().await?;
+    let proxy = collector.proxy_inventory().await.unwrap_or_else(|error| {
+        eprintln!("Could not read local proxy inventory; using local provider probes: {error}");
+        ProxyInventory::default()
+    });
     let mut supported = Vec::new();
     for (provider, label, service) in PROVIDERS {
-        let batch = collector.batch(provider, label, service, &proxy_rows).await;
+        let Some(batch) = collector.batch(provider, label, service, &proxy).await else {
+            continue;
+        };
         if !batch.capabilities.is_empty() {
             supported.push(provider.to_owned());
         }
@@ -374,11 +392,18 @@ impl Collector {
         }
     }
 
-    async fn batch(&self, provider: &str, label: &str, service: &str, proxy: &[Value]) -> ObservationBatch {
+    async fn batch(&self, provider: &str, label: &str, service: &str, proxy: &ProxyInventory) -> Option<ObservationBatch> {
+        if provider == "antigravity" && proxy.hub_sync_configured {
+            return None;
+        }
         let now = Utc::now();
         let selected = self.catalog.selected(service, &self.host, &self.user);
+        let proxy_accounts = self.proxy_accounts(provider, &proxy.credentials, now);
+        // A reachable proxy inventory already represents the Google accounts;
+        // the catalogue and T3 token can describe the same accounts under other IDs.
+        let proxy_owns_accounts = provider == "antigravity" && !proxy_accounts.is_empty();
         let mut accounts = BTreeMap::new();
-        if let Some(entry) = self.catalog.services.get(service) {
+        if !proxy_owns_accounts && let Some(entry) = self.catalog.services.get(service) {
             for (id, entry) in &entry.accounts {
                 let mut a = model_account(provider, id, entry.label.as_deref().unwrap_or(id));
                 let deployed = entry.deployments.iter().any(|d| d.host == self.host && d.user == self.user);
@@ -393,7 +418,8 @@ impl Collector {
                 accounts.insert(a.id.clone(), a);
             }
         }
-        for mut a in self.local_accounts(provider, selected).await.into_iter().chain(self.proxy_accounts(provider, proxy, now)) {
+        let local = if proxy_owns_accounts { Vec::new() } else { self.local_accounts(provider, selected).await };
+        for mut a in local.into_iter().chain(proxy_accounts) {
             if let Some(catalogued) = accounts.get(&a.id) {
                 a.is_preferred |= catalogued.is_preferred;
                 a.display_name.clone_from(&catalogued.display_name);
@@ -409,7 +435,7 @@ impl Collector {
         } else {
             ProviderHealth::Unobserved
         };
-        ObservationBatch {
+        Some(ObservationBatch {
             provider_id: provider.into(),
             provider_label: label.into(),
             provider_family: provider.into(),
@@ -428,7 +454,7 @@ impl Collector {
             models: Vec::new(),
             routing_status: None,
             proxy_logs: Vec::new(),
-        }
+        })
     }
 
     async fn proxy_request(&self, method: Method, path: &str, payload: Option<Value>) -> Result<Value> {
@@ -450,12 +476,11 @@ impl Collector {
         serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("invalid local proxy response"))
     }
 
-    async fn proxy_rows(&self) -> Result<Vec<Value>> {
+    async fn proxy_inventory(&self) -> Result<ProxyInventory> {
         if self.proxy.is_none() {
-            return Ok(Vec::new());
+            return Ok(ProxyInventory::default());
         }
-        let response = self.proxy_request(Method::GET, "usage/windows", None).await?;
-        response["credentials"].as_array().cloned().context("local proxy returned no credential inventory")
+        ProxyInventory::from_response(self.proxy_request(Method::GET, "usage/windows", None).await?)
     }
 
     fn proxy_id(&self, provider: &str, row: &Value) -> Option<String> {
@@ -545,11 +570,14 @@ impl Collector {
         if op.target_host.as_deref().is_some_and(|h| h != self.host) || op.target_user.as_deref().is_some_and(|u| u != self.user) {
             return Err(failed("Operation targets a different session"));
         }
-        let mut proxy = self.proxy_rows().await.map_err(|_| failed("Could not read local proxy inventory"))?;
+        let proxy = self.proxy_inventory().await.map_err(|_| failed("Could not read local proxy inventory"))?;
+        if provider == "antigravity" && proxy.hub_sync_configured {
+            return Err(failed("Antigravity operations are owned by the native proxy"));
+        }
         match &op.command {
             ProviderCommand::Quota(QuotaCommand::RefreshQuota { account_id }) => {
                 let target = account_id.as_ref().or(op.target_account_id.as_ref());
-                for row in &proxy {
+                for row in &proxy.credentials {
                     if let Some(id) = self.proxy_id(provider, row)
                         && target.is_none_or(|target| target == &id)
                         && row["disabled"].as_bool() != Some(true)
@@ -565,8 +593,9 @@ impl Collector {
                         }
                     }
                 }
-                proxy = self.proxy_rows().await.map_err(|_| failed("Could not read refreshed proxy inventory"))?;
-                let batch = self.batch(provider, label, service, &proxy).await;
+                let proxy = self.proxy_inventory().await.map_err(|_| failed("Could not read refreshed proxy inventory"))?;
+                let batch =
+                    self.batch(provider, label, service, &proxy).await.ok_or_else(|| failed("Provider is owned by the native proxy"))?;
                 if !batch.accounts.iter().any(|a| {
                     target.is_none_or(|id| id == &a.id)
                         && a.capabilities.contains(&REFRESH)
@@ -585,6 +614,7 @@ impl Collector {
                     return Err(failed("Local proxy switching requires an explicit host and user"));
                 }
                 let (family, index) = proxy
+                    .credentials
                     .iter()
                     .find_map(|row| {
                         (self.proxy_id(provider, row)?.as_str() == target
@@ -630,6 +660,27 @@ fn record(account: &mut ModelAccount, result: Result<Vec<QuotaWindow>, String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn antigravity_uses_one_proxy_publisher_and_canonical_ids() {
+        let collector = Collector {
+            http: Client::new(),
+            host: "host-a".into(),
+            user: "operator".into(),
+            uid: 1000,
+            home: PathBuf::new(),
+            catalog: serde_json::from_value(json!({"services":{"google":{"accounts":{"primary":{}}}}})).unwrap(),
+            meridian: None,
+            proxy: None,
+        };
+        let credentials: Vec<_> = (1..=6).map(|i| json!({"provider":"antigravity","id":format!("google-{i}")})).collect();
+        let native = ProxyInventory::from_response(json!({"credentials":credentials,"hub_sync_configured":true})).unwrap();
+        assert!(collector.batch("antigravity", "Antigravity", "google", &native).await.is_none());
+        let external = ProxyInventory::from_response(json!({"credentials":credentials})).unwrap();
+        let accounts = collector.batch("antigravity", "Antigravity", "google", &external).await.unwrap().accounts;
+        assert_eq!(accounts.len(), 6);
+        assert_eq!(accounts[0].id, "antigravity:host-a:operator:google-1");
+    }
 
     #[test]
     fn catalogue_selects_host_then_user_then_fleet() {
