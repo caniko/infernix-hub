@@ -36,8 +36,8 @@ pub(crate) fn local_error(kind: AccountErrorKind, source: AccountErrorSource, me
     }
 }
 
-pub(crate) fn probe_error(message: &str) -> AccountError {
-    local_error(ProbeFailed, QuotaProbe, message)
+pub(crate) fn probe_error(message: &str) -> Box<AccountError> {
+    Box::new(local_error(ProbeFailed, QuotaProbe, message))
 }
 
 pub(crate) fn safe_label(account: &Account) -> String {

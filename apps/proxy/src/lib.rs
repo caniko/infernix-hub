@@ -530,16 +530,17 @@ impl Proxy {
         true
     }
 
-    async fn token(&self, a: &Account, force: bool) -> Result<String, AccountError> {
+    async fn token(&self, a: &Account, force: bool) -> Result<String, Box<AccountError>> {
         self.token_account(a, force).await.map(|a| a.access)
     }
 
-    async fn token_account(&self, a: &Account, force: bool) -> Result<Account, AccountError> {
+    async fn token_account(&self, a: &Account, force: bool) -> Result<Account, Box<AccountError>> {
         let auth_error = |message| {
             let kind = if force { AccountErrorKind::Other } else { AccountErrorKind::AuthExpired };
-            local_error(kind, AccountErrorSource::OAuthRefresh, message)
+            Box::new(local_error(kind, AccountErrorSource::OAuthRefresh, message))
         };
-        let superseded = || local_error(AccountErrorKind::Other, AccountErrorSource::OAuthRefresh, "credential changed or was disabled");
+        let superseded =
+            || Box::new(local_error(AccountErrorKind::Other, AccountErrorSource::OAuthRefresh, "credential changed or was disabled"));
         if a.api_key || a.lane == Lane::Go {
             return if force { Err(auth_error("credential renewal is unavailable for this provider")) } else { Ok(a.clone()) };
         }
@@ -635,7 +636,7 @@ impl Proxy {
             Ok(result) => result,
             Err(error) => {
                 self.report_account_error(&current, &error).await;
-                return Err(error);
+                return Err(Box::new(error));
             }
         };
         let mut state = self.state.write().await;
@@ -680,7 +681,7 @@ impl Proxy {
         &self,
         account: &mut Account,
         request: impl Fn(&Account) -> reqwest::RequestBuilder,
-    ) -> Result<Value, AccountError> {
+    ) -> Result<Value, Box<AccountError>> {
         let send = |account: &Account| request(account).timeout(Duration::from_secs(12)).send();
         let mut response = send(account).await.map_err(|_| probe_transport_error())?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED && !account.api_key {
@@ -728,7 +729,7 @@ impl Proxy {
         None
     }
 
-    async fn google_quota_windows(&self, account: &mut Account) -> Result<(Vec<QuotaWindow>, bool), AccountError> {
+    async fn google_quota_windows(&self, account: &mut Account) -> Result<(Vec<QuotaWindow>, bool), Box<AccountError>> {
         use integrations::providers::antigravity;
         let hosts = self.antigravity_hosts();
         let request = |url, access: &str, project: Option<&str>| {
@@ -741,7 +742,7 @@ impl Proxy {
                 .timeout(Duration::from_secs(12))
         };
         let mut renewed = false;
-        let mut failure: Option<AccountError> = None;
+        let mut failure: Option<Box<AccountError>> = None;
         let mut received = false;
         for (op, parse) in [
             ("retrieveUserQuotaSummary", antigravity::parse_antigravity_summary as fn(&Value, _) -> _),
@@ -830,7 +831,7 @@ impl Proxy {
             .unwrap_or_else(|| probe_error("provider returned no quota evidence")))
     }
 
-    async fn refresh_usage(&self, account: &Account) -> Result<(), AccountError> {
+    async fn refresh_usage(&self, account: &Account) -> Result<(), Box<AccountError>> {
         use integrations::providers::{claude, opencode};
         let mut account = {
             let mut state = self.state.write().await;
@@ -1184,21 +1185,21 @@ async fn error_body(response: reqwest::Response) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn probe_transport_error() -> AccountError {
-    local_error(AccountErrorKind::UpstreamUnavailable, AccountErrorSource::QuotaProbe, "quota probe request failed")
+fn probe_transport_error() -> Box<AccountError> {
+    Box::new(local_error(AccountErrorKind::UpstreamUnavailable, AccountErrorSource::QuotaProbe, "quota probe request failed"))
 }
 
-fn unchanged_quota_credential() -> AccountError {
+fn unchanged_quota_credential() -> Box<AccountError> {
     let mut error = local_error(
         AccountErrorKind::AuthExpired,
         AccountErrorSource::QuotaProbe,
         "No renewed credential was available after the quota endpoint returned 401.",
     );
     error.http_status = Some(401);
-    error
+    Box::new(error)
 }
 
-async fn quota_response_json(account: &Account, response: Result<reqwest::Response, reqwest::Error>) -> Result<Value, AccountError> {
+async fn quota_response_json(account: &Account, response: Result<reqwest::Response, reqwest::Error>) -> Result<Value, Box<AccountError>> {
     let response = response.map_err(|_| probe_transport_error())?;
     let status = response.status();
     if status.is_success() {
@@ -1207,6 +1208,7 @@ async fn quota_response_json(account: &Account, response: Result<reqwest::Respon
     let headers = response.headers().clone();
     let bytes = error_body(response).await;
     Err(classify_upstream_http_error(account.lane, status, &headers, &bytes, AccountErrorSource::QuotaProbe, &account_secrets(account))
+        .map(Box::new)
         .unwrap_or_else(|| probe_error("upstream rejected quota probe")))
 }
 

@@ -442,53 +442,6 @@ pub fn sanitize_provider_error(message: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(240).collect()
 }
 
-#[cfg(test)]
-mod account_error_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn redacts_camel_case_fields_and_whole_credential_headers() {
-        for field in ["refreshToken", "accessToken", "clientSecret", "apiKey", "idToken", "sessionToken"] {
-            assert!(!sanitize_provider_error(&format!(r#"{{"{field}":"opaque-value"}}"#)).contains("opaque-value"));
-        }
-        for header in ["Cookie", "Set-Cookie", "Authorization", "Proxy-Authorization", "x-api-key", "x-goog-api-key"] {
-            let clean = sanitize_provider_error(&format!("{header}: \"a=first\"; b=second, c=third\nKeep this"));
-            assert_eq!(clean, "[redacted] Keep this");
-        }
-        let clean = sanitize_provider_error(r#"{"Cookie":"a=\"example\"; b=second","keep":"yes"}"#);
-        assert!(!clean.contains("example") && !clean.contains("second") && clean.contains(r#""keep":"yes""#));
-    }
-
-    #[test]
-    fn account_errors_extend_legacy_json_and_blocking_status_wins() {
-        let mut account: ModelAccount = serde_json::from_value(json!({
-            "id": "a", "provider_id": "google", "source_account_id": "a", "display_name": "Account"
-        }))
-        .unwrap();
-        assert!(account.last_error.is_none());
-        assert!(serde_json::to_value(&account).unwrap().get("last_error").is_none());
-        let now = Utc::now();
-        let cooldown = Some(now + chrono::TimeDelta::minutes(1));
-        let error: AccountError = serde_json::from_value(json!({
-            "kind": "auth_expired", "source": "oauth_refresh", "message": "Sign in\nto continue.", "occurred_at": now
-        }))
-        .unwrap();
-        assert_eq!(error.consecutive_count, 0);
-        assert_eq!(error.kind, AccountErrorKind::from_str_lossy(error.kind.as_str()));
-        assert_eq!(error.summary(), "Authentication expired: Sign in to continue.");
-        assert_eq!(AccountErrorKind::from_str_lossy("future_kind"), AccountErrorKind::Other);
-        assert_eq!(AccountStatus::resolve_with_error(true, cooldown, now, true, true, Some(&error)), AccountStatus::Error);
-        assert_eq!(AccountStatus::resolve_with_error(true, cooldown, now, true, true, None), AccountStatus::Limited);
-        assert_eq!(AccountStatus::resolve_with_error(true, None, now, true, true, None), AccountStatus::Error);
-        assert_eq!(AccountStatus::resolve(true, None, now, true, true), AccountStatus::NextPick);
-        account.last_error = Some(error.clone());
-        let row = serde_json::to_value(&account).unwrap();
-        assert!(row["last_error"].get("http_status").is_none());
-        assert_eq!(serde_json::from_value::<ModelAccount>(row).unwrap().last_error, Some(error));
-    }
-}
-
 /// Separate lifecycle truth: catalogued, deployed, selected, and verified by observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -2349,4 +2302,51 @@ pub struct ClearDataIn {
 pub struct ClearDataOut {
     pub target: ClearTarget,
     pub rows_deleted: u64,
+}
+
+#[cfg(test)]
+mod account_error_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn redacts_camel_case_fields_and_whole_credential_headers() {
+        for field in ["refreshToken", "accessToken", "clientSecret", "apiKey", "idToken", "sessionToken"] {
+            assert!(!sanitize_provider_error(&format!(r#"{{"{field}":"opaque-value"}}"#)).contains("opaque-value"));
+        }
+        for header in ["Cookie", "Set-Cookie", "Authorization", "Proxy-Authorization", "x-api-key", "x-goog-api-key"] {
+            let clean = sanitize_provider_error(&format!("{header}: \"a=first\"; b=second, c=third\nKeep this"));
+            assert_eq!(clean, "[redacted] Keep this");
+        }
+        let clean = sanitize_provider_error(r#"{"Cookie":"a=\"example\"; b=second","keep":"yes"}"#);
+        assert!(!clean.contains("example") && !clean.contains("second") && clean.contains(r#""keep":"yes""#));
+    }
+
+    #[test]
+    fn account_errors_extend_legacy_json_and_blocking_status_wins() {
+        let mut account: ModelAccount = serde_json::from_value(json!({
+            "id": "a", "provider_id": "google", "source_account_id": "a", "display_name": "Account"
+        }))
+        .unwrap();
+        assert!(account.last_error.is_none());
+        assert!(serde_json::to_value(&account).unwrap().get("last_error").is_none());
+        let now = Utc::now();
+        let cooldown = Some(now + chrono::TimeDelta::minutes(1));
+        let error: AccountError = serde_json::from_value(json!({
+            "kind": "auth_expired", "source": "oauth_refresh", "message": "Sign in\nto continue.", "occurred_at": now
+        }))
+        .unwrap();
+        assert_eq!(error.consecutive_count, 0);
+        assert_eq!(error.kind, AccountErrorKind::from_str_lossy(error.kind.as_str()));
+        assert_eq!(error.summary(), "Authentication expired: Sign in to continue.");
+        assert_eq!(AccountErrorKind::from_str_lossy("future_kind"), AccountErrorKind::Other);
+        assert_eq!(AccountStatus::resolve_with_error(true, cooldown, now, true, true, Some(&error)), AccountStatus::Error);
+        assert_eq!(AccountStatus::resolve_with_error(true, cooldown, now, true, true, None), AccountStatus::Limited);
+        assert_eq!(AccountStatus::resolve_with_error(true, None, now, true, true, None), AccountStatus::Error);
+        assert_eq!(AccountStatus::resolve(true, None, now, true, true), AccountStatus::NextPick);
+        account.last_error = Some(error.clone());
+        let row = serde_json::to_value(&account).unwrap();
+        assert!(row["last_error"].get("http_status").is_none());
+        assert_eq!(serde_json::from_value::<ModelAccount>(row).unwrap().last_error, Some(error));
+    }
 }

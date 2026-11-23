@@ -312,7 +312,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         let reload_on_401 = !account.api_key && matches!(lane, Lane::Claude | Lane::Codex);
         let incoming = async {
             let upstream_error = || inference_error("upstream request failed");
-            let resolved = proxy.token_account(&account, false).await?;
+            let resolved = proxy.token_account(&account, false).await.map_err(|error| *error)?;
             if required_project.is_some_and(|project| resolved.project.as_deref() != Some(project)) {
                 return Err(upstream_error());
             }
@@ -365,7 +365,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                         account = fresh;
                         res = build(&account).send().await.map_err(|_| upstream_error())?;
                     }
-                    Err(error) => refresh_error = Some(error),
+                    Err(error) => refresh_error = Some(*error),
                     Ok(fresh) => {
                         account = fresh;
                         let mut error = local_error(
