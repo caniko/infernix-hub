@@ -594,7 +594,7 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
                         limited = false;
                         quota_until = None;
                         exchange.attempt_error(&error);
-                        classified = Some(error);
+                        classified = Some(*error);
                     }
                 }
                 prelude.first = body.chunks;
@@ -1260,7 +1260,7 @@ impl ErrorPrefix {
         headers: &HeaderMap,
         header: Cooldown,
         reader: Option<QuotaReader>,
-    ) -> Result<Cooldown, AccountError> {
+    ) -> Result<Cooldown, Box<AccountError>> {
         if let Some(error) = classify_upstream_http_error(
             Lane::Google,
             StatusCode::TOO_MANY_REQUESTS,
@@ -1275,7 +1275,7 @@ impl ErrorPrefix {
             if let Some(reader) = reader.as_ref() {
                 discard_google_quota_read(proxy, account, reader).await;
             }
-            return Err(error);
+            return Err(Box::new(error));
         }
         let now = Utc::now();
         let (reset, verified) = self.quota_evidence(now);

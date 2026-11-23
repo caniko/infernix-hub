@@ -2835,18 +2835,31 @@ async fn google_unusable_reset_header_rejects_immediate_and_delayed_body_proof()
 
 #[tokio::test]
 async fn google_billing_error_array_quarantines_without_quota_proof() {
+    check_google_error_array_quarantine(
+        json!([{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
+            {"@type":"google.rpc.ErrorInfo","reason":"BILLING_DISABLED"},
+            {"@type":"google.rpc.RetryInfo","retryDelay":"60s"}
+        ]}}]),
+        AccountErrorKind::BillingRequired,
+        "BILLING_DISABLED",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn google_permission_error_array_quarantines_without_quota_proof() {
+    check_google_error_array_quarantine(
+        json!([{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Permission denied"}}]),
+        AccountErrorKind::PermissionDenied,
+        "PERMISSION_DENIED",
+    )
+    .await;
+}
+
+async fn check_google_error_array_quarantine(body: Value, kind: AccountErrorKind, provider_code: &str) {
     let mock = serve(Router::new().route(
         "/v1internal:generateContent",
-        post(|| async {
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", "30")],
-                axum::Json(json!([{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
-                    {"@type":"google.rpc.ErrorInfo","reason":"BILLING_DISABLED"},
-                    {"@type":"google.rpc.RetryInfo","retryDelay":"60s"}
-                ]}}])),
-            )
-        }),
+        post(move || async move { (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "60")], axum::Json(body)) }),
     ))
     .await;
     let dir = Scratch::new();
@@ -2864,8 +2877,8 @@ async fn google_billing_error_array_quarantines_without_quota_proof() {
     let state = proxy.state.read().await;
     let account = &state.pool.accounts["google-a.json"];
     let error = account.last_error.as_ref().unwrap();
-    assert_eq!(error.kind, AccountErrorKind::BillingRequired);
-    assert_eq!(error.provider_code.as_deref(), Some("BILLING_DISABLED"));
+    assert_eq!(error.kind, kind);
+    assert_eq!(error.provider_code.as_deref(), Some(provider_code));
     assert!(account.quarantined(Utc::now()));
     assert!(account.scoped_cooldowns.is_empty() && account.cooldown.is_none());
     drop(state);
