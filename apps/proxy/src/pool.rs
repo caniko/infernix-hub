@@ -159,6 +159,7 @@ pub struct Account {
     pub google_client: Option<String>,
     pub google_secret: Option<String>,
     provenance_enrollment: Option<String>,
+    provenance_project: Option<String>,
     pub project: Option<String>,
     pub api_key: bool,
     pub base: Option<reqwest::Url>,
@@ -198,6 +199,7 @@ impl Account {
             return false;
         }
         self.project = project;
+        self.provenance_project = None;
         self.clear_google_route_evidence();
         true
     }
@@ -473,6 +475,7 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             google_client,
             google_secret,
             provenance_enrollment: None,
+            provenance_project: None,
             project: text(entry, &["project_id", "projectId", "project"]).map(str::to_owned),
             api_key,
             base: (api_key || lane == Lane::Go).then(|| base.clone()).flatten(),
@@ -960,14 +963,21 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         pool.accounts.values().find(|a| a.lane == Lane::Google && a.refresh.as_ref() == Some(refresh))
     });
     if let Some(existing) = existing.map(|a| a.id.clone()).and_then(|id| pool.accounts.get_mut(&id)) {
-        if existing.provenance_enrollment.as_deref() == Some(label) && existing.refresh != refresh {
+        let enrolled = existing.provenance_enrollment.as_deref() == Some(label);
+        if enrolled && (existing.refresh != refresh || refresh.is_none()) {
             let Ok(mut replacements) = parse_credentials(&existing.name, &raw, true) else { return };
             let Some(mut replacement) = replacements.pop().filter(|a| a.id == existing.id) else { return };
-            replacement.provenance_enrollment = existing.provenance_enrollment.clone();
-            replacement.probe_generation = existing.probe_generation.saturating_add(1);
-            pool.insert(vec![replacement]);
-            pool.revision += 1;
-            return;
+            if existing.refresh != refresh
+                || existing.access != replacement.access
+                || existing.api_key != replacement.api_key
+                || existing.base != replacement.base
+            {
+                replacement.provenance_enrollment = existing.provenance_enrollment.clone();
+                replacement.probe_generation = existing.probe_generation.saturating_add(1);
+                pool.insert(vec![replacement]);
+                pool.revision += 1;
+                return;
+            }
         }
         let relabel = existing.local
             && existing.label != label
@@ -987,9 +997,14 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         if existing.local && existing.provenance_enrollment.is_none() {
             existing.provenance_enrollment = Some(label.to_owned());
         }
-        let project_changed = (existing.provenance_enrollment.as_deref() == Some(label) || existing.project.is_none())
+        let project_changed = (existing.provenance_enrollment.as_deref() == Some(label)
+            || existing.provenance_project.as_deref() == Some(label)
+            || existing.project.is_none())
             && project.is_some()
             && existing.set_google_project(project);
+        if project_changed {
+            existing.provenance_project = Some(label.to_owned());
+        }
         if existing.email.is_none() {
             existing.email = email;
         }

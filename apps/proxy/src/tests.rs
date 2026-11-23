@@ -1632,6 +1632,19 @@ fn verified_google_resets_require_complete_model_scoped_timing() {
 }
 
 #[test]
+fn invalid_duplicate_retry_after_preserves_fallback_delay_without_proof() {
+    let now = Utc::now();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.append("retry-after", "invalid".parse().unwrap());
+    headers.append("retry-after", "600".parse().unwrap());
+    headers.insert("x-ratelimit-reset", "60".parse().unwrap());
+    assert_eq!(
+        router::header_cooldown(Lane::Google, &headers, now),
+        Some(pool::Cooldown { until: now + TimeDelta::seconds(60), verified_reset: false }),
+    );
+}
+
+#[test]
 fn cooldown_provenance_rejects_fallback_clamped_and_invalid_hints_and_survives_only_same_credential() {
     use pool::Cooldown;
     let now = DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap();
@@ -2894,6 +2907,62 @@ fn provenance_reload_replaces_the_enrolled_google_project() {
     assert_eq!(pool.accounts.len(), 1);
     assert_eq!(pool.accounts[&id].project.as_deref(), Some("project-c"));
     assert_eq!(pool.accounts[&id].refresh.as_deref(), Some("new-refresh"));
+}
+
+#[test]
+fn provenance_reload_replaces_an_access_token_without_a_refresh_token() {
+    let mut pool = Pool::default();
+    let enrollment = |access| json!({"access_token":access,"project_id":"project"});
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("old-token"));
+    let old = pool.accounts.values_mut().next().unwrap();
+    let id = old.id.clone();
+    seed_old_google_route(old);
+    let old_generation = old.probe_generation;
+
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("old-token"));
+    assert_eq!(pool.accounts[&id].probe_generation, old_generation);
+    assert!(pool.accounts[&id].cooldown.is_some());
+
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("new-token"));
+    let account = &pool.accounts[&id];
+    assert_eq!(pool.accounts.len(), 1);
+    assert_eq!(account.access, "new-token");
+    assert!(account.refresh.is_none());
+    assert!(account.probe_generation > old_generation);
+    assert_google_route_cleared(account);
+}
+
+#[test]
+fn provenance_reload_updates_inherited_but_not_explicit_uploaded_projects() {
+    let mut pool = Pool::default();
+    let enrollment = |refresh, project| json!({"refresh_token":refresh,"project_id":project});
+    for (id, refresh, project) in [("inherited.json", "inherited-refresh", None), ("explicit.json", "explicit-refresh", Some("project-a"))]
+    {
+        let mut raw = enrollment(refresh, project);
+        raw["type"] = json!("google");
+        raw["access_token"] = json!("uploaded-token");
+        pool.insert(pool::parse_credentials(id, &raw, false).unwrap());
+        pool::add_provenance_google(&mut pool, id, enrollment(refresh, Some("project-a")));
+        assert_eq!(pool.accounts[id].project.as_deref(), Some("project-a"));
+        let old = pool.accounts.get_mut(id).unwrap();
+        seed_old_google_route(old);
+        let old_generation = old.probe_generation;
+
+        pool::add_provenance_google(&mut pool, id, enrollment(refresh, Some("project-b")));
+        let account = &pool.accounts[id];
+        assert!(!account.local);
+        assert_eq!(account.access, "uploaded-token");
+        if project.is_none() {
+            assert_eq!(account.project.as_deref(), Some("project-b"));
+            assert!(account.probe_generation > old_generation);
+            assert_google_route_cleared(account);
+        } else {
+            assert_eq!(account.project.as_deref(), project);
+            assert_eq!(account.probe_generation, old_generation);
+            assert!(account.cooldown.is_some());
+        }
+    }
+    assert_eq!(pool.accounts.len(), 2);
 }
 
 fn seed_old_google_route(account: &mut Account) {
