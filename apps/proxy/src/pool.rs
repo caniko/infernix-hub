@@ -539,20 +539,25 @@ impl Pool {
         self.accounts.get(id).or_else(|| self.accounts.values().find(|a| a.auth_index == id || self.hub_id(a) == id || a.hub_id() == id))
     }
 
-    fn supported<'a>(&'a self, lane: Lane, model: &'a str) -> impl Iterator<Item = &'a Account> {
-        self.accounts.values().filter(move |a| {
-            a.lane == lane && a.supports(model) && !(a.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly)
-        })
+    pub(crate) fn supports(&self, a: &Account, lane: Lane, model: &str, required_project: Option<&str>) -> bool {
+        a.lane == lane
+            && required_project.is_none_or(|project| a.project.as_deref() == Some(project))
+            && a.supports(model)
+            && !(a.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly)
     }
 
-    pub fn next_reset(&self, lane: Lane, model: &str) -> Option<DateTime<Utc>> {
-        let now = Utc::now();
-        self.supported(lane, model).filter_map(|a| a.quota_limited_until(now, model)).min()
+    fn supported<'a>(&'a self, lane: Lane, model: &'a str, required_project: Option<&'a str>) -> impl Iterator<Item = &'a Account> {
+        self.accounts.values().filter(move |a| self.supports(a, lane, model, required_project))
     }
 
-    pub fn all_quota_limited(&self, lane: Lane, model: &str) -> bool {
+    pub fn next_reset(&self, lane: Lane, model: &str, required_project: Option<&str>) -> Option<DateTime<Utc>> {
         let now = Utc::now();
-        let mut accounts = self.supported(lane, model).peekable();
+        self.supported(lane, model, required_project).filter_map(|a| a.quota_limited_until(now, model)).min()
+    }
+
+    pub fn all_quota_limited(&self, lane: Lane, model: &str, required_project: Option<&str>) -> bool {
+        let now = Utc::now();
+        let mut accounts = self.supported(lane, model, required_project).peekable();
         accounts.peek().is_some() && accounts.all(|a| a.quota_limited_until(now, model).is_some())
     }
 
@@ -566,14 +571,17 @@ impl Pool {
             .map(|a| a.id.as_str())
     }
 
-    pub fn pick(&mut self, lane: Lane, session: Option<&str>, parent: Option<&str>, model: &str, tried: &[String]) -> Option<Account> {
+    pub fn pick(
+        &mut self,
+        lane: Lane,
+        session: Option<&str>,
+        parent: Option<&str>,
+        model: &str,
+        required_project: Option<&str>,
+        tried: &[String],
+    ) -> Option<Account> {
         let now = Utc::now();
-        let eligible = |a: &&Account| {
-            a.lane == lane
-                && a.eligible(now, model)
-                && !tried.contains(&a.id)
-                && !(a.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly)
-        };
+        let eligible = |a: &&Account| self.supports(a, lane, model, required_project) && a.eligible(now, model) && !tried.contains(&a.id);
         if let Some(a) = self.preferred(lane).and_then(|id| self.accounts.get(id)).filter(eligible) {
             return Some(a.clone());
         }
@@ -659,12 +667,16 @@ impl Pool {
             cursors: self.cursors.clone(),
             ..Self::default()
         };
-        copy.pick(lane, None, None, "", &[]).map(|a| a.id)
+        copy.pick(lane, None, None, "", None, &[]).map(|a| a.id)
     }
 
     pub fn bound(&self, lane: Lane, id: &str) -> Option<&str> {
         let ttl = Duration::from_secs(self.policy.session_affinity_secs);
         self.affinity.get(&(lane, id.into())).filter(|(_, seen)| seen.elapsed() < ttl).map(|(id, _)| id.as_str())
+    }
+
+    pub(crate) fn clear_affinity(&mut self) {
+        self.affinity.clear();
     }
 
     pub fn bind(&mut self, lane: Lane, session: &str, account: &str) {
@@ -696,7 +708,7 @@ impl Pool {
         }
         let account = self.find(id).filter(|a| !a.disabled).ok_or("account not found")?;
         let (lane, id) = (account.lane, account.id.clone());
-        if self.bound(lane, session).is_none() {
+        if session.starts_with('#') || self.bound(lane, session).is_none() {
             return Err("session not found");
         }
         let mut moved = BTreeSet::new();

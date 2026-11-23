@@ -6,7 +6,7 @@ use fleetix_agent_proxy::{
     Lane, Proxy,
     clients::{Client, register_t3code},
     config::{self, Config, DEFAULT_BIND, DEFAULT_URL},
-    hub_sync,
+    hub_sync, verify,
 };
 use tokio::net::TcpListener;
 
@@ -68,6 +68,15 @@ enum Command {
         url: String,
         #[arg(long, env = "PROXY_CLIENT_KEY_FILE")]
         client_key_file: Option<PathBuf>,
+    },
+    /// Run the offline algorithmic T3 Code + Antigravity integration verification suite.
+    ///
+    /// Set T3CODE_VERIFY_ROOT to a T3 Code checkout with installed dependencies
+    /// to also run the native TypeScript client and recovery checks via Node.
+    VerifyT3code {
+        /// Emit the full verification report as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -165,6 +174,15 @@ async fn main() -> Result<()> {
                 }
             };
             client.wire(&config::home()?, key.as_deref().map(|key| (url.trim_end_matches('/'), key)))?;
+        }
+        Command::VerifyT3code { json } => {
+            let report = verify::run_all().await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report.format_human());
+            }
+            ensure!(report.passed, "T3 Code verification failed ({}/{} checks passed)", report.passed_count, report.total_count);
         }
     }
     Ok(())
