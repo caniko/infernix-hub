@@ -4290,6 +4290,76 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
 }
 
 #[tokio::test]
+async fn google_auth_miss_reloads_after_concurrent_discovery_expires() {
+    let inspection_started = Arc::new(Notify::new());
+    let enrollment_ready = Arc::new(Notify::new());
+    let mock = serve(
+        Router::new()
+            .route("/test/google-token", post(|| async { axum::Json(json!({"access_token":"ya29.pool-new","expires_in":3600})) }))
+            .route(
+                "/test/google-tokeninfo",
+                post({
+                    let inspection_started = inspection_started.clone();
+                    let enrollment_ready = enrollment_ready.clone();
+                    move |body: String| {
+                        let inspection_started = inspection_started.clone();
+                        let enrollment_ready = enrollment_ready.clone();
+                        async move {
+                            if body == "access_token=ya29.client-new" {
+                                inspection_started.notify_one();
+                                enrollment_ready.notified().await;
+                            }
+                            axum::Json(json!({"aud":"agy-client","email":"new@example.test","email_verified":true,"expires_in":3599}))
+                        }
+                    }
+                }),
+            ),
+    )
+    .await;
+    let dir = Scratch::new();
+    let mut config = fixture_config(&dir, &mock);
+    config.discover_local = true;
+    let fake_bin = dir.join("fake-provenance-oauth");
+    fs::write(
+        &fake_bin,
+        b"#!/bin/sh\nprintf '%s' '{\"client_id\":\"agy-client\",\"client_secret\":\"agy-secret\",\"refresh_token\":\"refresh-new\"}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o700)).unwrap();
+    config.provenance_oauth_bin = Some(fake_bin);
+    let mut proxy = Proxy::new(config).unwrap();
+    proxy.management_mock = Some(mock.0.clone());
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials(
+            "google-existing.json",
+            &json!({"type":"antigravity","client_id":"agy-client","email":"existing@example.test","access_token":"ya29.pool-existing"}),
+            true,
+        )
+        .unwrap(),
+    );
+
+    let enroll = async {
+        inspection_started.notified().await;
+        assert!(proxy.refresh_local_commands(Duration::from_secs(15)).await);
+        // Age that completed pass without making the test wait out the throttle.
+        *proxy.local_discovery.lock().await = Some(Instant::now() - Duration::from_secs(16));
+        let user = &proxy.source_user;
+        config::write_private(
+            &proxy.config.provenance_oauth_dir.join(format!("{user}-google-new.json")),
+            &serde_json::to_vec(&json!({"target":{"provider":"google","profile":"antigravity","user":user}})).unwrap(),
+            true,
+        )
+        .unwrap();
+        enrollment_ready.notify_one();
+    };
+    let (authorized, ()) =
+        tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(proxy.authorize_google("ya29.client-new"), enroll) })
+            .await
+            .unwrap();
+    assert!(authorized, "the auth miss must reload the enrollment added after the expired pass");
+}
+
+#[tokio::test]
 async fn expired_claude_token_reloads_from_disk_and_activity_preserves_effort() {
     let seen_auth = Arc::new(Mutex::new(Vec::<String>::new()));
     let captured = seen_auth.clone();

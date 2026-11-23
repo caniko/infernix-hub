@@ -246,12 +246,9 @@ impl Proxy {
             return false;
         }
         let mut last = self.local_discovery.lock().await;
-        if self.local_discovery_generation.load(Ordering::Acquire) != seen {
-            // Another caller finished a discovery pass since this caller's snapshot.
-            return true;
-        }
         if last.is_some_and(|at| at.elapsed() < min_interval) {
-            return false;
+            // Reuse a pass completed since the caller's snapshot only while it is fresh.
+            return self.local_discovery_generation.load(Ordering::Acquire) != seen;
         }
         self.discover_local_commands_locked().await;
         *last = Some(Instant::now());
