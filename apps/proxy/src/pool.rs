@@ -275,14 +275,21 @@ impl Account {
             .reduce(Cooldown::merge)
     }
 
-    pub(crate) fn begin_google_quota_read(&mut self, model: &str, provisional: Option<Cooldown>, now: DateTime<Utc>) -> QuotaReader {
+    pub(crate) fn begin_google_quota_read(
+        &mut self,
+        model: &str,
+        provisional: Option<Cooldown>,
+        unverified_until: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> QuotaReader {
         self.pending_quota.retain(|pending| pending.blocks_verification(now));
         let reader = Arc::new(());
         self.pending_quota.push(PendingQuota {
             reader: Arc::downgrade(&reader),
             scope: model_cooldown_scope(self.lane, model),
             provisional: provisional.map(|cooldown| Cooldown { verified_reset: false, ..cooldown }),
-            unverified_until: None,
+            // A headerless fallback outlives a dropped reader for verification only.
+            unverified_until,
         });
         QuotaReader(reader)
     }

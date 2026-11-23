@@ -420,8 +420,8 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
         } else if limited {
             let header = header_cooldown(lane, &headers, received_at);
             if lane == Lane::Google {
-                let provisional = quota_deadline(header, policy.failover_cooldown_secs, received_at);
-                quota_reader = begin_google_quota_read(&proxy, &account, model, Some(provisional), received_at).await;
+                let unverified_until = header.is_none().then(|| quota_deadline(None, policy.failover_cooldown_secs, received_at).until);
+                quota_reader = begin_google_quota_read(&proxy, &account, model, header, unverified_until, received_at).await;
             }
             let body_reset = if lane == Lane::Google && header.is_none() {
                 let body = read_google_quota_body(&mut response, deadline).await;
@@ -758,8 +758,8 @@ pub(crate) async fn run_window_start(
             let now = Utc::now();
             let header = header_cooldown(account.lane, response.headers(), now);
             let body = if account.lane == Lane::Google {
-                let provisional = header.is_none().then(|| quota_deadline(None, fallback, now));
-                quota_reader = begin_google_quota_read(&proxy, account, model, provisional, now).await;
+                let unverified_until = header.is_none().then(|| quota_deadline(None, fallback, now).until);
+                quota_reader = begin_google_quota_read(&proxy, account, model, None, unverified_until, now).await;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
                 let body = read_google_quota_body(&mut response, deadline).await;
                 quota_body_verified = Some(body.verified);
@@ -1429,6 +1429,7 @@ async fn begin_google_quota_read(
     account: &Account,
     model: &str,
     provisional: Option<Cooldown>,
+    unverified_until: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Option<QuotaReader> {
     proxy
@@ -1439,7 +1440,7 @@ async fn begin_google_quota_read(
         .accounts
         .get_mut(&account.id)
         .filter(|a| a.same_credential(account))
-        .map(|current| current.begin_google_quota_read(model, provisional, now))
+        .map(|current| current.begin_google_quota_read(model, provisional, unverified_until, now))
 }
 
 async fn extend_quota(proxy: &Proxy, account: &Account, model: &str, until: Cooldown) {

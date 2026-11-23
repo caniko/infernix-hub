@@ -2035,8 +2035,12 @@ async fn google_cancelled_429_body_blocks_a_longer_same_scope_witness() {
         arrived.notified().await;
         let now = Utc::now();
         let header = pool::Cooldown { until: now + TimeDelta::seconds(10), verified_reset: true };
-        let reader =
-            proxy.state.write().await.pool.accounts.get_mut("google-a.json").unwrap().begin_google_quota_read(model, Some(header), now);
+        let reader = proxy.state.write().await.pool.accounts.get_mut("google-a.json").unwrap().begin_google_quota_read(
+            model,
+            Some(header),
+            None,
+            now,
+        );
         release.notify_one();
         (reader, header.until)
     };
@@ -2055,6 +2059,15 @@ async fn google_cancelled_429_body_blocks_a_longer_same_scope_witness() {
 
 #[tokio::test]
 async fn google_cancelled_headerless_429_body_blocks_a_longer_same_scope_witness() {
+    check_cancelled_headerless_429_body(false).await;
+}
+
+#[tokio::test]
+async fn google_cancelled_headerless_window_starter_blocks_a_longer_same_scope_witness() {
+    check_cancelled_headerless_429_body(true).await;
+}
+
+async fn check_cancelled_headerless_429_body(window_starter: bool) {
     let arrived = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let mock = serve(Router::new().route(
@@ -2102,7 +2115,15 @@ async fn google_cancelled_headerless_429_body_blocks_a_longer_same_scope_witness
     let first = tokio::spawn(request(proxy.clone()));
     tokio::time::timeout(Duration::from_secs(3), async {
         arrived.notified().await;
-        let mut second = Box::pin(request(proxy.clone()));
+        let mut second = Box::pin(async {
+            if window_starter {
+                let account = proxy.state.read().await.pool.accounts["google-a.json"].clone();
+                let request = proxy.http.post(mock.0.join("/v1internal:generateContent").unwrap());
+                let _ = router::run_window_start(proxy.clone(), &account, model, request).await;
+            } else {
+                drop(request(proxy.clone()).await);
+            }
+        });
         tokio::select! {
             _ = &mut second => panic!("headerless 429 body should still be pending"),
             () = async {
@@ -2111,11 +2132,19 @@ async fn google_cancelled_headerless_429_body_blocks_a_longer_same_scope_witness
                 }
             } => {}
         }
+        assert!(proxy.state.read().await.pool.accounts["google-a.json"].eligible(Utc::now(), model));
+        drop(second);
+        {
+            let state = proxy.state.read().await;
+            let account = &state.pool.accounts["google-a.json"];
+            let now = Utc::now();
+            assert!(account.eligible(now, model));
+            assert!(account.has_unverified_google_quota_read(model, now));
+        }
         release.notify_one();
         let first = first.await.unwrap();
         assert_eq!(first.status(), 429);
         assert!(!first.headers().contains_key(router::POOL_QUOTA_HEADER));
-        drop(second);
     })
     .await
     .unwrap();
@@ -2921,8 +2950,8 @@ fn dropped_google_quota_readers_release_only_their_own_scope() {
     let other = "gemini-argon";
     let a = pool.accounts.get_mut("a.json").unwrap();
     a.cooldown = Some(pool::Cooldown { until, verified_reset: true });
-    let scoped = a.begin_google_quota_read(model, Some(header), now);
-    let global = a.begin_google_quota_read("", None, now);
+    let scoped = a.begin_google_quota_read(model, Some(header), None, now);
+    let global = a.begin_google_quota_read("", None, None, now);
 
     assert_eq!(pool.verified_google_reset_at(other, None, now), None);
     drop(global);
@@ -2943,7 +2972,7 @@ fn failed_google_quota_read_blocks_witness_until_its_own_deadline() {
     let failed_until = now + TimeDelta::seconds(10);
     let account = pool.accounts.get_mut("a.json").unwrap();
     account.scoped_cooldowns.insert("gemini".into(), pool::Cooldown { until: reset, verified_reset: true });
-    let reader = account.begin_google_quota_read(model, None, now);
+    let reader = account.begin_google_quota_read(model, None, None, now);
     assert!(account.finish_google_quota_read(&reader, Some(failed_until)));
 
     assert_eq!(pool.next_reset(Lane::Google, model, None, now), Some(reset));
