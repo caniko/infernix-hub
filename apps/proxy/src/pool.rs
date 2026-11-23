@@ -264,6 +264,13 @@ impl Account {
             && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
     }
 
+    fn discard_discovered_access(&mut self) {
+        // Remember the disk token without making it available for routing.
+        self.provenance_token_fp = Some(Sha256::digest(&self.access).into());
+        self.replace_access(String::new());
+        self.expires = None;
+    }
+
     pub(crate) fn set_google_project(&mut self, project: Option<String>) -> bool {
         if self.project == project {
             return false;
@@ -1197,11 +1204,19 @@ fn add(pool: &mut Pool, lane: Lane, label: &str, mut raw: Value) {
     let name = local_credential_name(lane, label);
     if let Ok(mut found) = parse_credentials(&name, &raw, true) {
         let cutoff = Utc::now() + chrono::TimeDelta::seconds(30);
-        found.retain(|a| {
+        found.retain_mut(|a| {
             if !a.api_key && matches!(a.lane, Lane::Claude | Lane::Codex) && a.expires.is_some_and(|e| e <= cutoff) {
                 return false;
             }
-            !pool.accounts.values().any(|old| old.id != a.id && old.shares_discovery_token(a))
+            let mut duplicates = pool.accounts.values().filter(|old| old.id != a.id && old.shares_discovery_token(a)).peekable();
+            if duplicates.peek().is_none() {
+                return true;
+            }
+            if a.lane != Lane::Google || a.api_key || duplicates.any(|old| old.compatible_refresh(a)) {
+                return false;
+            }
+            a.discard_discovered_access();
+            true
         });
         pool.insert(found);
     }
@@ -1293,10 +1308,7 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
                     }
                 } else {
                     if duplicate.is_some() {
-                        // Remember the disk token without making it available for routing.
-                        replacement.provenance_token_fp = Some(Sha256::digest(&replacement.access).into());
-                        replacement.replace_access(String::new());
-                        replacement.expires = None;
+                        replacement.discard_discovered_access();
                     }
                     replacement.provenance_enrollment = existing.provenance_enrollment.clone();
                     replacement.probe_generation = existing.probe_generation.saturating_add(1);
@@ -1393,7 +1405,9 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
     add(pool, Lane::Google, &source, raw);
     if let Some(account) = pool.accounts.get_mut(&local_credential_name(Lane::Google, &source)) {
         account.provenance_enrollment = Some(label.to_owned());
-        account.provenance_token_fp = (!account.access.is_empty()).then(|| Sha256::digest(&account.access).into());
+        if !account.access.is_empty() {
+            account.provenance_token_fp = Some(Sha256::digest(&account.access).into());
+        }
     }
 }
 

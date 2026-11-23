@@ -83,7 +83,12 @@ pub(crate) fn classify_upstream_http_error(
     let body = String::from_utf8_lossy(body);
     let html = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/html"))
         || body.trim_start().starts_with('<');
-    classify(lane, Some(status.as_u16()), &raw, &body, html, source, secrets)
+    let status = Some(status.as_u16());
+    let error = classify(lane, status, &raw, &body, html, source, secrets);
+    if error.is_none() && lane == Lane::Google && raw.is_array() {
+        return classify(lane, status, &Value::Null, "", html, source, secrets);
+    }
+    error
 }
 
 pub(crate) fn classify_oauth_error(lane: Lane, status: StatusCode, body: &[u8], secrets: &[&str]) -> AccountError {
@@ -423,6 +428,14 @@ pub(crate) mod tests {
         }
         assert_eq!(http(Lane::Google, 404, "", QuotaProbe).unwrap().kind, ProbeFailed);
         assert_eq!(http(Lane::Google, 302, "", Inference).unwrap().kind, Other);
+    }
+
+    #[test]
+    fn google_empty_error_array_falls_back_to_http_status() {
+        for body in ["[]", "[null, [], 42]"] {
+            let error = http(Lane::Google, 403, body, Inference).unwrap();
+            assert_eq!((error.kind, error.http_status), (PermissionDenied, Some(403)));
+        }
     }
 
     #[test]

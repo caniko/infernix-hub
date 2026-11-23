@@ -5797,6 +5797,32 @@ fn provenance_reload_deduplicates_access_rotation_with_unchanged_refresh_token()
 }
 
 #[test]
+fn provenance_discovery_keeps_distinct_refresh_tokens_with_shared_access() {
+    let mut pool = Pool::default();
+    let enrollment = |refresh| {
+        json!({
+            "access_token":"shared-access","refresh_token":refresh,"client_id":"client",
+            "client_secret":"secret","project_id":"project",
+            "expires_at":Utc::now().timestamp() + 3600
+        })
+    };
+    pool::add_provenance_google(&mut pool, "a", enrollment("refresh-a"));
+    // Check both initial discovery and a reread of the same disk token.
+    for _ in 0..2 {
+        pool::add_provenance_google(&mut pool, "b", enrollment("refresh-b"));
+        assert_eq!(pool.accounts.len(), 2);
+        let a = pool.accounts.values().find(|a| a.label == "a").unwrap();
+        let b = pool.accounts.values().find(|a| a.label == "b").unwrap();
+        assert_eq!(a.refresh.as_deref(), Some("refresh-a"));
+        assert_eq!(a.access, "shared-access");
+        assert_eq!(b.refresh.as_deref(), Some("refresh-b"));
+        assert!(b.access.is_empty());
+        assert!(b.expires.is_none());
+        assert!(b.eligible(Utc::now(), "gemini-neon"));
+    }
+}
+
+#[test]
 fn provenance_reload_keeps_distinct_refresh_tokens_without_reusing_quarantined_access() {
     for prior_refresh in ["refresh-a", "old-refresh-a"] {
         let mut pool = Pool::default();
