@@ -194,6 +194,11 @@ impl Account {
             && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
     }
 
+    fn shares_discovery_token(&self, other: &Self) -> bool {
+        self.lane == other.lane
+            && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
+    }
+
     pub(crate) fn set_google_project(&mut self, project: Option<String>) -> bool {
         if self.project == project {
             return false;
@@ -912,11 +917,7 @@ fn add(pool: &mut Pool, lane: Lane, label: &str, mut raw: Value) {
             if !a.api_key && matches!(a.lane, Lane::Claude | Lane::Codex) && a.expires.is_some_and(|e| e <= cutoff) {
                 return false;
             }
-            !pool.accounts.values().any(|old| {
-                old.lane == a.lane
-                    && ((!a.access.is_empty() && old.access == a.access)
-                        || a.refresh.as_ref().is_some_and(|r| old.refresh.as_ref() == Some(r)))
-            })
+            !pool.accounts.values().any(|old| old.shares_discovery_token(a))
         });
         pool.insert(found);
     }
@@ -962,9 +963,9 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         let refresh = refresh.as_ref()?;
         pool.accounts.values().find(|a| a.lane == Lane::Google && a.refresh.as_ref() == Some(refresh))
     });
-    if let Some(existing) = existing.map(|a| a.id.clone()).and_then(|id| pool.accounts.get_mut(&id)) {
-        let enrolled = existing.provenance_enrollment.as_deref() == Some(label);
-        if enrolled && (existing.refresh != refresh || refresh.is_none()) {
+    if let Some(existing) = existing {
+        let mut id = existing.id.clone();
+        if enrolled.is_some() && (existing.refresh != refresh || refresh.is_none()) {
             let Ok(mut replacements) = parse_credentials(&existing.name, &raw, true) else { return };
             let Some(mut replacement) = replacements.pop().filter(|a| a.id == existing.id) else { return };
             if existing.refresh != refresh
@@ -972,14 +973,27 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
                 || existing.api_key != replacement.api_key
                 || existing.base != replacement.base
             {
-                replacement.provenance_enrollment = existing.provenance_enrollment.clone();
-                replacement.probe_generation = existing.probe_generation.saturating_add(1);
-                pool.insert(vec![replacement]);
+                let duplicate_id = pool
+                    .accounts
+                    .values()
+                    .find(|other| other.id != id && other.shares_discovery_token(&replacement))
+                    .map(|other| other.id.clone());
                 pool.revision += 1;
-                return;
+                if let Some(duplicate_id) = duplicate_id {
+                    // Keep the account that already holds the credential and its route evidence.
+                    pool.accounts.remove(&id);
+                    id = duplicate_id;
+                } else {
+                    replacement.provenance_enrollment = existing.provenance_enrollment.clone();
+                    replacement.probe_generation = existing.probe_generation.saturating_add(1);
+                    pool.insert(vec![replacement]);
+                    return;
+                }
             }
         }
+        let Some(existing) = pool.accounts.get_mut(&id) else { return };
         let relabel = existing.local
+            && existing.provenance_enrollment.as_deref().is_none_or(|enrollment| enrollment == label)
             && existing.label != label
             && (existing.label == existing.name || existing.label.starts_with("local-") || existing.label.len() == 64);
         let enriched = (existing.google_client.is_none() && client.is_some())

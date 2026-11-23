@@ -2933,6 +2933,56 @@ fn provenance_reload_replaces_an_access_token_without_a_refresh_token() {
 }
 
 #[test]
+fn provenance_reload_deduplicates_access_token_without_clearing_cooldown() {
+    let mut pool = Pool::default();
+    let enrollment = |access| json!({"access_token":access,"project_id":"project"});
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-a"));
+    pool::add_provenance_google(&mut pool, "b", enrollment("token-b"));
+    assert_eq!(pool.accounts.len(), 2);
+    let b = pool.accounts.values_mut().find(|a| a.label == "b").unwrap();
+    seed_old_google_route(b);
+    let b_id = b.id.clone();
+    let cooldown_until = b.cooldown.unwrap().until;
+    let generation = b.probe_generation;
+    let revision = pool.revision;
+
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-b"));
+
+    assert_eq!(pool.accounts.len(), 1);
+    assert!(pool.revision > revision);
+    let b = &pool.accounts[&b_id];
+    assert_eq!(b.label, "b");
+    assert_eq!(b.access, "token-b");
+    assert_eq!(b.cooldown.unwrap().until, cooldown_until);
+    assert_eq!(b.probe_generation, generation);
+    assert!(!b.eligible(Utc::now(), "gemini-neon"));
+}
+
+#[test]
+fn provenance_reload_deduplicates_refresh_token_and_enriches_the_retained_route() {
+    let mut pool = Pool::default();
+    let enrollment = |access, refresh| json!({"access_token":access,"refresh_token":refresh});
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-a", "refresh-a"));
+    pool::add_provenance_google(&mut pool, "b", enrollment("token-b", "refresh-b"));
+    assert_eq!(pool.accounts.len(), 2);
+    let b = pool.accounts.values_mut().find(|a| a.label == "b").unwrap();
+    seed_old_google_route(b);
+    let b_id = b.id.clone();
+    let generation = b.probe_generation;
+
+    let mut updated = enrollment("new-token", "refresh-b");
+    updated["project_id"] = json!("project");
+    pool::add_provenance_google(&mut pool, "a", updated);
+
+    assert_eq!(pool.accounts.len(), 1);
+    let b = &pool.accounts[&b_id];
+    assert_eq!(b.access, "token-b");
+    assert_eq!(b.project.as_deref(), Some("project"));
+    assert!(b.probe_generation > generation);
+    assert_google_route_cleared(b);
+}
+
+#[test]
 fn provenance_reload_updates_inherited_but_not_explicit_uploaded_projects() {
     let mut pool = Pool::default();
     let enrollment = |refresh, project| json!({"refresh_token":refresh,"project_id":project});
