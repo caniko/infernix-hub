@@ -353,7 +353,7 @@ pub(crate) async fn refresh_selected(proxy: &Proxy, id: Option<&str>, family: Op
     };
     let mut pending = stream::iter(accounts.into_iter().map(|account| async move {
         let result = if account.disabled || account.api_key {
-            Err("account does not support quota probes")
+            Err(crate::error_classify::probe_error("account does not support quota probes"))
         } else {
             proxy.refresh_usage(&account).await
         };
@@ -363,7 +363,7 @@ pub(crate) async fn refresh_selected(proxy: &Proxy, id: Option<&str>, family: Op
     let mut errors = Map::new();
     while let Some((id, result)) = pending.next().await {
         if let Err(e) = result {
-            errors.insert(id, json!(e));
+            errors.insert(id, json!(e.summary()));
         }
     }
     if !errors.is_empty() {
@@ -400,6 +400,7 @@ async fn upload(State(proxy): State<Arc<Proxy>>, Query(query): Query<Name>, Json
     state.pool.insert(accounts);
     state.pool.revision += 1;
     drop(state);
+    proxy.notify_hub_sync();
     if hydrate_google {
         tokio::spawn(async move { proxy.hydrate_google_metadata().await });
     }
@@ -797,7 +798,8 @@ fn clear_quota(pool: &mut Pool, account: &Account, manual: bool) -> usize {
     a.next_grant = None;
     a.probe_generation = 0;
     if manual {
-        a.auth_cooldown = None;
+        a.clear_account_error();
+        a.probe_failed = false;
     }
     let before = a.windows.len();
     a.windows.retain(|w| match w.kind {
@@ -813,6 +815,7 @@ fn clear_quota(pool: &mut Pool, account: &Account, manual: bool) -> usize {
 async fn reset_quota(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -> Reply {
     let account = select(&proxy, &raw).await?;
     let count = clear_quota(&mut proxy.state.write().await.pool, &account, true);
+    proxy.notify_hub_sync();
     ok(json!({"status":"ok","windows_reset":count}))
 }
 
@@ -885,7 +888,7 @@ async fn reset_credit(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
     } else {
         0
     };
-    let refresh_error = proxy.refresh_usage(&account).await.err();
+    let refresh_error = proxy.refresh_usage(&account).await.err().map(|e| e.summary());
     if refresh_error.is_none() && account.lane == Lane::Claude && matches!(code, "reset" | "already_redeemed") {
         let mut state = proxy.state.write().await;
         let now = Utc::now();
@@ -930,7 +933,7 @@ async fn start_window(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
             "input":[{"role":"user","content":[{"type":"input_text","text":"Hi"}]}]}))
     };
     crate::router::run_window_start(proxy.clone(), &account, model, request).await.map_err(|_| upstream())?;
-    let refresh_error = proxy.refresh_usage(&account).await.err();
+    let refresh_error = proxy.refresh_usage(&account).await.err().map(|e| e.summary());
     ok(json!({"usage":usage(&proxy.state.read().await.pool), "refresh_error":refresh_error}))
 }
 

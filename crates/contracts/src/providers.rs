@@ -90,6 +90,7 @@ pub type ProviderCapabilities = BTreeSet<ProviderCapability>;
 #[serde(rename_all = "snake_case")]
 pub enum ProviderHealth {
     Healthy,
+    #[serde(alias = "error")]
     Degraded,
     Offline,
     #[default]
@@ -148,6 +149,24 @@ pub enum AccountStatus {
 }
 
 impl AccountStatus {
+    /// Structured blocking errors outrank routing preference and quota cooldown.
+    /// Keep the legacy ordering for soft probe failures.
+    pub fn resolve_with_error(
+        enabled: bool,
+        cooldown_until: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        is_next_pick: bool,
+        probe_failed: bool,
+        error: Option<&AccountError>,
+    ) -> Self {
+        if enabled && error.is_some_and(|error| error.blocks_routing(now)) {
+            Self::Error
+        } else {
+            let soft_error = probe_failed || error.is_some_and(|error| error.kind == AccountErrorKind::ProbeFailed);
+            Self::resolve(enabled, cooldown_until, now, is_next_pick && !soft_error, soft_error)
+        }
+    }
+
     /// Compute canonical display status from account state without conflating
     /// disabled, cooldown-limited, next-pick, error, and ready states.
     pub fn resolve(enabled: bool, cooldown_until: Option<DateTime<Utc>>, now: DateTime<Utc>, is_next_pick: bool, has_error: bool) -> Self {
@@ -162,6 +181,311 @@ impl AccountStatus {
         } else {
             Self::Ready
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountErrorKind {
+    VerificationRequired,
+    AccountSuspended,
+    AuthExpired,
+    BillingRequired,
+    PermissionDenied,
+    QuotaExhausted,
+    UpstreamUnavailable,
+    ProbeFailed,
+    Other,
+}
+
+impl AccountErrorKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::VerificationRequired => "verification_required",
+            Self::AccountSuspended => "account_suspended",
+            Self::AuthExpired => "auth_expired",
+            Self::BillingRequired => "billing_required",
+            Self::PermissionDenied => "permission_denied",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::UpstreamUnavailable => "upstream_unavailable",
+            Self::ProbeFailed => "probe_failed",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn from_str_lossy(value: &str) -> Self {
+        match value {
+            "verification_required" => Self::VerificationRequired,
+            "account_suspended" => Self::AccountSuspended,
+            "auth_expired" => Self::AuthExpired,
+            "billing_required" => Self::BillingRequired,
+            "permission_denied" => Self::PermissionDenied,
+            "quota_exhausted" => Self::QuotaExhausted,
+            "upstream_unavailable" => Self::UpstreamUnavailable,
+            "probe_failed" => Self::ProbeFailed,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::VerificationRequired => "Verification required",
+            Self::AccountSuspended => "Account suspended",
+            Self::AuthExpired => "Authentication expired",
+            Self::BillingRequired => "Billing required",
+            Self::PermissionDenied => "Permission denied",
+            Self::QuotaExhausted => "Quota exhausted",
+            Self::UpstreamUnavailable => "Upstream unavailable",
+            Self::ProbeFailed => "Quota probe failed",
+            Self::Other => "Provider error",
+        }
+    }
+
+    pub fn is_blocking(&self) -> bool {
+        matches!(
+            self,
+            Self::VerificationRequired | Self::AccountSuspended | Self::AuthExpired | Self::BillingRequired | Self::PermissionDenied
+        )
+    }
+
+    pub fn is_action_required(&self) -> bool {
+        self.is_blocking()
+    }
+
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::UpstreamUnavailable | Self::ProbeFailed | Self::Other)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountErrorSource {
+    Inference,
+    Stream,
+    #[serde(rename = "oauth_refresh")]
+    OAuthRefresh,
+    QuotaProbe,
+    Collector,
+}
+
+impl AccountErrorSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inference => "inference",
+            Self::Stream => "stream",
+            Self::OAuthRefresh => "oauth_refresh",
+            Self::QuotaProbe => "quota_probe",
+            Self::Collector => "collector",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AccountError {
+    pub kind: AccountErrorKind,
+    pub source: AccountErrorSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_url: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    #[serde(default)]
+    pub consecutive_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_until: Option<DateTime<Utc>>,
+}
+
+impl AccountError {
+    pub fn blocks_routing(&self, now: DateTime<Utc>) -> bool {
+        self.kind.is_blocking() || self.backoff_until.is_some_and(|until| until > now)
+    }
+
+    /// A zero count is also valid for an immediate error from an older publisher.
+    pub fn is_notification_worthy(&self) -> bool {
+        match self.kind {
+            AccountErrorKind::QuotaExhausted => false,
+            AccountErrorKind::UpstreamUnavailable => self.consecutive_count >= 3,
+            AccountErrorKind::ProbeFailed | AccountErrorKind::Other => self.consecutive_count >= 2,
+            _ => true,
+        }
+    }
+
+    pub fn sanitized(mut self) -> Self {
+        self.message = sanitize_provider_error(&self.message);
+        self.provider_code = self.provider_code.map(|code| sanitize_provider_error(&code)).filter(|code| !code.is_empty());
+        self.action_hint = self.action_hint.map(|hint| sanitize_provider_error(&hint)).filter(|hint| !hint.is_empty());
+        // Verification links can contain credentials in paths, queries, or fragments.
+        self.action_url = self.action_url.as_deref().and_then(|value| {
+            let url = url::Url::parse(value).ok()?;
+            (url.scheme() == "https").then(|| url.origin().ascii_serialization()).filter(|origin| origin.len() <= 240)
+        });
+        self
+    }
+
+    pub fn summary(&self) -> String {
+        let message = self.message.split_whitespace().collect::<Vec<_>>().join(" ");
+        if message.is_empty() { self.kind.label().into() } else { format!("{}: {message}", self.kind.label()) }
+    }
+}
+
+/// Redact credentials and URL details before making a provider diagnostic visible.
+pub fn sanitize_provider_error(message: &str) -> String {
+    let clean: String = message.chars().filter(|c| !c.is_control() || c.is_whitespace()).collect();
+    let lower = clean.to_ascii_lowercase();
+    let field_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-');
+    let value_end = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ',' | ';' | '}' | ']');
+    let mut out = String::new();
+    let mut at = 0;
+    while at < clean.len() {
+        let tail = &clean[at..];
+        let folded = &lower[at..];
+        let first = tail.chars().next().unwrap();
+        let boundary = at == 0 || !clean.as_bytes()[at - 1].is_ascii_alphanumeric();
+        if folded.starts_with("https://") || folded.starts_with("http://") {
+            let n = tail.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>')).unwrap_or(tail.len());
+            // Even a URL path can contain a credential; only publish the origin.
+            let origin = url::Url::parse(&tail[..n]).ok().map(|url| url.origin().ascii_serialization());
+            out.push_str(origin.as_deref().unwrap_or("[url]"));
+            at += n;
+        } else if matches!(first, '?' | '#') {
+            // Also drop query/fragment from relative provider links.
+            at += tail.find(char::is_whitespace).unwrap_or(tail.len());
+        } else if boundary && ["aiza", "sk-", "ya29.", "eyj", "ihub_", "ghp_", "gho_"].iter().any(|p| folded.starts_with(p)) {
+            at += tail.find(value_end).unwrap_or(tail.len());
+            out.push_str("[redacted]");
+        } else if boundary && field_char(first) {
+            let n = tail.find(|c| !field_char(c)).unwrap_or(tail.len());
+            let quoted_field = tail[n..].starts_with(['"', '\'']);
+            let rest = tail[n..].trim_start_matches(['"', '\'']).trim_start_matches([' ', '\t']);
+            let field = &folded[..n];
+            let credential_header =
+                matches!(field, "cookie" | "set-cookie" | "authorization" | "proxy-authorization" | "x-api-key" | "x-goog-api-key");
+            let assigned = matches!(
+                field,
+                "key"
+                    | "api_key"
+                    | "apikey"
+                    | "api-key"
+                    | "token"
+                    | "api_token"
+                    | "auth_token"
+                    | "access_token"
+                    | "accesstoken"
+                    | "refresh_token"
+                    | "refreshtoken"
+                    | "id_token"
+                    | "idtoken"
+                    | "client_secret"
+                    | "clientsecret"
+                    | "session_token"
+                    | "sessiontoken"
+                    | "secret"
+                    | "password"
+            );
+            let value = if field == "bearer" && tail.len() > n {
+                Some(rest.trim_start_matches(['=', ':']).trim_start())
+            } else if assigned || credential_header {
+                rest.strip_prefix(['=', ':']).map(|v| v.trim_start_matches([' ', '\t']))
+            } else {
+                None
+            };
+            if let Some(value) = value {
+                let consumed = if credential_header && !quoted_field {
+                    // A raw header consumes the entire line even if its first cookie is quoted.
+                    value.find(['\r', '\n']).unwrap_or(value.len())
+                } else if let Some(quote @ ('"' | '\'')) = value.chars().next() {
+                    let mut escaped = false;
+                    value[1..]
+                        .char_indices()
+                        .find_map(|(i, c)| {
+                            if std::mem::take(&mut escaped) {
+                                None
+                            } else if c == '\\' {
+                                escaped = true;
+                                None
+                            } else {
+                                (c == quote).then_some(i + 2)
+                            }
+                        })
+                        .unwrap_or(value.len())
+                } else if credential_header {
+                    // Commas and semicolons may separate cookies, not headers.
+                    value.find(['\r', '\n']).unwrap_or(value.len())
+                } else {
+                    // An unquoted Authorization value can include the authentication scheme.
+                    let value_tail = &lower[clean.len() - value.len()..];
+                    let payload = ["bearer", "basic"].into_iter().find_map(|scheme| {
+                        value_tail.strip_prefix(scheme).filter(|s| s.starts_with(char::is_whitespace)).map(str::trim_start)
+                    });
+                    payload.map_or_else(
+                        || value.find(value_end).unwrap_or(value.len()),
+                        |p| value.len() - p.len() + p.find(value_end).unwrap_or(p.len()),
+                    )
+                };
+                at += tail.len() - value.len() + consumed;
+                out.push_str("[redacted]");
+            } else {
+                out.push_str(&tail[..n]);
+                at += n;
+            }
+        } else {
+            out.push(first);
+            at += first.len_utf8();
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(240).collect()
+}
+
+#[cfg(test)]
+mod account_error_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn redacts_camel_case_fields_and_whole_credential_headers() {
+        for field in ["refreshToken", "accessToken", "clientSecret", "apiKey", "idToken", "sessionToken"] {
+            assert!(!sanitize_provider_error(&format!(r#"{{"{field}":"opaque-value"}}"#)).contains("opaque-value"));
+        }
+        for header in ["Cookie", "Set-Cookie", "Authorization", "Proxy-Authorization", "x-api-key", "x-goog-api-key"] {
+            let clean = sanitize_provider_error(&format!("{header}: \"a=first\"; b=second, c=third\nKeep this"));
+            assert_eq!(clean, "[redacted] Keep this");
+        }
+        let clean = sanitize_provider_error(r#"{"Cookie":"a=\"example\"; b=second","keep":"yes"}"#);
+        assert!(!clean.contains("example") && !clean.contains("second") && clean.contains(r#""keep":"yes""#));
+    }
+
+    #[test]
+    fn account_errors_extend_legacy_json_and_blocking_status_wins() {
+        let mut account: ModelAccount = serde_json::from_value(json!({
+            "id": "a", "provider_id": "google", "source_account_id": "a", "display_name": "Account"
+        }))
+        .unwrap();
+        assert!(account.last_error.is_none());
+        assert!(serde_json::to_value(&account).unwrap().get("last_error").is_none());
+        let now = Utc::now();
+        let cooldown = Some(now + chrono::TimeDelta::minutes(1));
+        let error: AccountError = serde_json::from_value(json!({
+            "kind": "auth_expired", "source": "oauth_refresh", "message": "Sign in\nto continue.", "occurred_at": now
+        }))
+        .unwrap();
+        assert_eq!(error.consecutive_count, 0);
+        assert_eq!(error.kind, AccountErrorKind::from_str_lossy(error.kind.as_str()));
+        assert_eq!(error.summary(), "Authentication expired: Sign in to continue.");
+        assert_eq!(AccountErrorKind::from_str_lossy("future_kind"), AccountErrorKind::Other);
+        assert_eq!(AccountStatus::resolve_with_error(true, cooldown, now, true, true, Some(&error)), AccountStatus::Error);
+        assert_eq!(AccountStatus::resolve_with_error(true, cooldown, now, true, true, None), AccountStatus::Limited);
+        assert_eq!(AccountStatus::resolve_with_error(true, None, now, true, true, None), AccountStatus::Error);
+        assert_eq!(AccountStatus::resolve(true, None, now, true, true), AccountStatus::NextPick);
+        account.last_error = Some(error.clone());
+        let row = serde_json::to_value(&account).unwrap();
+        assert!(row["last_error"].get("http_status").is_none());
+        assert_eq!(serde_json::from_value::<ModelAccount>(row).unwrap().last_error, Some(error));
     }
 }
 
@@ -357,6 +681,11 @@ pub struct ModelAccount {
     pub cooldown_until: Option<DateTime<Utc>>,
     #[serde(default)]
     pub status_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<AccountError>,
+    /// When true, an absent `last_error` is explicit recovery, not unsupported reporting.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_error_observed: bool,
     /// Currently selected/active on the local consumer.
     #[serde(default)]
     pub is_active: bool,
@@ -927,7 +1256,13 @@ pub struct ObservationBatch {
     pub provider_family: String,
     pub source_host: String,
     pub source_user: String,
+    /// Producer identity within the source host and user. Legacy batches cannot prune inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_publisher: Option<String>,
     pub collected_at: DateTime<Utc>,
+    /// Includes all accounts owned by this publisher, even when none remain.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub account_inventory_complete: bool,
     #[serde(default)]
     pub health: ProviderHealth,
     #[serde(default)]

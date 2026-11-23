@@ -14,6 +14,7 @@ use contracts::{AdapterMode, Severity, Verification};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::notifications::{self, Raise};
 use crate::ports::{ProviderDispatch, ProviderIntent};
 use crate::{ANY_READER, Actor, DResult, DomainError, Hub, OPERATOR, OPERATOR_OR_COLLECTOR, audit, conflict, hash, invalid};
 
@@ -75,6 +76,14 @@ async fn upsert_provider_descriptor(db: &sqlx::PgPool, d: &ProviderDescriptor) -
 /// by a server-side `ModelProvider`. Commits provider, accounts, quota samples,
 /// reset grants, key groups, discovered models, and routing state atomically.
 pub async fn ingest_observations(hub: &Hub, actor: &Actor, provider_id: &str, batch: ObservationBatch) -> DResult<ObservationAck> {
+    ingest_batch(hub, actor, provider_id, batch, false).await
+}
+
+pub async fn ingest_pushed_observations(hub: &Hub, actor: &Actor, provider_id: &str, batch: ObservationBatch) -> DResult<ObservationAck> {
+    ingest_batch(hub, actor, provider_id, batch, true).await
+}
+
+async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: ObservationBatch, pushed: bool) -> DResult<ObservationAck> {
     actor.require(OPERATOR_OR_COLLECTOR)?;
     if batch.provider_id != provider_id {
         return Err(invalid("provider_id_mismatch", "path provider_id does not match batch.provider_id"));
@@ -108,8 +117,9 @@ pub async fn ingest_observations(hub: &Hub, actor: &Actor, provider_id: &str, ba
             status_message = excluded.status_message,
             capabilities = case when jsonb_array_length(excluded.capabilities) > 0 then excluded.capabilities else model_provider_instances.capabilities end,
             evidence_kinds = case when jsonb_array_length(excluded.evidence_kinds) > 0 then excluded.evidence_kinds else model_provider_instances.evidence_kinds end,
-            last_observed_at = excluded.last_observed_at,
-            updated_at = now()",
+            last_observed_at = greatest(model_provider_instances.last_observed_at, excluded.last_observed_at),
+            updated_at = now()
+         where model_provider_instances.last_observed_at is null or excluded.last_observed_at >= model_provider_instances.last_observed_at",
     )
     .bind(provider_id)
     .bind(&batch.provider_label)
@@ -118,17 +128,48 @@ pub async fn ingest_observations(hub: &Hub, actor: &Actor, provider_id: &str, ba
     .bind(verification.as_str())
     .bind(&batch.router_id)
     .bind(&health_str)
-    .bind(&batch.status_message)
+    .bind(batch.status_message.as_deref().map(sanitize_provider_error))
     .bind(&caps_json)
     .bind(&evs_json)
     .bind(batch.collected_at)
     .execute(&mut *tx)
     .await?;
 
+    let source_publisher = batch.source_publisher.as_deref().filter(|id| !id.trim().is_empty());
+    let publisher = (pushed && mode != AdapterMode::Fixture).then_some((batch.source_host.as_str(), batch.source_user.as_str()));
+    if let Some((host, user)) = publisher {
+        let accepted = sqlx::query(
+            "insert into model_provider_publishers (provider_id, source_host, source_user, source_publisher, last_observed_at)
+             values ($1, $2, $3, $4, $5)
+             on conflict (provider_id, source_host, source_user, source_publisher) do update
+             set last_observed_at = greatest(model_provider_publishers.last_observed_at, excluded.last_observed_at)
+             where excluded.last_observed_at >= model_provider_publishers.last_observed_at",
+        )
+        .bind(provider_id)
+        .bind(host)
+        .bind(user)
+        .bind(source_publisher.unwrap_or_default())
+        .bind(batch.collected_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if accepted == 0 {
+            return Ok(ObservationAck {
+                provider_id: provider_id.into(),
+                accounts_upserted: 0,
+                samples_inserted: 0,
+                grants_upserted: 0,
+                recorded_at: Utc::now(),
+            });
+        }
+    }
+
     let mut accounts_upserted = 0usize;
     let mut samples_inserted = 0usize;
     let mut grants_upserted = 0usize;
 
+    // Some collectors mirror proxy rows with the same ID. They can refresh
+    // evidence without taking over the existing producer's removal rights.
     for acct in &batch.accounts {
         let masked = acct.masked_email.clone().or_else(|| acct.email.as_deref().map(mask_email));
         let enroll_str = serde_json::to_value(acct.enrollment_state)
@@ -137,18 +178,33 @@ pub async fn ingest_observations(hub: &Hub, actor: &Actor, provider_id: &str, ba
             .unwrap_or_else(|| "unobserved".into());
         let acct_caps = serde_json::to_value(&acct.capabilities).unwrap_or_else(|_| json!([]));
         let starter_json = acct.rolling_starter.as_ref().and_then(|s| serde_json::to_value(s).ok());
-        sqlx::query(
+        let error = acct.last_error.clone().map(AccountError::sanitized);
+        let error = error.as_ref();
+        let status_message = acct
+            .status_message
+            .as_deref()
+            .map(sanitize_provider_error)
+            .filter(|s| !s.is_empty())
+            .or_else(|| error.map(AccountError::summary));
+        // A legacy writer can report a failure, but omission is not evidence
+        // that a previous typed incident has recovered.
+        let reports_error_state = error.is_some()
+            || (acct.last_error_observed && acct.enrollment_state != EnrollmentState::Error && acct.status != AccountStatus::Error);
+        let row = sqlx::query(
             "insert into model_accounts
                 (id, provider_id, source_account_id, display_name, email, masked_email, note, plan,
                  tier_multiplier, enabled, priority, weight, cooldown_until, status_message,
                  is_active, is_preferred, is_next_pick, enrollment_state, host, unix_user,
                  credential_fingerprint, last_used_at, last_observed_at, capabilities,
-                 success_count, failure_count, rolling_starter, updated_at)
+                 success_count, failure_count, rolling_starter,
+                 error_kind, error_source, error_http_status, error_code, error_message,
+                 error_action_hint, error_action_url, error_at, error_consecutive_count, error_backoff_until,
+                  observation_batch_at, publisher_host, publisher_user, source_publisher, updated_at)
              values ($1, $2, $3, $4, $5, $6, $7, $8,
                      $9, $10, $11, $12, $13, $14,
                      $15, $16, $17, $18, $19, $20,
                      $21, $22, $23, $24,
-                     $25, $26, $27, now())
+                      $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $42, now())
              on conflict (provider_id, id) do update set
                 source_account_id = excluded.source_account_id,
                 display_name = excluded.display_name,
@@ -161,7 +217,8 @@ pub async fn ingest_observations(hub: &Hub, actor: &Actor, provider_id: &str, ba
                 priority = excluded.priority,
                 weight = excluded.weight,
                 cooldown_until = excluded.cooldown_until,
-                status_message = excluded.status_message,
+                status_message = case when $41 or model_accounts.error_kind is null then excluded.status_message
+                                      else model_accounts.status_message end,
                 is_active = excluded.is_active,
                 is_preferred = excluded.is_preferred,
                 is_next_pick = excluded.is_next_pick,
@@ -170,12 +227,30 @@ pub async fn ingest_observations(hub: &Hub, actor: &Actor, provider_id: &str, ba
                 unix_user = coalesce(excluded.unix_user, model_accounts.unix_user),
                 credential_fingerprint = coalesce(excluded.credential_fingerprint, model_accounts.credential_fingerprint),
                 last_used_at = coalesce(excluded.last_used_at, model_accounts.last_used_at),
-                last_observed_at = coalesce(excluded.last_observed_at, excluded.updated_at),
+                last_observed_at = greatest(model_accounts.last_observed_at, excluded.last_observed_at),
                 capabilities = excluded.capabilities,
                 success_count = greatest(model_accounts.success_count, excluded.success_count),
                 failure_count = greatest(model_accounts.failure_count, excluded.failure_count),
-                rolling_starter = coalesce(excluded.rolling_starter, model_accounts.rolling_starter),
-                updated_at = now()",
+                 rolling_starter = coalesce(excluded.rolling_starter, model_accounts.rolling_starter),
+                 error_kind = case when $41 then excluded.error_kind else model_accounts.error_kind end,
+                 error_source = case when $41 then excluded.error_source else model_accounts.error_source end,
+                 error_http_status = case when $41 then excluded.error_http_status else model_accounts.error_http_status end,
+                 error_code = case when $41 then excluded.error_code else model_accounts.error_code end,
+                 error_message = case when $41 then excluded.error_message else model_accounts.error_message end,
+                 error_action_hint = case when $41 then excluded.error_action_hint else model_accounts.error_action_hint end,
+                 error_action_url = case when $41 then excluded.error_action_url else model_accounts.error_action_url end,
+                 error_at = case when $41 then excluded.error_at else model_accounts.error_at end,
+                 error_consecutive_count = case when $41 then excluded.error_consecutive_count else model_accounts.error_consecutive_count end,
+                 error_backoff_until = case when $41 then excluded.error_backoff_until else model_accounts.error_backoff_until end,
+                 observation_batch_at = excluded.observation_batch_at,
+                 publisher_host = coalesce(model_accounts.publisher_host, excluded.publisher_host),
+                  publisher_user = coalesce(model_accounts.publisher_user, excluded.publisher_user),
+                  source_publisher = coalesce(model_accounts.source_publisher, excluded.source_publisher),
+                 updated_at = now()
+             where (model_accounts.last_observed_at is null or excluded.last_observed_at >= model_accounts.last_observed_at)
+               and (model_accounts.observation_batch_at is null or excluded.observation_batch_at >= model_accounts.observation_batch_at)
+               and (model_accounts.publisher_host is null or
+                    (model_accounts.publisher_host, model_accounts.publisher_user) = (excluded.publisher_host, excluded.publisher_user))",
         )
         .bind(&acct.id)
         .bind(provider_id)
@@ -190,7 +265,7 @@ pub async fn ingest_observations(hub: &Hub, actor: &Actor, provider_id: &str, ba
         .bind(acct.priority)
         .bind(acct.weight as i32)
         .bind(acct.cooldown_until)
-        .bind(&acct.status_message)
+        .bind(&status_message)
         .bind(acct.is_active)
         .bind(acct.is_preferred)
         .bind(acct.is_next_pick)
@@ -204,8 +279,26 @@ pub async fn ingest_observations(hub: &Hub, actor: &Actor, provider_id: &str, ba
         .bind(acct.success_count as i64)
         .bind(acct.failure_count as i64)
         .bind(&starter_json)
+        .bind(error.map(|e| e.kind.as_str()))
+        .bind(error.map(|e| e.source.as_str()))
+        .bind(error.and_then(|e| e.http_status).map(i32::from))
+        .bind(error.and_then(|e| e.provider_code.as_deref()))
+        .bind(error.map(|e| e.message.as_str()))
+        .bind(error.and_then(|e| e.action_hint.as_deref()))
+        .bind(error.and_then(|e| e.action_url.as_deref()))
+        .bind(error.map(|e| e.occurred_at))
+        .bind(error.map_or(0, |e| i32::try_from(e.consecutive_count).unwrap_or(i32::MAX)))
+        .bind(error.and_then(|e| e.backoff_until))
+        .bind(batch.collected_at)
+        .bind(publisher.map(|p| p.0))
+        .bind(publisher.map(|p| p.1))
+        .bind(reports_error_state)
+        .bind(source_publisher)
         .execute(&mut *tx)
         .await?;
+        if row.rows_affected() == 0 {
+            continue;
+        }
         accounts_upserted += 1;
 
         for win in &acct.windows {
@@ -216,6 +309,27 @@ pub async fn ingest_observations(hub: &Hub, actor: &Actor, provider_id: &str, ba
             upsert_reset_grant(&mut tx, provider_id, &acct.id, grant).await?;
             grants_upserted += 1;
         }
+    }
+
+    if let (Some((host, user)), Some(source_publisher)) = (publisher.filter(|_| batch.account_inventory_complete), source_publisher) {
+        let ids: Vec<_> = batch.accounts.iter().map(|a| a.id.as_str()).collect();
+        sqlx::query(
+            "with removed as (
+                 delete from model_accounts
+                 where provider_id = $1 and publisher_host = $2 and publisher_user = $3
+                   and source_publisher = $4 and observation_batch_at <= $5 and id <> all($6)
+                 returning id
+             )
+             delete from model_reset_grants where provider_id = $1 and account_id in (select id from removed)",
+        )
+        .bind(provider_id)
+        .bind(host)
+        .bind(user)
+        .bind(source_publisher)
+        .bind(batch.collected_at)
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
     }
 
     for sample in &batch.quota_samples {
@@ -331,9 +445,12 @@ pub async fn ingest_observations(hub: &Hub, actor: &Actor, provider_id: &str, ba
 
     tx.commit().await?;
 
-    // Best-effort quota notification sync into the hub's long-polled notification feed.
+    // Sync independently so an unavailable source cannot block the other.
     if let Err(error) = sync_quota_notifications(hub, provider_id).await {
         tracing::warn!(%provider_id, %error, "provider quota notification sync failed");
+    }
+    if let Err(error) = sync_provider_health_notifications(hub, provider_id).await {
+        tracing::warn!(%provider_id, %error, "provider health notification sync failed");
     }
 
     Ok(ObservationAck {
@@ -392,7 +509,7 @@ async fn insert_quota_sample(
     .bind(&obs_state)
     .bind(observed_at)
     .bind(win.stale)
-    .bind(&win.error_reason)
+    .bind(win.error_reason.as_deref().map(sanitize_provider_error))
     .execute(tx)
     .await?;
     Ok(())
@@ -670,7 +787,13 @@ async fn load_accounts_with_latest_windows(db: &sqlx::PgPool, provider_id: &str)
                    tier_multiplier, enabled, priority, weight, cooldown_until, status_message,
                    is_active, is_preferred, is_next_pick, enrollment_state, host, unix_user,
                    credential_fingerprint, last_used_at, last_observed_at, capabilities,
-                   success_count, failure_count, rolling_starter
+                   success_count, failure_count, rolling_starter,
+                   case when error_kind is not null then jsonb_build_object(
+                       'kind', error_kind, 'source', error_source, 'http_status', error_http_status,
+                       'provider_code', error_code, 'message', error_message, 'action_hint', error_action_hint,
+                       'action_url', error_action_url, 'occurred_at', error_at, 'consecutive_count', error_consecutive_count,
+                       'backoff_until', error_backoff_until
+                   ) end as last_error
             from model_accounts
             where provider_id = $1
             order by priority desc, id asc
@@ -740,8 +863,10 @@ async fn load_accounts_with_latest_windows(db: &sqlx::PgPool, provider_id: &str)
         acct.windows = windows;
         acct.reset_grant = grants_by_acct.remove(&acct.id);
         let has_err = acct.enrollment_state == EnrollmentState::Error
-            || acct.windows.iter().any(|w| matches!(w.observation_state, QuotaObservationState::ProbeFailed));
-        acct.status = AccountStatus::resolve(acct.enabled, acct.cooldown_until, now, acct.is_next_pick, has_err);
+            || (acct.last_error.is_none()
+                && acct.windows.iter().any(|w| matches!(w.observation_state, QuotaObservationState::ProbeFailed)));
+        acct.status =
+            AccountStatus::resolve_with_error(acct.enabled, acct.cooldown_until, now, acct.is_next_pick, has_err, acct.last_error.as_ref());
         out.push(acct);
     }
     Ok(out)
@@ -1620,6 +1745,9 @@ pub async fn set_settings(hub: &Hub, actor: &Actor, settings: ProviderPanelSetti
     )
     .await?;
     tx.commit().await?;
+    if let Err(error) = reconcile_provider_health_notifications(hub).await {
+        tracing::warn!(%error, "provider health notification reconciliation after settings update failed");
+    }
     Ok(settings)
 }
 
@@ -1638,16 +1766,228 @@ pub async fn sync_quota_notifications(hub: &Hub, provider_id: &str) -> DResult<(
     let settings = get_settings(hub, &internal_operator("provider-notify")).await?;
     let accounts = load_accounts_with_latest_windows(&hub.db, provider_id).await?;
     let source = format!("providers:{provider_id}");
-    crate::notifications::sync(hub, &source, quota_raises(provider_id, &settings, &accounts, Utc::now())).await?;
+    notifications::sync(hub, &source, quota_raises(provider_id, &settings, &accounts, Utc::now())).await?;
     Ok(())
 }
 
-fn quota_raises(
-    provider_id: &str,
+/// Refresh health and staleness even when a provider has stopped reporting.
+pub async fn reconcile_provider_health_notifications(hub: &Hub) -> DResult<()> {
+    let settings = get_settings(hub, &internal_operator("provider-notify")).await?;
+    for provider in load_descriptors(hub).await? {
+        if let Err(error) = sync_provider_health(hub, &provider, &settings).await {
+            tracing::warn!(provider_id = %provider.id, %error, "provider health notification reconciliation failed");
+        }
+    }
+    Ok(())
+}
+
+pub async fn sync_provider_health_notifications(hub: &Hub, provider_id: &str) -> DResult<()> {
+    let settings = get_settings(hub, &internal_operator("provider-notify")).await?;
+    let provider = load_descriptor(hub, provider_id).await?;
+    sync_provider_health(hub, &provider, &settings).await
+}
+
+async fn sync_provider_health(hub: &Hub, provider: &ProviderDescriptor, settings: &ProviderPanelSettings) -> DResult<()> {
+    let accounts = load_accounts_with_latest_windows(&hub.db, &provider.id).await?;
+    let publishers = sqlx::query_as(
+        "select source_host, source_user, max(last_observed_at) from model_provider_publishers
+         where provider_id = $1 group by source_host, source_user order by source_host, source_user",
+    )
+    .bind(&provider.id)
+    .fetch_all(&hub.db)
+    .await?;
+    let items = {
+        let offline = hub.expected_offline_hosts.read().unwrap_or_else(|error| error.into_inner());
+        let now = Utc::now();
+        let mut items = provider_health_raises(provider, settings, &accounts, now);
+        items.extend(stale_publisher_raises(provider, publishers, &offline, now));
+        items
+    };
+    notifications::sync(hub, &format!("providers-health:{}", provider.id), items).await?;
+    Ok(())
+}
+
+/// Keep conventional keys stable and suffix noncanonical keys with a digest so
+/// long, mixed-case, and punctuation-heavy IDs do not collide when normalized.
+pub fn provider_notification_key(provider_id: &str, tail: &str) -> String {
+    let raw = format!("provider:{provider_id}:{tail}");
+    let mut key: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '_' | '-') { c.to_ascii_lowercase() } else { '-' })
+        .collect();
+    if key != raw || key.len() > 128 || provider_id.contains(':') {
+        let digest = hash::sha256_hex(format!("{provider_id}\0{tail}").as_bytes());
+        key.truncate(115);
+        key.push('-');
+        key.push_str(&digest[..12]);
+    }
+    key
+}
+
+fn account_error_key(provider_id: &str, account_id: &str) -> String {
+    // These tails already belong to the provider and its poller.
+    let suffix = if matches!(account_id, "health" | "poller") { "error:account" } else { "error" };
+    provider_notification_key(provider_id, &format!("{account_id}:{suffix}"))
+}
+
+fn account_notification_label(acct: &ModelAccount, mask_emails: bool) -> String {
+    if mask_emails {
+        acct.masked_email
+            .clone()
+            .or_else(|| acct.email.as_deref().map(mask_email))
+            .unwrap_or_else(|| if acct.display_name.contains('@') { mask_email(&acct.display_name) } else { acct.display_name.clone() })
+    } else {
+        acct.email.as_ref().unwrap_or(&acct.display_name).clone()
+    }
+}
+
+fn account_error_alert(acct: &ModelAccount) -> Option<(Severity, &'static str)> {
+    use AccountErrorKind::*;
+    use Severity::{Critical, Warning};
+    if acct.last_error.as_ref().is_some_and(|e| !e.is_notification_worthy()) {
+        return None;
+    }
+    Some(match acct.last_error.as_ref().map(|e| e.kind) {
+        Some(VerificationRequired) => (Critical, "requires verification"),
+        Some(AccountSuspended) => (Critical, "suspended"),
+        Some(AuthExpired) => (Critical, "authentication expired"),
+        Some(BillingRequired) => (Critical, "billing/credits required"),
+        Some(PermissionDenied) => (Warning, "permission denied"),
+        Some(ProbeFailed) => (Warning, "quota probe failing"),
+        Some(UpstreamUnavailable) => (Warning, "upstream errors"),
+        Some(Other) => (Warning, "error"),
+        None if acct.enrollment_state == EnrollmentState::Error => (Critical, "enrollment error"),
+        None if acct.windows.iter().any(|w| w.observation_state == QuotaObservationState::ProbeFailed) => (Warning, "quota probe failing"),
+        _ => return None,
+    })
+}
+
+fn provider_health_raises(
+    provider: &ProviderDescriptor,
     settings: &ProviderPanelSettings,
     accounts: &[ModelAccount],
     now: DateTime<Utc>,
-) -> Vec<crate::notifications::Raise> {
+) -> Vec<Raise> {
+    let source = format!("providers-health:{}", provider.id);
+    let label = sanitize_provider_error(&provider.label);
+    let raise = |dedupe_key, severity, title, body| Raise {
+        source: source.clone(),
+        dedupe_key,
+        severity,
+        title,
+        body,
+        subject_type: Some("model_provider".into()),
+        subject_id: Some(provider.id.clone()),
+        url: None,
+    };
+    let enabled: Vec<_> = accounts.iter().filter(|a| a.enabled).collect();
+    let account_label = |acct| {
+        let mut label = sanitize_provider_error(&account_notification_label(acct, settings.mask_emails));
+        label.truncate(label.floor_char_boundary(240));
+        label
+    };
+    let mut items = Vec::new();
+    for acct in &enabled {
+        let Some((severity, detail)) = account_error_alert(acct) else { continue };
+        let body = if let Some(error) = acct.last_error.clone().map(AccountError::sanitized) {
+            let mut lines = vec![format!("Error kind: {}", error.kind.as_str()), format!("Source: {}", error.source.as_str())];
+            if let Some(code) = error.provider_code {
+                lines.push(format!("Provider code: {code}"));
+            }
+            lines.extend(error.action_hint);
+            lines.join("\n")
+        } else {
+            format!("Account {detail}.")
+        };
+        let account_label = account_label(acct);
+        let body = if let Some(email) = acct.email.as_deref().filter(|email| settings.mask_emails && !email.is_empty()) {
+            body.replace(email, &mask_email(email))
+        } else {
+            body
+        };
+        items.push(raise(account_error_key(&provider.id, &acct.id), severity, format!("{label}: {account_label} {detail}"), body));
+    }
+
+    let unavailable = |a: &ModelAccount| {
+        a.enrollment_state == EnrollmentState::Error
+            || a.last_error.as_ref().is_some_and(|e| e.blocks_routing(now))
+            || a.cooldown_until.is_some_and(|until| until > now)
+    };
+    if !enabled.is_empty() && enabled.iter().all(|a| unavailable(a)) {
+        const DISPLAY_LIMIT: usize = 8;
+        let mut reasons: Vec<_> = enabled
+            .iter()
+            .take(DISPLAY_LIMIT)
+            .map(|a| {
+                let reason = match (&a.last_error, a.cooldown_until) {
+                    (Some(e), _) if e.blocks_routing(now) => e.kind.label().to_owned(),
+                    (_, Some(until)) if until > now => format!("cooldown until {}", until.format("%Y-%m-%d %H:%M UTC")),
+                    _ => "Account error".into(),
+                };
+                format!("{}: {reason}", account_label(a))
+            })
+            .collect();
+        if enabled.len() > DISPLAY_LIMIT {
+            reasons.push(format!("… and {} more", enabled.len() - DISPLAY_LIMIT));
+        }
+        items.push(raise(
+            provider_notification_key(&provider.id, "pool:unavailable"),
+            Severity::Critical,
+            format!("{label}: all accounts unavailable"),
+            reasons.join("\n"),
+        ));
+    }
+    if items.is_empty()
+        && let Some(severity) = match provider.health {
+            ProviderHealth::Offline => Some(Severity::Critical),
+            ProviderHealth::Degraded => Some(Severity::Warning),
+            _ => None,
+        }
+    {
+        items.push(raise(
+            provider_notification_key(&provider.id, "health:error"),
+            severity,
+            format!("{label}: provider health {}", if severity == Severity::Critical { "error" } else { "degraded" }),
+            provider
+                .status_message
+                .as_deref()
+                .map(sanitize_provider_error)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "No additional provider details were reported.".into()),
+        ));
+    }
+    items
+}
+
+fn stale_publisher_raises<'a>(
+    provider: &'a ProviderDescriptor,
+    publishers: Vec<(String, String, DateTime<Utc>)>,
+    expected_offline_hosts: &'a [String],
+    now: DateTime<Utc>,
+) -> impl Iterator<Item = Raise> + 'a {
+    publishers.into_iter().filter_map(move |(host, user, last)| {
+        if provider.mode == AdapterMode::Fixture || now - last <= Duration::minutes(10) || expected_offline_hosts.contains(&host) {
+            return None;
+        }
+        let publisher = hash::sha256_hex(format!("{host}\0{user}").as_bytes());
+        Some(Raise {
+            source: format!("providers-health:{}", provider.id),
+            dedupe_key: provider_notification_key(&provider.id, &format!("collector:{}:stale", &publisher[..24])),
+            severity: Severity::Warning,
+            title: format!("{}: proxy/collector stopped reporting", sanitize_provider_error(&provider.label)),
+            body: format!(
+                "Publisher: {}\nLast observation: {}",
+                sanitize_provider_error(&format!("{user}@{host}")),
+                last.format("%Y-%m-%d %H:%M UTC")
+            ),
+            subject_type: Some("model_provider".into()),
+            subject_id: Some(provider.id.clone()),
+            url: None,
+        })
+    })
+}
+
+fn quota_raises(provider_id: &str, settings: &ProviderPanelSettings, accounts: &[ModelAccount], now: DateTime<Utc>) -> Vec<Raise> {
     let source = format!("providers:{provider_id}");
     let mut items = Vec::new();
 
@@ -1655,16 +1995,12 @@ fn quota_raises(
         if !acct.enabled {
             continue;
         }
-        let label = if settings.mask_emails {
-            acct.masked_email.as_deref().unwrap_or(&acct.display_name)
-        } else {
-            acct.email.as_deref().unwrap_or(&acct.display_name)
-        };
+        let label = account_notification_label(acct, settings.mask_emails);
         if settings.notify_limit_hit {
             if acct.cooldown_until.is_some_and(|u| u > now) {
-                items.push(crate::notifications::Raise {
+                items.push(Raise {
                     source: source.clone(),
-                    dedupe_key: format!("provider:{provider_id}:{}:cooldown", acct.id),
+                    dedupe_key: provider_notification_key(provider_id, &format!("{}:cooldown", acct.id)),
                     severity: Severity::Warning,
                     title: format!("{provider_id} · {label} rate-limited"),
                     body: acct.status_message.clone().unwrap_or_else(|| "Account is in cooldown until reset.".to_string()),
@@ -1678,9 +2014,9 @@ fn quota_raises(
                     && win.resets_at.is_none_or(|reset| reset > now)
                     && win.remaining_percent.is_some_and(|rem| rem <= 5.0)
                 {
-                    items.push(crate::notifications::Raise {
+                    items.push(Raise {
                         source: source.clone(),
-                        dedupe_key: format!("provider:{provider_id}:{}:{}:low", acct.id, win.window_key),
+                        dedupe_key: provider_notification_key(provider_id, &format!("{}:{}:low", acct.id, win.window_key)),
                         severity: if win.remaining_percent.unwrap_or(0.0) <= 0.5 { Severity::Critical } else { Severity::Warning },
                         title: format!("{provider_id} · {label} {} low ({:.0}% left)", win.label, win.remaining_percent.unwrap_or(0.0)),
                         body: match win.resets_at {
@@ -1743,6 +2079,8 @@ mod tests {
             weight: 1,
             cooldown_until: None,
             status_message: None,
+            last_error: None,
+            last_error_observed: false,
             is_active: false,
             is_preferred: false,
             is_next_pick: false,
@@ -1759,6 +2097,172 @@ mod tests {
             reset_grant: None,
             rolling_starter: None,
         }
+    }
+
+    fn account_error(kind: AccountErrorKind, consecutive_count: u32) -> AccountError {
+        AccountError {
+            kind,
+            source: AccountErrorSource::Inference,
+            http_status: Some(403),
+            provider_code: Some("TEST_CODE".into()),
+            message: "Try again without Bearer private-token or https://example.com?secret=private-query".into(),
+            action_hint: Some("Open the provider dashboard".into()),
+            action_url: Some("https://example.com".into()),
+            occurred_at: Utc::now(),
+            consecutive_count,
+            backoff_until: None,
+        }
+    }
+
+    fn health_provider() -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: "test".into(),
+            label: "Test Provider".into(),
+            family: "test".into(),
+            mode: AdapterMode::Live,
+            verification: Verification::Built,
+            evidence_kinds: Default::default(),
+            capabilities: Default::default(),
+            router_id: None,
+            health: ProviderHealth::Healthy,
+            status_message: None,
+            last_observed_at: None,
+        }
+    }
+
+    #[test]
+    fn health_alerts_cover_each_account_error_and_threshold() {
+        use AccountErrorKind::*;
+        let provider = health_provider();
+        let now = Utc::now();
+        let mut a = acct("primary", true, None, None, sample_window("quota", None, QuotaObservationState::NeverObserved));
+        let settings = ProviderPanelSettings { mask_emails: true, ..Default::default() };
+        for (kind, threshold, severity, suffix) in [
+            (VerificationRequired, 0, Severity::Critical, "requires verification"),
+            (AccountSuspended, 0, Severity::Critical, "suspended"),
+            (AuthExpired, 0, Severity::Critical, "authentication expired"),
+            (BillingRequired, 0, Severity::Critical, "billing/credits required"),
+            (PermissionDenied, 0, Severity::Warning, "permission denied"),
+            (ProbeFailed, 2, Severity::Warning, "quota probe failing"),
+            (UpstreamUnavailable, 3, Severity::Warning, "upstream errors"),
+            (Other, 2, Severity::Warning, "error"),
+        ] {
+            for count in 0..=3 {
+                a.last_error = Some(account_error(kind, count));
+                let items = provider_health_raises(&provider, &settings, std::slice::from_ref(&a), now);
+                let found = items.iter().find(|r| r.dedupe_key == "provider:test:primary:error");
+                assert_eq!(found.is_some(), count >= threshold, "{kind:?}/{count}");
+                if let Some(r) = found {
+                    assert_eq!(r.source, "providers-health:test");
+                    assert_eq!(r.severity, severity);
+                    assert_eq!(r.title, format!("Test Provider: {} {suffix}", a.masked_email.as_deref().unwrap()));
+                    assert_eq!(r.subject_type.as_deref(), Some("model_provider"));
+                    assert_eq!(r.subject_id.as_deref(), Some("test"));
+                    assert_eq!(r.url, None);
+                    for fragment in ["TEST_CODE", "inference", "Open the provider dashboard"] {
+                        assert!(r.body.contains(fragment), "{fragment}: {}", r.body);
+                    }
+                    assert!(!r.body.contains("private-"));
+                }
+            }
+        }
+        a.last_error = Some(account_error(QuotaExhausted, 5));
+        a.enrollment_state = EnrollmentState::Error;
+        a.windows[0].observation_state = QuotaObservationState::ProbeFailed;
+        assert!(
+            provider_health_raises(&provider, &settings, std::slice::from_ref(&a), now)
+                .iter()
+                .all(|r| r.dedupe_key == "provider:test:pool:unavailable")
+        );
+        a.last_error = None;
+        let legacy = |a: &ModelAccount| provider_health_raises(&provider, &settings, std::slice::from_ref(a), now);
+        assert!(legacy(&a)[0].title.ends_with("enrollment error"));
+        assert_eq!(legacy(&a)[0].severity, Severity::Critical);
+        a.enrollment_state = EnrollmentState::Verified;
+        assert!(legacy(&a)[0].title.ends_with("quota probe failing"));
+        assert_eq!(legacy(&a)[0].severity, Severity::Warning);
+        a.enabled = false;
+        assert!(legacy(&a).is_empty());
+    }
+
+    #[test]
+    fn health_alerts_bound_keys_and_pool_details_without_affecting_quota() {
+        let provider = health_provider();
+        let now = Utc::now();
+        let mut failed =
+            acct(&format!("{}🌱A", "a".repeat(150)), true, None, None, sample_window("quota", None, QuotaObservationState::NeverObserved));
+        failed.last_error = Some(account_error(AccountErrorKind::VerificationRequired, 1));
+        let mut limited = acct("secondary", true, None, None, sample_window("five_hour", Some(100.0), QuotaObservationState::Measured));
+        limited.status = AccountStatus::Limited;
+        limited.cooldown_until = Some(now + Duration::minutes(5));
+        let settings = ProviderPanelSettings { mask_emails: true, notify_limit_hit: true, ..Default::default() };
+        let mut accounts = vec![failed, limited];
+        let raises = |a: &[ModelAccount], now| provider_health_raises(&provider, &settings, a, now);
+        let items = raises(&accounts, now);
+        let key = &items[0].dedupe_key;
+        assert!(key.len() <= 128 && key.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b":._-".contains(&b)));
+        assert_eq!(*key, raises(&accounts, now)[0].dedupe_key);
+        assert_ne!(*key, provider_notification_key("test", &format!("{}🌱B:error", "a".repeat(150))));
+        assert_ne!(account_error_key("test", "poller"), provider_notification_key("test", "poller:error"));
+        let pool = &items[1];
+        assert_eq!(pool.dedupe_key, "provider:test:pool:unavailable");
+        assert_eq!(pool.severity, Severity::Critical);
+        assert!(pool.body.contains("Verification required"));
+        assert!(pool.body.contains("cooldown until"));
+        assert!(pool.body.contains(accounts[1].masked_email.as_deref().unwrap()));
+        assert!(!pool.body.contains("secondary@example.com"));
+        let quota = quota_raises("test", &settings, &accounts, now);
+        assert_eq!(quota.len(), 2);
+        assert!(quota.iter().all(|r| r.source == "providers:test" && !items.iter().any(|h| h.dedupe_key == r.dedupe_key)));
+        accounts[0].last_error = None;
+        assert!(raises(&accounts, now).is_empty());
+        assert_eq!(quota_raises("test", &settings, &accounts, now).len(), 2);
+        accounts[0].enabled = false;
+        assert!(raises(&accounts, now + Duration::minutes(5)).is_empty());
+        let many_unavailable: Vec<_> = (0..32)
+            .map(|i| {
+                let mut a = accounts[1].clone();
+                a.masked_email = Some(format!("{i}{}@example.net", "á".repeat(500)));
+                a
+            })
+            .collect();
+        let body = &raises(&many_unavailable, now)[0].body;
+        assert!(body.len() < 2_500);
+        assert!(body.contains("and 24 more"));
+        let unmasked = ProviderPanelSettings { mask_emails: false, ..settings };
+        assert!(provider_health_raises(&provider, &unmasked, &accounts, now)[0].body.contains("secondary@example.com"));
+    }
+
+    #[test]
+    fn provider_fallback_and_stale_collector_have_independent_lifecycles() {
+        let mut provider = health_provider();
+        let now = Utc::now();
+        let settings = ProviderPanelSettings::default();
+        let stale = now - Duration::minutes(11);
+        let publishers = vec![
+            ("nomad".into(), "can".into(), stale),
+            ("atlas".into(), "can".into(), now - Duration::minutes(10)),
+            ("atlas".into(), "other".into(), stale),
+        ];
+        let alerts: Vec<_> = stale_publisher_raises(&provider, publishers.clone(), &["nomad".into()], now).collect();
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].body.contains("other@atlas"));
+        assert_eq!(alerts[0].severity, Severity::Warning);
+        assert_eq!(stale_publisher_raises(&provider, vec![], &[], now).count(), 0);
+        provider.mode = AdapterMode::Fixture;
+        assert_eq!(stale_publisher_raises(&provider, publishers, &[], now).count(), 0);
+        provider.mode = AdapterMode::Live;
+        provider.status_message = Some("No credentials configured".into());
+        for (health, severity) in [(ProviderHealth::Degraded, Severity::Warning), (ProviderHealth::Offline, Severity::Critical)] {
+            provider.health = health;
+            let items = provider_health_raises(&provider, &settings, &[], now);
+            assert_eq!(items[0].dedupe_key, "provider:test:health:error");
+            assert_eq!(items[0].body, "No credentials configured");
+            assert_eq!(items[0].severity, severity);
+        }
+        let mut a = acct("primary", true, None, None, sample_window("quota", None, QuotaObservationState::NeverObserved));
+        a.last_error = Some(account_error(AccountErrorKind::BillingRequired, 1));
+        assert!(provider_health_raises(&provider, &settings, &[a], now).iter().all(|r| r.dedupe_key != "provider:test:health:error"));
     }
 
     #[test]

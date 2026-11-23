@@ -4,6 +4,369 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[tokio::test]
+async fn provider_account_errors_survive_migration_and_resolve_independently_over_http() {
+    use chrono::{Duration, Utc};
+    use contracts::providers::*;
+    use contracts::{NotificationPage, Severity};
+    use domain::{MIGRATOR, ports::ModelProvider, sqlx};
+
+    let Ok(base) = std::env::var("HUB_TEST_DATABASE_URL") else {
+        eprintln!("HUB_TEST_DATABASE_URL unset; skipping DB-backed test");
+        return;
+    };
+    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let name = format!("t_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("create database {name}")).execute(&admin).await.unwrap();
+    let mut url = reqwest::Url::parse(&base).unwrap();
+    url.set_path(&format!("/{name}"));
+    let db = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+    let before_17 = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Borrowed(&MIGRATOR.migrations[..MIGRATOR.migrations.partition_point(|m| m.version < 17)]),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    before_17.run(&db).await.unwrap();
+    sqlx::query("insert into model_provider_instances (id, label, family, health) values ('test-proxy', 'Test Proxy', 'test', 'degraded')")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("insert into model_accounts (provider_id, id, source_account_id, display_name) values ('test-proxy', 'primary', 'primary', 'Primary')")
+        .execute(&db)
+        .await
+        .unwrap();
+    MIGRATOR.run(&db).await.unwrap();
+    let fields: (Option<String>, i32, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("select error_kind, error_consecutive_count, error_backoff_until from model_accounts").fetch_one(&db).await.unwrap();
+    assert_eq!(fields, (None, 0, None));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut settings = Settings::fixture(url.as_str(), &addr.to_string());
+    settings.asset_dir = std::env::temp_dir().join(&name);
+    settings.registry_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../registry").into();
+    settings.seed_file = Some(settings.registry_dir.join("hub.fixture.json"));
+    let (state, _) = bootstrap::build(&settings).await.unwrap();
+    let token = Uuid::new_v4().to_string();
+    domain::system::issue_token(&state.hub.db, "operator", contracts::Role::Operator, Some(token.clone())).await.unwrap();
+    let hub = state.hub.clone();
+    let server = tokio::spawn(async move { axum::serve(listener, fleetix_hubd::router(state)).await.unwrap() });
+    let http = reqwest::Client::new();
+    let get = |path: &str| http.get(format!("http://{addr}/v1/{path}")).bearer_auth(&token);
+    let post_batch = |batch: &ObservationBatch| {
+        http.post(format!("http://{addr}/v1/providers/test-proxy/observations")).bearer_auth(&token).json(batch).send()
+    };
+    let set_mask = |mask_emails| {
+        http.put(format!("http://{addr}/v1/providers/settings"))
+            .bearer_auth(&token)
+            .json(&ProviderPanelSettings { mask_emails, ..Default::default() })
+            .send()
+    };
+    let alerts = || async {
+        get("notifications?state=all").send().await.unwrap().error_for_status().unwrap().json::<NotificationPage>().await.unwrap().items
+    };
+    let get_accounts = || async {
+        get("providers/test-proxy/accounts").send().await.unwrap().error_for_status().unwrap().json::<Vec<ModelAccount>>().await.unwrap()
+    };
+    let mut batch =
+        integrations::providers::FullFixtureModelProvider::new("test-proxy", "Test Proxy", "test").collect().await.unwrap().unwrap();
+    batch.accounts.truncate(2);
+    batch.accounts[0].id = "primary".into(); // exercises the pre-0017 row's conflict update
+    let email = "verification-person@example.test";
+    batch.accounts[0].email = Some(email.into());
+    batch.accounts[0].masked_email = None;
+    batch.accounts[0].enabled = true;
+    batch.accounts[0].is_next_pick = true;
+    batch.accounts[0].cooldown_until = None;
+    batch.accounts[0].enrollment_state = EnrollmentState::Verified;
+    batch.accounts[1].id = "backup".into();
+    batch.accounts[1].enabled = true;
+    let at = chrono::DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap();
+    batch.collected_at = at;
+    batch.accounts[1].cooldown_until = Some(at + Duration::minutes(5));
+    batch.reset_grants.clear();
+    batch.health = ProviderHealth::Degraded;
+    for account in &mut batch.accounts {
+        account.last_error_observed = true;
+    }
+    batch.account_inventory_complete = true;
+    batch.source_publisher = Some("fleetix-agent-proxy".into());
+    let error = AccountError {
+        kind: AccountErrorKind::VerificationRequired,
+        source: AccountErrorSource::OAuthRefresh,
+        http_status: Some(403),
+        provider_code: Some("VALIDATION_REQUIRED".into()),
+        message: "Verify your account".into(),
+        action_hint: Some(format!("Sign in again as {email}")),
+        action_url: Some("https://example.com".into()),
+        occurred_at: at,
+        consecutive_count: 1,
+        backoff_until: Some(at + Duration::minutes(15)),
+    };
+    batch.accounts[0].last_error = Some(error.clone());
+    batch.accounts[1].last_error = Some(AccountError { kind: AccountErrorKind::QuotaExhausted, backoff_until: None, ..error.clone() });
+    set_mask(false).await.unwrap().error_for_status().unwrap();
+    post_batch(&batch).await.unwrap().error_for_status().unwrap();
+    let loaded = get_accounts().await;
+    let primary = loaded.iter().find(|a| a.id == "primary").unwrap();
+    assert_eq!(primary.last_error.as_ref(), Some(&error));
+    assert_eq!(primary.status, AccountStatus::Error);
+    assert_eq!(loaded.iter().find(|a| a.id == "backup").unwrap().last_error.as_ref().unwrap().kind, AccountErrorKind::QuotaExhausted);
+    let error_key = "provider:test-proxy:primary:error";
+    let pool_key = "provider:test-proxy:pool:unavailable";
+    let quota_key = "provider:test-proxy:backup:cooldown";
+    let items = alerts().await;
+    let find = |items: &[contracts::Notification], key: &str| items.iter().find(|n| n.dedupe_key == key).unwrap().clone();
+    let first_alert = find(&items, error_key);
+    assert_eq!(first_alert.severity, Severity::Critical);
+    assert!(first_alert.title.ends_with("requires verification"));
+    assert!(first_alert.title.contains(email) && first_alert.body.contains(email));
+    assert!(first_alert.body.contains("VALIDATION_REQUIRED"));
+    let first_pool_alert = find(&items, pool_key);
+    assert!(first_pool_alert.resolved_at.is_none());
+    assert!(first_pool_alert.body.contains(email));
+    assert!(find(&items, quota_key).resolved_at.is_none());
+    assert!(!items.iter().any(|n| n.dedupe_key == "provider:test-proxy:backup:error"));
+
+    let post = |path: &str| http.post(format!("http://{addr}/v1/{path}")).bearer_auth(&token);
+    post("notifications/ack").json(&json!({"ids":[first_alert.id,first_pool_alert.id]})).send().await.unwrap().error_for_status().unwrap();
+    let items = alerts().await;
+    let ack = find(&items, error_key);
+    let pool_ack = find(&items, pool_key);
+    assert!(pool_ack.read_at.is_some());
+    let ack_seq = ack.seq;
+    set_mask(true).await.unwrap().error_for_status().unwrap();
+    let items = alerts().await;
+    let masked = find(&items, error_key);
+    let masked_email = mask_email(email);
+    assert!(masked.title.contains(&masked_email) && masked.body.contains(&masked_email));
+    assert!(!masked.title.contains(email) && !masked.body.contains(email));
+    assert_eq!((masked.read_at, masked.seq), (ack.read_at, ack.seq));
+    let masked_pool = find(&items, pool_key);
+    assert!(masked_pool.body.contains(&masked_email));
+    assert!(!masked_pool.title.contains(email) && !masked_pool.body.contains(email));
+    assert_eq!(masked_pool.title, pool_ack.title);
+    assert_eq!(masked_pool.resolved_at, None);
+    assert_eq!((masked_pool.read_at, masked_pool.seq), (pool_ack.read_at, pool_ack.seq));
+    batch.accounts[0].last_error.as_mut().unwrap().message = "Please verify. Request ID: unique-2".into();
+    batch.accounts[0].last_error.as_mut().unwrap().consecutive_count = 2;
+    batch.accounts[0].status_message = None;
+    post_batch(&batch).await.unwrap().error_for_status().unwrap();
+    let acknowledged = find(&alerts().await, error_key);
+    assert!(acknowledged.read_at.is_some());
+    assert!(!acknowledged.body.contains("unique-2"));
+    assert_eq!(acknowledged.seq, ack_seq);
+    assert!(get_accounts().await.iter().find(|a| a.id == "primary").unwrap().status_message.as_ref().unwrap().contains("unique-2"));
+    batch.accounts[0].last_error.as_mut().unwrap().provider_code = Some("NEW_DIAGNOSTIC_CODE".into());
+    post_batch(&batch).await.unwrap().error_for_status().unwrap();
+    let updated = find(&alerts().await, error_key);
+    assert!(updated.body.contains("NEW_DIAGNOSTIC_CODE"));
+    assert_eq!(updated.seq, ack_seq);
+
+    let mut legacy = batch.clone();
+    legacy.accounts[0].last_error_observed = false;
+    legacy.account_inventory_complete = false;
+    legacy.accounts[0].last_error = None;
+    legacy.accounts[0].status_message = Some("legacy diagnostic".into());
+    legacy.accounts.truncate(1);
+    post_batch(&legacy).await.unwrap().error_for_status().unwrap();
+    assert_eq!(get_accounts().await.len(), 2, "omission from a partial inventory is not removal");
+    assert_eq!(get_accounts().await.iter().find(|a| a.id == "primary").unwrap().last_error.as_ref().unwrap().consecutive_count, 2);
+
+    batch.health = ProviderHealth::Degraded;
+    batch.accounts[0].last_error = Some(AccountError {
+        kind: AccountErrorKind::PermissionDenied,
+        provider_code: None,
+        action_hint: None,
+        action_url: None,
+        consecutive_count: 2,
+        ..error.clone()
+    });
+    post_batch(&batch).await.unwrap().error_for_status().unwrap();
+    let items = alerts().await;
+    let updated = find(&items, error_key);
+    assert_eq!(updated.id, first_alert.id);
+    assert_eq!(updated.severity, Severity::Warning);
+    assert!(updated.title.ends_with("permission denied"));
+    assert!(!updated.body.contains("VALIDATION_REQUIRED"));
+    assert!(updated.read_at.is_none());
+    assert!(updated.seq > ack_seq);
+
+    batch.health = ProviderHealth::Healthy;
+    batch.accounts[0].last_error = None;
+    let mut delayed = batch.clone();
+    delayed.collected_at -= Duration::minutes(1);
+    post_batch(&delayed).await.unwrap().error_for_status().unwrap();
+    assert!(get_accounts().await.iter().find(|a| a.id == "primary").unwrap().last_error.is_some());
+    let previous_observed = batch.accounts[0].last_observed_at.unwrap_or(batch.collected_at);
+    batch.accounts[0].last_observed_at = Some(previous_observed - Duration::minutes(1));
+    post_batch(&batch).await.unwrap().error_for_status().unwrap();
+    assert!(get_accounts().await.iter().find(|a| a.id == "primary").unwrap().last_error.is_some());
+    batch.accounts[0].last_observed_at = Some(previous_observed);
+    post_batch(&batch).await.unwrap().error_for_status().unwrap();
+    let loaded = get_accounts().await;
+    let primary = loaded.iter().find(|a| a.id == "primary").unwrap();
+    assert!(primary.last_error.is_none());
+    assert_eq!(primary.status, AccountStatus::NextPick);
+    let cleared: bool = sqlx::query_scalar(
+        "select num_nonnulls(error_kind, error_source, error_http_status, error_code, error_message, error_action_hint, error_action_url, error_at, error_backoff_until) = 0
+            and error_consecutive_count = 0 from model_accounts where provider_id = 'test-proxy' and id = 'primary'",
+    ).fetch_one(&db).await.unwrap();
+    assert!(cleared);
+    let items = alerts().await;
+    assert!(find(&items, error_key).resolved_at.is_some());
+    assert!(find(&items, pool_key).resolved_at.is_some());
+    assert!(find(&items, quota_key).resolved_at.is_none());
+
+    // First establish a second push publisher; the fresh one must not hide it.
+    let mut other = batch.clone();
+    other.source_host = "other-live-host".into();
+    other.collected_at = at - Duration::minutes(11);
+    other.accounts.clear();
+    other.status_message = Some("Cookie: session=opaque-header; other=opaque-cookie".into());
+    post_batch(&other).await.unwrap().error_for_status().unwrap();
+    let stale = alerts().await.into_iter().find(|n| n.title.ends_with("collector stopped reporting")).unwrap();
+    assert!(stale.body.contains("other-live-host"));
+    let stale_key = stale.dedupe_key.as_str();
+    hub.expected_offline_hosts.write().unwrap().push("fixture-host".into());
+    domain::providers::reconcile_provider_health_notifications(&hub).await.unwrap();
+    assert!(find(&alerts().await, stale_key).resolved_at.is_none());
+    hub.expected_offline_hosts.write().unwrap().push("other-live-host".into());
+    domain::providers::reconcile_provider_health_notifications(&hub).await.unwrap();
+    assert!(find(&alerts().await, stale_key).resolved_at.is_some());
+    fleetix_hubd::notify_pass(&hub, Some(std::path::Path::new("/nonexistent-fleet-status-fixture.json")), None, None).await;
+    assert!(hub.expected_offline_hosts.read().unwrap().iter().any(|host| host == "other-live-host"));
+    hub.expected_offline_hosts.write().unwrap().clear();
+    other.collected_at = at;
+    post_batch(&other).await.unwrap().error_for_status().unwrap();
+    other.collected_at = at - Duration::minutes(12);
+    post_batch(&other).await.unwrap().error_for_status().unwrap();
+    assert!(find(&alerts().await, stale_key).resolved_at.is_some());
+    let freshest: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "select last_observed_at from model_provider_publishers where provider_id = 'test-proxy' and source_host = 'other-live-host'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(freshest, at);
+
+    // A complete inventory owns only its publisher's rows and resolves removals.
+    other.collected_at = at + Duration::seconds(1);
+    let mut foreign_account = batch.accounts[1].clone();
+    foreign_account.id = "other-account".into();
+    foreign_account.enabled = false;
+    other.accounts.push(foreign_account);
+    post_batch(&other).await.unwrap().error_for_status().unwrap();
+    batch.accounts[0].last_error = Some(error.clone());
+    post_batch(&batch).await.unwrap().error_for_status().unwrap();
+    assert!(find(&alerts().await, error_key).resolved_at.is_none());
+    assert!(find(&alerts().await, error_key).read_at.is_none());
+    batch.accounts.remove(0);
+    batch.status_message = Some("Cookie: a=opaque-header; b=opaque-cookie".into());
+    batch.accounts[0].status_message = Some("clientSecret=opaque-legacy".into());
+    batch.accounts[0].last_error = None;
+    batch.accounts[0].windows[0].error_reason = Some("refreshToken=opaque-quota".into());
+    batch.accounts[0].windows[0].observed_at = Some(at + Duration::seconds(1));
+    batch.collected_at = at + Duration::seconds(1);
+    let mut cli = batch.clone();
+    cli.collected_at = at + Duration::seconds(2);
+    cli.account_inventory_complete = false;
+    cli.accounts[0].id = "cli-only-account".into();
+    cli.accounts[0].enabled = false;
+    cli.source_publisher = Some("fleetix-cli-collector".into());
+    post_batch(&cli).await.unwrap().error_for_status().unwrap();
+    let mut legacy_complete = batch.clone();
+    legacy_complete.source_publisher = None;
+    post_batch(&legacy_complete).await.unwrap().error_for_status().unwrap();
+    assert!(get_accounts().await.iter().any(|a| a.id == "primary"), "legacy snapshots cannot remove accounts");
+    post_batch(&batch).await.unwrap().error_for_status().unwrap();
+    let loaded = get_accounts().await;
+    assert_eq!(loaded.len(), 3);
+    assert!(loaded.iter().any(|a| a.id == "other-account"));
+    assert!(loaded.iter().any(|a| a.id == "cli-only-account"));
+    assert!(!loaded.iter().any(|a| a.id == "primary"));
+    let backup = loaded.iter().find(|a| a.id == "backup").unwrap();
+    assert!(find(&alerts().await, error_key).resolved_at.is_some());
+    assert!(!backup.status_message.as_ref().unwrap().contains("opaque-legacy"));
+    assert!(backup.windows.iter().any(|w| w.error_reason.as_deref() == Some("[redacted]")));
+    let saved: Option<String> =
+        sqlx::query_scalar("select status_message from model_provider_instances where id = 'test-proxy'").fetch_one(&db).await.unwrap();
+    assert_eq!(saved.as_deref(), Some("[redacted]"));
+
+    // One transient diagnostic isn't an outage; a persisted active backoff is.
+    batch.accounts[0].cooldown_until = None;
+    batch.accounts[0].enrollment_state = EnrollmentState::Verified;
+    batch.accounts[0].last_error = Some(AccountError {
+        kind: AccountErrorKind::UpstreamUnavailable,
+        source: AccountErrorSource::Inference,
+        consecutive_count: 1,
+        backoff_until: None,
+        ..error.clone()
+    });
+    post_batch(&batch).await.unwrap().error_for_status().unwrap();
+    assert_ne!(get_accounts().await.iter().find(|a| a.id == "backup").unwrap().status, AccountStatus::Error);
+    assert!(find(&alerts().await, pool_key).resolved_at.is_some());
+    let diagnostic = batch.accounts[0].last_error.as_mut().unwrap();
+    diagnostic.consecutive_count = 3;
+    diagnostic.backoff_until = Some(at + Duration::minutes(2));
+    post_batch(&batch).await.unwrap().error_for_status().unwrap();
+    assert_eq!(get_accounts().await.iter().find(|a| a.id == "backup").unwrap().status, AccountStatus::Error);
+    assert!(find(&alerts().await, pool_key).resolved_at.is_none());
+
+    let entry = |source: &str, key: &str| {
+        json!({
+            "source":source, "dedupe_key":key, "severity":"warning", "title":"Fixture", "body":"Fixture body"
+        })
+    };
+    for (name, role) in [("fixture-agent", contracts::Role::Agent), ("fixture-procedure", contracts::Role::Procedure)] {
+        let writer = Uuid::new_v4().to_string();
+        domain::system::issue_token(&db, name, role, Some(writer.clone())).await.unwrap();
+        let send = |path: &str, body: Value| http.post(format!("http://{addr}/v1/{path}")).bearer_auth(&writer).json(&body).send();
+        for prefix in ["providers:", "providers-health:", "providers-poller:"] {
+            let source = format!("{prefix}test-proxy");
+            assert_eq!(send("notifications", entry(&source, "allowed-key")).await.unwrap().status(), 422);
+            assert_eq!(send("notifications/sync", json!({"source":source, "items":[]})).await.unwrap().status(), 422);
+            assert_eq!(
+                send("notifications/sync", json!({"source":source, "items":[entry(&source, "allowed-key")]})).await.unwrap().status(),
+                422
+            );
+        }
+        assert_eq!(send("notifications", entry(name, pool_key)).await.unwrap().status(), 422);
+        assert_eq!(send("notifications/sync", json!({"source":name,"items":[entry(name, pool_key)]})).await.unwrap().status(), 422);
+    }
+    post("notifications").json(&entry("owner-a", "shared-fixture-key")).send().await.unwrap().error_for_status().unwrap();
+    assert_eq!(post("notifications").json(&entry("owner-b", "shared-fixture-key")).send().await.unwrap().status(), 422);
+    assert_eq!(
+        post("notifications/sync")
+            .json(&json!({"source":"owner-b", "items":[entry("owner-b","shared-fixture-key")]}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        422
+    );
+    post("notifications/sync").json(&json!({"source":"owner-b", "items":[]})).send().await.unwrap().error_for_status().unwrap();
+    assert!(find(&alerts().await, "shared-fixture-key").resolved_at.is_none());
+    let conflict = domain::notifications::Raise {
+        source: "owner-b".into(),
+        dedupe_key: "shared-fixture-key".into(),
+        severity: Severity::Critical,
+        title: "Conflicting writer".into(),
+        body: String::new(),
+        subject_type: None,
+        subject_id: None,
+        url: None,
+    };
+    assert!(domain::notifications::raise(&hub, &conflict).await.is_err());
+    println!("migration 0017 upgrade and provider health alert round-trip verified against PostgreSQL");
+
+    server.abort();
+    let _ = server.await;
+    hub.db.close().await;
+    db.close().await;
+    sqlx::query(&format!("drop database {name} with (force)")).execute(&admin).await.unwrap();
+    let _ = std::fs::remove_dir_all(settings.asset_dir);
+}
+
+#[tokio::test]
 async fn fixture_providers_and_activity_over_http() {
     let Ok(base) = std::env::var("HUB_TEST_DATABASE_URL") else {
         eprintln!("HUB_TEST_DATABASE_URL unset; skipping DB-backed test");

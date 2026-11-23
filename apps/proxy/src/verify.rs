@@ -18,13 +18,16 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, TimeDelta, Utc};
-use contracts::providers::{QuotaObservationState, QuotaStatus, QuotaUnit, QuotaWindow, QuotaWindowKind, ResetCadence, RouteStrategy};
+use contracts::providers::{
+    AccountErrorKind, AccountErrorSource, QuotaObservationState, QuotaStatus, QuotaUnit, QuotaWindow, QuotaWindowKind, ResetCadence,
+    RouteStrategy,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::Mutex};
 use uuid::Uuid;
 
-use crate::{Proxy, clients::register_t3code, config::Config, management, router};
+use crate::{Proxy, clients::register_t3code, config::Config, error_classify::local_error, management, router};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckOutcome {
@@ -587,7 +590,7 @@ async fn check_t3code_management_api_contract() -> Result<String> {
     ensure!(ssrf.status() == StatusCode::FORBIDDEN, "expected 403 for disallowed upstream, got {}", ssrf.status());
 
     // Native Google quota probing runs independently of T3's CLIProxy account filtering.
-    proxy.refresh_usage(&accounts["ag-a.json"]).await.map_err(|err| anyhow!("{err}"))?;
+    proxy.refresh_usage(&accounts["ag-a.json"]).await.map_err(|err| anyhow!("{}", err.summary()))?;
     ensure!(proxy.state.read().await.pool.accounts["ag-a.json"].windows.iter().any(|w| w.used_percent.is_some()));
 
     let codex_cooldown = Utc::now() + TimeDelta::minutes(3);
@@ -1222,7 +1225,7 @@ async fn check_antigravity_quota_exhaustion_and_thread_auto_resume() -> Result<S
         state.pool.accounts.get_mut("ag-a.json").unwrap().scoped_cooldowns.clear();
         let beta = state.pool.accounts.get_mut("ag-b.json").unwrap();
         beta.scoped_cooldowns.clear();
-        beta.auth_cooldown = Some(Utc::now() + TimeDelta::minutes(2));
+        beta.record_error_once(&local_error(AccountErrorKind::AuthExpired, AccountErrorSource::Inference, "fixture auth failure"));
     }
     let calls_before_mixed = upstream_calls.load(Ordering::SeqCst);
     for attempt in 1..=2 {
@@ -1334,9 +1337,13 @@ async fn check_antigravity_in_band_errors() -> Result<String> {
             let pool = &mut state.pool;
             let alpha = pool.accounts.get_mut("ag-a.json").unwrap();
             alpha.scoped_cooldowns.clear();
-            alpha.auth_cooldown = None;
+            alpha.clear_account_error();
             if case == "exhausted-sse" {
-                pool.accounts.get_mut("ag-b.json").unwrap().auth_cooldown = Some(Utc::now() + TimeDelta::minutes(2));
+                pool.accounts.get_mut("ag-b.json").unwrap().record_error_once(&local_error(
+                    AccountErrorKind::AuthExpired,
+                    AccountErrorSource::Inference,
+                    "fixture auth failure",
+                ));
             }
             pool.clear_affinity();
             pool.overrides.insert(crate::pool::Lane::Google, "ag-a.json".into());
@@ -1380,7 +1387,7 @@ async fn check_antigravity_in_band_errors() -> Result<String> {
         let alpha = &state.pool.accounts["ag-a.json"];
         ensure!(alpha.failure == index as u64 + 1 && alpha.success == 0);
         ensure!(alpha.scoped_cooldowns.contains_key("gemini") == (code == 429));
-        ensure!(alpha.auth_cooldown.is_some() == (code == 401));
+        ensure!(alpha.quarantined(Utc::now()) == (code == 401));
         if !mid {
             ensure!(state.pool.bound(crate::pool::Lane::Google, "verify-in-band") == early.then_some("ag-b.json"));
         }
