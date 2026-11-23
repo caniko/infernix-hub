@@ -388,6 +388,7 @@ struct Name {
 async fn upload(State(proxy): State<Arc<Proxy>>, Query(query): Query<Name>, Json(raw): Json<Value>) -> Reply {
     let name = query.name.as_deref().ok_or_else(|| bad("credential file name required"))?;
     let accounts = parse_credentials(name, &raw, false).map_err(|_| bad("unsupported credential document"))?;
+    let hydrate_google = accounts.iter().any(Account::needs_google_metadata);
     let mut state = proxy.state.write().await;
     if state.pool.accounts.values().any(|a| a.name == name && a.local) {
         return Err(Failure(StatusCode::CONFLICT, "discovered accounts cannot be overwritten"));
@@ -398,6 +399,10 @@ async fn upload(State(proxy): State<Arc<Proxy>>, Query(query): Query<Name>, Json
     state.pool.accounts.retain(|id, a| a.name != name || ids.contains(id.as_str()));
     state.pool.insert(accounts);
     state.pool.revision += 1;
+    drop(state);
+    if hydrate_google {
+        tokio::spawn(async move { proxy.hydrate_google_metadata().await });
+    }
     ok(json!({"status":"ok"}))
 }
 
@@ -689,44 +694,58 @@ async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) ->
     }
     let http = if mock { proxy.http.clone() } else { management_http(&url).await? };
     let account = proxy.token_account(&account, false).await.map_err(|_| upstream())?;
-    let token = account.access.clone();
-    let mut request = http.request(if method == "POST" { reqwest::Method::POST } else { reqwest::Method::GET }, url);
-    for (key, value) in call.header {
-        let name = key.to_ascii_lowercase();
-        if !matches!(
-            name.as_str(),
-            "authorization"
-                | "content-type"
-                | "accept"
-                | "anthropic-beta"
-                | "user-agent"
-                | "openai-beta"
-                | "originator"
-                | "chatgpt-account-id"
-                | "x-goog-api-client"
-        ) || (value.contains("$TOKEN$") && name != "authorization")
-        {
-            return Err(bad("API call header is not allowed"));
+    let request = |token: &str| {
+        let mut request = http.request(if method == "POST" { reqwest::Method::POST } else { reqwest::Method::GET }, url.clone());
+        for (key, value) in &call.header {
+            let name = key.to_ascii_lowercase();
+            if !matches!(
+                name.as_str(),
+                "authorization"
+                    | "content-type"
+                    | "accept"
+                    | "anthropic-beta"
+                    | "user-agent"
+                    | "openai-beta"
+                    | "originator"
+                    | "chatgpt-account-id"
+                    | "x-goog-api-client"
+            ) || (value.contains("$TOKEN$") && name != "authorization")
+            {
+                return Err(bad("API call header is not allowed"));
+            }
+            if name == "authorization" && value != "Bearer $TOKEN$" {
+                return Err(bad("invalid token substitution"));
+            }
+            if name == "chatgpt-account-id" && account.chatgpt_id.as_deref() != Some(value.as_str()) {
+                return Err(bad("account header does not match credential"));
+            }
+            request = request.header(name, value.replace("$TOKEN$", token));
         }
-        if name == "authorization" && value != "Bearer $TOKEN$" {
-            return Err(bad("invalid token substitution"));
+        if let Some(data) = &call.data {
+            request = request.body(data.clone());
         }
-        if name == "chatgpt-account-id" && account.chatgpt_id.as_deref() != Some(value.as_str()) {
-            return Err(bad("account header does not match credential"));
-        }
-        request = request.header(name, value.replace("$TOKEN$", &token));
-    }
-    if let Some(data) = call.data {
-        request = request.body(data);
-    }
-    let response = request.timeout(Duration::from_secs(12)).send().await.map_err(|_| upstream())?;
+        Ok(request.timeout(Duration::from_secs(12)))
+    };
+    let mut response = request(&account.access)?.send().await.map_err(|_| upstream())?;
+    let fresh = if response.status() == StatusCode::UNAUTHORIZED
+        && !account.api_key
+        && (matches!(account.lane, Lane::Claude | Lane::Codex) || (account.lane == Lane::Google && account.refresh.is_some()))
+        && let Ok(fresh) = proxy.token_account(&account, true).await
+        && fresh.access != account.access
+    {
+        response = request(&fresh.access)?.send().await.map_err(|_| upstream())?;
+        Some(fresh)
+    } else {
+        None
+    };
     let status = response.status().as_u16();
     let bytes = bounded_body(response, 2 * 1024 * 1024).await.map_err(|_| upstream())?;
     let mut body = String::from_utf8_lossy(&bytes).into_owned();
-    for secret in [&token, &proxy.config.management_key, &proxy.config.client_key]
+    for secret in [&proxy.config.management_key, &proxy.config.client_key]
         .into_iter()
-        .chain(account.refresh.as_ref())
-        .chain(account.google_secret.as_ref())
+        .chain(
+            fresh.iter().chain([&account]).flat_map(|a| [&a.access].into_iter().chain(a.refresh.as_ref()).chain(a.google_secret.as_ref())),
+        )
         .filter(|s| !s.is_empty())
     {
         body = body.replace(secret, "[REDACTED]");

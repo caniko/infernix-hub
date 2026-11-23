@@ -159,6 +159,10 @@ pub struct Account {
 }
 
 impl Account {
+    pub(crate) fn needs_google_metadata(&self) -> bool {
+        self.lane == Lane::Google && !self.disabled && !self.api_key && (self.email.is_none() || self.project.is_none())
+    }
+
     pub(crate) fn same_credential(&self, other: &Self) -> bool {
         self.lane == other.lane
             && self.api_key == other.api_key
@@ -481,6 +485,9 @@ impl Pool {
     }
 
     pub fn reload_local(config: &Config, account: &Account) -> Option<Account> {
+        if config.exclude_local_lanes.contains(&account.lane) {
+            return None;
+        }
         let mut found = Self::default();
         match account.lane {
             Lane::Claude => discover_claude(config, &mut found),
@@ -736,7 +743,11 @@ fn add(pool: &mut Pool, lane: Lane, label: &str, mut raw: Value) {
     fields.remove("family");
     let name = format!("local-{}-{}.json", lane.name(), hex::encode(&Sha256::digest(label)[..8]));
     if let Ok(mut found) = parse_credentials(&name, &raw, true) {
+        let cutoff = Utc::now() + chrono::TimeDelta::seconds(30);
         found.retain(|a| {
+            if !a.api_key && matches!(a.lane, Lane::Claude | Lane::Codex) && a.expires.is_some_and(|e| e <= cutoff) {
+                return false;
+            }
             !pool.accounts.values().any(|old| {
                 old.lane == a.lane
                     && ((!a.access.is_empty() && old.access == a.access)
@@ -780,10 +791,16 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
     let project = text(&raw, &["project_id", "projectId", "project"]).map(str::to_owned);
     let email = text(&raw, &["email"]).map(str::to_owned);
     if let Some(refresh) = refresh.as_deref()
-        && let Some(existing) =
-            pool.accounts.values_mut().find(|a| a.lane == Lane::Google && a.local && a.refresh.as_deref() == Some(refresh))
+        && let Some(existing) = pool.accounts.values_mut().find(|a| a.lane == Lane::Google && a.refresh.as_deref() == Some(refresh))
     {
-        if existing.label == existing.name || existing.label.starts_with("local-") || existing.label.len() == 64 {
+        let relabel = existing.local
+            && existing.label != label
+            && (existing.label == existing.name || existing.label.starts_with("local-") || existing.label.len() == 64);
+        let enriched = (existing.google_client.is_none() && client.is_some())
+            || (existing.google_secret.is_none() && secret.is_some())
+            || (existing.project.is_none() && project.is_some())
+            || (existing.email.is_none() && email.is_some());
+        if relabel {
             existing.label = label.to_owned();
         }
         if existing.google_client.is_none() {
@@ -798,17 +815,18 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         if existing.email.is_none() {
             existing.email = email;
         }
+        pool.revision += i64::from(relabel || enriched);
         return;
     }
     add(pool, Lane::Google, &format!("provenance:{label}"), raw);
 }
 
-pub(crate) fn add_opencode(pool: &mut Pool, raw: &Value) {
+pub(crate) fn add_opencode(pool: &mut Pool, raw: &Value, excluded: &BTreeSet<Lane>) {
     let rows = raw.get("credentials").unwrap_or(raw);
     let object = rows.as_object().into_iter().flatten().map(|(name, row)| (name.as_str(), row));
     let list = rows.as_array().into_iter().flatten().filter_map(|row| Some((text(row, &["provider", "providerID", "id"])?, row)));
     for (name, entry) in object.chain(list) {
-        if let Some(lane) = Lane::parse(name) {
+        if let Some(lane) = Lane::parse(name).filter(|lane| !excluded.contains(lane)) {
             add(pool, lane, name, entry.get("auth").unwrap_or(entry).clone());
         }
     }
@@ -869,13 +887,18 @@ fn discover_opencode(config: &Config, pool: &mut Pool) {
     if let Some(raw) =
         env::var("OPENCODE_AUTH_CONTENT").ok().and_then(|raw| serde_json::from_str(&raw).ok()).or_else(|| read_json(&opencode))
     {
-        add_opencode(pool, &raw);
+        add_opencode(pool, &raw, &config.exclude_local_lanes);
     }
 }
 
 fn discover(config: &Config, pool: &mut Pool) {
-    discover_claude(config, pool);
-    discover_codex(config, pool);
+    let excluded = &config.exclude_local_lanes;
+    if !excluded.contains(&Lane::Claude) {
+        discover_claude(config, pool);
+    }
+    if !excluded.contains(&Lane::Codex) {
+        discover_codex(config, pool);
+    }
     discover_opencode(config, pool);
     for (var, lane) in [
         ("OPENCODE_GO_API_KEY", Lane::Go),
@@ -883,9 +906,14 @@ fn discover(config: &Config, pool: &mut Pool) {
         ("OPENAI_API_KEY", Lane::Codex),
         ("ANTHROPIC_API_KEY", Lane::Claude),
     ] {
-        if let Ok(key) = env::var(var) {
+        if !excluded.contains(&lane)
+            && let Ok(key) = env::var(var)
+        {
             add(pool, lane, var, json!({"key":key}));
         }
+    }
+    if excluded.contains(&Lane::Google) {
+        return;
     }
     let user = env::var("USER").unwrap_or_default();
     let manifests: Vec<_> = paths(&config.provenance_oauth_dir)

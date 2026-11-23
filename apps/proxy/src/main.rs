@@ -3,7 +3,7 @@ use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::{Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use fleetix_agent_proxy::{
-    Proxy,
+    Lane, Proxy,
     clients::{Client, register_t3code},
     config::{self, Config, DEFAULT_BIND, DEFAULT_URL},
     hub_sync,
@@ -43,6 +43,9 @@ enum Command {
         t3code_home: Option<PathBuf>,
         #[arg(long, env = "PROXY_DISCOVER_LOCAL", value_parser = clap::builder::FalseyValueParser::new(), default_value_t = false, action = clap::ArgAction::SetTrue)]
         discover_local: bool,
+        /// Skip this provider during local credential discovery (does not affect --auth-dir).
+        #[arg(long = "exclude-local-provider", value_name = "PROVIDER", env = "PROXY_EXCLUDE_LOCAL_PROVIDERS", value_delimiter = ',', value_parser = parse_local_provider)]
+        exclude_local_providers: Vec<Lane>,
     },
     RegisterT3code {
         #[arg(long, default_value = DEFAULT_URL)]
@@ -68,6 +71,10 @@ enum Command {
     },
 }
 
+fn parse_local_provider(name: &str) -> Result<Lane, String> {
+    Lane::parse(name.trim()).ok_or_else(|| format!("unknown provider {name:?}; use claude, codex, antigravity, or opencode-go"))
+}
+
 fn state_dir(path: Option<PathBuf>) -> Result<PathBuf> {
     path.or_else(|| env::var_os("PROXY_STATE_DIR").map(PathBuf::from)).map(Ok).unwrap_or_else(config::state_dir)
 }
@@ -87,8 +94,10 @@ async fn main() -> Result<()> {
             register_t3code: register,
             t3code_home,
             discover_local,
+            exclude_local_providers,
         } => {
             let mut config = Config::new(bind, &state_dir(state)?, auth_dir, discover_local, client_key_file, management_key_file)?;
+            config.exclude_local_lanes = exclude_local_providers.into_iter().collect();
             if let Some(home) = t3code_home {
                 config.t3code_home = home;
             }
@@ -159,4 +168,20 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_excludes_multiple_local_provider_aliases_and_rejects_unknowns() {
+        let cli =
+            Cli::try_parse_from(["proxy", "serve", "--exclude-local-provider", "anthropic,google", "--exclude-local-provider", "openai"])
+                .unwrap();
+        let Command::Serve { exclude_local_providers, .. } = cli.command else { panic!("expected serve command") };
+        assert_eq!(exclude_local_providers, [Lane::Claude, Lane::Google, Lane::Codex]);
+        let error = Cli::try_parse_from(["proxy", "serve", "--exclude-local-provider", "unknown"]).err().unwrap();
+        assert!(error.to_string().contains("unknown provider"));
+    }
 }

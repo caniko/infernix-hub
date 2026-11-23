@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env, fs,
     io::{ErrorKind, Write},
     net::SocketAddr,
@@ -12,6 +13,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+use crate::pool::Lane;
+
 pub const DEFAULT_BIND: &str = "127.0.0.1:8317";
 pub const DEFAULT_URL: &str = "http://127.0.0.1:8317";
 
@@ -21,6 +24,7 @@ pub struct Config {
     pub t3code_home: PathBuf,
     pub auth_dir: PathBuf,
     pub discover_local: bool,
+    pub exclude_local_lanes: BTreeSet<Lane>,
     pub provenance_oauth_dir: PathBuf,
     pub provenance_oauth_bin: Option<PathBuf>,
     pub client_key: String,
@@ -55,6 +59,7 @@ impl Config {
             home,
             auth_dir,
             discover_local,
+            exclude_local_lanes: BTreeSet::new(),
             provenance_oauth_dir: env::var_os("PROXY_PROVENANCE_OAUTH_DIR")
                 .filter(|p| !p.is_empty())
                 .map(PathBuf::from)
