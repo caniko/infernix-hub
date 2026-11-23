@@ -8,7 +8,8 @@ mod detail;
 mod evals;
 
 const TABS: [&str; 8] = ["Overview", "Compare", "Requests", "Traces", "Drift", "Totals", "Thinking", "Evals"];
-const METRICS: &[(&str, &str)] = &[("requests", "Requests"), ("tokens", "Tokens"), ("cost", "API-equivalent cost")];
+const METRICS: &[(&str, &str)] =
+    &[("requests", "Requests"), ("tokens", "Tokens"), ("cost", "API-equivalent cost"), ("cache_hit", "Cache hit rate")];
 
 fn usd(value: f64) -> String {
     format!("${value:.4}")
@@ -123,7 +124,8 @@ fn OverviewBoard(report: ActivityOverview, board: Signal<Option<Vec<BoardTile>>>
         tiles
     });
     let unpriced = report.unpriced_models.join(", ");
-    let hit_pct = report.cache_hit_rate * 100.0;
+    let hit_rate = effective_cache_hit_rate(report.input_tokens, report.cache_read_tokens, report.cache_hit_rate);
+    let hit_pct = fmt_hit_pct(hit_rate);
     rsx! {
         div { class: "stat-row",
             article { class: "glass-card stat-card", title: unpriced.clone(),
@@ -140,7 +142,9 @@ fn OverviewBoard(report: ActivityOverview, board: Signal<Option<Vec<BoardTile>>>
                 strong { class: "value", "{fmt_count(report.requests)}" } span { "{fmt_count(report.failures)} failed" }
             }
             article { class: "glass-card stat-card", span { class: "label-tech", "Cache hit" }
-                strong { class: "value", "{hit_pct:.1}%" } span { "{usd(report.cache_savings_usd)} estimated savings" }
+                strong { class: "value", "{hit_pct}" }
+                span { "{fmt_count(report.cache_read_tokens)} / {fmt_count(report.input_tokens)} input" }
+                span { "{usd(report.cache_savings_usd)} estimated savings" }
             }
             article { class: "glass-card stat-card", span { class: "label-tech", "Traffic coverage" }
                 span { "{fmt_count(report.matched_proxy_requests)} matched proxy" }
@@ -175,8 +179,22 @@ fn OverviewBoard(report: ActivityOverview, board: Signal<Option<Vec<BoardTile>>>
                             "heatmap" => rsx! { ActivityHeatmap { cells: report.heatmap.clone(), metric } },
                             "rhythm" => rsx! { ActivityRhythmChart { points: report.rhythm.clone(), metric } },
                             "cache" => rsx! {
-                                p { "{fmt_count(report.cache_read_tokens)} read tokens · {fmt_count(report.cache_write_tokens)} written tokens" }
-                                p { "Estimated savings {usd(report.cache_savings_usd)} relative to uncached input." }
+                                div { class: "cache-summary stack",
+                                    div { class: "spread",
+                                        strong { class: "mono", "{hit_pct} cache hit rate" }
+                                        span { class: "muted", "{usd(report.cache_savings_usd)} estimated savings" }
+                                    }
+                                    svg { class: "quota-meter cache-meter", view_box: "0 0 100 6", preserve_aspect_ratio: "none", "aria-hidden": "true",
+                                        rect { width: "100", height: "6", rx: "3", class: "quota-track" }
+                                        if let Some(rate) = hit_rate {
+                                            rect { width: "{rate * 100.0:.2}", height: "6", rx: "3", class: "cache-meter-fill" }
+                                        }
+                                    }
+                                    p { class: "muted",
+                                        "{fmt_count(report.cache_read_tokens)} read · {fmt_count(report.cache_write_tokens)} write · {fmt_count(report.input_tokens.saturating_sub(report.cache_read_tokens))} uncached input"
+                                    }
+                                    CacheHitRateChart { points: report.trend.clone() }
+                                }
                             },
                             "models" => breakdown("Models", &report.by_model),
                             "accounts" => breakdown("Accounts", &report.by_account),
@@ -215,12 +233,36 @@ fn tile_name(kind: &str) -> &str {
 
 fn breakdown(label: &'static str, list: &[BreakdownRow]) -> Element {
     let mask = try_consume_context::<PanelState>().is_some_and(|p| p.settings.read().mask_emails);
-    rsx! { Table { label, headers: &["Group", "Requests", "Failed", "Tokens", "Output", "Cache read", "Thinking", "API-equivalent USD", "Unpriced"],
-    rows: list.iter().map(|r| vec![
-        if label == "Accounts" && mask && r.label.contains('@') { mask_email(&r.label) } else { r.label.clone() },
-        fmt_count(r.requests), fmt_count(r.failures), fmt_count(r.total_tokens), fmt_count(r.output_tokens),
-        fmt_count(r.cache_read_tokens), fmt_count(r.thinking_tokens), usd(r.api_equivalent_cost_usd), fmt_count(r.unpriced_requests)
-    ]).collect() } }
+    rsx! { Table { label, headers: &["Group", "Requests", "Failed", "Tokens", "Output", "Cache read", "Cache hit %", "Thinking", "API-equivalent USD", "Unpriced"],
+    rows: list.iter().map(|r| {
+        let input = if r.input_tokens > 0 { r.input_tokens } else { r.total_tokens.saturating_sub(r.output_tokens) };
+        vec![
+            if label == "Accounts" && mask && r.label.contains('@') { mask_email(&r.label) } else { r.label.clone() },
+            fmt_count(r.requests), fmt_count(r.failures), fmt_count(r.total_tokens), fmt_count(r.output_tokens),
+            fmt_count(r.cache_read_tokens), fmt_hit_pct(effective_cache_hit_rate(input, r.cache_read_tokens, r.cache_hit_rate)),
+            fmt_count(r.thinking_tokens), usd(r.api_equivalent_cost_usd), fmt_count(r.unpriced_requests)
+        ]
+    }).collect() } }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_breakdown_uses_total_minus_output_for_cache_hit_rate() {
+        fn app() -> Element {
+            let row = serde_json::from_value(serde_json::json!({
+                "key": "legacy", "label": "Legacy", "requests": 1, "failures": 0,
+                "total_tokens": 120, "output_tokens": 20, "cache_read_tokens": 80,
+                "thinking_tokens": 0, "api_equivalent_cost_usd": 0.0, "unpriced_requests": 0
+            }))
+            .unwrap();
+            breakdown("Models", &[row])
+        }
+        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        assert!(rendered.contains("80.0%"));
+    }
 }
 
 #[component]
@@ -393,6 +435,7 @@ fn Totals(scope: ActivityScope) -> Element {
             fmt_count(b.output_tokens),
             fmt_count(b.cache_read_tokens),
             fmt_count(b.cache_write_tokens),
+            fmt_hit_pct(effective_cache_hit_rate(b.input_tokens, b.cache_read_tokens, b.cache_hit_rate)),
             fmt_count(b.thinking_tokens),
             usd(b.api_equivalent_cost_usd),
             fmt_count(b.unpriced_requests),
@@ -407,7 +450,7 @@ fn Totals(scope: ActivityScope) -> Element {
         p { class: "muted", "Historical totals can survive request-detail expiry. API-equivalent USD is not billing. Local hourly views use the displayed session’s local UTC offset." }
         {read_view(result.as_ref(), |r| rsx! {
             p { "Showing {granularity_label(r.granularity)} aggregates" }
-            Table { label: "Activity totals", headers: &["Period", "Requests", "Failures", "Input", "Output", "Cache read", "Cache write", "Thinking", "API-equivalent USD", "Unpriced", "Coverage"],
+            Table { label: "Activity totals", headers: &["Period", "Requests", "Failures", "Input", "Output", "Cache read", "Cache write", "Cache hit %", "Thinking", "API-equivalent USD", "Unpriced", "Coverage"],
                 rows: r.buckets.iter().map(|b| row(b, b.period.clone())).chain(std::iter::once(row(&r.grand_total, "Grand Total".into()))).collect() }
         })}
     } }
