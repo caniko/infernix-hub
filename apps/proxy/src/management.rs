@@ -810,8 +810,7 @@ fn public_ip(ip: IpAddr) -> bool {
 
 fn clear_quota(pool: &mut Pool, account: &Account, manual: bool) -> usize {
     let Some(a) = pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account)) else { return 0 };
-    a.cooldown = None;
-    a.scoped_cooldowns.clear();
+    a.clear_quota_cooldowns();
     a.grants.clear();
     a.next_grant = None;
     a.probe_generation = 0;

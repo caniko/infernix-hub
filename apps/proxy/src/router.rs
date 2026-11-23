@@ -24,7 +24,7 @@ use crate::{
     ACTIVITY_CAP, CAPTURE_BYTES, Proxy,
     config::matches_secret,
     openai_account,
-    pool::{Account, Cooldown, Lane, MAX_COOLDOWN_SECS, Pool, bounded_identifier, model_cooldown_scope, text},
+    pool::{Account, Cooldown, Lane, MAX_COOLDOWN_SECS, Pool, QuotaReader, bounded_identifier, model_cooldown_scope, text},
 };
 
 pub(crate) const POOL_QUOTA_HEADER: &str = "x-fleetix-pool-quota";
@@ -413,10 +413,14 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             .filter(|_| limited)
             .map(|(error, _)| quota_hint(lane, &headers, error.reset, received_at).map_or(received_at, |hint| hint.until));
         let mut pending_quota_body = None;
+        let mut quota_reader = None;
         let cooldown = if let Some((error, _)) = &prelude.error {
             error.backoff(&headers, policy.failover_cooldown_secs, received_at)
         } else if limited {
             let header = header_cooldown(lane, &headers, received_at);
+            if lane == Lane::Google {
+                quota_reader = begin_google_quota_read(&proxy, &account, model, header, received_at).await;
+            }
             let body_reset = if lane == Lane::Google && header.is_none() {
                 let body = read_google_quota_body(&mut response, deadline).await;
                 prelude.first = body.chunks;
@@ -426,9 +430,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                 pending_quota_body = header.filter(|_| lane == Lane::Google);
                 None
             };
-            let mut until = quota_deadline(merge_quota_hints(&headers, header, body_reset), policy.failover_cooldown_secs, Utc::now());
-            until.verified_reset &= pending_quota_body.is_none();
-            Some(Backoff::Quota(until))
+            Some(Backoff::Quota(quota_deadline(merge_quota_hints(&headers, header, body_reset), policy.failover_cooldown_secs, Utc::now())))
         } else if status == StatusCode::UNAUTHORIZED {
             Some(auth_backoff(policy.failover_cooldown_secs))
         } else {
@@ -454,7 +456,10 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             },
         );
         if !status.is_success() {
-            result(&proxy, &account, model, cooldown, false).await;
+            result(&proxy, &account, model, cooldown.filter(|_| pending_quota_body.is_none()), false).await;
+        }
+        if pending_quota_body.is_none() {
+            drop(quota_reader.take());
         }
         if limited {
             proxy.schedule_usage_refresh(account.id.clone()).await;
@@ -479,7 +484,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                     let account = account.clone();
                     tokio::spawn(async move {
                         let body = read_google_quota_body(&mut response, deadline).await;
-                        let merged = body.settle(&proxy, &account, &model, &headers, header_until).await;
+                        let merged = body.settle(&proxy, &account, &model, &headers, header_until, quota_reader).await;
                         merged.until
                     })
                 });
@@ -492,7 +497,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             }
             if let Some(header_until) = pending_quota_body {
                 let body = read_google_quota_body(&mut response, deadline).await;
-                let merged = body.settle(&proxy, &account, model, &headers, header_until).await;
+                let merged = body.settle(&proxy, &account, model, &headers, header_until, quota_reader).await;
                 quota_until = Some(merged.until);
                 prelude.first = body.chunks;
                 prelude.stream_error = body.error;
@@ -740,6 +745,7 @@ pub(crate) async fn run_window_start(
     let started = Utc::now();
     let response = request.timeout(Duration::from_secs(45)).send().await;
     let mut usage = Usage::default();
+    let mut quota_reader = None;
     let (status, outcome, limited) = if let Ok(mut response) = response {
         let status = response.status();
         let limited = if status == StatusCode::TOO_MANY_REQUESTS {
@@ -747,6 +753,7 @@ pub(crate) async fn run_window_start(
             let now = Utc::now();
             let header = header_cooldown(account.lane, response.headers(), now);
             let body = if account.lane == Lane::Google {
+                quota_reader = begin_google_quota_read(&proxy, account, model, None, now).await;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
                 read_google_quota_body(&mut response, deadline).await.reset
             } else {
@@ -778,6 +785,7 @@ pub(crate) async fn run_window_start(
     exchange.attempt(account, None, started, began, status, outcome);
     let success = outcome == "success";
     result(&proxy, account, model, limited, success).await;
+    drop(quota_reader);
     if limited.is_some() {
         proxy.schedule_usage_refresh(account.id.clone()).await;
     }
@@ -1053,12 +1061,24 @@ struct QuotaBody {
 }
 
 impl QuotaBody {
-    async fn settle(&self, proxy: &Proxy, account: &Account, model: &str, headers: &HeaderMap, header: Cooldown) -> Cooldown {
+    async fn settle(
+        &self,
+        proxy: &Proxy,
+        account: &Account,
+        model: &str,
+        headers: &HeaderMap,
+        header: Cooldown,
+        reader: Option<QuotaReader>,
+    ) -> Cooldown {
         let mut merged = merge_quota_hints(headers, Some(header), self.reset).unwrap_or(header);
         merged.verified_reset &= self.verified && header.verified_reset;
-        let provisional = Cooldown { verified_reset: false, ..header };
-        if merged != provisional {
-            extend_quota(proxy, account, model, merged, Some(provisional)).await;
+        if let Some(reader) = reader {
+            let mut state = proxy.state.write().await;
+            if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account))
+                && current.finish_google_quota_read(&reader)
+            {
+                apply_quota(current, model, merged, Utc::now());
+            }
         }
         merged
     }
@@ -1380,27 +1400,43 @@ async fn result(proxy: &Proxy, account: &Account, model: &str, cooldown: Option<
             current.auth_cooldown = current.auth_cooldown.max(Some(until));
         }
         Some(Backoff::Quota(until)) => {
-            apply_quota(current, model, until, now, None);
+            apply_quota(current, model, until, now);
         }
         None => {}
     }
 }
 
-async fn extend_quota(proxy: &Proxy, account: &Account, model: &str, until: Cooldown, provisional: Option<Cooldown>) {
+async fn begin_google_quota_read(
+    proxy: &Proxy,
+    account: &Account,
+    model: &str,
+    header: Option<Cooldown>,
+    now: DateTime<Utc>,
+) -> Option<QuotaReader> {
+    proxy
+        .state
+        .write()
+        .await
+        .pool
+        .accounts
+        .get_mut(&account.id)
+        .filter(|a| a.same_credential(account))
+        .map(|current| current.begin_google_quota_read(model, header, now))
+}
+
+async fn extend_quota(proxy: &Proxy, account: &Account, model: &str, until: Cooldown) {
     let mut state = proxy.state.write().await;
     if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account)) {
-        apply_quota(current, model, until, Utc::now(), provisional);
+        apply_quota(current, model, until, Utc::now());
     }
 }
 
-fn apply_quota(account: &mut Account, model: &str, until: Cooldown, now: DateTime<Utc>, provisional: Option<Cooldown>) {
-    // Only replace this reader's preliminary value; preserve independent cooldown observations.
-    let merge = |old: Cooldown| if Some(old) == provisional { until } else { old.merge(until) };
+fn apply_quota(account: &mut Account, model: &str, until: Cooldown, now: DateTime<Utc>) {
     if let Some(scope) = model_cooldown_scope(account.lane, model) {
         account.scoped_cooldowns.retain(|_, c| c.until > now);
-        account.scoped_cooldowns.entry(scope).and_modify(|old| *old = merge(*old)).or_insert(until);
+        account.scoped_cooldowns.entry(scope).and_modify(|old| *old = old.merge(until)).or_insert(until);
     } else {
-        account.cooldown = Some(account.cooldown.map_or(until, merge));
+        account.cooldown = Some(account.cooldown.map_or(until, |old| old.merge(until)));
     }
 }
 
@@ -1953,7 +1989,7 @@ impl Wire {
                     }
                     self.guard.1 = Some((error, self.usage, millis(self.started.elapsed())));
                 } else if let Some(Backoff::Quota(until)) = cooldown {
-                    extend_quota(&self.proxy, &self.account, &exchange.model, until, None).await;
+                    extend_quota(&self.proxy, &self.account, &exchange.model, until).await;
                 }
                 if matches!(cooldown, Some(Backoff::Quota(_))) {
                     if first_error {

@@ -1924,7 +1924,7 @@ async fn google_terminal_429_retries_an_alternate_that_recovers_during_the_body_
     let send = http.request("POST", "/v1internal:generateContent").bearer_auth("inference-fixture").timeout(Duration::from_secs(3)).send();
     let recover = async {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while proxy.state.read().await.pool.accounts["google-a.json"].cooldown.is_none() {
+            while proxy.state.read().await.pool.accounts["google-a.json"].cooldown_until().is_none() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -1974,7 +1974,7 @@ async fn google_pending_429_body_does_not_publish_a_header_witness_to_concurrent
     };
     let concurrent = async {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !proxy.state.read().await.pool.accounts["google-a.json"].scoped_cooldowns.contains_key("gemini") {
+            while proxy.state.read().await.pool.accounts["google-a.json"].quota_limited_until(Utc::now(), model).is_none() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -1991,6 +1991,96 @@ async fn google_pending_429_body_does_not_publish_a_header_witness_to_concurrent
     let settled = settled.unwrap();
     assert_eq!(settled.status(), 429);
     let witness = google_witness(settled.headers(), model).unwrap();
+    assert!((88..=90).contains(&(witness - Utc::now()).num_seconds()));
+    assert_eq!(google_witness(request().await.unwrap().headers(), model), Some(witness));
+}
+
+#[tokio::test]
+async fn google_concurrent_429_bodies_with_the_same_deadline_must_both_settle_before_witnessing() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    let arrived = Arc::new(Notify::new());
+    let respond = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let release_second = Arc::new(Notify::new());
+    // An HTTP-date ten seconds out makes the two parsed deadlines exactly equal.
+    let retry_after = (Utc::now() + TimeDelta::seconds(10)).format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post({
+            let release_second = release_second.clone();
+            let release_first = release_first.clone();
+            let (arrived, respond) = (arrived.clone(), respond.clone());
+            let calls = Arc::new(AtomicUsize::new(0));
+            move || {
+                let first = calls.fetch_add(1, Relaxed) == 0;
+                let (arrived, respond) = (arrived.clone(), respond.clone());
+                let (release_first, release_second) = (release_first.clone(), release_second.clone());
+                let retry_after = retry_after.clone();
+                async move {
+                    if first {
+                        let respond = respond.notified();
+                        arrived.notify_one();
+                        respond.await;
+                    } else {
+                        respond.notify_one();
+                    }
+                    let body = Body::from_stream(futures_util::stream::once(async move {
+                        let body = if first {
+                            release_first.notified().await;
+                            "{}"
+                        } else {
+                            release_second.notified().await;
+                            r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#
+                        };
+                        Ok::<_, std::io::Error>(body)
+                    }));
+                    (StatusCode::TOO_MANY_REQUESTS, [("retry-after", retry_after)], body)
+                }
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    {
+        let mut state = proxy.state.write().await;
+        state.pool.accounts.remove("google-b.json");
+        state.pool.policy.first_byte_timeout_secs = 5;
+    }
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let model = "gemini-4-neon-high";
+    let request = || {
+        http.request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model": model}))
+            .timeout(Duration::from_secs(4))
+            .send()
+    };
+    let first = request();
+    let second = async {
+        arrived.notified().await;
+        request().await
+    };
+    let probe = async {
+        while proxy.state.read().await.pool.accounts["google-a.json"].failure != 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        release_first.notify_one();
+    };
+    let run = async {
+        let (first, ()) = tokio::join!(first, probe);
+        assert_eq!(first.unwrap().status(), 429);
+        let concurrent = request().await.unwrap();
+        assert_eq!(concurrent.status(), 429);
+        assert!(!concurrent.headers().contains_key(router::POOL_QUOTA_HEADER));
+        release_second.notify_one();
+    };
+    let ((), second) = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(run, second) }).await.unwrap();
+    let second = second.unwrap();
+    assert_eq!(second.status(), 429);
+    let witness = google_witness(second.headers(), model).unwrap();
     assert!((88..=90).contains(&(witness - Utc::now()).num_seconds()));
     assert_eq!(google_witness(request().await.unwrap().headers(), model), Some(witness));
 }
@@ -2367,8 +2457,8 @@ async fn google_failover_reads_delayed_429_body_and_extends_cooldown_once() {
             {
                 let state = proxy.state.read().await;
                 let failed = &state.pool.accounts["google-a.json"];
-                if failed.scoped_cooldowns["gemini"].until > Utc::now() + TimeDelta::seconds(115) {
-                    assert!(failed.scoped_cooldowns["gemini"].verified_reset);
+                if let Some(cooldown) = failed.scoped_cooldowns.get("gemini").filter(|c| c.until > Utc::now() + TimeDelta::seconds(115)) {
+                    assert!(cooldown.verified_reset);
                     assert_eq!(failed.failure, 1);
                     break;
                 }
@@ -2685,6 +2775,29 @@ fn quota_decisions_agree_at_the_expiration_boundary() {
         assert_eq!(pool.all_quota_limited(Lane::Google, model, None, now), reset.is_some());
         assert_eq!(pool.verified_google_reset_at(model, None, now), reset);
     }
+}
+
+#[test]
+fn dropped_google_quota_readers_release_only_their_own_scope() {
+    let mut pool = Pool::default();
+    pool.insert(pool::parse_credentials("a.json", &json!({"type":"google","access_token":"fixture"}), false).unwrap());
+    let now = Utc::now();
+    let until = now + TimeDelta::seconds(90);
+    let header = pool::Cooldown { until: now + TimeDelta::seconds(10), verified_reset: true };
+    let model = "gemini-neon";
+    let other = "gemini-argon";
+    let a = pool.accounts.get_mut("a.json").unwrap();
+    a.cooldown = Some(pool::Cooldown { until, verified_reset: true });
+    let scoped = a.begin_google_quota_read(model, Some(header), now);
+    let global = a.begin_google_quota_read("", None, now);
+
+    assert_eq!(pool.verified_google_reset_at(other, None, now), None);
+    drop(global);
+    assert_eq!(pool.verified_google_reset_at(other, None, now), Some(until));
+    assert_eq!(pool.verified_google_reset_at(model, None, header.until), None);
+    drop(scoped);
+    assert_eq!(pool.verified_google_reset_at(model, None, now), None, "cancelled header stays unverified until expiry");
+    assert_eq!(pool.verified_google_reset_at(model, None, header.until), Some(until));
 }
 
 #[test]

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env, fs,
     path::{Path, PathBuf},
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -135,6 +136,15 @@ impl Cooldown {
     }
 }
 
+pub(crate) struct QuotaReader(Arc<()>);
+
+#[derive(Clone)]
+struct PendingQuota {
+    reader: Weak<()>,
+    scope: Option<String>,
+    provisional: Option<Cooldown>,
+}
+
 #[derive(Clone)]
 pub struct Account {
     pub id: String,
@@ -168,6 +178,7 @@ pub struct Account {
     pub cooldown: Option<Cooldown>,
     pub auth_cooldown: Option<DateTime<Utc>>,
     pub scoped_cooldowns: BTreeMap<String, Cooldown>,
+    pending_quota: Vec<PendingQuota>,
     pub windows: Vec<QuotaWindow>,
     pub google_fallback_keys: BTreeSet<String>,
     pub grants: Vec<ResetGrant>,
@@ -213,6 +224,7 @@ impl Account {
         self.cooldown = None;
         self.auth_cooldown = None;
         self.scoped_cooldowns.clear();
+        self.pending_quota.clear();
         self.windows.clear();
         self.google_fallback_keys.clear();
         self.observed = None;
@@ -241,11 +253,52 @@ impl Account {
     }
 
     pub fn cooldown_until(&self) -> Option<DateTime<Utc>> {
-        self.cooldown.map(|cooldown| cooldown.until)
+        self.quota_cooldown(None).map(|cooldown| cooldown.until)
     }
 
     fn scoped_cooldown(&self, model: &str) -> Option<Cooldown> {
-        model_cooldown_scope(self.lane, model).and_then(|scope| self.scoped_cooldowns.get(&scope).copied())
+        model_cooldown_scope(self.lane, model).and_then(|scope| self.quota_cooldown(Some(&scope)))
+    }
+
+    fn quota_cooldown(&self, scope: Option<&str>) -> Option<Cooldown> {
+        let settled = scope.map_or(self.cooldown, |scope| self.scoped_cooldowns.get(scope).copied());
+        settled
+            .into_iter()
+            .chain(self.pending_quota.iter().filter(|pending| pending.scope.as_deref() == scope).filter_map(|pending| pending.provisional))
+            .reduce(Cooldown::merge)
+    }
+
+    pub(crate) fn begin_google_quota_read(&mut self, model: &str, header: Option<Cooldown>, now: DateTime<Utc>) -> QuotaReader {
+        self.pending_quota.retain(|pending| pending.reader.strong_count() != 0 || pending.provisional.is_some_and(|c| c.until > now));
+        let reader = Arc::new(());
+        self.pending_quota.push(PendingQuota {
+            reader: Arc::downgrade(&reader),
+            scope: model_cooldown_scope(self.lane, model),
+            provisional: header.map(|header| Cooldown { verified_reset: false, ..header }),
+        });
+        QuotaReader(reader)
+    }
+
+    pub(crate) fn finish_google_quota_read(&mut self, reader: &QuotaReader) -> bool {
+        let identity = Arc::downgrade(&reader.0);
+        let Some(index) = self.pending_quota.iter().position(|pending| pending.reader.ptr_eq(&identity)) else { return false };
+        self.pending_quota.swap_remove(index);
+        true
+    }
+
+    pub(crate) fn clear_quota_cooldowns(&mut self) {
+        self.cooldown = None;
+        self.scoped_cooldowns.clear();
+        self.pending_quota.retain_mut(|pending| {
+            pending.provisional = None;
+            pending.reader.strong_count() != 0
+        });
+    }
+
+    fn has_pending_google_quota_read(&self, model: &str) -> bool {
+        let scope = model_cooldown_scope(self.lane, model);
+        // Dropping the guard clears the pending status, but keeps the header as unverified backoff until expiry.
+        self.pending_quota.iter().any(|pending| (pending.scope.is_none() || pending.scope == scope) && pending.reader.strong_count() != 0)
     }
 
     fn active_quota_windows<'a>(&'a self, now: DateTime<Utc>, model: &'a str) -> impl Iterator<Item = &'a QuotaWindow> {
@@ -265,7 +318,7 @@ impl Account {
                     }
                 })
             })
-            .chain(self.cooldown.into_iter().chain(self.scoped_cooldown(model)).map(|c| c.until).filter(|until| *until > now))
+            .chain(self.quota_cooldown(None).into_iter().chain(self.scoped_cooldown(model)).map(|c| c.until).filter(|until| *until > now))
             .max()
     }
 
@@ -489,6 +542,7 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             cooldown: None,
             auth_cooldown: None,
             scoped_cooldowns: BTreeMap::new(),
+            pending_quota: Vec::new(),
             windows: vec![],
             google_fallback_keys: BTreeSet::new(),
             grants: vec![],
@@ -599,6 +653,7 @@ impl Pool {
 
     pub fn insert(&mut self, accounts: Vec<Account>) {
         for mut a in accounts {
+            a.pending_quota.clear();
             if let Some(old) = self.accounts.get(&a.id) {
                 if a.local && old.local && old.lane == a.lane {
                     a.disabled = old.disabled;
@@ -610,6 +665,7 @@ impl Pool {
                     a.cooldown = old.cooldown;
                     a.auth_cooldown = old.auth_cooldown;
                     a.scoped_cooldowns.clone_from(&old.scoped_cooldowns);
+                    a.pending_quota.clone_from(&old.pending_quota);
                     a.windows.clone_from(&old.windows);
                     a.google_fallback_keys.clone_from(&old.google_fallback_keys);
                     a.grants.clone_from(&old.grants);
@@ -686,7 +742,9 @@ impl Pool {
                 if account.auth_cooldown.is_some_and(|at| at > now) {
                     block("auth_cooldown", None);
                 }
-                for (reason, cooldown) in [("global_cooldown", account.cooldown), ("scoped_cooldown", account.scoped_cooldown(model))] {
+                for (reason, cooldown) in
+                    [("global_cooldown", account.quota_cooldown(None)), ("scoped_cooldown", account.scoped_cooldown(model))]
+                {
                     if let Some(c) = cooldown.filter(|c| c.until > now) {
                         block(reason, c.verified_reset.then_some(c.until));
                     }
@@ -702,7 +760,10 @@ impl Pool {
                 }
                 if reasons.is_empty() {
                     evaluation.eligible_accounts += 1;
-                } else if complete && let Some(reset) = account_reset {
+                } else if complete
+                    && !account.has_pending_google_quota_read(model)
+                    && let Some(reset) = account_reset
+                {
                     evaluation.verified_next_reset_at = Some(evaluation.verified_next_reset_at.map_or(reset, |old| old.min(reset)));
                 }
             }
