@@ -1996,6 +1996,64 @@ async fn google_pending_429_body_does_not_publish_a_header_witness_to_concurrent
 }
 
 #[tokio::test]
+async fn google_cancelled_429_body_blocks_a_longer_same_scope_witness() {
+    let arrived = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post({
+            let (arrived, release) = (arrived.clone(), release.clone());
+            move || {
+                let (arrived, release) = (arrived.clone(), release.clone());
+                async move {
+                    arrived.notify_one();
+                    release.notified().await;
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "10")],
+                        r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#,
+                    )
+                }
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    proxy.state.write().await.pool.accounts.remove("google-b.json");
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let model = "gemini-4-neon-high";
+    let request = || {
+        http.request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model": model}))
+            .timeout(Duration::from_secs(3))
+            .send()
+    };
+    let second = async {
+        arrived.notified().await;
+        let now = Utc::now();
+        let header = pool::Cooldown { until: now + TimeDelta::seconds(10), verified_reset: true };
+        let reader =
+            proxy.state.write().await.pool.accounts.get_mut("google-a.json").unwrap().begin_google_quota_read(model, Some(header), now);
+        release.notify_one();
+        (reader, header.until)
+    };
+    let (first, (reader, blocker_until)) =
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(request(), second) }).await.unwrap();
+    assert!(!first.unwrap().headers().contains_key(router::POOL_QUOTA_HEADER));
+    drop(reader);
+
+    let response = request().await.unwrap();
+    assert_eq!(response.status(), 429);
+    let retry: u64 = response.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!((85..=90).contains(&retry), "legacy Retry-After must still use the 90s reset");
+    assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER));
+    assert!(proxy.state.read().await.pool.verified_google_reset_at(model, None, blocker_until).is_some());
+}
+
+#[tokio::test]
 async fn google_concurrent_429_bodies_with_the_same_deadline_must_both_settle_before_witnessing() {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
@@ -2798,6 +2856,30 @@ fn dropped_google_quota_readers_release_only_their_own_scope() {
     drop(scoped);
     assert_eq!(pool.verified_google_reset_at(model, None, now), None, "cancelled header stays unverified until expiry");
     assert_eq!(pool.verified_google_reset_at(model, None, header.until), Some(until));
+}
+
+#[test]
+fn failed_google_quota_read_blocks_witness_until_its_own_deadline() {
+    let mut pool = Pool::default();
+    pool.insert(pool::parse_credentials("a.json", &json!({"type":"google","access_token":"fixture"}), false).unwrap());
+    let now = Utc::now();
+    let model = "gemini-neon";
+    let reset = now + TimeDelta::seconds(90);
+    let failed_until = now + TimeDelta::seconds(10);
+    let account = pool.accounts.get_mut("a.json").unwrap();
+    account.scoped_cooldowns.insert("gemini".into(), pool::Cooldown { until: reset, verified_reset: true });
+    let reader = account.begin_google_quota_read(model, None, now);
+    assert!(account.finish_google_quota_read(&reader, Some(failed_until)));
+
+    assert_eq!(pool.next_reset(Lane::Google, model, None, now), Some(reset));
+    assert_eq!(pool.verified_google_reset_at(model, None, now), None);
+    // The reader is still in scope, but it must no longer count as running.
+    assert_eq!(pool.verified_google_reset_at(model, None, failed_until), Some(reset));
+
+    let account = pool.accounts.get_mut("a.json").unwrap();
+    account.clear_quota_cooldowns();
+    account.scoped_cooldowns.insert("gemini".into(), pool::Cooldown { until: reset, verified_reset: true });
+    assert_eq!(pool.verified_google_reset_at(model, None, now), Some(reset));
 }
 
 #[test]

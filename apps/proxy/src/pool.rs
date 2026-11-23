@@ -143,6 +143,13 @@ struct PendingQuota {
     reader: Weak<()>,
     scope: Option<String>,
     provisional: Option<Cooldown>,
+    unverified_until: Option<DateTime<Utc>>,
+}
+
+impl PendingQuota {
+    fn blocks_verification(&self, now: DateTime<Utc>) -> bool {
+        self.reader.strong_count() != 0 || self.unverified_until.or(self.provisional.map(|c| c.until)).is_some_and(|until| until > now)
+    }
 }
 
 #[derive(Clone)]
@@ -269,20 +276,28 @@ impl Account {
     }
 
     pub(crate) fn begin_google_quota_read(&mut self, model: &str, header: Option<Cooldown>, now: DateTime<Utc>) -> QuotaReader {
-        self.pending_quota.retain(|pending| pending.reader.strong_count() != 0 || pending.provisional.is_some_and(|c| c.until > now));
+        self.pending_quota.retain(|pending| pending.blocks_verification(now));
         let reader = Arc::new(());
         self.pending_quota.push(PendingQuota {
             reader: Arc::downgrade(&reader),
             scope: model_cooldown_scope(self.lane, model),
             provisional: header.map(|header| Cooldown { verified_reset: false, ..header }),
+            unverified_until: None,
         });
         QuotaReader(reader)
     }
 
-    pub(crate) fn finish_google_quota_read(&mut self, reader: &QuotaReader) -> bool {
+    pub(crate) fn finish_google_quota_read(&mut self, reader: &QuotaReader, unverified_until: Option<DateTime<Utc>>) -> bool {
         let identity = Arc::downgrade(&reader.0);
         let Some(index) = self.pending_quota.iter().position(|pending| pending.reader.ptr_eq(&identity)) else { return false };
-        self.pending_quota.swap_remove(index);
+        if unverified_until.is_some() {
+            let pending = &mut self.pending_quota[index];
+            pending.reader = Weak::new();
+            pending.provisional = None;
+            pending.unverified_until = unverified_until;
+        } else {
+            self.pending_quota.swap_remove(index);
+        }
         true
     }
 
@@ -291,14 +306,16 @@ impl Account {
         self.scoped_cooldowns.clear();
         self.pending_quota.retain_mut(|pending| {
             pending.provisional = None;
+            pending.unverified_until = None;
             pending.reader.strong_count() != 0
         });
     }
 
-    fn has_pending_google_quota_read(&self, model: &str) -> bool {
+    fn has_unverified_google_quota_read(&self, model: &str, now: DateTime<Utc>) -> bool {
         let scope = model_cooldown_scope(self.lane, model);
-        // Dropping the guard clears the pending status, but keeps the header as unverified backoff until expiry.
-        self.pending_quota.iter().any(|pending| (pending.scope.is_none() || pending.scope == scope) && pending.reader.strong_count() != 0)
+        // An unread or failed body still blocks verification until its own backoff expires,
+        // even if a longer cooldown wins the legacy routing decision.
+        self.pending_quota.iter().any(|pending| (pending.scope.is_none() || pending.scope == scope) && pending.blocks_verification(now))
     }
 
     fn active_quota_windows<'a>(&'a self, now: DateTime<Utc>, model: &'a str) -> impl Iterator<Item = &'a QuotaWindow> {
@@ -761,7 +778,7 @@ impl Pool {
                 if reasons.is_empty() {
                     evaluation.eligible_accounts += 1;
                 } else if complete
-                    && !account.has_pending_google_quota_read(model)
+                    && !account.has_unverified_google_quota_read(model, now)
                     && let Some(reset) = account_reset
                 {
                     evaluation.verified_next_reset_at = Some(evaluation.verified_next_reset_at.map_or(reset, |old| old.min(reset)));

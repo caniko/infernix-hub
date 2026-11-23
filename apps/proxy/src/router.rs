@@ -392,7 +392,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                     None,
                     if timed_out { "first_byte_timeout" } else { "upstream_error" },
                 );
-                result(&proxy, &account, model, None, false).await;
+                result(&proxy, &account, model, None, false, None).await;
                 exchange.complete_attempt(Usage::default(), None);
                 continue;
             }
@@ -414,6 +414,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             .map(|(error, _)| quota_hint(lane, &headers, error.reset, received_at).map_or(received_at, |hint| hint.until));
         let mut pending_quota_body = None;
         let mut quota_reader = None;
+        let mut unverified_quota_read = false;
         let cooldown = if let Some((error, _)) = &prelude.error {
             error.backoff(&headers, policy.failover_cooldown_secs, received_at)
         } else if limited {
@@ -423,6 +424,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             }
             let body_reset = if lane == Lane::Google && header.is_none() {
                 let body = read_google_quota_body(&mut response, deadline).await;
+                unverified_quota_read = !body.verified;
                 prelude.first = body.chunks;
                 prelude.stream_error = body.error;
                 body.reset
@@ -456,7 +458,8 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             },
         );
         if !status.is_success() {
-            result(&proxy, &account, model, cooldown.filter(|_| pending_quota_body.is_none()), false).await;
+            let unverified_reader = quota_reader.as_ref().filter(|_| unverified_quota_read);
+            result(&proxy, &account, model, cooldown.filter(|_| pending_quota_body.is_none()), false, unverified_reader).await;
         }
         if pending_quota_body.is_none() {
             drop(quota_reader.take());
@@ -746,6 +749,7 @@ pub(crate) async fn run_window_start(
     let response = request.timeout(Duration::from_secs(45)).send().await;
     let mut usage = Usage::default();
     let mut quota_reader = None;
+    let mut unverified_quota_read = false;
     let (status, outcome, limited) = if let Ok(mut response) = response {
         let status = response.status();
         let limited = if status == StatusCode::TOO_MANY_REQUESTS {
@@ -755,7 +759,9 @@ pub(crate) async fn run_window_start(
             let body = if account.lane == Lane::Google {
                 quota_reader = begin_google_quota_read(&proxy, account, model, None, now).await;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
-                read_google_quota_body(&mut response, deadline).await.reset
+                let body = read_google_quota_body(&mut response, deadline).await;
+                unverified_quota_read = !body.verified;
+                body.reset
             } else {
                 None
             };
@@ -784,7 +790,7 @@ pub(crate) async fn run_window_start(
     };
     exchange.attempt(account, None, started, began, status, outcome);
     let success = outcome == "success";
-    result(&proxy, account, model, limited, success).await;
+    result(&proxy, account, model, limited, success, quota_reader.as_ref().filter(|_| unverified_quota_read)).await;
     drop(quota_reader);
     if limited.is_some() {
         proxy.schedule_usage_refresh(account.id.clone()).await;
@@ -1075,7 +1081,7 @@ impl QuotaBody {
         if let Some(reader) = reader {
             let mut state = proxy.state.write().await;
             if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account))
-                && current.finish_google_quota_read(&reader)
+                && current.finish_google_quota_read(&reader, (!self.verified).then_some(merged.until))
             {
                 apply_quota(current, model, merged, Utc::now());
             }
@@ -1385,7 +1391,14 @@ fn auth_backoff(fallback: u64) -> Backoff {
     Backoff::Auth(cooldown_after(Utc::now(), fallback.clamp(1, 60) as i64))
 }
 
-async fn result(proxy: &Proxy, account: &Account, model: &str, cooldown: Option<Backoff>, success: bool) {
+async fn result(
+    proxy: &Proxy,
+    account: &Account,
+    model: &str,
+    cooldown: Option<Backoff>,
+    success: bool,
+    unverified_reader: Option<&QuotaReader>,
+) {
     let mut state = proxy.state.write().await;
     let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account)) else { return };
     let now = Utc::now();
@@ -1400,6 +1413,9 @@ async fn result(proxy: &Proxy, account: &Account, model: &str, cooldown: Option<
             current.auth_cooldown = current.auth_cooldown.max(Some(until));
         }
         Some(Backoff::Quota(until)) => {
+            if let Some(reader) = unverified_reader {
+                current.finish_google_quota_read(reader, Some(until.until));
+            }
             apply_quota(current, model, until, now);
         }
         None => {}
@@ -1982,7 +1998,7 @@ impl Wire {
                 let cooldown = error.backoff(self.upstream.headers(), self.fallback, Utc::now());
                 let first_error = self.guard.1.is_none();
                 if first_error {
-                    result(&self.proxy, &self.account, &exchange.model, cooldown, false).await;
+                    result(&self.proxy, &self.account, &exchange.model, cooldown, false, None).await;
                     if let Some(last) = exchange.attempts.last_mut() {
                         last.status_code = Some(i32::from(error.status.as_u16()));
                         last.outcome = error.outcome().into();
@@ -2056,7 +2072,7 @@ impl Wire {
                     self.usage.observe(&raw, self.account.lane);
                 }
                 if self.status.is_success() && self.guard.1.is_none() {
-                    result(&self.proxy, &self.account, "", None, done.is_ok()).await;
+                    result(&self.proxy, &self.account, "", None, done.is_ok(), None).await;
                 }
                 if let Some(mut exchange) = self.guard.0.take() {
                     let outcome = if let Some((error, _, _)) = self.guard.1 {
