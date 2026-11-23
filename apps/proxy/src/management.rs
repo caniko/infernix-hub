@@ -415,6 +415,18 @@ pub(crate) struct Changes {
     pub note: Option<Value>,
 }
 
+fn scrub_saved_label(field: Option<&mut Value>, pool: &Pool, accounts: &[Account]) {
+    let Some(field) = field else { return };
+    let Some(raw) = field.as_str() else { return };
+    let previous = accounts.iter().filter_map(|a| pool.accounts.get(&a.id));
+    let mut known = previous.clone().filter_map(|a| a.known_safe_label(raw));
+    let label = known.next().unwrap_or(raw);
+    // A shared label may have different redactions for different keys.
+    let label = if known.any(|other| other != label) { "[redacted]" } else { label };
+    let secrets: Vec<_> = accounts.iter().chain(previous).flat_map(Account::current_secrets).collect();
+    *field = json!(crate::error_classify::scrub_label(label, &secrets));
+}
+
 pub(crate) fn change(proxy: &Proxy, pool: &mut Pool, id: &str, changes: Changes) -> Result<(), Failure> {
     let found = pool.find(id).or_else(|| pool.accounts.values().find(|a| a.name == id)).cloned().ok_or_else(missing)?;
     let note = match changes.note.as_ref() {
@@ -469,7 +481,22 @@ pub(crate) fn change(proxy: &Proxy, pool: &mut Pool, id: &str, changes: Changes)
         } else {
             apply_fields(&mut saved);
         }
-        let accounts = parse_credentials(&found.name, &Value::Object(saved.clone()), false).map_err(|_| disk())?;
+        let mut saved = Value::Object(saved);
+        let accounts = parse_credentials(&found.name, &saved, false).map_err(|_| disk())?;
+        scrub_saved_label(saved.get_mut("label"), pool, &accounts);
+        scrub_saved_label(saved.get_mut("name"), pool, &accounts);
+        let group = if saved["api_key"].is_object() {
+            let group = &mut saved["api_key"];
+            scrub_saved_label(group.get_mut("label"), pool, &accounts);
+            group
+        } else {
+            &mut saved
+        };
+        if let Some(keys) = group.get_mut("keys").and_then(Value::as_array_mut) {
+            for (key, account) in keys.iter_mut().zip(&accounts) {
+                scrub_saved_label(key.get_mut("label"), pool, std::slice::from_ref(account));
+            }
+        }
         write_private(&path, &serde_json::to_vec_pretty(&saved).map_err(|_| disk())?, true).map_err(|_| disk())?;
         pool.insert(accounts);
     } else if let Some(a) = pool.accounts.get_mut(&found.id) {

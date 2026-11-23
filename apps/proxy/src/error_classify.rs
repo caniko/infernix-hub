@@ -41,11 +41,15 @@ pub(crate) fn probe_error(message: &str) -> Box<AccountError> {
 }
 
 pub(crate) fn safe_label(account: &Account) -> String {
-    sanitize(&redact_known_secrets(&account.label, &account_secrets(account)))
+    scrub_label(&account.label, &account_secrets(account))
 }
 
-pub(crate) fn account_secrets(account: &Account) -> Vec<&str> {
-    account.current_secrets().into_iter().chain(account.prior_secrets.iter().map(String::as_str)).collect()
+pub(crate) fn scrub_label(label: &str, secrets: &[&str]) -> String {
+    sanitize(&redact_known_secrets(label, secrets))
+}
+
+pub(crate) fn account_secrets(account: &Account) -> [&str; 3] {
+    account.current_secrets()
 }
 
 fn redact_known_secrets(mut text: &str, secrets: &[&str]) -> String {

@@ -911,7 +911,8 @@ async fn multi_key_group_edits_only_affect_the_selected_key_and_hub_ids_are_sour
             Some(json!({
                 "type": "api_key",
                 "family": "anthropic",
-                "keys": ["sk-ant-key-one", "sk-ant-key-two"]
+                "label": "Group opaque-key-one",
+                "keys": ["opaque-key-one", {"api_key":"opaque-key-two","label":"Second opaque-key-two"}]
             })),
         )
         .await;
@@ -932,6 +933,9 @@ async fn multi_key_group_edits_only_affect_the_selected_key_and_hub_ids_are_sour
         )
         .await;
     assert_eq!(edit.status(), 200);
+    let saved: Value = serde_json::from_slice(&fs::read(proxy.config.auth_dir.join("group.json")).unwrap()).unwrap();
+    assert_eq!(saved["label"], "Group [redacted]");
+    assert_eq!(saved["keys"][1]["label"], "Second [redacted]");
 
     let state = proxy.state.read().await;
     let first = &state.pool.accounts["group.json#1"];
@@ -3548,32 +3552,38 @@ async fn credential_replacement_and_metadata_reload_keep_prior_secrets_redacted(
     let proxy = fixture(&dir, &mock);
     let server = serve(proxy.clone().app()).await;
     let http = Http::new(&server);
-    let check = async |expected| {
+    let check = async |expected, label| {
         let state = proxy.state.read().await;
         let account = &state.pool.accounts["a.json"];
         assert_eq!(account.access, expected);
-        assert_eq!(account.inventory(&state.pool)["label"], "Account [redacted]");
+        assert_eq!(account.inventory(&state.pool)["label"], label);
         drop(state);
         let batches = hub_sync::observations(&proxy, "host", "user").await;
         let observed = batches.iter().flat_map(|batch| &batch.accounts).find(|account| account.source_account_id == "a.json").unwrap();
-        assert_eq!(observed.display_name, "Account [redacted]");
+        assert_eq!(observed.display_name, label);
     };
-    for access in ["fixture-a", "replacement-two"] {
+    for rotation in 1..=25 {
+        let access = format!("replacement-{rotation:02}");
+        let label = if rotation == 1 { "upstream-fixture-a" } else { &access };
         let response = http
             .management(
                 "POST",
                 "/v8/management/credentials?name=a.json",
-                Some(json!({"type":"claude","access_token":access,"label":"Account upstream-fixture-a"})),
+                Some(json!({"type":"claude","access_token":access,"label":format!("Account {rotation}: {label}")})),
             )
             .await;
         assert_eq!(response.status(), 200);
-        check(access).await;
+        check(access, format!("Account {rotation}: [redacted]")).await;
     }
 
+    let path = proxy.config.auth_dir.join("a.json");
+    fs::write(&path, json!({"type":"claude","access_token":"replacement-25","label":"Account 1: upstream-fixture-a"}).to_string()).unwrap();
     let response =
         http.management("PATCH", "/v8/management/credentials/fields", Some(json!({"account_id":"a.json","note":"metadata update"}))).await;
     assert_eq!(response.status(), 200);
-    check("replacement-two").await;
+    check("replacement-25".into(), "Account 1: [redacted]".into()).await;
+    let saved: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(saved["label"], "Account 1: [redacted]");
 }
 
 #[tokio::test]

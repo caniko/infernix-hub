@@ -133,7 +133,8 @@ pub struct Account {
     pub access: String,
     pub refresh: Option<String>,
     // In-memory only: labels on disk can still contain retired credentials.
-    pub(crate) prior_secrets: Vec<String>,
+    // Keep safe labels keyed by the original label digest for the life of this account.
+    redacted_labels: HashMap<[u8; 32], String>,
     pub expires: Option<DateTime<Utc>>,
     pub chatgpt_id: Option<String>,
     pub chatgpt_user: Option<String>,
@@ -168,29 +169,37 @@ impl Account {
         [&self.access, self.refresh.as_deref().unwrap_or_default(), self.google_secret.as_deref().unwrap_or_default()]
     }
 
-    fn remember_secret(&mut self, secret: String) {
-        const HISTORY_LIMIT: usize = 16;
-        if secret.is_empty() || self.current_secrets().contains(&secret.as_str()) {
-            return;
+    pub(crate) fn known_safe_label(&self, raw: &str) -> Option<&str> {
+        self.redacted_labels.get(&<[u8; 32]>::from(Sha256::digest(raw))).map(String::as_str)
+    }
+
+    fn scrub_label(&mut self, previous_secrets: &[&str]) {
+        let hash = Sha256::digest(&self.label).into();
+        let mut redacted_labels = std::mem::take(&mut self.redacted_labels);
+        let label = redacted_labels.get(&hash).unwrap_or(&self.label);
+        let secrets = self.current_secrets().into_iter().chain(previous_secrets.iter().copied()).collect::<Vec<_>>();
+        let safe = crate::error_classify::scrub_label(label, &secrets);
+        // A newly known credential may also appear in an inactive saved label.
+        for label in redacted_labels.values_mut() {
+            if secrets.iter().any(|secret| !secret.is_empty() && label.contains(secret)) {
+                *label = crate::error_classify::scrub_label(label, &secrets);
+            }
         }
-        self.prior_secrets.retain(|prior| prior != &secret);
-        if self.prior_secrets.len() == HISTORY_LIMIT {
-            self.prior_secrets.remove(0);
+        if safe != self.label {
+            redacted_labels.insert(hash, safe.clone());
         }
-        self.prior_secrets.push(secret);
+        self.redacted_labels = redacted_labels;
+        self.label = safe;
     }
 
     pub(crate) fn replace_access(&mut self, access: String) {
         let old = std::mem::replace(&mut self.access, access);
-        self.remember_secret(old);
-        self.label = crate::error_classify::safe_label(self);
+        self.scrub_label(&[&old]);
     }
 
     pub(crate) fn replace_refresh(&mut self, refresh: Option<String>) {
-        if let Some(old) = std::mem::replace(&mut self.refresh, refresh) {
-            self.remember_secret(old);
-        }
-        self.label = crate::error_classify::safe_label(self);
+        let old = std::mem::replace(&mut self.refresh, refresh);
+        self.scrub_label(&[old.as_deref().unwrap_or_default()]);
     }
 
     pub(crate) fn needs_google_metadata(&self) -> bool {
@@ -493,7 +502,7 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
                 .filter(|n| *n > 0.0),
             access: access.into(),
             refresh: refresh.map(str::to_owned),
-            prior_secrets: Vec::new(),
+            redacted_labels: HashMap::new(),
             expires: ["expires_at", "expiresAt", "expiry", "expired", "expires", "/claudeAiOauth/expiresAt"]
                 .into_iter()
                 .find_map(|k| date(if k.starts_with('/') { entry.pointer(k).unwrap_or(&Value::Null) } else { &entry[k] }))
@@ -622,7 +631,10 @@ impl Pool {
 
     pub fn insert(&mut self, accounts: Vec<Account>) {
         for mut a in accounts {
-            if let Some(old) = self.accounts.get(&a.id) {
+            if let Some(old) = self.accounts.get_mut(&a.id) {
+                a.redacted_labels.extend(std::mem::take(&mut old.redacted_labels));
+                // Scrub before preserving any live credentials on an unchanged reload.
+                a.scrub_label(&old.current_secrets());
                 if a.local && old.local && old.lane == a.lane {
                     a.disabled = old.disabled;
                     a.priority = old.priority;
@@ -645,7 +657,7 @@ impl Pool {
                         a.email.clone_from(&old.email);
                     }
                     if a.local {
-                        a.label.clone_from(&old.label);
+                        a.label = crate::error_classify::safe_label(old);
                     }
                     a.cooldown = old.cooldown;
                     a.last_error.clone_from(&old.last_error);
@@ -662,15 +674,9 @@ impl Pool {
                     a.success = old.success;
                     a.failure = old.failure;
                 }
-                a.prior_secrets.clone_from(&old.prior_secrets);
-                for secret in old.current_secrets() {
-                    if !secret.is_empty() && !a.current_secrets().contains(&secret) {
-                        a.remember_secret(secret.to_owned());
-                    }
-                }
+            } else {
+                a.scrub_label(&[]);
             }
-            // Scrub after merging history, before sanitization can shorten a secret.
-            a.label = crate::error_classify::safe_label(&a);
             self.accounts.insert(a.id.clone(), a);
         }
     }
@@ -985,7 +991,7 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         if existing.email.is_none() {
             existing.email = email;
         }
-        existing.label = crate::error_classify::safe_label(existing);
+        existing.scrub_label(&[]);
         // Track the last discovered token separately from any access token the
         // proxy refreshed in memory; an unchanged disk snapshot is not a renewal.
         let mut rotated = false;
