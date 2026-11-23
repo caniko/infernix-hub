@@ -74,6 +74,8 @@ pub(super) fn account(provider: &ProviderDescriptor, id: &str, label: &str) -> M
         weight: 1,
         cooldown_until: None,
         status_message: None,
+        last_error: None,
+        last_error_observed: false,
         is_active: false,
         is_preferred: false,
         is_next_pick: false,
@@ -140,7 +142,10 @@ pub(super) fn batch(provider: &ProviderDescriptor, source: &str, accounts: Vec<M
         ProviderHealth::Unobserved
     } else if accounts.iter().all(|a| a.status == AccountStatus::Error) {
         ProviderHealth::Offline
-    } else if accounts.iter().any(|a| a.status_message.is_some() && a.status != AccountStatus::Disabled) {
+    } else if accounts
+        .iter()
+        .any(|a| a.enabled && a.last_error.as_ref().map_or(a.status_message.is_some(), AccountError::is_notification_worthy))
+    {
         ProviderHealth::Degraded
     } else {
         ProviderHealth::Healthy
@@ -152,7 +157,9 @@ pub(super) fn batch(provider: &ProviderDescriptor, source: &str, accounts: Vec<M
         provider_family: provider.family.clone(),
         source_host: source.into(),
         source_user: "hub".into(),
+        source_publisher: None,
         collected_at: at,
+        account_inventory_complete: false,
         health,
         status_message: None,
         router_id: provider.router_id.clone(),

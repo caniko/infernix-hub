@@ -2,12 +2,16 @@
 //! model providers, multi-account quota tracking, activity analytics, routing,
 //! capture policy and exports.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use contracts::Severity;
 use contracts::providers::*;
+use domain::notifications::{self, Raise};
+use domain::ports::PortError;
+use domain::providers::provider_notification_key;
 use domain::{Actor, Hub};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -125,7 +129,7 @@ async fn ingest_observations(
     Path(id): Path<String>,
     Json(batch): Json<ObservationBatch>,
 ) -> R<ObservationAck> {
-    domain::providers::ingest_observations(&s.hub, &a, &id, batch).await.map(Json).map_err(err(&a))
+    domain::providers::ingest_pushed_observations(&s.hub, &a, &id, batch).await.map(Json).map_err(err(&a))
 }
 
 async fn get_settings(State(s): State<AppState>, Caller(a): Caller) -> R<ProviderPanelSettings> {
@@ -288,6 +292,7 @@ async fn set_clickhouse(State(s): State<AppState>, Caller(a): Caller, Json(confi
 pub async fn run_loop(hub: Hub) {
     let mut poll_tick = tokio::time::interval(Duration::from_secs(60));
     let mut retention_counter = 0u32;
+    let mut failures = BTreeMap::new();
     let system_actor = Actor {
         principal: contracts::Principal { id: Uuid::nil(), name: "provider-poller".into(), role: contracts::Role::Operator },
         correlation_id: None,
@@ -295,23 +300,189 @@ pub async fn run_loop(hub: Hub) {
     loop {
         poll_tick.tick().await;
         for (id, provider) in hub.providers.iter() {
-            match provider.collect().await {
-                Ok(Some(batch)) => {
-                    if let Err(error) = domain::providers::ingest_observations(&hub, &system_actor, id, batch).await {
-                        tracing::warn!(provider = %id, %error, "provider observation ingest failed");
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(provider = %id, %error, "provider collect failed");
-                }
-            }
+            poll_provider(&hub, &system_actor, id, provider.as_ref(), failures.entry(id).or_default()).await;
         }
         retention_counter = retention_counter.wrapping_add(1);
         if retention_counter.is_multiple_of(15)
             && let Err(error) = domain::providers::capture::enforce_retention(&hub).await
         {
             tracing::warn!(%error, "provider capture retention failed");
+        }
+    }
+}
+
+async fn poll_provider(hub: &Hub, actor: &Actor, id: &str, provider: &dyn domain::ports::ModelProvider, streak: &mut u32) {
+    let result = match provider.collect().await {
+        Ok(Some(batch)) => domain::providers::ingest_observations(hub, actor, id, batch)
+            .await
+            .map(|_| ())
+            .map_err(|error| PortError::Unreachable(format!("observation ingest failed: {error}"))),
+        Ok(None) => return,
+        Err(error) => Err(error),
+    };
+    if let Some(raises) = poller_raises(id, streak, result.as_ref().err()) {
+        let source = poller_source(id);
+        if let Err(error) = notifications::sync(hub, &source, raises).await {
+            tracing::warn!(provider = %id, %error, "provider poller notification sync failed");
+        }
+    }
+    if let Err(error) = result {
+        let detail = sanitize_provider_error(&error.to_string());
+        tracing::warn!(provider = %id, %detail, consecutive_failures = *streak, "provider poll failed");
+    }
+}
+
+fn poller_source(id: &str) -> String {
+    format!("providers-poller:{id}")
+}
+
+/// Only a successful poll and ingest clear outstanding alerts.
+fn poller_raises(id: &str, failures: &mut u32, error: Option<&PortError>) -> Option<Vec<Raise>> {
+    let Some(error) = error else {
+        *failures = 0;
+        return Some(Vec::new());
+    };
+    *failures = failures.saturating_add(1);
+    let detail = sanitize_provider_error(&error.to_string());
+    let lower = detail.to_ascii_lowercase();
+    let immediate = matches!(error, PortError::Rejected { status: 401 | 403, .. } | PortError::Unsupported(_))
+        || [
+            "unauthorized",
+            "forbidden",
+            "access denied",
+            "authentication",
+            "auth failed",
+            "invalid credentials",
+            "invalid api key",
+            "credential file",
+            "invalid config",
+            "missing config",
+            "misconfigured",
+            "not configured",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|word| matches!(word, "401" | "403"));
+    if *failures < 2 && !immediate {
+        return None;
+    }
+    Some(vec![Raise {
+        source: poller_source(id),
+        dedupe_key: provider_notification_key(id, "poller:error"),
+        severity: if *failures >= 5 { Severity::Critical } else { Severity::Warning },
+        title: format!("{}: provider poller failed", sanitize_provider_error(id)),
+        body: detail,
+        subject_type: Some("model_provider".into()),
+        subject_id: Some(id.into()),
+        url: None,
+    }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn poller_failures_include_ingestion_and_recovery_requires_a_saved_batch() {
+        use domain::ports::{ModelProvider, PortResult, ProviderFacets};
+        use domain::sqlx;
+        struct Poller(ProviderDescriptor, Option<ObservationBatch>);
+
+        #[async_trait::async_trait]
+        impl ModelProvider for Poller {
+            fn descriptor(&self) -> ProviderDescriptor {
+                self.0.clone()
+            }
+            fn facets(&self) -> ProviderFacets<'_> {
+                ProviderFacets::observation_only(Default::default())
+            }
+            async fn collect(&self) -> PortResult<Option<ObservationBatch>> {
+                Ok(self.1.clone())
+            }
+        }
+
+        let Ok(base) = std::env::var("HUB_TEST_DATABASE_URL") else {
+            eprintln!("HUB_TEST_DATABASE_URL unset; skipping DB-backed test");
+            return;
+        };
+        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let name = format!("t_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("create database {name}")).execute(&admin).await.unwrap();
+        let mut url = reqwest::Url::parse(&base).unwrap();
+        url.set_path(&format!("/{name}"));
+        let mut settings = crate::bootstrap::Settings::fixture(url.as_str(), "127.0.0.1:0");
+        settings.asset_dir = std::env::temp_dir().join(&name);
+        settings.registry_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../registry").into();
+        settings.seed_file = Some(settings.registry_dir.join("hub.fixture.json"));
+        let (state, _) = crate::bootstrap::build(&settings).await.unwrap();
+        let hub = &state.hub;
+        let actor = Actor {
+            principal: contracts::Principal { id: Uuid::nil(), name: "provider-poller".into(), role: contracts::Role::Operator },
+            correlation_id: None,
+        };
+        let fixture = integrations::providers::FullFixtureModelProvider::new("audit-poller", "Audit Poller", "test");
+        let mut batch = fixture.collect().await.unwrap().unwrap();
+        let good = Poller(fixture.descriptor(), Some(batch.clone()));
+        batch.provider_id = "incorrect-provider-id".into();
+        let bad = Poller(fixture.descriptor(), Some(batch));
+        let noop = Poller(fixture.descriptor(), None);
+        let open = || {
+            sqlx::query_scalar::<_, bool>(
+                "select exists (select 1 from notifications where source = 'providers-poller:audit-poller' and resolved_at is null)",
+            )
+            .fetch_one(&hub.db)
+        };
+        let mut streak = 0;
+        for expected in 1..=2 {
+            poll_provider(hub, &actor, "audit-poller", &bad, &mut streak).await;
+            assert_eq!(streak, expected);
+        }
+        assert!(open().await.unwrap());
+        poll_provider(hub, &actor, "audit-poller", &noop, &mut streak).await;
+        assert!(open().await.unwrap());
+        assert_eq!(streak, 2);
+        poll_provider(hub, &actor, "audit-poller", &good, &mut streak).await;
+        assert!(!open().await.unwrap());
+        assert_eq!(streak, 0);
+        let publishers: i64 = sqlx::query_scalar("select count(*) from model_provider_publishers where provider_id = 'audit-poller'")
+            .fetch_one(&hub.db)
+            .await
+            .unwrap();
+        assert_eq!(publishers, 0, "pull providers never register a push collector");
+        hub.db.close().await;
+        sqlx::query(&format!("drop database {name}")).execute(&admin).await.unwrap();
+        let _ = std::fs::remove_dir_all(settings.asset_dir);
+    }
+
+    #[test]
+    fn poller_alerts_escalate_and_reset_on_any_success() {
+        let mut streak = 0;
+        let unavailable = PortError::Unreachable("request failed".into());
+        let mut step = |error| poller_raises("test", &mut streak, error);
+        assert!(step(Some(&unavailable)).is_none());
+        for count in 2..=6 {
+            let raises = step(Some(&unavailable)).unwrap();
+            assert_eq!(raises[0].severity, if count >= 5 { Severity::Critical } else { Severity::Warning });
+            assert_eq!(raises[0].source, "providers-poller:test");
+            assert_eq!(raises[0].dedupe_key, "provider:test:poller:error");
+        }
+        assert!(step(None).unwrap().is_empty());
+        assert!(step(Some(&unavailable)).is_none());
+    }
+
+    #[test]
+    fn auth_and_configuration_failures_alert_immediately_without_secrets() {
+        for error in [
+            PortError::Rejected { status: 401, message: "Authorization: bearer very-private".into() },
+            PortError::Rejected { status: 401, message: "Authorization: basic very-private".into() },
+            PortError::Rejected { status: 403, message: "https://example.com/path?token=very-private".into() },
+            PortError::Unreachable("credential file is unreadable".into()),
+            PortError::Unsupported(format!("invalid configuration: access_token=very-private {}", "a".repeat(600))),
+        ] {
+            let raises = poller_raises("test", &mut 0, Some(&error)).unwrap();
+            assert_eq!(raises[0].severity, Severity::Warning);
+            assert!(!raises[0].body.contains("very-private"));
+            assert!(raises[0].body.len() < 400);
         }
     }
 }

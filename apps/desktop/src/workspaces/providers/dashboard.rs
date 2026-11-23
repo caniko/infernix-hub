@@ -23,12 +23,13 @@ fn is_extra(kind: QuotaWindowKind) -> bool {
 }
 
 fn status(provider: &ProviderSummary, account: &ModelAccount) -> AccountStatus {
-    AccountStatus::resolve(
+    AccountStatus::resolve_with_error(
         account.enabled,
         account.cooldown_until,
         Utc::now(),
         account.is_next_pick || provider.next_pick_account_id.as_ref() == Some(&account.id),
-        account.status == AccountStatus::Error || account.enrollment_state == EnrollmentState::Error,
+        account.enrollment_state == EnrollmentState::Error || (account.last_error.is_none() && account.status == AccountStatus::Error),
+        account.last_error.as_ref(),
     )
 }
 
@@ -173,6 +174,8 @@ pub(super) fn AccountIdentity(provider: ProviderSummary, account: ModelAccount, 
     } else {
         account.email.clone().or_else(|| account.masked_email.clone())
     };
+    let message = account.status_message.clone().or_else(|| account.last_error.as_ref().map(AccountError::summary));
+    let hint = account.last_error.as_ref().and_then(|error| error.action_hint.as_deref());
     rsx! {
         div { class: "row",
             strong { "{account_name(&account, mask)}" }
@@ -186,7 +189,8 @@ pub(super) fn AccountIdentity(provider: ProviderSummary, account: ModelAccount, 
             if let Some(plan) = &account.plan { span { "{plan}" } }
             if let Some(tier) = account.tier_multiplier { span { "{tier}× capacity" } }
             if label == "Limited" { span { "Cooldown until {date(account.cooldown_until)}" } }
-            if let Some(message) = &account.status_message { span { "{message}" } }
+            if let Some(message) = &message { span { "{message}" } }
+            if let Some(hint) = hint { span { "{hint}" } }
         }
     }
 }

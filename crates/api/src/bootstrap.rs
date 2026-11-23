@@ -441,6 +441,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         topics: Arc::new(BTreeMap::new()),
         providers: Arc::new(providers),
         notified: Arc::new(tokio::sync::Notify::new()),
+        expected_offline_hosts: Default::default(),
         feeds: Default::default(),
     };
     if let Some(seed) = &seed {

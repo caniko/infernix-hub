@@ -643,6 +643,7 @@ impl ModelProvider for SpillwayProxyProvider {
             .flat_map(|(id, grants)| grants.into_iter().map(move |grant| (id.clone(), grant)))
             .collect::<Vec<_>>();
         let mut batch = batch(&self.descriptor, "spillway", accounts.into_values().collect(), at);
+        batch.source_publisher = Some("spillway-proxy".into());
         batch.reset_grants = grants;
         if batch.accounts.is_empty() {
             batch.health = ProviderHealth::Healthy;
@@ -812,11 +813,22 @@ fn read_account(account: &mut ModelAccount, raw: &Value, quota_row: bool, now: D
     if let Some(last_used_at) = iso(&raw["last_used_at"]) {
         account.last_used_at = Some(last_used_at);
     }
-    let errored = matches!(raw["status"].as_str(), Some("error" | "unavailable"));
-    if errored {
-        account.status_message = Some("proxy reports a credential error".into());
+    if let Some(error) = raw.get("last_error") {
+        let parsed = serde_json::from_value::<AccountError>(error.clone()).ok().map(AccountError::sanitized);
+        if parsed.is_some() || error.is_null() {
+            account.last_error = parsed;
+            account.last_error_observed = true;
+        }
     }
-    account.enrollment_state = if errored { EnrollmentState::Error } else { EnrollmentState::Deployed };
+    let legacy_error = account.last_error.is_none()
+        && match raw["status"].as_str() {
+            Some("error" | "unavailable") => true,
+            None if raw.get("last_error").is_none() => account.enrollment_state == EnrollmentState::Error,
+            _ => false,
+        };
+    account.status_message =
+        account.last_error.as_ref().map(AccountError::summary).or_else(|| legacy_error.then(|| "proxy reports a credential error".into()));
+    account.enrollment_state = if legacy_error { EnrollmentState::Error } else { EnrollmentState::Deployed };
     if quota_row {
         account.plan = str_field(&raw["plan"]["label"]).or_else(|| str_field(&raw["plan"]["tier"])).map(str::to_owned);
         account.tier_multiplier = raw["plan"]["multiplier"].as_f64().filter(|value| *value > 0.0);
@@ -824,7 +836,7 @@ fn read_account(account: &mut ModelAccount, raw: &Value, quota_row: bool, now: D
         account.is_next_pick = raw["next_pick"].as_bool() == Some(true);
         account.cooldown_until = iso(&raw["cooldown_until"]);
         account.last_observed_at = iso(&raw["observed_at"]);
-        if account.last_observed_at.is_some() && !errored {
+        if account.last_observed_at.is_some() && !legacy_error {
             account.enrollment_state = EnrollmentState::Verified;
         }
         account.success_count = raw["api_key"]["success"].as_u64().unwrap_or_default();
@@ -848,8 +860,14 @@ fn read_account(account: &mut ModelAccount, raw: &Value, quota_row: bool, now: D
             }
         }
     }
-    account.status =
-        AccountStatus::resolve(account.enabled, account.cooldown_until, now, account.is_next_pick, account.status_message.is_some());
+    account.status = AccountStatus::resolve_with_error(
+        account.enabled,
+        account.cooldown_until,
+        now,
+        account.is_next_pick,
+        legacy_error,
+        account.last_error.as_ref(),
+    );
 }
 
 fn read_window(raw: &Value, account_time: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<QuotaWindow> {
@@ -921,4 +939,28 @@ fn read_logs(body: &Value) -> Vec<ProxyLogEntry> {
             Some(ProxyLogEntry { at, stream: "proxy".into(), level: level.into(), message: "Proxy log entry (message omitted)".into() })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quota_payload_preserves_structured_account_error_and_can_clear_it() {
+        let at = Utc::now();
+        let d = descriptor("test", "Test", "claude", AdapterMode::Live);
+        let mut a = account(&d, "primary", "Primary");
+        let failure =
+            json!({"kind":"auth_expired","source":"oauth_refresh","message":"Sign in again","occurred_at":at,"consecutive_count":2});
+        read_account(&mut a, &json!({"status":"error","last_error":failure}), false, at);
+        read_account(&mut a, &json!({"next_pick":true}), true, at);
+        assert_eq!(a.status, AccountStatus::Error);
+        assert_eq!(a.last_error.as_ref().unwrap().kind, AccountErrorKind::AuthExpired);
+        assert_eq!(a.status_message.as_deref(), Some("Authentication expired: Sign in again"));
+        read_account(&mut a, &json!({"next_pick":true,"observed_at":at,"last_error":null}), true, at);
+        assert!(a.last_error.is_none());
+        assert!(a.last_error_observed);
+        assert!(a.status_message.is_none());
+        assert_eq!(a.status, AccountStatus::NextPick);
+    }
 }

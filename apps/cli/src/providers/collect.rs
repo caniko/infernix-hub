@@ -430,7 +430,10 @@ impl Collector {
         }
         let accounts: Vec<_> = accounts.into_values().collect();
         let capabilities = accounts.iter().flat_map(|a| a.capabilities.iter().copied()).collect();
-        let health = if accounts.iter().any(|a| a.status_message.is_some()) {
+        let health = if accounts
+            .iter()
+            .any(|a| a.enabled && a.last_error.as_ref().map_or(a.status_message.is_some(), AccountError::is_notification_worthy))
+        {
             ProviderHealth::Degraded
         } else if accounts.iter().any(|a| a.enrollment_state == EnrollmentState::Verified) {
             ProviderHealth::Healthy
@@ -443,7 +446,9 @@ impl Collector {
             provider_family: provider.into(),
             source_host: self.host.clone(),
             source_user: self.user.clone(),
+            source_publisher: Some("fleetix-cli-collector".into()),
             collected_at: now,
+            account_inventory_complete: false,
             health,
             status_message: None,
             router_id: None,
@@ -507,9 +512,25 @@ impl Collector {
                 a.cooldown_until = datetime(&row["cooldown_until"]);
                 a.last_observed_at = datetime(&row["observed_at"]);
                 a.enrollment_state = if a.last_observed_at.is_some() { EnrollmentState::Verified } else { EnrollmentState::Deployed };
-                let has_error = matches!(row["status"].as_str(), Some("error" | "unavailable"));
-                a.status = AccountStatus::resolve(a.enabled, a.cooldown_until, now, a.is_next_pick, has_error);
-                a.status_message = has_error.then(|| "Local proxy reports an account error".into());
+                a.last_error = serde_json::from_value::<AccountError>(row["last_error"].clone()).ok().map(AccountError::sanitized);
+                a.last_error_observed = a.last_error.is_some() || row.get("last_error").is_some_and(Value::is_null);
+                let legacy_error = a.last_error.is_none() && matches!(row["status"].as_str(), Some("error" | "unavailable"));
+                if legacy_error {
+                    a.enrollment_state = EnrollmentState::Error;
+                }
+                a.status = AccountStatus::resolve_with_error(
+                    a.enabled,
+                    a.cooldown_until,
+                    now,
+                    a.is_next_pick,
+                    legacy_error,
+                    a.last_error.as_ref(),
+                );
+                a.status_message = a
+                    .last_error
+                    .as_ref()
+                    .map(AccountError::summary)
+                    .or_else(|| legacy_error.then(|| "Local proxy reports an account error".into()));
                 if str_field(&row["auth_index"]).is_some() && !row["api_key"].is_object() {
                     a.capabilities.extend([REFRESH, OVERRIDE]);
                 }
@@ -675,7 +696,12 @@ mod tests {
             meridian: None,
             proxy: None,
         };
-        let credentials: Vec<_> = (1..=6).map(|i| json!({"provider":"antigravity","id":format!("google-{i}")})).collect();
+        let mut credentials: Vec<_> = (1..=6).map(|i| json!({"provider":"antigravity","id":format!("google-{i}")})).collect();
+        credentials[0]["next_pick"] = json!(true);
+        credentials[0]["last_error"] = json!({
+            "kind":"verification_required", "source":"oauth_refresh", "occurred_at":"2026-11-22T10:00:00Z",
+            "message":"Verify your account", "consecutive_count":1, "action_hint":"Sign in to Antigravity"
+        });
         let native = ProxyInventory::from_response(json!({"credentials":credentials,"hub_sync_configured":true})).unwrap();
         assert!(collector.batch("antigravity", "Antigravity", "google", &native).await.is_none());
         let unavailable = ProxyInventory { unavailable: true, ..ProxyInventory::default() };
@@ -684,6 +710,19 @@ mod tests {
         let accounts = collector.batch("antigravity", "Antigravity", "google", &external).await.unwrap().accounts;
         assert_eq!(accounts.len(), 6);
         assert_eq!(accounts[0].id, "antigravity:host-a:operator:google-1");
+        assert_eq!(accounts[0].status, AccountStatus::Error);
+        assert_eq!(accounts[0].status_message.as_deref(), Some("Verification required: Verify your account"));
+        let error = accounts[0].last_error.as_ref().unwrap();
+        assert_eq!(error.source, AccountErrorSource::OAuthRefresh);
+        assert_eq!(error.action_hint.as_deref(), Some("Sign in to Antigravity"));
+        assert!(accounts[1].last_error.is_none());
+        assert!(!accounts[1].last_error_observed);
+        let mut transient = external;
+        transient.credentials[1]["last_error"] = Value::Null;
+        transient.credentials[0]["last_error"]["kind"] = json!("upstream_unavailable");
+        let batch = collector.batch("antigravity", "Antigravity", "google", &transient).await.unwrap();
+        assert!(batch.accounts[1].last_error_observed);
+        assert_ne!(batch.health, ProviderHealth::Degraded, "one transient error must not trigger the fallback alert");
     }
 
     #[test]

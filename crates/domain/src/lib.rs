@@ -119,6 +119,8 @@ pub struct Hub {
     pub providers: Arc<BTreeMap<String, Arc<dyn ports::ModelProvider>>>,
     /// Wakes long-polling notification readers after a committed change.
     pub notified: Arc<tokio::sync::Notify>,
+    /// Expected-offline hosts from the latest fleet snapshot read by the API's notifier.
+    pub expected_offline_hosts: Arc<std::sync::RwLock<Vec<String>>>,
     /// Status feed states the producer loop last saw, for `/v1/status`.
     pub feeds: Arc<std::sync::RwLock<Vec<contracts::FeedState>>>,
 }

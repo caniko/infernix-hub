@@ -14,7 +14,10 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, TimeDelta, Utc};
-use contracts::providers::{ActivityAttemptIn, ActivityExchangeIn, ActivityPurpose, ActivitySource, CaptureState, TraceEdgeKind};
+use contracts::providers::{
+    AccountError, AccountErrorKind, AccountErrorSource, ActivityAttemptIn, ActivityExchangeIn, ActivityPurpose, ActivitySource,
+    CaptureState, TraceEdgeKind,
+};
 use futures_util::stream;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -23,8 +26,9 @@ use uuid::Uuid;
 use crate::{
     ACTIVITY_CAP, CAPTURE_BYTES, Proxy,
     config::matches_secret,
+    error_classify::{ERROR_BODY_LIMIT, account_secrets, classify_sse_error, classify_upstream_http_error, local_error, safe_label},
     openai_account,
-    pool::{Account, Lane, model_cooldown_scope, text},
+    pool::{Account, Lane, Pool, model_cooldown_scope, text},
 };
 
 pub(crate) fn routes() -> Router<Arc<Proxy>> {
@@ -279,17 +283,27 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         }
     };
     loop {
-        let account = {
+        let (account, unavailable) = {
             let mut state = proxy.state.write().await;
-            state.pool.pick(lane, exchange.affinity_key.as_deref(), exchange.parent.as_deref(), model, required_project, &tried)
+            let account =
+                state.pool.pick(lane, exchange.affinity_key.as_deref(), exchange.parent.as_deref(), model, required_project, &tried);
+            let unavailable = account.is_none().then(|| unavailable_pool(&state.pool, lane, model, required_project)).flatten();
+            (account, unavailable)
         };
         let Some(mut account) = account else {
             if let Some(reset) = exhausted_reset(&mut retained_quota).await.or(last_decoded_quota_reset) {
                 return exchange.rate_limited(reset, Usage::default(), None).await;
             }
+            if let Some(response) = unavailable {
+                exchange.finish(Some(StatusCode::SERVICE_UNAVAILABLE), "unavailable", Usage::default(), None, None).await;
+                return response;
+            }
             exchange.finish(Some(last_error), "unavailable", Usage::default(), None, None).await;
             return lane_error(lane, last_error, "no eligible upstream account");
         };
+        if !tried.is_empty() {
+            proxy.log("warn", &format!("{} request {} failed over to {}", lane.name(), exchange.id, safe_label(&account))).await;
+        }
         tried.push(account.id.clone());
         let began = Instant::now();
         let started = Utc::now();
@@ -297,7 +311,13 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         let deadline = tokio::time::Instant::now() + timeout;
         let reload_on_401 = !account.api_key && matches!(lane, Lane::Claude | Lane::Codex);
         let incoming = async {
-            let url = upstream(&proxy, &account, &parts.uri).ok_or(())?;
+            let upstream_error = || inference_error("upstream request failed");
+            let resolved = proxy.token_account(&account, false).await.map_err(|error| *error)?;
+            if required_project.is_some_and(|project| resolved.project.as_deref() != Some(project)) {
+                return Err(upstream_error());
+            }
+            account = resolved;
+            let url = upstream(&proxy, &account, &parts.uri).ok_or_else(upstream_error)?;
             let build = |account: &Account| {
                 let payload = request_body(&body, &projects, account);
                 let mut req = proxy.http.request(parts.method.clone(), url.clone()).body(payload);
@@ -332,29 +352,47 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                     _ => req.bearer_auth(&account.access),
                 }
             };
-            let resolved = proxy.token_account(&account, false).await.map_err(|_| ())?;
-            if required_project.is_some_and(|project| resolved.project.as_deref() != Some(project)) {
-                return Err(());
-            }
-            account = resolved;
-            let mut res = build(&account).send().await.map_err(|_| ())?;
+            let mut res = build(&account).send().await.map_err(|_| upstream_error())?;
+            let mut refresh_error = None;
             if res.status() == StatusCode::UNAUTHORIZED
                 && (reload_on_401 || (lane == Lane::Google && !account.api_key && account.refresh.is_some()))
-                && let Ok(fresh) = proxy.token_account(&account, true).await
-                && required_project.is_none_or(|project| fresh.project.as_deref() == Some(project))
             {
-                account = fresh;
-                res = build(&account).send().await.map_err(|_| ())?;
+                match proxy.token_account(&account, true).await {
+                    Ok(fresh) if required_project.is_some_and(|project| fresh.project.as_deref() != Some(project)) => {
+                        return Err(upstream_error());
+                    }
+                    Ok(fresh) if fresh.access != account.access => {
+                        account = fresh;
+                        res = build(&account).send().await.map_err(|_| upstream_error())?;
+                    }
+                    Err(error) => refresh_error = Some(*error),
+                    Ok(fresh) => {
+                        account = fresh;
+                        let mut error = local_error(
+                            AccountErrorKind::AuthExpired,
+                            AccountErrorSource::OAuthRefresh,
+                            "No renewed credential was available after the upstream returned 401.",
+                        );
+                        error.http_status = Some(401);
+                        refresh_error = Some(error);
+                    }
+                }
             }
-            // A known client error must survive an upstream body failure or stall.
-            let first = if res.status().is_client_error() { None } else { res.chunk().await.map_err(|_| ())? };
-            Ok::<_, ()>((res, first))
+            let first = if res.status().is_success() { res.chunk().await.map_err(|_| upstream_error())? } else { None };
+            Ok::<_, AccountError>((res, first, refresh_error))
         };
-        let (mut response, first) = match tokio::time::timeout_at(deadline, incoming).await {
+        let (mut response, first, refresh_error) = match tokio::time::timeout_at(deadline, incoming).await {
             Ok(Ok(result)) => result,
             failure => {
                 let timed_out = failure.is_err();
-                last_error = if timed_out { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::BAD_GATEWAY };
+                let classified = failure.ok().and_then(Result::err).unwrap_or_else(|| inference_error("upstream first byte timed out"));
+                last_error = if timed_out {
+                    StatusCode::GATEWAY_TIMEOUT
+                } else if classified.kind == AccountErrorKind::AuthExpired {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
                 exchange.attempt(
                     &account,
                     previous_session_account,
@@ -363,8 +401,16 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                     None,
                     if timed_out { "first_byte_timeout" } else { "upstream_error" },
                 );
-                let _ = result(&proxy, &account, model, None, false).await;
+                exchange.attempt_error(&classified);
+                result(&proxy, &account, model, None, false, started).await;
+                proxy.report_account_error(&account, &classified).await;
                 exchange.complete_attempt(Usage::default(), None);
+                // Credential preparation failed before any inference request was sent.
+                if !policy.switch_on_server_error && !classified.kind.is_blocking() && classified.source != AccountErrorSource::OAuthRefresh
+                {
+                    exchange.finish(Some(last_error), "upstream_error", Usage::default(), None, None).await;
+                    return lane_error(lane, last_error, "upstream request failed");
+                }
                 continue;
             }
         };
@@ -375,40 +421,68 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         if google_stream && let Some(first) = prelude.first[0].take() {
             prelude = google_first(&mut response, first, sse).await;
         }
-        let status = prelude.error.as_ref().map_or_else(|| response.status(), |(error, _)| error.status);
-        let limited = status == StatusCode::TOO_MANY_REQUESTS;
+        let mut status = prelude.error.as_ref().map_or_else(|| response.status(), |(error, _)| error.status);
         let received_at = Utc::now();
+        let oauth_unavailable = refresh_error.as_ref().is_some_and(|e| e.kind == AccountErrorKind::UpstreamUnavailable);
+        let mut pending_quota_body = None;
+        let mut header_reset = None;
+        let mut body_reset = None;
+        let mut classified = refresh_error;
+        if let Some((error, raw)) = prelude.error.as_ref() {
+            classified = error.classify(raw, &account, AccountErrorSource::Inference);
+            // Auth rejection can be retried before output. Other blocking SSE events
+            // terminate the established stream with a sanitized event, not a replay.
+            if sse && classified.as_ref().is_some_and(|e| e.kind.is_blocking() && e.kind != AccountErrorKind::AuthExpired) {
+                prelude.error = None;
+                classified = None;
+                status = response.status();
+            }
+        } else if !status.is_success() {
+            let google_quota = lane == Lane::Google && status == StatusCode::TOO_MANY_REQUESTS;
+            header_reset = header_cooldown(lane, &headers, received_at);
+            let diagnostic_deadline =
+                if google_quota && header_reset.is_none() { deadline } else { error_prefix_deadline(lane, status, &headers, deadline) };
+            let mut prefix = ErrorPrefix::default();
+            prefix.read(&mut response, diagnostic_deadline, google_quota).await;
+            let diagnostic = prefix.diagnostic();
+            if classified.is_none() && (status != StatusCode::FORBIDDEN || prefix.complete || !diagnostic.is_empty()) {
+                classified = classify_upstream_http_error(
+                    lane,
+                    status,
+                    &headers,
+                    diagnostic,
+                    AccountErrorSource::Inference,
+                    &account_secrets(&account),
+                );
+            }
+            if google_quota {
+                body_reset = body_reset_hint(diagnostic);
+                if !prefix.finished() && classified.as_ref().is_some_and(|e| e.kind == AccountErrorKind::QuotaExhausted) {
+                    pending_quota_body = header_reset.map(|until| (until, std::mem::take(&mut prefix)));
+                }
+            }
+            prelude.first = prefix.chunks;
+            prelude.stream_error = prefix.error;
+        }
+        let limited = classified.as_ref().is_some_and(|e| e.kind == AccountErrorKind::QuotaExhausted);
         let decoded_quota_reset = prelude
             .error
             .as_ref()
             .filter(|_| limited)
             .map(|(error, _)| header_cooldown(lane, &headers, received_at).max(error.reset).unwrap_or(received_at));
-        let mut pending_quota_body = None;
-        let cooldown = if let Some((error, _)) = &prelude.error {
-            error.backoff(&headers, policy.failover_cooldown_secs, received_at)
-        } else if limited {
-            let header = header_cooldown(lane, &headers, received_at);
-            let body_reset = if lane == Lane::Google && header.is_none() {
-                let body = read_google_quota_body(&mut response, deadline).await;
-                prelude.first = body.chunks;
-                prelude.stream_error = body.error;
-                body.reset
-            } else {
-                pending_quota_body = header.filter(|_| lane == Lane::Google);
-                None
-            };
-            let until = quota_deadline(header, body_reset, policy.failover_cooldown_secs, Utc::now());
-            Some(Backoff::Quota(until))
-        } else if status == StatusCode::UNAUTHORIZED {
-            Some(auth_backoff(policy.failover_cooldown_secs))
-        } else {
-            None
-        };
-        let mut quota_until = match cooldown {
-            Some(Backoff::Quota(until)) if lane == Lane::Google => Some(until),
-            _ => None,
-        };
-        let failover = limited || status == StatusCode::UNAUTHORIZED || (status.is_server_error() && policy.switch_on_server_error);
+        let cooldown = limited.then(|| {
+            if let Some((error, _)) = &prelude.error {
+                header_reset = header_cooldown(lane, &headers, received_at);
+                body_reset = error.reset;
+            }
+            quota_deadline(header_reset, body_reset, policy.failover_cooldown_secs, Utc::now())
+        });
+        let mut quota_until = cooldown.filter(|_| lane == Lane::Google);
+        let failover = classified.as_ref().is_some_and(|e| {
+            e.kind.is_blocking()
+                || limited
+                || (e.kind == AccountErrorKind::UpstreamUnavailable && (oauth_unavailable || policy.switch_on_server_error))
+        });
         exchange.attempt(
             &account,
             previous_session_account,
@@ -423,8 +497,10 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                 "http_error"
             },
         );
-        if !status.is_success() {
-            let _ = result(&proxy, &account, model, cooldown, false).await;
+        if let Some(error) = classified.as_ref() {
+            exchange.attempt_error(error);
+            result(&proxy, &account, model, cooldown, false, started).await;
+            proxy.report_account_error(&account, error).await;
         }
         if limited {
             proxy.schedule_usage_refresh(account.id.clone()).await;
@@ -445,14 +521,15 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             };
             if has_next {
                 last_decoded_quota_reset = decoded_quota_reset.or(last_decoded_quota_reset);
-                let reader = pending_quota_body.map(|header_until| {
+                let reader = pending_quota_body.map(|(header_until, mut body)| {
                     let proxy = proxy.clone();
                     let model = model.to_owned();
                     let account = account.clone();
                     tokio::spawn(async move {
-                        let body = read_google_quota_body(&mut response, deadline).await;
-                        extend_quota(&proxy, &account, &model, body.reset.filter(|until| *until > header_until)).await;
-                        header_until.max(body.reset.unwrap_or(header_until))
+                        body.read(&mut response, deadline, true).await;
+                        let reset = body_reset_hint(body.diagnostic()).filter(|until| *until > header_until);
+                        extend_quota(&proxy, &account, &model, reset).await;
+                        header_until.max(reset.unwrap_or(header_until))
                     })
                 });
                 if let Some(until) = quota_until {
@@ -462,18 +539,34 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                 proxy.log("warn", "upstream request failed over").await;
                 continue;
             }
-            if let Some(header_until) = pending_quota_body {
-                let body = read_google_quota_body(&mut response, deadline).await;
-                extend_quota(&proxy, &account, model, body.reset.filter(|until| *until > header_until)).await;
-                quota_until = Some(header_until.max(body.reset.unwrap_or(header_until)));
+            if let Some((header_until, mut body)) = pending_quota_body {
+                body.read(&mut response, deadline, true).await;
+                let reset = body_reset_hint(body.diagnostic()).filter(|until| *until > header_until);
+                extend_quota(&proxy, &account, model, reset).await;
+                quota_until = Some(header_until.max(reset.unwrap_or(header_until)));
                 prelude.first = body.chunks;
                 prelude.stream_error = body.error;
             }
             if let Some(until) = quota_until {
                 retained_quota.push(RetainedQuota { account: account.clone(), until, reader: None });
             }
-            if let Some(reset) = exhausted_reset(&mut retained_quota).await {
+            if prelude.stream_error.is_none()
+                && let Some(reset) = exhausted_reset(&mut retained_quota).await
+            {
                 return exchange.rate_limited(reset, prelude.usage, Some(millis(began.elapsed()))).await;
+            }
+            if !limited {
+                let unavailable = unavailable_pool(&proxy.state.read().await.pool, lane, model, required_project);
+                if let Some(response) = unavailable {
+                    exchange.complete_attempt(prelude.usage, Some(millis(began.elapsed())));
+                    exchange.finish(Some(StatusCode::SERVICE_UNAVAILABLE), "unavailable", Usage::default(), None, None).await;
+                    return response;
+                }
+                if classified.as_ref().is_some_and(|e| e.kind.is_blocking()) {
+                    exchange.complete_attempt(prelude.usage, Some(millis(began.elapsed())));
+                    exchange.finish(Some(StatusCode::BAD_GATEWAY), "upstream_error", Usage::default(), None, None).await;
+                    return lane_error(lane, StatusCode::BAD_GATEWAY, "upstream account rejected this request");
+                }
             }
         }
         if let Some((error, raw)) = prelude.error {
@@ -517,11 +610,16 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             flush_google_prefix: prelude.flush_prefix,
             upstream_done: false,
             sse,
-            google: (google_stream && status.is_success()).then(|| GoogleFrames::new(sse)),
+            google: (google_stream && !sse && status.is_success()).then(|| GoogleFrames::new(false)),
+            google_sse: google_stream && sse && status.is_success(),
             fallback: policy.failover_cooldown_secs,
             usage: Usage::default(),
             usage_buf: Vec::new(),
-            discard_line: false,
+            sse_frames: SseFrames::default(),
+            sse_eof: false,
+            sse_terminal: false,
+            sse_failed: false,
+            request_at: started,
             capture_buf: Vec::new(),
             response_size: 0,
         };
@@ -543,6 +641,19 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         }
         return response;
     }
+}
+
+fn unavailable_pool(pool: &Pool, lane: Lane, model: &str, required_project: Option<&str>) -> Option<Response> {
+    if pool.has_eligible_account(lane, model, required_project) {
+        return None;
+    }
+    let kind = pool.uniform_quarantine_kind(lane, model, required_project).map_or("accounts_unavailable", |kind| kind.as_str());
+    Some((StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({
+        "error": {
+            "type": kind,
+            "message": "All accounts for this provider lane are currently unavailable. Check Fleetix Hub notifications or proxy management for details."
+        }
+    }))).into_response())
 }
 
 fn google_quota_message(model: &str) -> String {
@@ -703,44 +814,62 @@ pub(crate) async fn run_window_start(
     let started = Utc::now();
     let response = request.timeout(Duration::from_secs(45)).send().await;
     let mut usage = Usage::default();
-    let (status, outcome, limited) = if let Ok(mut response) = response {
+    let fallback = proxy.state.read().await.pool.policy.failover_cooldown_secs;
+    let (status, outcome, limited, error) = if let Ok(mut response) = response {
         let status = response.status();
-        let limited = if status == StatusCode::TOO_MANY_REQUESTS {
-            let fallback = proxy.state.read().await.pool.policy.failover_cooldown_secs;
-            let now = Utc::now();
-            let header = header_cooldown(account.lane, response.headers(), now);
-            let body = if account.lane == Lane::Google {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
-                read_google_quota_body(&mut response, deadline).await.reset
-            } else {
-                None
-            };
-            Some(Backoff::Quota(quota_deadline(header, body, fallback, Utc::now())))
+        if !status.is_success() {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+            let headers = response.headers().clone();
+            let google_quota = account.lane == Lane::Google && status == StatusCode::TOO_MANY_REQUESTS;
+            let wait = if google_quota { deadline } else { error_prefix_deadline(account.lane, status, &headers, deadline) };
+            let mut prefix = ErrorPrefix::default();
+            prefix.read(&mut response, wait, google_quota).await;
+            let body = prefix.diagnostic();
+            let error = classify_upstream_http_error(
+                account.lane,
+                status,
+                &headers,
+                body,
+                AccountErrorSource::Inference,
+                &account_secrets(account),
+            );
+            let limited = error
+                .as_ref()
+                .filter(|e| e.kind == AccountErrorKind::QuotaExhausted)
+                .map(|_| cooldown(account.lane, &headers, body, fallback));
+            (Some(status), "http_error", limited, error)
         } else {
-            None
-        };
-        let sse = is_sse(response.headers());
-        let outcome = if !status.is_success() {
-            "http_error"
-        } else if let Ok(body) = crate::bounded_body(response, 256 * 1024).await {
-            if sse {
-                for line in body.split(|b| *b == b'\n') {
-                    observe_line(&mut usage, line, account.lane);
+            let sse = is_sse(response.headers());
+            let error = match crate::bounded_body(response, 256 * 1024).await {
+                Ok(body) if sse => SseObserver::frame(&body, &mut usage, account),
+                Ok(body) => {
+                    if let Ok(raw) = serde_json::from_slice(&body) {
+                        usage.observe(&raw, account.lane);
+                    }
+                    None
                 }
-            } else if let Ok(raw) = serde_json::from_slice(&body) {
-                usage.observe(&raw, account.lane);
-            }
-            "success"
-        } else {
-            "stream_error"
-        };
-        (Some(status), outcome, limited)
+                Err(message) => Some(local_error(AccountErrorKind::UpstreamUnavailable, AccountErrorSource::Stream, message)),
+            };
+            (Some(status), if error.is_some() { "stream_error" } else { "success" }, None, error)
+        }
     } else {
-        (None, "upstream_error", None)
+        (None, "upstream_error", None, Some(inference_error("upstream window start request failed")))
     };
     exchange.attempt(account, None, started, began, status, outcome);
     let success = outcome == "success";
-    let _ = result(&proxy, account, model, limited, success).await;
+    let limited = limited.or_else(|| {
+        error
+            .as_ref()
+            .filter(|e| e.kind == AccountErrorKind::QuotaExhausted && e.source == AccountErrorSource::Stream)
+            .map(|_| cooldown_after(Utc::now(), fallback as i64))
+    });
+    if success || error.is_some() {
+        result(&proxy, account, model, limited, success, started).await;
+    }
+    if let Some(error) = error {
+        exchange.attempt_error(&error);
+        proxy.report_account_error(account, &error).await;
+    }
     if limited.is_some() {
         proxy.schedule_usage_refresh(account.id.clone()).await;
     }
@@ -1012,48 +1141,94 @@ pub(crate) fn upstream(proxy: &Proxy, account: &Account, uri: &axum::http::Uri) 
     Some(url)
 }
 
-struct QuotaBody {
-    chunks: [Option<Bytes>; 2],
-    error: Option<reqwest::Error>,
-    reset: Option<DateTime<Utc>>,
+fn inference_error(message: &str) -> AccountError {
+    local_error(AccountErrorKind::UpstreamUnavailable, AccountErrorSource::Inference, message)
 }
 
-async fn read_google_quota_body(response: &mut reqwest::Response, deadline: tokio::time::Instant) -> QuotaBody {
-    const LIMIT: usize = 64 * 1024;
-    let mut prefix = Vec::new();
-    let mut tail = None;
-    let mut error = None;
-    let mut boundary = JsonBoundary::default();
-    let mut scanned = 0;
-    let mut object = None;
-    while prefix.len() < LIMIT {
-        let chunk = match tokio::time::timeout_at(deadline, response.chunk()).await {
-            Ok(Ok(Some(chunk))) => chunk,
-            Ok(Err(err)) => {
-                error = Some(err);
-                break;
-            }
-            _ => break,
-        };
-        let take = chunk.len().min(LIMIT - prefix.len());
-        prefix.extend_from_slice(&chunk[..take]);
-        if take < chunk.len() {
-            tail = Some(chunk.slice(take..));
-        }
-        if object.is_none() {
-            let trimmed = prefix[scanned..].trim_ascii_start();
-            scanned = prefix.len() - trimmed.len();
-            object = trimmed.first().map(|b| matches!(b, b'{' | b'['));
-        }
-        if object == Some(true) {
-            if let Some(end) = boundary.scan(&prefix[scanned..]) {
-                let reset = body_reset_hint(&prefix[..scanned + end]);
-                return QuotaBody { chunks: [Some(prefix.into()), tail], error, reset };
-            }
-            scanned = prefix.len();
+fn error_prefix_deadline(lane: Lane, status: StatusCode, headers: &HeaderMap, deadline: tokio::time::Instant) -> tokio::time::Instant {
+    if status == StatusCode::TOO_MANY_REQUESTS && header_cooldown(lane, headers, Utc::now()).is_some() {
+        // Give a billing error body a chance to arrive without stalling a quota failover.
+        deadline.min(tokio::time::Instant::now() + Duration::from_millis(250))
+    } else {
+        deadline.min(tokio::time::Instant::now() + Duration::from_secs(3))
+    }
+}
+
+#[derive(Default)]
+struct ErrorPrefix {
+    chunks: [Option<Bytes>; 2],
+    error: Option<reqwest::Error>,
+    complete: bool,
+    json_end: Option<usize>,
+}
+
+impl ErrorPrefix {
+    fn finished(&self) -> bool {
+        self.complete
+            || self.json_end.is_some()
+            || self.error.is_some()
+            || self.chunks[0].as_ref().is_some_and(|bytes| bytes.len() >= ERROR_BODY_LIMIT)
+    }
+
+    fn diagnostic(&self) -> &[u8] {
+        // Incomplete free text can end in a partial credential. Forward it, but
+        // never use it for operator diagnostics.
+        let bytes = self.chunks[0].as_deref().unwrap_or_default();
+        if let Some(end) = self.json_end {
+            &bytes[..end]
+        } else if self.complete || serde_json::from_slice::<Value>(bytes).is_ok() {
+            bytes
+        } else {
+            &[]
         }
     }
-    QuotaBody { chunks: [(!prefix.is_empty()).then(|| prefix.into()), tail], error, reset: None }
+
+    async fn read(&mut self, response: &mut reqwest::Response, deadline: tokio::time::Instant, stop_at_json: bool) {
+        if self.finished() {
+            return;
+        }
+        let mut prefix = self.chunks[0].take().map_or_else(Vec::new, |bytes| bytes.to_vec());
+        let mut boundary = JsonBoundary::default();
+        let mut scanned = 0;
+        let mut object = None;
+        loop {
+            if stop_at_json {
+                if object.is_none() {
+                    let trimmed = prefix[scanned..].trim_ascii_start();
+                    scanned = prefix.len() - trimmed.len();
+                    object = trimmed.first().map(|b| matches!(b, b'{' | b'['));
+                }
+                if object == Some(true) {
+                    if let Some(end) = boundary.scan(&prefix[scanned..]) {
+                        self.json_end = Some(scanned + end);
+                        break;
+                    }
+                    scanned = prefix.len();
+                }
+            }
+            if prefix.len() >= ERROR_BODY_LIMIT {
+                break;
+            }
+            let chunk = match tokio::time::timeout_at(deadline, response.chunk()).await {
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Err(err)) => {
+                    self.error = Some(err);
+                    break;
+                }
+                Ok(Ok(None)) => {
+                    self.complete = true;
+                    break;
+                }
+                Err(_) => break,
+            };
+            let take = chunk.len().min(ERROR_BODY_LIMIT - prefix.len());
+            prefix.extend_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                self.chunks[1] = Some(chunk.slice(take..));
+            }
+        }
+        self.chunks[0] = (!prefix.is_empty()).then(|| prefix.into());
+    }
 }
 
 fn duration_seconds(mut raw: &str) -> Option<i64> {
@@ -1200,41 +1375,35 @@ fn quota_deadline(header: Option<DateTime<Utc>>, body: Option<DateTime<Utc>>, fa
     header.max(body).unwrap_or_else(|| cooldown_after(now, fallback.min(MAX_COOLDOWN_SECS as u64) as i64))
 }
 
-#[cfg(test)]
 pub(crate) fn cooldown(lane: Lane, headers: &HeaderMap, body: &[u8], fallback: u64) -> DateTime<Utc> {
     let now = Utc::now();
     quota_deadline(header_cooldown(lane, headers, now), if lane == Lane::Google { body_reset_hint(body) } else { None }, fallback, now)
 }
 
-#[derive(Clone, Copy)]
-enum Backoff {
-    Auth(DateTime<Utc>),
-    Quota(DateTime<Utc>),
-}
-
-fn auth_backoff(fallback: u64) -> Backoff {
-    Backoff::Auth(cooldown_after(Utc::now(), fallback.clamp(1, 60) as i64))
-}
-
-async fn result(proxy: &Proxy, account: &Account, model: &str, cooldown: Option<Backoff>, success: bool) -> Option<DateTime<Utc>> {
+async fn result(
+    proxy: &Proxy,
+    account: &Account,
+    model: &str,
+    cooldown: Option<DateTime<Utc>>,
+    success: bool,
+    request_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
     let mut state = proxy.state.write().await;
-    let current = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account))?;
+    let current = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_secret(account))?;
     let now = Utc::now();
     current.last_used = Some(now);
     if success {
         current.success = current.success.saturating_add(1);
+        if current.last_error.as_ref().is_none_or(|e| e.occurred_at <= request_at) && current.clear_account_error() {
+            current.probe_failed = false;
+            proxy.notify_hub_sync();
+        }
     } else {
         current.failure = current.failure.saturating_add(1);
     }
-    match cooldown {
-        Some(Backoff::Auth(until)) => {
-            current.auth_cooldown = current.auth_cooldown.max(Some(until));
-        }
-        Some(Backoff::Quota(until)) => {
-            apply_quota(current, model, until, now);
-            return current.quota_limited_until(now, model);
-        }
-        None => {}
+    if let Some(until) = cooldown {
+        apply_quota(current, model, until, now);
+        return current.quota_limited_until(now, model);
     }
     None
 }
@@ -1364,7 +1533,11 @@ fn google_usage_observes_array_and_later_cache_details_without_counting_prompt_a
 }
 
 fn is_sse(headers: &HeaderMap) -> bool {
-    headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"))
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 fn inspect_google(headers: &HeaderMap) -> bool {
@@ -1426,14 +1599,24 @@ impl GoogleError {
         Some((Self { status, reset: google_reset_hint(raw, Utc::now()) }, raw))
     }
 
-    fn backoff(self, headers: &HeaderMap, fallback: u64, now: DateTime<Utc>) -> Option<Backoff> {
-        match self.status {
-            StatusCode::TOO_MANY_REQUESTS => {
-                Some(Backoff::Quota(quota_deadline(header_cooldown(Lane::Google, headers, now), self.reset, fallback, now)))
-            }
-            StatusCode::UNAUTHORIZED => Some(auth_backoff(fallback)),
-            _ => None,
+    fn classify(self, raw: &Value, account: &Account, source: AccountErrorSource) -> Option<AccountError> {
+        let mut classified = classify_upstream_http_error(
+            Lane::Google,
+            self.status,
+            &HeaderMap::new(),
+            raw.to_string().as_bytes(),
+            source,
+            &account_secrets(account),
+        )?;
+        // A generic in-band 403 can be specific to the requested resource.
+        if classified.kind == AccountErrorKind::PermissionDenied
+            && !raw.pointer("/error/details").is_some_and(Value::is_array)
+            && source == AccountErrorSource::Inference
+        {
+            return None;
         }
+        classified.source = source;
+        Some(classified)
     }
 
     fn outcome(self) -> &'static str {
@@ -1743,10 +1926,15 @@ struct Wire {
     upstream_done: bool,
     sse: bool,
     google: Option<GoogleFrames>,
+    google_sse: bool,
     fallback: u64,
     usage: Usage,
     usage_buf: Vec<u8>,
-    discard_line: bool,
+    sse_frames: SseFrames,
+    sse_eof: bool,
+    sse_terminal: bool,
+    sse_failed: bool,
+    request_at: DateTime<Utc>,
     capture_buf: Vec<u8>,
     response_size: usize,
 }
@@ -1794,43 +1982,137 @@ impl Wire {
     async fn google_frame(&mut self, mut frame: GoogleFrame) -> Bytes {
         if let Some((span, mut raw)) = frame.json.take() {
             self.usage.observe(&raw, Lane::Google);
-            if let Some((error, _)) = GoogleError::from_frame(&raw)
+            if let Some((error, detail)) = GoogleError::from_frame(&raw)
                 && let Some(exchange) = &mut self.guard.0
             {
-                let cooldown = error.backoff(self.upstream.headers(), self.fallback, Utc::now());
+                let classified = error.classify(detail, &self.account, AccountErrorSource::Stream);
+                let now = Utc::now();
+                let cooldown = classified
+                    .as_ref()
+                    .filter(|e| e.kind == AccountErrorKind::QuotaExhausted)
+                    .map(|_| quota_deadline(header_cooldown(Lane::Google, self.upstream.headers(), now), error.reset, self.fallback, now));
                 let first_error = self.guard.1.is_none();
                 let effective = if first_error {
-                    let effective = result(&self.proxy, &self.account, &exchange.model, cooldown, false).await;
+                    let effective = result(&self.proxy, &self.account, &exchange.model, cooldown, false, self.request_at).await;
+                    if let Some(classified) = &classified {
+                        exchange.attempt_error(classified);
+                        self.proxy.report_account_error(&self.account, classified).await;
+                    }
                     if let Some(last) = exchange.attempts.last_mut() {
                         last.status_code = Some(i32::from(error.status.as_u16()));
                         last.outcome = error.outcome().into();
                     }
                     self.guard.1 = Some((error, self.usage, millis(self.started.elapsed())));
                     effective
-                } else if let Some(Backoff::Quota(until)) = cooldown {
+                } else if let Some(until) = cooldown {
                     extend_quota(&self.proxy, &self.account, &exchange.model, Some(until)).await
                 } else {
                     None
                 };
-                if let Some(Backoff::Quota(until)) = cooldown {
+                if let Some(until) = cooldown {
                     if first_error {
                         self.proxy.schedule_usage_refresh(self.account.id.clone()).await;
                     }
                     normalize_google_quota(&mut raw, &exchange.model, effective.map_or(until, |at| at.max(until)), Utc::now());
-                    let mut bytes = frame.bytes.to_vec();
-                    bytes.splice(span, raw.to_string().bytes());
-                    return bytes.into();
+                } else if let Some(error) = classified.filter(|e| e.kind.is_blocking()) {
+                    raw = stream_error_body(error.kind);
+                } else {
+                    return frame.bytes;
                 }
+                let mut bytes = frame.bytes.to_vec();
+                bytes.splice(span, raw.to_string().bytes());
+                return bytes.into();
             }
         }
         frame.bytes
     }
 
+    async fn record_stream_error(&mut self, error: AccountError) {
+        self.sse_failed = true;
+        let limited =
+            if error.kind == AccountErrorKind::QuotaExhausted { Some(cooldown_after(Utc::now(), self.fallback as i64)) } else { None };
+        if let Some(exchange) = &mut self.guard.0 {
+            exchange.attempt_error(&error);
+            if let Some(last) = exchange.attempts.last_mut() {
+                last.outcome = "stream_error".into();
+            }
+        }
+        let model = self.guard.0.as_ref().map_or("", |exchange| exchange.model.as_str());
+        result(&self.proxy, &self.account, model, limited, false, self.request_at).await;
+        self.proxy.report_account_error(&self.account, &error).await;
+        if limited.is_some() {
+            self.proxy.schedule_usage_refresh(self.account.id.clone()).await;
+        }
+    }
+
+    async fn upstream_chunk(&mut self) -> Result<Option<Bytes>, reqwest::Error> {
+        if let Some(chunk) = self.first[0].take().or_else(|| self.first[1].take()) {
+            Ok(Some(chunk))
+        } else if let Some(err) = self.stream_error.take() {
+            // Let the downstream dispatcher flush the buffered prefix before it aborts the body.
+            tokio::task::yield_now().await;
+            Err(err)
+        } else {
+            self.upstream.chunk().await
+        }
+    }
+
+    async fn next_sse_chunk(&mut self) -> Result<Option<Bytes>, reqwest::Error> {
+        if self.sse_terminal {
+            return Ok(None);
+        }
+        loop {
+            let (frame, error) = match self.sse_frames.take(self.sse_eof) {
+                Some((frame, true)) => {
+                    let error = SseObserver::frame(&frame, &mut self.usage, &self.account);
+                    if self.google_sse && !error.as_ref().is_some_and(|e| e.kind.is_blocking()) {
+                        let mut lines = GoogleFrames::new(true);
+                        lines.push(frame.clone());
+                        let mut rewritten = Vec::new();
+                        while let Some(line) = lines.next(true) {
+                            rewritten.extend_from_slice(&self.google_frame(line).await);
+                        }
+                        (rewritten.into(), error.filter(|_| self.guard.1.is_none()))
+                    } else {
+                        (frame, error)
+                    }
+                }
+                Some((bytes, false)) => return Ok(Some(bytes)),
+                None if self.sse_eof => return Ok(None),
+                None => {
+                    if let Some(chunk) = self.upstream_chunk().await? {
+                        self.sse_frames.push(chunk);
+                    } else {
+                        self.sse_eof = true;
+                    }
+                    continue;
+                }
+            };
+            if let Some(error) = error {
+                let kind = error.kind;
+                let terminal = kind.is_blocking();
+                if self.status.is_success() && (!self.sse_failed || terminal) {
+                    self.record_stream_error(error).await;
+                }
+                if terminal {
+                    self.sse_terminal = true;
+                    let body = stream_error_body(kind);
+                    return Ok(Some(Bytes::from(format!("event: error\ndata: {body}\n\n"))));
+                }
+            }
+            return Ok(Some(frame));
+        }
+    }
+
     async fn next(mut self) -> Result<Option<(Bytes, Self)>, reqwest::Error> {
-        let chunk = match self.next_frame().await {
-            Ok(Some(frame)) => Ok(Some(self.google_frame(frame).await)),
-            Ok(None) => Ok(None),
-            Err(err) => Err(err),
+        let chunk = if self.sse {
+            self.next_sse_chunk().await
+        } else {
+            match self.next_frame().await {
+                Ok(Some(frame)) => Ok(Some(self.google_frame(frame).await)),
+                Ok(None) => Ok(None),
+                Err(err) => Err(err),
+            }
         };
         if let Ok(Some(data)) = &chunk {
             self.response_size = self.response_size.saturating_add(data.len());
@@ -1845,44 +2127,39 @@ impl Wire {
                     self.capture_buf.extend_from_slice(data);
                 }
             }
-            if self.google.is_none() && self.sse {
-                for chunk in data.split_inclusive(|b| *b == b'\n') {
-                    if chunk.len() + self.usage_buf.len() > 1024 * 1024 {
-                        self.discard_line = true;
-                        self.usage_buf.clear();
-                    }
-                    if !self.discard_line {
-                        self.usage_buf.extend_from_slice(chunk);
-                    }
-                    if chunk.ends_with(b"\n") {
-                        if !self.discard_line {
-                            observe_line(&mut self.usage, &self.usage_buf, self.account.lane);
-                        }
-                        self.usage_buf.clear();
-                        self.discard_line = false;
-                    }
+            if !self.sse && self.google.is_none() {
+                if self.response_size <= 1024 * 1024 {
+                    self.usage_buf.extend_from_slice(data);
+                } else {
+                    self.usage_buf.clear();
                 }
-            } else if self.google.is_none() && self.response_size <= 1024 * 1024 {
-                self.usage_buf.extend_from_slice(data);
-            } else {
-                self.usage_buf.clear();
             }
         }
         match chunk {
             Ok(Some(data)) => Ok(Some((data, self))),
             done => {
-                if self.sse {
-                    observe_line(&mut self.usage, &self.usage_buf, self.account.lane);
-                } else if let Ok(raw) = serde_json::from_slice(&self.usage_buf) {
+                if !self.sse
+                    && let Ok(raw) = serde_json::from_slice(&self.usage_buf)
+                {
                     self.usage.observe(&raw, self.account.lane);
                 }
                 if self.status.is_success() && self.guard.1.is_none() {
-                    let _ = result(&self.proxy, &self.account, "", None, done.is_ok()).await;
+                    if done.is_err() && !self.sse_failed {
+                        self.record_stream_error(local_error(
+                            AccountErrorKind::UpstreamUnavailable,
+                            AccountErrorSource::Stream,
+                            "upstream response stream broke",
+                        ))
+                        .await;
+                    }
+                    if !self.sse_failed {
+                        result(&self.proxy, &self.account, "", None, true, self.request_at).await;
+                    }
                 }
                 if let Some(mut exchange) = self.guard.0.take() {
                     let outcome = if let Some((error, _, _)) = self.guard.1 {
                         error.outcome()
-                    } else if done.is_err() {
+                    } else if done.is_err() || self.sse_failed {
                         "stream_error"
                     } else if self.status.is_success() {
                         "success"
@@ -1912,11 +2189,151 @@ impl Wire {
     }
 }
 
-fn observe_line(usage: &mut Usage, line: &[u8], lane: Lane) {
-    if let Some(data) = line.strip_prefix(b"data:")
-        && let Ok(raw) = serde_json::from_slice::<Value>(data)
-    {
-        usage.observe(&raw, lane);
+fn stream_error_body(kind: AccountErrorKind) -> Value {
+    json!({"error": {
+        "type": kind.as_str(),
+        "message": "The provider stopped this stream. Check Fleetix Hub notifications for details."
+    }})
+}
+
+// Hold whole events, not HTTP chunks: an upstream error can start in one
+// chunk and become classifiable only in a later chunk.
+#[derive(Default)]
+struct SseFrames {
+    pending: Bytes,
+    frame: Vec<u8>,
+    line_has_data: bool,
+    passthrough: bool,
+    after_cr: bool,
+}
+
+fn sse_line_break(bytes: &[u8]) -> Option<(usize, usize)> {
+    let at = bytes.iter().position(|b| matches!(b, b'\r' | b'\n'))?;
+    let crlf = bytes[at] == b'\r' && bytes.get(at + 1) == Some(&b'\n');
+    Some((at, at + 1 + usize::from(crlf)))
+}
+
+impl SseFrames {
+    fn push(&mut self, chunk: Bytes) {
+        debug_assert!(self.pending.is_empty() || self.pending.as_ref() == b"\r");
+        self.pending = if self.pending.is_empty() {
+            chunk
+        } else {
+            // An isolated trailing CR might be the first byte of CRLF.
+            let mut joined = Vec::with_capacity(chunk.len() + 1);
+            joined.push(b'\r');
+            joined.extend_from_slice(&chunk);
+            joined.into()
+        };
+    }
+
+    // The bool indicates a complete frame eligible for inspection, not raw passthrough bytes.
+    fn take(&mut self, eof: bool) -> Option<(Bytes, bool)> {
+        const MAX_EVENT_BYTES: usize = 1024 * 1024;
+        if !self.pending.is_empty() && std::mem::take(&mut self.after_cr) && self.pending[0] == b'\n' {
+            return Some((self.pending.split_to(1), false));
+        }
+        let mut forwarded = 0;
+        while forwarded < self.pending.len() {
+            let rest = &self.pending[forwarded..];
+            let (len, end) = sse_line_break(rest).unwrap_or((rest.len(), rest.len()));
+            let boundary = len == 0 && !self.line_has_data;
+            let trailing_cr = !eof && len + 1 == rest.len() && rest[len] == b'\r';
+            // A blank line ending in a CR already completes the event. If its
+            // optional LF arrives later, forward it without treating it as another line.
+            let wait_for_lf = trailing_cr && !boundary && !self.passthrough;
+            if !self.passthrough && self.frame.len() + end > MAX_EVENT_BYTES {
+                self.passthrough = true;
+                if !self.frame.is_empty() {
+                    return Some((std::mem::take(&mut self.frame).into(), false));
+                }
+                continue;
+            }
+            let end = if wait_for_lf { len } else { end };
+            if end == 0 {
+                break;
+            }
+            let line_ended = end > len;
+            self.line_has_data = !line_ended && (self.line_has_data || len > 0);
+            self.after_cr = trailing_cr && line_ended;
+            if self.passthrough {
+                forwarded += end;
+                if boundary {
+                    self.passthrough = false;
+                    break;
+                }
+            } else {
+                self.frame.extend_from_slice(&self.pending.split_to(end));
+                if boundary {
+                    return Some((std::mem::take(&mut self.frame).into(), true));
+                }
+            }
+        }
+        if forwarded > 0 {
+            Some((self.pending.split_to(forwarded), false))
+        } else {
+            (eof && !self.frame.is_empty()).then(|| (std::mem::take(&mut self.frame).into(), true))
+        }
+    }
+}
+
+#[derive(Default)]
+struct SseObserver {
+    event: String,
+    data: Vec<u8>,
+}
+
+impl SseObserver {
+    fn frame(frame: &[u8], usage: &mut Usage, account: &Account) -> Option<AccountError> {
+        let mut observer = Self::default();
+        let mut rest = frame.strip_prefix(b"\xef\xbb\xbf").unwrap_or(frame);
+        let mut first_error = None;
+        while !rest.is_empty() {
+            let (len, end) = sse_line_break(rest).unwrap_or((rest.len(), rest.len()));
+            if let Some(error) = observer.observe(&rest[..len], usage, account) {
+                if error.kind.is_blocking() {
+                    return Some(error);
+                }
+                first_error.get_or_insert(error);
+            }
+            rest = &rest[end..];
+        }
+        observer.flush(usage, account).or(first_error)
+    }
+
+    fn observe(&mut self, line: &[u8], usage: &mut Usage, account: &Account) -> Option<AccountError> {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            return self.flush(usage, account);
+        }
+        if let Some(event) = line.strip_prefix(b"event:") {
+            self.event = match event.trim_ascii() {
+                b"error" => "error".into(),
+                b"response.failed" => "response.failed".into(),
+                _ => String::new(),
+            };
+        } else if let Some(data) = line.strip_prefix(b"data:") {
+            self.data.extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
+            self.data.push(b'\n');
+            if let Ok(raw) = serde_json::from_slice::<Value>(data) {
+                usage.observe(&raw, account.lane);
+                if let Some(error) = classify_sse_error(account.lane, &self.event, data, &account_secrets(account)) {
+                    return Some(error);
+                }
+            }
+        }
+        None
+    }
+
+    fn flush(&mut self, usage: &mut Usage, account: &Account) -> Option<AccountError> {
+        if let Ok(raw) = serde_json::from_slice::<Value>(&self.data) {
+            usage.observe(&raw, account.lane);
+        }
+        let error = classify_sse_error(account.lane, &self.event, &self.data, &account_secrets(account));
+        self.event.clear();
+        self.data.clear();
+        error
     }
 }
 
@@ -1932,10 +2349,17 @@ impl Drop for RecordOnDrop {
                     exchange.finish(Some(error.status), error.outcome(), usage, Some(latency), None).await;
                     return;
                 }
+                let mut status = None;
+                let mut outcome = "disconnected";
                 if let Some(last) = exchange.attempts.last_mut() {
-                    last.outcome = "disconnected".into();
+                    if last.outcome == "stream_error" {
+                        outcome = "stream_error";
+                        status = last.status_code.and_then(|n| StatusCode::from_u16(n as u16).ok());
+                    } else {
+                        last.outcome = "disconnected".into();
+                    }
                 }
-                exchange.finish(None, "disconnected", Usage::default(), None, None).await;
+                exchange.finish(status, outcome, Usage::default(), None, None).await;
             });
         }
     }
@@ -2051,6 +2475,12 @@ impl Exchange {
         }
     }
 
+    fn attempt_error(&mut self, error: &AccountError) {
+        if let Some(last) = self.attempts.last_mut() {
+            last.error_message = Some(error.summary());
+        }
+    }
+
     async fn rate_limited(self, reset: DateTime<Utc>, usage: Usage, latency: Option<i64>) -> Response {
         let lane = self.lane;
         let model = self.model.clone();
@@ -2145,7 +2575,7 @@ impl Exchange {
             effort: self.effort,
             outcome: outcome.into(),
             status_code: status.map(|s| i32::from(s.as_u16())),
-            error_message: None,
+            error_message: last.and_then(|a| a.error_message.clone()),
             latency_ms: Some(millis(self.started.elapsed())),
             ttft_ms: last.and_then(|a| a.ttft_ms),
             input_tokens: usage.total(self.lane),

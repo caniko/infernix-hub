@@ -132,6 +132,9 @@ pub struct Account {
     pub multiplier: Option<f64>,
     pub access: String,
     pub refresh: Option<String>,
+    // In-memory only: labels on disk can still contain retired credentials.
+    // Keep safe labels keyed by the original label digest for the life of this account.
+    redacted_labels: HashMap<[u8; 32], String>,
     pub expires: Option<DateTime<Utc>>,
     pub chatgpt_id: Option<String>,
     pub chatgpt_user: Option<String>,
@@ -144,7 +147,9 @@ pub struct Account {
     pub local: bool,
     pub models: Vec<String>,
     pub cooldown: Option<DateTime<Utc>>,
-    pub auth_cooldown: Option<DateTime<Utc>>,
+    pub last_error: Option<AccountError>,
+    pub error_generation: u64,
+    pub source_fingerprint: Option<String>,
     pub scoped_cooldowns: BTreeMap<String, DateTime<Utc>>,
     pub windows: Vec<QuotaWindow>,
     pub google_fallback_keys: BTreeSet<String>,
@@ -154,11 +159,49 @@ pub struct Account {
     pub last_used: Option<DateTime<Utc>>,
     pub probe_failed: bool,
     pub probe_generation: u64,
+    provenance_token_fp: Option<[u8; 32]>,
     pub success: u64,
     pub failure: u64,
 }
 
 impl Account {
+    pub(crate) fn current_secrets(&self) -> [&str; 3] {
+        [&self.access, self.refresh.as_deref().unwrap_or_default(), self.google_secret.as_deref().unwrap_or_default()]
+    }
+
+    pub(crate) fn known_safe_label(&self, raw: &str) -> Option<&str> {
+        self.redacted_labels.get(&<[u8; 32]>::from(Sha256::digest(raw))).map(String::as_str)
+    }
+
+    fn scrub_label(&mut self, previous_secrets: &[&str]) {
+        let hash = Sha256::digest(&self.label).into();
+        let mut redacted_labels = std::mem::take(&mut self.redacted_labels);
+        let label = redacted_labels.get(&hash).unwrap_or(&self.label);
+        let secrets = self.current_secrets().into_iter().chain(previous_secrets.iter().copied()).collect::<Vec<_>>();
+        let safe = crate::error_classify::scrub_label(label, &secrets);
+        // A newly known credential may also appear in an inactive saved label.
+        for label in redacted_labels.values_mut() {
+            if secrets.iter().any(|secret| !secret.is_empty() && label.contains(secret)) {
+                *label = crate::error_classify::scrub_label(label, &secrets);
+            }
+        }
+        if safe != self.label {
+            redacted_labels.insert(hash, safe.clone());
+        }
+        self.redacted_labels = redacted_labels;
+        self.label = safe;
+    }
+
+    pub(crate) fn replace_access(&mut self, access: String) {
+        let old = std::mem::replace(&mut self.access, access);
+        self.scrub_label(&[&old]);
+    }
+
+    pub(crate) fn replace_refresh(&mut self, refresh: Option<String>) {
+        let old = std::mem::replace(&mut self.refresh, refresh);
+        self.scrub_label(&[old.as_deref().unwrap_or_default()]);
+    }
+
     pub(crate) fn needs_google_metadata(&self) -> bool {
         self.lane == Lane::Google && !self.disabled && !self.api_key && (self.email.is_none() || self.project.is_none())
     }
@@ -171,8 +214,67 @@ impl Account {
             && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
     }
 
+    pub(crate) fn same_secret(&self, other: &Self) -> bool {
+        self.same_credential(other)
+            && self.access == other.access
+            && self.refresh == other.refresh
+            && self.google_client == other.google_client
+            && self.google_secret == other.google_secret
+    }
+
+    pub fn record_account_error(&mut self, mut err: AccountError, now: DateTime<Utc>, backoff: Option<Duration>) -> bool {
+        if err.source != AccountErrorSource::QuotaProbe {
+            self.error_generation = self.error_generation.saturating_add(1);
+        }
+        let previous = self.last_error.as_ref();
+        // Blocking kinds remain quarantined until recovery, even after their retry backoff.
+        if !err.kind.is_blocking() && previous.is_some_and(|old| old.kind.is_blocking()) {
+            return false;
+        }
+        let same_kind = previous.is_some_and(|old| old.kind == err.kind);
+        err.consecutive_count = previous.filter(|_| same_kind).map_or(1, |old| old.consecutive_count.saturating_add(1));
+        let was_quarantined = self.quarantined(now);
+        let backoff = backoff
+            .or_else(|| (err.kind == AccountErrorKind::UpstreamUnavailable && err.consecutive_count >= 3).then(|| Duration::from_secs(30)));
+        err.backoff_until = backoff
+            .and_then(|d| now.checked_add_signed(chrono::TimeDelta::from_std(d).ok()?))
+            .max(previous.filter(|_| same_kind).and_then(|old| old.backoff_until));
+        let changed = !previous.is_some_and(|old| {
+            old.kind == err.kind
+                && old.provider_code == err.provider_code
+                && old.http_status == err.http_status
+                && old.message == err.message
+                && old.is_notification_worthy() == err.is_notification_worthy()
+        }) || was_quarantined != err.blocks_routing(now);
+        self.last_error = Some(err);
+        changed
+    }
+
+    pub fn clear_account_error(&mut self) -> bool {
+        self.last_error.take().is_some()
+    }
+
+    pub(crate) fn record_error_once(&mut self, error: &AccountError) -> bool {
+        // A failed OAuth refresh is recorded at the endpoint and returned to
+        // the inference or quota caller. Count the shared failure only once.
+        if self.last_error.as_ref().is_some_and(|old| old.occurred_at >= error.occurred_at) {
+            return false;
+        }
+        self.record_account_error(error.clone(), Utc::now(), crate::error_classify::blocking_backoff(error.kind))
+    }
+
+    pub(crate) fn quarantined(&self, now: DateTime<Utc>) -> bool {
+        self.last_error.as_ref().is_some_and(|error| error.blocks_routing(now))
+    }
+
+    pub(crate) fn has_account_error(&self) -> bool {
+        self.last_error
+            .as_ref()
+            .map_or(self.probe_failed, |err| err.blocks_routing(Utc::now()) || err.kind == AccountErrorKind::ProbeFailed)
+    }
+
     pub fn eligible(&self, now: DateTime<Utc>, model: &str) -> bool {
-        self.supports(model) && self.auth_cooldown.is_none_or(|at| at <= now) && self.quota_limited_until(now, model).is_none()
+        self.supports(model) && !self.quarantined(now) && self.quota_limited_until(now, model).is_none()
     }
 
     fn supports(&self, model: &str) -> bool {
@@ -208,9 +310,10 @@ impl Account {
     pub fn inventory(&self, pool: &Pool) -> Value {
         let mut row = json!({
             "id": self.id, "name": self.name, "auth_index": self.auth_index, "provider": self.provider,
-            "type": self.provider, "label": self.label, "disabled": self.disabled, "note": self.note, "priority": self.priority,
-            "weight": self.weight, "status": if self.disabled { "disabled" } else if self.probe_failed { "error" } else { "active" },
+            "type": self.provider, "label": crate::error_classify::safe_label(self), "disabled": self.disabled, "note": self.note, "priority": self.priority,
+            "weight": self.weight, "status": if self.disabled { "disabled" } else if self.has_account_error() { "error" } else { "active" },
             "cooldown_until": self.cooldown, "observed_at": self.observed, "last_used_at": self.last_used,
+            "last_error": self.last_error,
             "preferred": pool.preferred(self.lane) == Some(self.id.as_str()),
             "plan": self.plan.as_ref().map(|p| json!({"tier":p,"label":p,"multiplier":self.multiplier})),
         });
@@ -340,7 +443,8 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
                 || matches!(kind, "api_key" | "api-key")
                 || (kind == "openai" && access.starts_with("sk-") && refresh.is_none()));
         let access_claims = jwt_claims(access);
-        let claims = text(entry, &["id_token", "/tokens/id_token"]).map(jwt_claims).unwrap_or_else(|| access_claims.clone());
+        let id_token = text(entry, &["id_token", "/tokens/id_token"]);
+        let claims = id_token.map(jwt_claims).unwrap_or_else(|| access_claims.clone());
         let chat = &claims["https://api.openai.com/auth"];
         let access_chat = &access_claims["https://api.openai.com/auth"];
         let chatgpt_id =
@@ -379,7 +483,7 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
             _ => text(group, &["note"]).or_else(|| text(raw, &["note"])).map(str::to_owned),
         };
-        Ok(Account {
+        let mut account = Account {
             auth_index: hex::encode(&Sha256::digest(format!("fleetix-proxy:{id}"))[..12]),
             id,
             name: name.into(),
@@ -398,6 +502,7 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
                 .filter(|n| *n > 0.0),
             access: access.into(),
             refresh: refresh.map(str::to_owned),
+            redacted_labels: HashMap::new(),
             expires: ["expires_at", "expiresAt", "expiry", "expired", "expires", "/claudeAiOauth/expiresAt"]
                 .into_iter()
                 .find_map(|k| date(if k.starts_with('/') { entry.pointer(k).unwrap_or(&Value::Null) } else { &entry[k] }))
@@ -413,7 +518,9 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             local,
             models: models.clone(),
             cooldown: None,
-            auth_cooldown: None,
+            last_error: None,
+            error_generation: 0,
+            source_fingerprint: None,
             scoped_cooldowns: BTreeMap::new(),
             windows: vec![],
             google_fallback_keys: BTreeSet::new(),
@@ -423,9 +530,25 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             last_used: None,
             probe_failed: false,
             probe_generation: 0,
+            provenance_token_fp: None,
             success: 0,
             failure: 0,
-        })
+        };
+        // Hash parsed credential material, not the editable credential document.
+        let material = json!([
+            account.access,
+            account.refresh,
+            account.expires,
+            id_token,
+            account.google_client,
+            account.google_secret,
+            account.chatgpt_id,
+            account.chatgpt_user,
+            account.organization,
+            account.project,
+        ]);
+        account.source_fingerprint = Some(hex::encode(Sha256::digest(material.to_string())));
+        Ok(account)
     };
     if let Some(keys) = group["keys"].as_array() {
         ensure!(!keys.is_empty() && keys.len() <= 256, "invalid key group size");
@@ -508,16 +631,36 @@ impl Pool {
 
     pub fn insert(&mut self, accounts: Vec<Account>) {
         for mut a in accounts {
-            if let Some(old) = self.accounts.get(&a.id) {
+            if let Some(old) = self.accounts.get_mut(&a.id) {
+                a.redacted_labels.extend(std::mem::take(&mut old.redacted_labels));
+                // Scrub before preserving any live credentials on an unchanged reload.
+                a.scrub_label(&old.current_secrets());
                 if a.local && old.local && old.lane == a.lane {
                     a.disabled = old.disabled;
                     a.priority = old.priority;
                     a.weight = old.weight;
                     a.note.clone_from(&old.note);
                 }
-                if old.same_credential(&a) && old.access == a.access && old.refresh == a.refresh {
+                let unchanged = a.lane == old.lane
+                    && a.api_key == old.api_key
+                    && a.base == old.base
+                    && if a.source_fingerprint.is_some() { a.source_fingerprint == old.source_fingerprint } else { old.same_secret(&a) };
+                a.error_generation = old.error_generation.saturating_add(u64::from(!unchanged));
+                if unchanged {
+                    a.access.clone_from(&old.access);
+                    a.refresh.clone_from(&old.refresh);
+                    a.expires = old.expires;
+                    a.google_client.clone_from(&old.google_client);
+                    a.google_secret.clone_from(&old.google_secret);
+                    a.project.clone_from(&old.project);
+                    if a.email.is_none() {
+                        a.email.clone_from(&old.email);
+                    }
+                    if a.local {
+                        a.label = crate::error_classify::safe_label(old);
+                    }
                     a.cooldown = old.cooldown;
-                    a.auth_cooldown = old.auth_cooldown;
+                    a.last_error.clone_from(&old.last_error);
                     a.scoped_cooldowns.clone_from(&old.scoped_cooldowns);
                     a.windows.clone_from(&old.windows);
                     a.google_fallback_keys.clone_from(&old.google_fallback_keys);
@@ -527,9 +670,12 @@ impl Pool {
                     a.last_used = old.last_used;
                     a.probe_failed = old.probe_failed;
                     a.probe_generation = old.probe_generation;
+                    a.provenance_token_fp = old.provenance_token_fp;
                     a.success = old.success;
                     a.failure = old.failure;
                 }
+            } else {
+                a.scrub_label(&[]);
             }
             self.accounts.insert(a.id.clone(), a);
         }
@@ -552,13 +698,30 @@ impl Pool {
 
     pub fn next_reset(&self, lane: Lane, model: &str, required_project: Option<&str>) -> Option<DateTime<Utc>> {
         let now = Utc::now();
-        self.supported(lane, model, required_project).filter_map(|a| a.quota_limited_until(now, model)).min()
+        self.supported(lane, model, required_project)
+            .filter(|a| !a.quarantined(now))
+            .filter_map(|a| a.quota_limited_until(now, model))
+            .min()
     }
 
     pub fn all_quota_limited(&self, lane: Lane, model: &str, required_project: Option<&str>) -> bool {
         let now = Utc::now();
         let mut accounts = self.supported(lane, model, required_project).peekable();
-        accounts.peek().is_some() && accounts.all(|a| a.quota_limited_until(now, model).is_some())
+        accounts.peek().is_some() && accounts.all(|a| !a.quarantined(now) && a.quota_limited_until(now, model).is_some())
+    }
+
+    pub(crate) fn has_eligible_account(&self, lane: Lane, model: &str, required_project: Option<&str>) -> bool {
+        let now = Utc::now();
+        self.supported(lane, model, required_project).any(|a| a.eligible(now, model))
+    }
+
+    pub(crate) fn uniform_quarantine_kind(&self, lane: Lane, model: &str, required_project: Option<&str>) -> Option<AccountErrorKind> {
+        let now = Utc::now();
+        let mut kinds = self
+            .supported(lane, model, required_project)
+            .map(|a| a.last_error.as_ref().filter(|err| err.blocks_routing(now)).map(|err| err.kind));
+        let kind = kinds.next()??;
+        kinds.all(|other| other == Some(kind)).then_some(kind)
     }
 
     pub fn preferred(&self, lane: Lane) -> Option<&str> {
@@ -761,7 +924,8 @@ fn add(pool: &mut Pool, lane: Lane, label: &str, mut raw: Value) {
                 return false;
             }
             !pool.accounts.values().any(|old| {
-                old.lane == a.lane
+                old.id != a.id
+                    && old.lane == a.lane
                     && ((!a.access.is_empty() && old.access == a.access)
                         || a.refresh.as_ref().is_some_and(|r| old.refresh.as_ref() == Some(r)))
             })
@@ -827,7 +991,34 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         if existing.email.is_none() {
             existing.email = email;
         }
-        pool.revision += i64::from(relabel || enriched);
+        existing.scrub_label(&[]);
+        // Track the last discovered token separately from any access token the
+        // proxy refreshed in memory; an unchanged disk snapshot is not a renewal.
+        let mut rotated = false;
+        if existing.local
+            && let Some(access) = text(&raw, &["access_token", "accessToken", "access", "token"])
+                .filter(|s| s.len() <= 32_768 && s.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            let digest = Sha256::digest(access).into();
+            let expiry = ["expires_at", "expiresAt", "expiry", "expires"].into_iter().find_map(|key| date(&raw[key]));
+            let previous = existing.provenance_token_fp.replace(digest);
+            let expired = existing.access.is_empty() || existing.expires.is_some_and(|at| at <= Utc::now());
+            if (previous.is_some_and(|fp| fp != digest) || (previous.is_none() && expired))
+                && access != existing.access
+                && expiry.is_none_or(|at| at > Utc::now())
+            {
+                existing.replace_access(access.to_owned());
+                existing.expires = expiry;
+                rotated = true;
+            }
+        }
+        if rotated {
+            existing.clear_account_error();
+            existing.probe_failed = false;
+            existing.probe_generation = 0;
+            existing.error_generation = existing.error_generation.saturating_add(1);
+        }
+        pool.revision += i64::from(relabel || enriched || rotated);
         return;
     }
     add(pool, Lane::Google, &format!("provenance:{label}"), raw);
