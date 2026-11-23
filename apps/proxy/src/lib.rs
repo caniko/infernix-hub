@@ -20,7 +20,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, TimeDelta, Utc};
 use config::Config;
 use contracts::providers::{ActivityExchangeIn, ProxyLogEntry, QuotaObservationState, QuotaStatus, QuotaWindow, ResetGrant};
-use pool::{Account, Lane, Pool, enforces_quota, quota_window_active};
+pub use pool::Lane;
+use pool::{Account, Pool, enforces_quota, quota_window_active};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -253,9 +254,12 @@ impl Proxy {
         use tokio::{process::Command, time::timeout};
 
         if let Some(raw) = read_local_opencode_auth().await {
-            pool::add_opencode(&mut self.state.write().await.pool, &raw);
+            pool::add_opencode(&mut self.state.write().await.pool, &raw, &self.config.exclude_local_lanes);
         }
 
+        if self.config.exclude_local_lanes.contains(&Lane::Google) {
+            return;
+        }
         let manifests = pool::provenance_google_manifests(&self.config, &self.source_user);
         if manifests.is_empty() {
             return;
@@ -328,14 +332,18 @@ impl Proxy {
         verified.then(|| pool::text(&info, &["email"]).map(str::to_owned)).flatten()
     }
 
-    async fn hydrate_google_emails(&self) {
+    async fn hydrate_google_metadata(&self) {
+        self.hydrate_missing_google_metadata(true).await;
+    }
+
+    async fn hydrate_missing_google_metadata(&self, include_project: bool) {
         let missing: Vec<Account> = {
             let state = self.state.read().await;
             state
                 .pool
                 .accounts
                 .values()
-                .filter(|a| a.lane == Lane::Google && !a.disabled && !a.api_key && a.email.is_none() && a.google_client.is_some())
+                .filter(|a| a.needs_google_metadata() && (include_project || (a.email.is_none() && a.google_client.is_some())))
                 .cloned()
                 .collect()
         };
@@ -344,23 +352,39 @@ impl Proxy {
         }
         let resolved = futures_util::future::join_all(missing.into_iter().map(|account| async move {
             let mut account = self.token_account(&account, false).await.ok()?;
-            let email = match self.google_token_email(&account.access).await {
-                Some(email) => Some(email),
-                None if account.refresh.is_some() => {
-                    account = self.token_account(&account, true).await.ok()?;
-                    self.google_token_email(&account.access).await
-                }
-                None => None,
-            }?;
-            Some((account, email))
+            let lookup = async |access: &str, email, project| {
+                tokio::join!(async { if email { self.google_token_email(access).await } else { None } }, async {
+                    if project { self.google_project_id(access).await } else { None }
+                },)
+            };
+            let need_email = account.email.is_none();
+            let need_project = include_project && account.project.is_none();
+            let (mut email, mut project) = lookup(&account.access, need_email, need_project).await;
+            let retry_email = need_email && email.is_none();
+            let retry_project = need_project && project.is_none();
+            if (retry_email || retry_project)
+                && account.refresh.is_some()
+                && let Ok(fresh) = self.token_account(&account, true).await
+                && fresh.access != account.access
+            {
+                account = fresh;
+                let (found_email, found_project) = lookup(&account.access, retry_email, retry_project).await;
+                email = email.or(found_email);
+                project = project.or(found_project);
+            }
+            Some((account, email, project))
         }))
         .await;
         let mut state = self.state.write().await;
-        for (account, email) in resolved.into_iter().flatten() {
-            if let Some(current) =
-                state.pool.accounts.get_mut(&account.id).filter(|c| !c.disabled && c.email.is_none() && c.same_credential(&account))
-            {
-                current.email = Some(email);
+        for (account, email, project) in resolved.into_iter().flatten() {
+            if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|c| !c.disabled && c.same_credential(&account)) {
+                if current.email.is_none() {
+                    current.email = email;
+                }
+                if current.project.is_none() && project.is_some() {
+                    current.project = project;
+                    state.pool.revision += 1;
+                }
             }
         }
     }
@@ -398,7 +422,7 @@ impl Proxy {
                 return matches_pool(&self.state.read().await.pool, &client_id, &email);
             }
         }
-        self.hydrate_google_emails().await;
+        self.hydrate_missing_google_metadata(false).await;
         let has_pool_candidates = |pool: &Pool| {
             pool.accounts
                 .values()
@@ -408,7 +432,7 @@ impl Proxy {
         let mut refreshed = false;
         if !has_candidates && self.refresh_local_commands(Duration::from_secs(15)).await {
             refreshed = true;
-            self.hydrate_google_emails().await;
+            self.hydrate_missing_google_metadata(false).await;
             has_candidates = has_pool_candidates(&self.state.read().await.pool);
         }
         if !has_candidates {
@@ -432,7 +456,7 @@ impl Proxy {
             clients.iter().copied().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned)
         };
         if matched_client.is_none() && !refreshed && self.refresh_local_commands(Duration::from_secs(15)).await {
-            self.hydrate_google_emails().await;
+            self.hydrate_missing_google_metadata(false).await;
             let state = self.state.read().await;
             matched_client = clients.iter().copied().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned);
         }
@@ -494,12 +518,13 @@ impl Proxy {
                     .filter(usable);
             if current.local
                 && self.config.discover_local
+                && !self.config.exclude_local_lanes.contains(&current.lane)
                 && updated.as_ref().is_none_or(|next| next.access == current.access)
                 && let Some(raw) = read_local_opencode_auth().await
             {
                 // Some OpenCode installs store OAuth only in their database.
                 let mut found = Pool::default();
-                pool::add_opencode(&mut found, &raw);
+                pool::add_opencode(&mut found, &raw, &self.config.exclude_local_lanes);
                 updated = found.accounts.remove(&current.id).filter(usable).or(updated);
             }
             let updated = updated.ok_or_else(|| anyhow!("no usable credential found on reload"))?;
@@ -567,9 +592,26 @@ impl Proxy {
         });
     }
 
-    async fn google_quota_windows(&self, account: &Account, token: &mut String) -> (Vec<QuotaWindow>, bool) {
-        use integrations::providers::antigravity;
-        let project = account.project.as_deref().map_or_else(|| serde_json::json!({}), |id| serde_json::json!({"project":id}));
+    async fn oauth_usage_json(
+        &self,
+        account: &Account,
+        token: &mut String,
+        request: impl Fn(&str) -> reqwest::RequestBuilder,
+    ) -> Result<Value, &'static str> {
+        let send = |access: &str| request(access).timeout(Duration::from_secs(12)).send();
+        let mut response = send(token).await.map_err(|_| "upstream request failed")?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && !account.api_key
+            && let Ok(fresh) = self.token(account, true).await
+            && fresh != *token
+        {
+            *token = fresh;
+            response = send(token).await.map_err(|_| "upstream request failed")?;
+        }
+        provider_response_json(response).await
+    }
+
+    fn antigravity_hosts(&self) -> Vec<reqwest::Url> {
         let mut hosts = vec![self.config.antigravity.clone()];
         if hosts[0].host_str() == Some("daily-cloudcode-pa.googleapis.com") {
             let mut standard = hosts[0].clone();
@@ -577,12 +619,37 @@ impl Proxy {
                 hosts.push(standard);
             }
         }
-        let request = |url, access: &str| {
+        hosts
+    }
+
+    async fn google_project_id(&self, token: &str) -> Option<String> {
+        for mut url in self.antigravity_hosts() {
+            url.set_path("/v1internal:loadCodeAssist");
+            let request = self
+                .http
+                .post(url)
+                .bearer_auth(token)
+                .header("user-agent", "antigravity/hub/2.24.0")
+                .json(&serde_json::json!({"metadata":{"ideType":"ANTIGRAVITY"}}));
+            if let Ok(raw) = provider_json(request).await
+                && let Some(project) = pool::text(&raw, &["cloudaicompanionProject", "/cloudaicompanionProject/id"])
+            {
+                return Some(project.trim().to_owned());
+            }
+        }
+        None
+    }
+
+    async fn google_quota_windows(&self, account: &mut Account, token: &mut String) -> (Vec<QuotaWindow>, bool) {
+        use integrations::providers::antigravity;
+        let hosts = self.antigravity_hosts();
+        let request = |url, access: &str, project: Option<&str>| {
+            let body = project.map_or_else(|| serde_json::json!({}), |id| serde_json::json!({"project":id}));
             self.http
                 .post(url)
                 .bearer_auth(access)
                 .header("user-agent", "antigravity/hub/2.24.0")
-                .json(&project)
+                .json(&body)
                 .timeout(Duration::from_secs(12))
         };
         let mut renewed = false;
@@ -600,7 +667,9 @@ impl Proxy {
                 })
                 .collect();
             let at = Utc::now();
-            let reads = futures_util::future::join_all(urls.iter().cloned().map(|url| request(url, token).send())).await;
+            let reads =
+                futures_util::future::join_all(urls.iter().cloned().map(|url| request(url, token, account.project.as_deref()).send()))
+                    .await;
             let mut retry = Vec::new();
             for (url, response) in urls.into_iter().zip(reads) {
                 if let Ok(response) = response {
@@ -614,9 +683,15 @@ impl Proxy {
             if !renewed && !retry.is_empty() {
                 renewed = true;
                 if let Ok(fresh) = self.token(account, true).await {
+                    if account.project.is_none() && fresh != *token {
+                        account.project = self.google_project_id(&fresh).await;
+                    }
                     *token = fresh;
                     let at = Utc::now();
-                    let reads = futures_util::future::join_all(retry.into_iter().map(|url| provider_json(request(url, token)))).await;
+                    let reads = futures_util::future::join_all(
+                        retry.into_iter().map(|url| provider_json(request(url, token, account.project.as_deref()))),
+                    )
+                    .await;
                     for raw in reads.into_iter().flatten() {
                         windows.extend(parse(&raw, at));
                     }
@@ -657,14 +732,19 @@ impl Proxy {
                     let mut url = self.config.anthropic.clone();
                     url.set_path("/api/oauth/usage");
                     url.set_query(Some("cedar_ember=1"));
-                    let raw = provider_json(self.claude_oauth(self.http.get(url), &token)).await?;
+                    let raw =
+                        self.oauth_usage_json(&account, &mut token, |token| self.claude_oauth(self.http.get(url.clone()), token)).await?;
                     let now = Utc::now();
                     let (grants, next) = claude_grants(&raw, now);
                     Ok((None, None, claude::parse_claude_oauth_usage(&raw, now), grants, next))
                 }
                 Lane::Codex => {
                     let (plan, windows, mut grant) = if let Some(url) = self.probe_override(Lane::Codex, "/backend-api/wham/usage") {
-                        let raw = provider_json(openai_account(self.http.get(url).bearer_auth(&token), &account)).await?;
+                        let raw = self
+                            .oauth_usage_json(&account, &mut token, |token| {
+                                openai_account(self.http.get(url.clone()).bearer_auth(token), &account)
+                            })
+                            .await?;
                         opencode::parse_chatgpt_wham_usage(&raw, Utc::now())
                     } else {
                         opencode::probe_chatgpt_wham_usage(&self.http, &token, account.chatgpt_id.as_deref())
@@ -719,7 +799,10 @@ impl Proxy {
                     .map(|w| (None, None, w, vec![], None))
                     .map_err(|_| "OpenCode Go usage probe failed"),
                 Lane::Google => {
-                    let (windows, summary) = self.google_quota_windows(&account, &mut token).await;
+                    if account.project.is_none() {
+                        account.project = self.google_project_id(&token).await;
+                    }
+                    let (windows, summary) = self.google_quota_windows(&mut account, &mut token).await;
                     google_summary = summary;
                     account.access.clone_from(&token);
                     let email = if account.email.is_none() { self.google_token_email(&token).await } else { None };
@@ -736,7 +819,11 @@ impl Proxy {
             .get_mut(&account.id)
             .filter(|c| !c.disabled && c.probe_generation == generation)
             .ok_or("quota refresh was superseded")?;
-        match result {
+        let project_added = current.lane == Lane::Google && current.project.is_none() && account.project.is_some();
+        if project_added {
+            current.project = account.project;
+        }
+        let result = match result {
             Ok((plan, email, windows, grants, next)) => {
                 if plan.is_some() {
                     current.plan = plan;
@@ -771,7 +858,9 @@ impl Proxy {
                 }
                 Err(e)
             }
-        }
+        };
+        state.pool.revision += i64::from(project_added);
+        result
     }
 
     fn claude_oauth(&self, request: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {

@@ -327,12 +327,19 @@ fn fixture(dir: &Scratch, mock: &Server) -> Arc<Proxy> {
         )
         .unwrap();
     }
-    let config = Config {
+    let mut proxy = Proxy::new(fixture_config(dir, mock)).unwrap();
+    proxy.management_mock = Some(mock.0.clone());
+    Arc::new(proxy)
+}
+
+fn fixture_config(dir: &Scratch, mock: &Server) -> Config {
+    Config {
         bind: config::DEFAULT_BIND.parse().unwrap(),
         home: dir.0.clone(),
         t3code_home: dir.0.clone(),
-        auth_dir,
+        auth_dir: dir.join("auth"),
         discover_local: false,
+        exclude_local_lanes: Default::default(),
         provenance_oauth_dir: dir.join("provenance-oauth"),
         provenance_oauth_bin: None,
         client_key: "inference-fixture".into(),
@@ -342,10 +349,7 @@ fn fixture(dir: &Scratch, mock: &Server) -> Arc<Proxy> {
         codex: mock.0.clone(),
         antigravity: mock.0.clone(),
         url: config::DEFAULT_URL.into(),
-    };
-    let mut proxy = Proxy::new(config).unwrap();
-    proxy.management_mock = Some(mock.0.clone());
-    Arc::new(proxy)
+    }
 }
 
 struct Http<'a>(&'a Server, reqwest::Client);
@@ -1628,16 +1632,28 @@ async fn google_usage_probe_renews_then_retains_rejected_buckets_omitted_from_a_
         Router::new()
             .route("/test/google-token", post(|| async { axum::Json(json!({"access_token":"google-fresh","expires_in":3600})) }))
             .route(
+                "/v1internal:loadCodeAssist",
+                post(|headers: HeaderMap| async move {
+                    if router::bearer(&headers) == Some("google-fresh") {
+                        axum::Json(json!({"cloudaicompanionProject":"fresh-project"})).into_response()
+                    } else {
+                        StatusCode::UNAUTHORIZED.into_response()
+                    }
+                }),
+            )
+            .route(
                 "/v1internal:retrieveUserQuotaSummary",
                 post({
                     let probes = probes.clone();
-                    move |headers: HeaderMap| {
+                    move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
                         let probes = probes.clone();
                         async move {
                             probes.fetch_add(1, Relaxed);
                             if router::bearer(&headers) != Some("google-fresh") {
+                                assert_eq!(body, json!({}));
                                 StatusCode::UNAUTHORIZED.into_response()
                             } else {
+                                assert_eq!(body, json!({"project":"fresh-project"}));
                                 axum::Json(json!({"buckets":[{"bucketId":"gemini-5h","window":"5h"}]})).into_response()
                             }
                         }
@@ -1687,6 +1703,7 @@ async fn google_usage_probe_renews_then_retains_rejected_buckets_omitted_from_a_
         let next = &state.pool.accounts["google.json"];
         assert!(!next.probe_failed);
         assert_eq!(next.access, "google-fresh");
+        assert_eq!(next.project.as_deref(), Some("fresh-project"));
         assert_eq!(next.windows.iter().map(|w| w.window_key.as_str()).collect::<Vec<_>>(), ["gemini-5h", "gemini-argon-quota"]);
         assert!(!next.eligible(Utc::now(), "gemini-4-neon-high"));
         assert!(next.eligible(Utc::now(), "gemini-4-argon-high"));
@@ -1890,6 +1907,7 @@ async fn provenance_oauth_discovers_all_antigravity_enrollments_and_deduplicates
         t3code_home: dir.0.clone(),
         auth_dir: dir.join("auth"),
         discover_local: true,
+        exclude_local_lanes: Default::default(),
         provenance_oauth_dir: oauth_dir,
         provenance_oauth_bin: Some(fake_bin),
         client_key: "inference-fixture".into(),
@@ -2001,6 +2019,7 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
         t3code_home: dir.0.clone(),
         auth_dir: dir.join("auth"),
         discover_local: true,
+        exclude_local_lanes: Default::default(),
         provenance_oauth_dir: oauth_dir.clone(),
         provenance_oauth_bin: Some(fake_bin),
         client_key: "inference-fixture".into(),
@@ -2162,4 +2181,242 @@ async fn expired_claude_token_reloads_from_disk_and_activity_preserves_effort() 
     let state = proxy.state.read().await;
     assert_eq!(state.pool.accounts["a.json"].windows.len(), 1);
     assert_eq!(state.pool.accounts["a.json"].windows[0].used_percent, Some(25.0));
+}
+
+#[tokio::test]
+async fn google_project_discovery_hydrates_uploads_and_supplies_quota_requests() {
+    let mock = serve(
+        Router::new()
+            .route(
+                "/v1internal:loadCodeAssist",
+                post(|headers: HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(headers["user-agent"], "antigravity/hub/2.24.0");
+                    assert_eq!(body, json!({"metadata":{"ideType":"ANTIGRAVITY"}}));
+                    let project = match router::bearer(&headers) {
+                        Some("google-upload") => json!(" upload-project "),
+                        Some("google-probe") => json!({"id":" probe-project "}),
+                        _ => panic!("unexpected Google access token"),
+                    };
+                    axum::Json(json!({"cloudaicompanionProject": project}))
+                }),
+            )
+            .route("/test/google-tokeninfo", post(|| async { axum::Json(json!({"email_verified":true,"email":"google@example.test"})) }))
+            .route(
+                "/v1internal:retrieveUserQuotaSummary",
+                post(|axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(body, json!({"project":"probe-project"}));
+                    axum::Json(json!({"buckets":[{"bucketId":"gemini-5h","window":"5h","remainingFraction":0.75}]}))
+                }),
+            ),
+    )
+    .await;
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let inventory = "/v0/management/auth-files";
+    let upload = http
+        .management("POST", "/v8/management/credentials?name=upload.json", Some(json!({"type":"google","access_token":"google-upload"})))
+        .await;
+    assert_eq!(upload.status(), StatusCode::OK);
+    let uploaded = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows: Value = http.management("GET", inventory, None).await.json().await.unwrap();
+            if let Some(row) =
+                rows["files"].as_array().unwrap().iter().find(|row| row["id"] == "upload.json" && row["project_id"] == "upload-project")
+            {
+                break row.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("uploaded project ID should appear in inventory");
+    assert_eq!(uploaded["email"], "google@example.test");
+    assert_eq!(uploaded["status"], "active");
+
+    let account = pool::parse_credentials(
+        "probe.json",
+        &json!({"type":"google","access_token":"google-probe","email":"existing@example.test"}),
+        false,
+    )
+    .unwrap()
+    .remove(0);
+    let revision = {
+        let mut state = proxy.state.write().await;
+        state.pool.insert(vec![account.clone()]);
+        state.pool.revision
+    };
+    proxy.refresh_usage(&account).await.unwrap();
+    assert_eq!(proxy.state.read().await.pool.revision, revision + 1);
+    let rows: Value = http.management("GET", inventory, None).await.json().await.unwrap();
+    let probe = rows["files"].as_array().unwrap().iter().find(|row| row["id"] == "probe.json").unwrap();
+    assert_eq!(probe["project_id"], "probe-project");
+}
+
+#[test]
+fn provenance_enriches_nonlocal_google_without_relabeling() {
+    let mut pool = Pool::default();
+    let mut uploaded = pool::parse_credentials(
+        "upload.json",
+        &json!({"type":"google","access_token":"uploaded-token","refresh_token":"shared-refresh"}),
+        false,
+    )
+    .unwrap()
+    .remove(0);
+    uploaded.google_client = None;
+    uploaded.google_secret = None;
+    pool.insert(vec![uploaded]);
+    pool::add_provenance_google(
+        &mut pool,
+        "provenance-label",
+        json!({"refresh_token":"shared-refresh","client_id":"client","client_secret":"secret","project_id":"project","email":"person@example.test"}),
+    );
+    assert_eq!(pool.accounts.len(), 1);
+    let account = &pool.accounts["upload.json"];
+    assert!(!account.local);
+    assert_eq!(account.label, "upload.json");
+    assert_eq!(account.google_client.as_deref(), Some("client"));
+    assert_eq!(account.google_secret.as_deref(), Some("secret"));
+    assert_eq!(account.project.as_deref(), Some("project"));
+    assert_eq!(account.email.as_deref(), Some("person@example.test"));
+}
+
+#[tokio::test]
+async fn local_claude_unauthorized_reloads_and_retries_management_and_quota() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mock = serve(Router::new().route(
+        "/api/oauth/usage",
+        get({
+            let seen = seen.clone();
+            move |headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    let token = router::bearer(&headers).unwrap();
+                    seen.lock().await.push(token.to_owned());
+                    match token {
+                        "local-management" if !headers.contains_key("anthropic-beta") => token.to_owned().into_response(),
+                        "local-old" | "local-management" => StatusCode::UNAUTHORIZED.into_response(),
+                        "local-usage" => axum::Json(json!({"five_hour":{"utilization":25}})).into_response(),
+                        _ => panic!("unexpected Claude access token"),
+                    }
+                }
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let profiles = dir.join(".config/meridian-opencode/profiles.json");
+    let write = |token| {
+        config::write_private(
+            &profiles,
+            json!({"profiles":{"test":{"access_token":token,"expires_at":Utc::now() + TimeDelta::hours(1)}}}).to_string().as_bytes(),
+            true,
+        )
+        .unwrap();
+    };
+    write("local-old");
+    let mut config = fixture_config(&dir, &mock);
+    config.discover_local = true;
+    let mut proxy = Proxy::new(config).unwrap();
+    proxy.management_mock = Some(mock.0.clone());
+    let proxy = Arc::new(proxy);
+    let account = proxy.state.read().await.pool.accounts.values().find(|a| a.access == "local-old").unwrap().clone();
+    assert!(account.local);
+    write("local-management");
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let call = || {
+        http.management(
+            "POST",
+            "/v0/management/api-call",
+            Some(json!({
+                "auth_index":account.auth_index,"method":"GET","url":mock.0.join("/api/oauth/usage").unwrap().as_str(),
+                "header":{"authorization":"Bearer $TOKEN$"}
+            })),
+        )
+    };
+    let reply: Value = call().await.json().await.unwrap();
+    assert_eq!(reply["status_code"], 200);
+    assert_eq!(reply["body"], "[REDACTED]");
+    assert_eq!(seen.lock().await.as_slice(), ["local-old", "local-management"]);
+
+    write("local-usage");
+    let snapshot = proxy.state.read().await.pool.accounts[&account.id].clone();
+    proxy.refresh_usage(&snapshot).await.unwrap();
+    assert_eq!(seen.lock().await.as_slice(), ["local-old", "local-management", "local-management", "local-usage"]);
+    let state = proxy.state.read().await;
+    assert_eq!(state.pool.accounts[&account.id].windows[0].used_percent, Some(25.0));
+    assert!(!state.pool.accounts[&account.id].probe_failed);
+}
+
+#[test]
+fn local_discovery_skips_expired_oauth_and_excluded_providers() {
+    const CHILD: &str = "PROXY_DISCOVERY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = Scratch::new();
+        // Isolate discovery's environment inputs from other tests and the host.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::local_discovery_skips_expired_oauth_and_excluded_providers"])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("USER", "fleetix-proxy-discovery-fixture")
+            .env("CLAUDE_CONFIG_DIR", dir.join(".claude"))
+            .env("CODEX_HOME", dir.join(".codex"))
+            .env("XDG_DATA_HOME", dir.join(".local/share"))
+            .env("ANTHROPIC_API_KEY", "env-claude")
+            .env("OPENAI_API_KEY", "env-codex")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let home = PathBuf::from(std::env::var_os("CODEX_HOME").unwrap()).parent().unwrap().to_owned();
+    let endpoint = config::origin(config::DEFAULT_URL).unwrap();
+    let mut config = Config {
+        bind: config::DEFAULT_BIND.parse().unwrap(),
+        home: home.clone(),
+        t3code_home: home.clone(),
+        auth_dir: home.join("auth"),
+        discover_local: true,
+        exclude_local_lanes: Default::default(),
+        provenance_oauth_dir: home.join("enrollments"),
+        provenance_oauth_bin: None,
+        client_key: String::new(),
+        management_key: String::new(),
+        anthropic: endpoint.clone(),
+        openai: endpoint.clone(),
+        codex: endpoint.clone(),
+        antigravity: endpoint,
+        url: config::DEFAULT_URL.into(),
+    };
+    let expired = Utc::now() - TimeDelta::minutes(5);
+    let write = |path: &str, body: Value| config::write_private(&home.join(path), body.to_string().as_bytes(), true).unwrap();
+    write(".claude/.credentials.json", json!({"access_token":"expired-claude","expires_at":expired}));
+    write(".codex/auth.json", json!({"tokens":{"access_token":"expired-codex"},"expires_at":expired}));
+    write(
+        ".local/share/opencode/auth.json",
+        json!({
+            "anthropic":{"access":"opencode-claude"},"opencode-go":{"key":"keep-opencode-go"}
+        }),
+    );
+    write("userdata/providers/antigravity/test/antigravity-acp/acp_token.json", json!({"access_token":"t3-google"}));
+    write("auth/explicit.json", json!({"type":"codex","access_token":"explicit-codex","expires_at":expired}));
+    let base = Pool::load(&config).unwrap();
+    let has = |pool: &Pool, token: &str| pool.accounts.values().any(|a| a.access == token);
+    for token in ["env-claude", "env-codex", "opencode-claude", "keep-opencode-go", "t3-google", "explicit-codex"] {
+        assert!(has(&base, token), "{token} should be loaded");
+    }
+    for token in ["expired-claude", "expired-codex"] {
+        assert!(!has(&base, token), "{token} should be skipped");
+    }
+    let opencode_claude = base.accounts.values().find(|a| a.access == "opencode-claude").unwrap();
+    assert!(Pool::reload_local(&config, opencode_claude).is_some());
+    config.exclude_local_lanes = [Lane::Claude, Lane::Codex, Lane::Google].into();
+    assert!(Pool::reload_local(&config, opencode_claude).is_none());
+    let filtered = Pool::load(&config).unwrap();
+    assert_eq!(filtered.accounts.len(), 2);
+    assert!(has(&filtered, "keep-opencode-go"));
+    assert_eq!(filtered.accounts["explicit.json"].access, "explicit-codex");
+    assert!(!filtered.accounts["explicit.json"].local);
 }
