@@ -994,17 +994,18 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
                         if adopting_refresh {
                             survivor.refresh.clone_from(&replacement.refresh);
                         }
-                        // Adopt the refresh token and its client credentials together, even
-                        // when the retained access token expires later.
-                        let fresher = replacement.expires.zip(survivor.expires).is_some_and(|(new, old)| new > old)
-                            && survivor.refresh == replacement.refresh;
+                        // Adoption also makes the refresh tokens match. Otherwise an access-token
+                        // match alone does not establish that the OAuth client is the same.
+                        if survivor.refresh == replacement.refresh {
+                            let fresher = replacement.expires.zip(survivor.expires).is_some_and(|(new, old)| new > old);
+                            if adopting_refresh || survivor.google_client.is_none() || (fresher && client.is_some()) {
+                                survivor.google_client = replacement.google_client;
+                            }
+                            if adopting_refresh || survivor.google_secret.is_none() || (fresher && secret.is_some()) {
+                                survivor.google_secret = replacement.google_secret;
+                            }
+                        }
                         survivor.expires = survivor.expires.max(replacement.expires);
-                        if adopting_refresh || survivor.google_client.is_none() || (fresher && client.is_some()) {
-                            survivor.google_client = replacement.google_client;
-                        }
-                        if adopting_refresh || survivor.google_secret.is_none() || (fresher && secret.is_some()) {
-                            survivor.google_secret = replacement.google_secret;
-                        }
                     }
                 } else {
                     replacement.provenance_enrollment = existing.provenance_enrollment.clone();

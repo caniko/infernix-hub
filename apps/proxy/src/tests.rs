@@ -3010,6 +3010,36 @@ fn provenance_reload_keeps_the_refresh_token_and_surviving_route_evidence() {
 }
 
 #[test]
+fn provenance_reload_does_not_mix_oauth_clients_across_refresh_tokens() {
+    let mut pool = Pool::default();
+    pool::add_provenance_google(&mut pool, "a", json!({"access_token":"old-access"}));
+    pool::add_provenance_google(&mut pool, "b", json!({"access_token":"shared-access"}));
+    let b_id = pool.accounts.values().find(|a| a.label == "b").unwrap().id.clone();
+    pool::add_provenance_google(&mut pool, "a", json!({"access_token":"shared-access","refresh_token":"adopted-refresh"}));
+    assert_eq!(pool.accounts.len(), 1);
+    let b = pool.accounts.get_mut(&b_id).unwrap();
+    assert_eq!(b.refresh.as_deref(), Some("adopted-refresh"));
+    // Keep this fixture independent of ambient Google OAuth defaults.
+    b.google_client = None;
+    b.google_secret = None;
+
+    for refresh in [None, Some("unrelated-refresh")] {
+        pool::add_provenance_google(&mut pool, "a", json!({"access_token":"other-access"}));
+        assert_eq!(pool.accounts.len(), 2);
+        pool::add_provenance_google(
+            &mut pool,
+            "a",
+            json!({"access_token":"shared-access","refresh_token":refresh,"client_id":"wrong-client","client_secret":"wrong-secret"}),
+        );
+        assert_eq!(pool.accounts.len(), 1);
+        let b = &pool.accounts[&b_id];
+        assert_eq!(b.refresh.as_deref(), Some("adopted-refresh"));
+        assert_eq!(b.google_client, None);
+        assert_eq!(b.google_secret, None);
+    }
+}
+
+#[test]
 fn provenance_reload_deduplicates_refresh_token_and_enriches_the_retained_route() {
     let mut pool = Pool::default();
     let enrollment = |access, refresh| json!({"access_token":access,"refresh_token":refresh});
