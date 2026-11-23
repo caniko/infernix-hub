@@ -114,6 +114,17 @@ fn classify(
     source: AccountErrorSource,
     secrets: &[&str],
 ) -> Option<AccountError> {
+    if lane == Lane::Google
+        && let Some(items) = raw.as_array()
+        && let Some(error) = items
+            .iter()
+            .filter(|item| item.is_object() || item.is_array())
+            .filter_map(|item| classify(lane, status, item, "", html, source, secrets))
+            .min_by_key(|error| !error.kind.is_blocking())
+    {
+        // A quota entry must not hide an account-level rejection in the same response.
+        return Some(error);
+    }
     let error = raw.get("error").or_else(|| raw.pointer("/response/error")).unwrap_or(raw);
     let rpc_status = (lane == Lane::Google).then(|| text(error, &["status"])).flatten();
     let status = status.or_else(|| {

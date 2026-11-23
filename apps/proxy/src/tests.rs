@@ -2790,6 +2790,88 @@ async fn google_failover_does_not_attest_a_delayed_billing_error() {
     check_delayed_google_429(true).await;
 }
 
+#[tokio::test]
+async fn google_unusable_reset_header_rejects_immediate_and_delayed_body_proof() {
+    for (reset, retry_after, delayed) in [("0", false, true), ("0", false, false), ("invalid", false, false), ("0", true, false)] {
+        let mock = serve(Router::new().route(
+            "/v1internal:generateContent",
+            post(move || async move {
+                let json = r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"60s"}]}}"#;
+                let body = if delayed {
+                    Body::from_stream(futures_util::stream::once(async move {
+                        tokio::time::sleep(Duration::from_millis(450)).await;
+                        Ok::<_, std::io::Error>(json)
+                    }))
+                } else {
+                    Body::from(json)
+                };
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, [("x-ratelimit-reset", reset)], body).into_response();
+                if retry_after {
+                    response.headers_mut().insert("retry-after", axum::http::HeaderValue::from_static("30"));
+                }
+                response
+            }),
+        ))
+        .await;
+        let dir = Scratch::new();
+        let proxy = google_routing_fixture(&dir, &mock).await;
+        proxy.state.write().await.pool.accounts.remove("google-b.json");
+        let server = serve(proxy.clone().app()).await;
+        let response = Http::new(&server)
+            .request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model":"gemini-neon"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER), "reset={reset}, retry_after={retry_after}, delayed={delayed}");
+        let delay: u64 = response.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((55..=60).contains(&delay), "{delay}");
+        let state = proxy.state.read().await;
+        assert!(!state.pool.accounts["google-a.json"].scoped_cooldowns["gemini"].verified_reset);
+    }
+}
+
+#[tokio::test]
+async fn google_billing_error_array_quarantines_without_quota_proof() {
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "30")],
+                axum::Json(json!([{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
+                    {"@type":"google.rpc.ErrorInfo","reason":"BILLING_DISABLED"},
+                    {"@type":"google.rpc.RetryInfo","retryDelay":"60s"}
+                ]}}])),
+            )
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    proxy.state.write().await.pool.accounts.remove("google-b.json");
+    let server = serve(proxy.clone().app()).await;
+    let response = Http::new(&server)
+        .request("POST", "/v1internal:generateContent")
+        .bearer_auth("inference-fixture")
+        .json(&json!({"model":"gemini-neon"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.headers().contains_key(router::POOL_QUOTA_HEADER));
+    let state = proxy.state.read().await;
+    let account = &state.pool.accounts["google-a.json"];
+    let error = account.last_error.as_ref().unwrap();
+    assert_eq!(error.kind, AccountErrorKind::BillingRequired);
+    assert_eq!(error.provider_code.as_deref(), Some("BILLING_DISABLED"));
+    assert!(account.quarantined(Utc::now()));
+    assert!(account.scoped_cooldowns.is_empty() && account.cooldown.is_none());
+    drop(state);
+    tokio::time::timeout(Duration::from_secs(1), proxy.hub_sync_notify.notified()).await.unwrap();
+}
+
 async fn check_delayed_google_429(billing: bool) {
     let release = Arc::new(Notify::new());
     let mock = serve(Router::new().route(
@@ -5660,6 +5742,48 @@ fn provenance_reload_deduplicates_access_token_without_clearing_cooldown() {
 }
 
 #[test]
+fn provenance_reload_deduplicates_access_rotation_with_unchanged_refresh_token() {
+    let mut pool = Pool::default();
+    let enrollment = |access| {
+        json!({
+            "access_token":access,"refresh_token":"refresh-a","client_id":"client-a",
+            "client_secret":"secret-a","project_id":"project-a"
+        })
+    };
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-a"));
+    pool::add_provenance_google(
+        &mut pool,
+        "b",
+        json!({
+            "access_token":"token-b","refresh_token":"refresh-b","client_id":"client-b",
+            "client_secret":"secret-b","project_id":"project-b"
+        }),
+    );
+    assert_eq!(pool.accounts.len(), 2);
+    let b = pool.accounts.values_mut().find(|a| a.label == "b").unwrap();
+    seed_old_google_route(b);
+    let b = b.clone();
+
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-b"));
+    assert_eq!(pool.accounts.len(), 1);
+    pool::add_provenance_google(&mut pool, "a", enrollment("token-b"));
+
+    assert_eq!(pool.accounts.len(), 1);
+    let survivor = &pool.accounts[&b.id];
+    assert_eq!(survivor.access, b.access);
+    assert_eq!(survivor.refresh, b.refresh);
+    assert_eq!(survivor.google_client, b.google_client);
+    assert_eq!(survivor.google_secret, b.google_secret);
+    assert_eq!(survivor.project, b.project);
+    assert_eq!(survivor.cooldown, b.cooldown);
+    assert_eq!(survivor.scoped_cooldowns, b.scoped_cooldowns);
+    assert_eq!(survivor.last_error, b.last_error);
+    assert_eq!(survivor.probe_generation, b.probe_generation);
+    assert!(survivor.quarantined(Utc::now()));
+    assert!(!survivor.eligible(Utc::now(), "gemini-neon"));
+}
+
+#[test]
 fn provenance_reload_keeps_the_refresh_token_and_surviving_route_evidence() {
     for (offset, client, secret) in [
         (-600, Some("new-client"), Some("new-secret")),
@@ -5797,6 +5921,32 @@ fn provenance_reload_updates_inherited_but_not_explicit_uploaded_projects() {
         }
     }
     assert_eq!(pool.accounts.len(), 2);
+}
+
+#[test]
+fn uploaded_google_note_edit_preserves_inherited_project_provenance() {
+    let mut pool = Pool::default();
+    let id = "upload.json";
+    let mut raw = json!({"type":"google","access_token":"uploaded-token","refresh_token":"uploaded-refresh"});
+    let enrollment = |project| json!({"refresh_token":"uploaded-refresh","project_id":project});
+    pool.insert(pool::parse_credentials(id, &raw, false).unwrap());
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("project-a"));
+    let account = pool.accounts.get_mut(id).unwrap();
+    seed_old_google_route(account);
+    let cooldown = account.cooldown;
+
+    raw["note"] = json!("updated note");
+    pool.insert(pool::parse_credentials(id, &raw, false).unwrap());
+    let account = &pool.accounts[id];
+    assert_eq!(account.note.as_deref(), Some("updated note"));
+    assert_eq!(account.project.as_deref(), Some("project-a"));
+    assert_eq!(account.cooldown, cooldown);
+
+    pool::add_provenance_google(&mut pool, "enrollment", enrollment("project-b"));
+    let account = &pool.accounts[id];
+    assert_eq!(account.project.as_deref(), Some("project-b"));
+    assert_eq!(account.note.as_deref(), Some("updated note"));
+    assert_google_route_cleared(account);
 }
 
 fn route_auth_error(until: DateTime<Utc>) -> AccountError {

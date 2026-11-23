@@ -512,7 +512,7 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
                 header_reset = header_cooldown(lane, &headers, received_at);
                 body_reset = error.reset;
             }
-            let hint = merge_quota_hints(&headers, header_reset, body_reset);
+            let hint = merge_quota_hints(lane, &headers, header_reset, body_reset);
             let mut cooldown = quota_deadline(hint, policy.failover_cooldown_secs, Utc::now());
             cooldown.verified_reset &= quota_body_verified.unwrap_or(true);
             cooldown
@@ -905,7 +905,8 @@ pub(crate) async fn run_window_start(
             let limited = error.as_ref().filter(|e| e.kind == AccountErrorKind::QuotaExhausted).map(|_| {
                 let (body_reset, verified) = if google_quota { prefix.quota_evidence(Utc::now()) } else { (None, true) };
                 quota_body_verified = Some(verified);
-                let mut cooldown = quota_deadline(merge_quota_hints(&headers, header_reset, body_reset), fallback, Utc::now());
+                let mut cooldown =
+                    quota_deadline(merge_quota_hints(account.lane, &headers, header_reset, body_reset), fallback, Utc::now());
                 cooldown.verified_reset &= verified;
                 cooldown
             });
@@ -1278,8 +1279,8 @@ impl ErrorPrefix {
         }
         let now = Utc::now();
         let (reset, verified) = self.quota_evidence(now);
-        let mut merged = merge_quota_hints(headers, Some(header), reset).unwrap_or(header);
-        merged.verified_reset &= verified && header.verified_reset;
+        let mut merged = merge_quota_hints(Lane::Google, headers, Some(header), reset).unwrap_or(header);
+        merged.verified_reset &= verified;
         if let Some(reader) = reader {
             let mut state = proxy.state.write().await;
             if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account))
@@ -1404,6 +1405,10 @@ fn upstream_delay(now: DateTime<Utc>, seconds: f64) -> Cooldown {
     Cooldown { until: cooldown_after(now, seconds.ceil() as i64), verified_reset: (1.0..=MAX_COOLDOWN_SECS as f64).contains(&seconds) }
 }
 
+fn is_rate_limit_reset(name: &str) -> bool {
+    (name.starts_with("anthropic-ratelimit-") || name.starts_with("x-ratelimit-")) && (name.ends_with("-reset") || name.contains("-reset-"))
+}
+
 pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc>) -> Option<Cooldown> {
     let digits = |raw: &str| !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
     let verify = |mut cooldown: Cooldown, strict| {
@@ -1419,7 +1424,7 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
     let fallback_can_verify = !headers.contains_key("retry-after");
     // Preserve the legacy interpretation, but only attest known header/format pairs.
     let parse_reset = |name: &str, raw: &str| {
-        let strict_source = fallback_can_verify && single(name);
+        let strict_source = (lane == Lane::Google || fallback_can_verify) && single(name);
         if let Ok(at) = raw.parse::<DateTime<Utc>>() {
             let known = matches!(
                 name,
@@ -1448,14 +1453,27 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
         let known = matches!(name, "x-ratelimit-reset" | "x-ratelimit-reset-requests" | "x-ratelimit-reset-tokens");
         duration_seconds(raw).map(|(n, strict)| verify(upstream_delay(now, n), strict_source && known && strict))
     };
-    if let Some(at) = get("retry-after").and_then(|raw| {
-        raw.parse::<i64>().ok().filter(|n| *n >= 0).map(|n| verify(upstream_delay(now, n as f64), digits(raw))).or_else(|| {
-            let at = DateTime::parse_from_rfc2822(raw).ok()?.with_timezone(&Utc);
-            let strict = raw == at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-            Some(verify(clamp(at), strict))
+    let retry_after = get("retry-after")
+        .and_then(|raw| {
+            raw.parse::<i64>().ok().filter(|n| *n >= 0).map(|n| verify(upstream_delay(now, n as f64), digits(raw))).or_else(|| {
+                let at = DateTime::parse_from_rfc2822(raw).ok()?.with_timezone(&Utc);
+                let strict = raw == at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                Some(verify(clamp(at), strict))
+            })
         })
-    }) {
-        return Some(verify(at, single("retry-after")));
+        .map(|at| verify(at, single("retry-after")));
+    let resets = headers
+        .iter()
+        .filter(|(name, _)| is_rate_limit_reset(name.as_str()))
+        .map(|(name, value)| value.to_str().ok().and_then(|raw| parse_reset(name.as_str(), raw)));
+    if lane == Lane::Google {
+        // A bad reset header invalidates proof even if another header wins for scheduling.
+        let mut verified = fallback_can_verify || retry_after.is_some_and(|hint| hint.verified_reset);
+        let reset = resets.inspect(|hint| verified &= hint.is_some_and(|hint| hint.verified_reset)).flatten().reduce(Cooldown::merge);
+        return retry_after.or(reset).map(|at| verify(at, verified));
+    }
+    if retry_after.is_some() {
+        return retry_after;
     }
     if lane == Lane::Codex {
         let windows = ["x-codex-primary", "x-codex-secondary"].map(|prefix| {
@@ -1502,16 +1520,7 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
                 .reduce(Cooldown::merge);
         }
     }
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let name = name.as_str();
-            ((name.starts_with("anthropic-ratelimit-") || name.starts_with("x-ratelimit-"))
-                && (name.ends_with("-reset") || name.contains("-reset-")))
-            .then(|| parse_reset(name, value.to_str().ok()?))
-            .flatten()
-        })
-        .reduce(Cooldown::merge)
+    resets.flatten().reduce(Cooldown::merge)
 }
 
 #[cfg(test)]
@@ -1575,15 +1584,17 @@ fn google_reset_hint(raw: &Value, now: DateTime<Utc>) -> (Option<Cooldown>, bool
     (reset, verified)
 }
 
-fn merge_quota_hints(headers: &HeaderMap, header: Option<Cooldown>, body: Option<Cooldown>) -> Option<Cooldown> {
+fn merge_quota_hints(lane: Lane, headers: &HeaderMap, header: Option<Cooldown>, body: Option<Cooldown>) -> Option<Cooldown> {
     let mut cooldown = header.into_iter().chain(body).reduce(Cooldown::merge)?;
-    // An unusable Retry-After must not be promoted by a later body hint.
-    cooldown.verified_reset &= !headers.contains_key(header::RETRY_AFTER) || header.is_some_and(|hint| hint.verified_reset);
+    // A later body hint can extend the cooldown, but cannot rehabilitate an unusable header.
+    let reset_header = headers.contains_key(header::RETRY_AFTER)
+        || (lane == Lane::Google && headers.keys().any(|name| is_rate_limit_reset(name.as_str())));
+    cooldown.verified_reset &= !reset_header || header.is_some_and(|hint| hint.verified_reset);
     Some(cooldown)
 }
 
 fn quota_hint(lane: Lane, headers: &HeaderMap, body: Option<Cooldown>, now: DateTime<Utc>) -> Option<Cooldown> {
-    merge_quota_hints(headers, header_cooldown(lane, headers, now), body)
+    merge_quota_hints(lane, headers, header_cooldown(lane, headers, now), body)
 }
 
 fn quota_deadline(hint: Option<Cooldown>, fallback: u64, now: DateTime<Utc>) -> Cooldown {

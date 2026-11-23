@@ -831,6 +831,7 @@ impl Pool {
                     a.google_client.clone_from(&old.google_client);
                     a.google_secret.clone_from(&old.google_secret);
                     a.project.clone_from(&old.project);
+                    a.provenance_project.clone_from(&old.provenance_project);
                     if a.email.is_none() {
                         a.email.clone_from(&old.email);
                     }
@@ -1226,6 +1227,29 @@ pub(crate) fn provenance_google_manifests(config: &Config, user: &str) -> Vec<(S
         .collect()
 }
 
+fn merge_google_duplicate(survivor: &mut Account, replacement: Account, explicit_client: bool, explicit_secret: bool) {
+    if survivor.api_key || replacement.api_key || survivor.access.is_empty() || survivor.access != replacement.access {
+        return;
+    }
+    let adopting_refresh = survivor.refresh.is_none() && replacement.refresh.is_some();
+    // Adoption also makes the refresh tokens match. Otherwise an access-token
+    // match alone does not establish that the OAuth client is the same.
+    if adopting_refresh || survivor.refresh == replacement.refresh {
+        if adopting_refresh {
+            survivor.refresh = replacement.refresh;
+        }
+        let fresher = replacement.expires.zip(survivor.expires).is_some_and(|(new, old)| new > old);
+        if adopting_refresh || survivor.google_client.is_none() || (fresher && explicit_client) {
+            survivor.google_client = replacement.google_client;
+        }
+        if adopting_refresh || survivor.google_secret.is_none() || (fresher && explicit_secret) {
+            survivor.google_secret = replacement.google_secret;
+        }
+    }
+    survivor.expires = survivor.expires.max(replacement.expires);
+    survivor.scrub_label(&[]);
+}
+
 pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value) {
     let Some(fields) = raw.as_object_mut() else { return };
     fields.entry("label").or_insert_with(|| json!(label));
@@ -1263,28 +1287,8 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
                     // Keep the account that already holds the credential and its route evidence.
                     pool.accounts.remove(&id);
                     id = duplicate_id;
-                    if let Some(survivor) = pool.accounts.get_mut(&id)
-                        && !survivor.api_key
-                        && !replacement.api_key
-                        && !survivor.access.is_empty()
-                        && survivor.access == replacement.access
-                    {
-                        let adopting_refresh = survivor.refresh.is_none() && replacement.refresh.is_some();
-                        if adopting_refresh {
-                            survivor.refresh.clone_from(&replacement.refresh);
-                        }
-                        // Adoption also makes the refresh tokens match. Otherwise an access-token
-                        // match alone does not establish that the OAuth client is the same.
-                        if survivor.refresh == replacement.refresh {
-                            let fresher = replacement.expires.zip(survivor.expires).is_some_and(|(new, old)| new > old);
-                            if adopting_refresh || survivor.google_client.is_none() || (fresher && client.is_some()) {
-                                survivor.google_client = replacement.google_client;
-                            }
-                            if adopting_refresh || survivor.google_secret.is_none() || (fresher && secret.is_some()) {
-                                survivor.google_secret = replacement.google_secret;
-                            }
-                        }
-                        survivor.expires = survivor.expires.max(replacement.expires);
+                    if let Some(survivor) = pool.accounts.get_mut(&id) {
+                        merge_google_duplicate(survivor, replacement, client.is_some(), secret.is_some());
                     }
                 } else {
                     replacement.provenance_enrollment = existing.provenance_enrollment.clone();
@@ -1357,6 +1361,20 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
             existing.error_generation = existing.error_generation.saturating_add(1);
         }
         pool.revision += i64::from(relabel || enriched || project_changed || rotated);
+        if rotated && let Some(rotated_account) = pool.accounts.get(&id) {
+            let duplicate_id = pool
+                .accounts
+                .values()
+                .find(|other| other.id != id && other.lane == Lane::Google && other.access == rotated_account.access)
+                .map(|other| other.id.clone());
+            if let Some(duplicate_id) = duplicate_id
+                && let Some(replacement) = pool.accounts.remove(&id)
+                && let Some(survivor) = pool.accounts.get_mut(&duplicate_id)
+            {
+                // Keep the surviving route's OAuth client unless it needs to adopt the refresh token.
+                merge_google_duplicate(survivor, replacement, false, false);
+            }
+        }
         return;
     }
     let source = format!("provenance:{label}");
