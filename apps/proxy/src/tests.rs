@@ -1812,7 +1812,7 @@ async fn google_terminal_429_keeps_an_expired_header_reset_when_the_body_stalls(
         state.pool.accounts.remove("google-b.json");
         state.pool.policy.first_byte_timeout_secs = 2;
     }
-    let server = serve(proxy.app()).await;
+    let server = serve(proxy.clone().app()).await;
     let res = Http::new(&server)
         .request("POST", "/v1internal:generateContent")
         .bearer_auth("inference-fixture")
@@ -1825,6 +1825,7 @@ async fn google_terminal_429_keeps_an_expired_header_reset_when_the_body_stalls(
     assert_eq!(res.headers()["retry-after"], "5");
     assert!(!res.headers().contains_key(router::POOL_QUOTA_HEADER));
     assert_google_pool_body(&res.json().await.unwrap(), "");
+    assert!(!proxy.state.read().await.pool.accounts["google-a.json"].cooldown.unwrap().verified_reset);
 }
 
 #[tokio::test]
@@ -1891,6 +1892,138 @@ async fn google_terminal_429_retains_an_expired_earlier_attempt_reset() {
     let state = proxy.state.read().await;
     assert_eq!(state.activity.back().unwrap().attempts.len(), 2);
     assert!(state.pool.accounts["google-a.json"].quota_limited_until(Utc::now(), "").is_none());
+}
+
+#[tokio::test]
+async fn google_terminal_429_retries_an_alternate_that_recovers_during_the_body_read() {
+    let release = Arc::new(Notify::new());
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post({
+            let release = release.clone();
+            move |headers: HeaderMap| async move {
+                if router::bearer(&headers) == Some("google-b.json") {
+                    return "alternate".into_response();
+                }
+                let body = Body::from_stream(futures_util::stream::once(async move {
+                    release.notified().await;
+                    Ok::<_, std::io::Error>("{}")
+                }));
+                (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "30")], body).into_response()
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let until = Utc::now() + TimeDelta::milliseconds(500);
+    proxy.state.write().await.pool.accounts.get_mut("google-b.json").unwrap().cooldown =
+        Some(pool::Cooldown { until, verified_reset: true });
+    let send = http.request("POST", "/v1internal:generateContent").bearer_auth("inference-fixture").timeout(Duration::from_secs(3)).send();
+    let recover = async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while proxy.state.read().await.pool.accounts["google-a.json"].cooldown.is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first account must record its header cooldown");
+        assert!(Utc::now() < until, "alternate must still be cooling down when failover starts");
+        while Utc::now() < until {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        release.notify_one();
+    };
+    let (response, ()) = tokio::join!(send, recover);
+    let response = response.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "alternate");
+}
+
+#[tokio::test]
+async fn google_pending_429_body_does_not_publish_a_header_witness_to_concurrent_requests() {
+    let release = Arc::new(Notify::new());
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post({
+            let release = release.clone();
+            move || async move {
+                let body = Body::from_stream(futures_util::stream::once(async move {
+                    release.notified().await;
+                    Ok::<_, std::io::Error>(r#"{"error":{"code":429,"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#)
+                }));
+                (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "10")], body)
+            }
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    proxy.state.write().await.pool.accounts.remove("google-b.json");
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let model = "gemini-4-neon-high";
+    let request = || {
+        http.request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model":model}))
+            .timeout(Duration::from_secs(3))
+            .send()
+    };
+    let concurrent = async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !proxy.state.read().await.pool.accounts["google-a.json"].scoped_cooldowns.contains_key("gemini") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first account must record its header cooldown");
+        let response = request().await.unwrap();
+        release.notify_one();
+        response
+    };
+    let (settled, pending) = tokio::join!(request(), concurrent);
+    assert_eq!(pending.status(), 429);
+    assert!(matches!(pending.headers()["retry-after"].to_str().unwrap(), "9" | "10"));
+    assert_eq!(google_witness(pending.headers(), model), None);
+    let settled = settled.unwrap();
+    assert_eq!(settled.status(), 429);
+    let witness = google_witness(settled.headers(), model).unwrap();
+    assert!((88..=90).contains(&(witness - Utc::now()).num_seconds()));
+    assert_eq!(google_witness(request().await.unwrap().headers(), model), Some(witness));
+}
+
+#[tokio::test]
+async fn google_terminal_429_cannot_witness_retry_info_from_a_non_quota_array_item() {
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(json!([
+                    {"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}},
+                    {"error":{"code":503,"status":"UNAVAILABLE","details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}
+                ])),
+            )
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let server = serve(proxy.app()).await;
+    let model = "gemini-4-neon-high";
+    let response = Http::new(&server)
+        .request("POST", "/v1internal:generateContent")
+        .bearer_auth("inference-fixture")
+        .json(&json!({"model":model}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+    assert!(response.headers().contains_key("retry-after"));
+    assert_eq!(google_witness(response.headers(), model), None);
 }
 
 #[tokio::test]
@@ -2176,9 +2309,11 @@ async fn google_terminal_429_does_not_wait_for_a_stalled_reader_with_a_later_res
     let proxy = google_routing_fixture(&dir, &mock).await;
     proxy.state.write().await.pool.policy.first_byte_timeout_secs = 6;
     let server = serve(proxy.app()).await;
+    let model = "gemini-4-neon-high";
     let res = Http::new(&server)
         .request("POST", "/v1internal:generateContent")
         .bearer_auth("inference-fixture")
+        .json(&json!({"model":model}))
         .timeout(Duration::from_secs(3))
         .send()
         .await
@@ -2186,6 +2321,8 @@ async fn google_terminal_429_does_not_wait_for_a_stalled_reader_with_a_later_res
     assert_eq!(res.status(), 429);
     let delay: u64 = res.headers()["retry-after"].to_str().unwrap().parse().unwrap();
     assert!((35..=40).contains(&delay), "{delay}");
+    let witness = google_witness(res.headers(), model).unwrap();
+    assert!((37..=40).contains(&(witness - Utc::now()).num_seconds()));
 }
 
 #[tokio::test]
@@ -2231,6 +2368,7 @@ async fn google_failover_reads_delayed_429_body_and_extends_cooldown_once() {
                 let state = proxy.state.read().await;
                 let failed = &state.pool.accounts["google-a.json"];
                 if failed.scoped_cooldowns["gemini"].until > Utc::now() + TimeDelta::seconds(115) {
+                    assert!(failed.scoped_cooldowns["gemini"].verified_reset);
                     assert_eq!(failed.failure, 1);
                     break;
                 }
@@ -2389,21 +2527,30 @@ async fn google_terminal_429_uses_the_earliest_pool_reset_from_chunked_upstream_
 
 #[tokio::test]
 async fn google_terminal_429_omits_unverified_witness_but_keeps_retry_after() {
+    let oversized = " ".repeat(65 * 1024);
     for (header, values, body, delay) in [
         ("retry-after", &["9999999"][..], "{}", 604_800),
         ("retry-after", &["+60"][..], r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#, 90),
         ("retry-after", &["invalid"][..], r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#, 90),
         ("retry-after", &["30", "60"][..], r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"90s"}]}}"#, 90),
         ("x-ratelimit-reset-unknown", &["90"][..], "{}", 90),
+        ("retry-after", &["60"][..], r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"0s"}]}}"#, 60),
+        ("retry-after", &["60"][..], r#"{"error":{"details":[{"@type":"RetryInfo","retryDelay":"invalid"}]}}"#, 60),
+        ("retry-after", &["60"][..], "{\"error\":", 60),
+        ("retry-after", &["60"][..], oversized.as_str(), 60),
     ] {
+        let body = Bytes::copy_from_slice(body.as_bytes());
         let mock = serve(Router::new().route(
             "/v1internal:generateContent",
-            post(move || async move {
-                let mut response = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
-                for value in values {
-                    response.headers_mut().append(header, axum::http::HeaderValue::from_static(value));
+            post(move || {
+                let body = body.clone();
+                async move {
+                    let mut response = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+                    for value in values {
+                        response.headers_mut().append(header, axum::http::HeaderValue::from_static(value));
+                    }
+                    response
                 }
-                response
             }),
         ))
         .await;

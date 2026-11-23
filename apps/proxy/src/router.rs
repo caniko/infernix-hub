@@ -281,33 +281,39 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         });
         pending.or(Some(QuotaSnapshot::Ready(PoolQuota { reset, verified_reset, now })))
     };
-    let exhausted_reset = async |mut snapshot, retained: &mut [RetainedQuota]| {
+    let pick = |pool: &mut Pool, exchange: &Exchange, tried: &[String], now| {
+        pool.pick(lane, (exchange.affinity_key.as_deref(), exchange.parent.as_deref()), model, required_project, tried, now)
+    };
+    let pick_or_quota = async |exchange: &Exchange, tried: &[String], retained: &mut [RetainedQuota]| {
         loop {
-            let (index, reader) = match snapshot? {
-                QuotaSnapshot::Ready(quota) => return Some(quota),
-                QuotaSnapshot::ReadBody(index, reader) => (index, reader),
+            let snapshot = {
+                let mut state = proxy.state.write().await;
+                let now = Utc::now();
+                if let Some(account) = pick(&mut state.pool, exchange, tried, now) {
+                    return (Some(account), None);
+                }
+                quota_snapshot(&state.pool, now, retained)
             };
-            if let Ok(until) = reader.await {
-                retained[index].until = until;
+            match snapshot {
+                Some(QuotaSnapshot::ReadBody(index, reader)) => {
+                    if let Ok(until) = reader.await {
+                        retained[index].until = until;
+                    }
+                    // Recheck both eligibility and quota after the body settles.
+                }
+                Some(QuotaSnapshot::Ready(quota)) => return (None, Some(quota)),
+                None => return (None, None),
             }
-            // A body reader can extend backoff; recheck the live route after joining it.
-            let state = proxy.state.read().await;
-            snapshot = quota_snapshot(&state.pool, Utc::now(), retained);
         }
     };
+    let mut next_account = None;
     loop {
-        let (account, snapshot) = {
-            let mut state = proxy.state.write().await;
-            let now = Utc::now();
-            let account =
-                state.pool.pick(lane, (exchange.affinity_key.as_deref(), exchange.parent.as_deref()), model, required_project, &tried, now);
-            let snapshot = if account.is_none() { quota_snapshot(&state.pool, now, &mut retained_quota) } else { None };
-            (account, snapshot)
+        let (account, quota) = match next_account.take() {
+            Some(account) => (Some(account), None),
+            None => pick_or_quota(&exchange, &tried, &mut retained_quota).await,
         };
         let Some(mut account) = account else {
-            if let Some(quota) =
-                exhausted_reset(snapshot, &mut retained_quota).await.or_else(|| last_decoded_quota_reset.map(PoolQuota::unverified))
-            {
+            if let Some(quota) = quota.or_else(|| last_decoded_quota_reset.map(PoolQuota::unverified)) {
                 return exchange.rate_limited(quota, Usage::default(), None).await;
             }
             exchange.finish(Some(last_error), "unavailable", Usage::default(), None, None).await;
@@ -420,7 +426,8 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                 pending_quota_body = header.filter(|_| lane == Lane::Google);
                 None
             };
-            let until = quota_deadline(merge_quota_hints(&headers, header, body_reset), policy.failover_cooldown_secs, Utc::now());
+            let mut until = quota_deadline(merge_quota_hints(&headers, header, body_reset), policy.failover_cooldown_secs, Utc::now());
+            until.verified_reset &= pending_quota_body.is_none();
             Some(Backoff::Quota(until))
         } else if status == StatusCode::UNAUTHORIZED {
             Some(auth_backoff(policy.failover_cooldown_secs))
@@ -457,10 +464,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                 let mut state = proxy.state.write().await;
                 let now = Utc::now();
                 // Preview on the real scheduler; retries do not increment the round-robin cursor.
-                let has_next = state
-                    .pool
-                    .pick(lane, (exchange.affinity_key.as_deref(), exchange.parent.as_deref()), model, required_project, &tried, now)
-                    .is_some();
+                let has_next = pick(&mut state.pool, &exchange, &tried, now).is_some();
                 #[cfg(test)]
                 if has_next {
                     let _ = AFTER_FAILOVER_PREVIEW.try_with(|hook| hook(&mut state.pool));
@@ -475,8 +479,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                     let account = account.clone();
                     tokio::spawn(async move {
                         let body = read_google_quota_body(&mut response, deadline).await;
-                        let merged = merge_quota_hints(&headers, Some(header_until), body.reset).unwrap_or(header_until);
-                        extend_quota(&proxy, &account, &model, (merged != header_until).then_some(merged)).await;
+                        let merged = body.settle(&proxy, &account, &model, &headers, header_until).await;
                         merged.until
                     })
                 });
@@ -489,8 +492,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             }
             if let Some(header_until) = pending_quota_body {
                 let body = read_google_quota_body(&mut response, deadline).await;
-                let merged = merge_quota_hints(&headers, Some(header_until), body.reset).unwrap_or(header_until);
-                extend_quota(&proxy, &account, model, (merged != header_until).then_some(merged)).await;
+                let merged = body.settle(&proxy, &account, model, &headers, header_until).await;
                 quota_until = Some(merged.until);
                 prelude.first = body.chunks;
                 prelude.stream_error = body.error;
@@ -498,11 +500,15 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             if let Some(until) = quota_until {
                 retained_quota.push(RetainedQuota { account: account.clone(), until, reader: None });
             }
-            let snapshot = {
-                let state = proxy.state.read().await;
-                quota_snapshot(&state.pool, Utc::now(), &mut retained_quota)
-            };
-            if let Some(reset) = exhausted_reset(snapshot, &mut retained_quota).await {
+            let (alternate, quota) = pick_or_quota(&exchange, &tried, &mut retained_quota).await;
+            if alternate.is_some() {
+                next_account = alternate;
+                last_decoded_quota_reset = decoded_quota_reset.or(last_decoded_quota_reset);
+                exchange.complete_attempt(prelude.usage, Some(millis(began.elapsed())));
+                proxy.log("warn", "upstream request failed over").await;
+                continue;
+            }
+            if let Some(reset) = quota {
                 return exchange.rate_limited(reset, prelude.usage, Some(millis(began.elapsed()))).await;
             }
         }
@@ -1043,6 +1049,19 @@ struct QuotaBody {
     chunks: [Option<Bytes>; 2],
     error: Option<reqwest::Error>,
     reset: Option<Cooldown>,
+    verified: bool,
+}
+
+impl QuotaBody {
+    async fn settle(&self, proxy: &Proxy, account: &Account, model: &str, headers: &HeaderMap, header: Cooldown) -> Cooldown {
+        let mut merged = merge_quota_hints(headers, Some(header), self.reset).unwrap_or(header);
+        merged.verified_reset &= self.verified && header.verified_reset;
+        let provisional = Cooldown { verified_reset: false, ..header };
+        if merged != provisional {
+            extend_quota(proxy, account, model, merged, Some(provisional)).await;
+        }
+        merged
+    }
 }
 
 async fn read_google_quota_body(response: &mut reqwest::Response, deadline: tokio::time::Instant) -> QuotaBody {
@@ -1053,9 +1072,14 @@ async fn read_google_quota_body(response: &mut reqwest::Response, deadline: toki
     let mut boundary = JsonBoundary::default();
     let mut scanned = 0;
     let mut object = None;
+    let mut verified = false;
     while prefix.len() < LIMIT {
         let chunk = match tokio::time::timeout_at(deadline, response.chunk()).await {
             Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => {
+                verified = object != Some(true); // EOF before closing a JSON value is not a complete read.
+                break;
+            }
             Ok(Err(err)) => {
                 error = Some(err);
                 break;
@@ -1074,13 +1098,18 @@ async fn read_google_quota_body(response: &mut reqwest::Response, deadline: toki
         }
         if object == Some(true) {
             if let Some(end) = boundary.scan(&prefix[scanned..]) {
-                let reset = body_reset_hint(&prefix[..scanned + end], Utc::now());
-                return QuotaBody { chunks: [Some(prefix.into()), tail], error, reset };
+                let (mut reset, verified) =
+                    serde_json::from_slice(&prefix[..scanned + end]).map_or((None, false), |raw| google_reset_hint(&raw, Utc::now()));
+                let verified = verified && tail.is_none();
+                if let Some(hint) = reset.as_mut() {
+                    hint.verified_reset &= verified;
+                }
+                return QuotaBody { chunks: [Some(prefix.into()), tail], error, reset, verified };
             }
             scanned = prefix.len();
         }
     }
-    QuotaBody { chunks: [(!prefix.is_empty()).then(|| prefix.into()), tail], error, reset: None }
+    QuotaBody { chunks: [(!prefix.is_empty()).then(|| prefix.into()), tail], error, reset: None, verified }
 }
 
 fn duration_seconds(mut raw: &str) -> Option<(f64, bool)> {
@@ -1238,9 +1267,10 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
         .reduce(Cooldown::merge)
 }
 
+#[cfg(test)]
 fn body_reset_hint(body: &[u8], now: DateTime<Utc>) -> Option<Cooldown> {
     let raw: Value = serde_json::from_slice(body).ok()?;
-    google_reset_hint(&raw, now)
+    google_reset_hint(&raw, now).0
 }
 
 fn google_detail_kind(detail: &Value) -> Option<&str> {
@@ -1248,30 +1278,54 @@ fn google_detail_kind(detail: &Value) -> Option<&str> {
 }
 
 fn google_reset_delay(value: &Value, now: DateTime<Utc>) -> Option<Cooldown> {
-    value.as_str().and_then(duration_seconds).map(|(secs, _)| upstream_delay(now, secs))
+    let (secs, strict) = duration_seconds(value.as_str()?)?;
+    let mut hint = upstream_delay(now, secs);
+    hint.verified_reset &= strict;
+    Some(hint)
 }
 
 fn google_reset_timestamp(value: &Value, now: DateTime<Utc>) -> Option<Cooldown> {
     value.as_str()?.parse::<DateTime<Utc>>().ok().map(|at| clamp_cooldown(now, at))
 }
 
-fn google_reset_hint(raw: &Value, now: DateTime<Utc>) -> Option<Cooldown> {
-    if let Value::Array(items) = raw {
-        return items.iter().filter_map(|item| google_reset_hint(item, now)).reduce(Cooldown::merge);
+fn google_reset_hint(raw: &Value, now: DateTime<Utc>) -> (Option<Cooldown>, bool) {
+    fn collect(raw: &Value, now: DateTime<Utc>, verified: &mut bool) -> Option<Cooldown> {
+        if let Value::Array(items) = raw {
+            return items.iter().filter_map(|item| collect(item, now, verified)).reduce(Cooldown::merge);
+        }
+        let error = raw.get("error")?;
+        // An item may omit its status in a 429 body, but an explicit non-quota error cannot attest a quota reset.
+        if !error.get("code").is_none_or(|code| matches!(code.as_u64(), Some(8 | 429)))
+            || !error.get("status").is_none_or(|status| matches!(status.as_str(), Some("RESOURCE_EXHAUSTED" | "QUOTA_EXHAUSTED")))
+        {
+            return None;
+        }
+        let mut parse = |value: Option<&Value>, parse: fn(&Value, DateTime<Utc>) -> Option<Cooldown>| {
+            let hint = parse(value?, now);
+            *verified &= hint.is_some_and(|hint| hint.verified_reset);
+            hint
+        };
+        error
+            .get("details")?
+            .as_array()?
+            .iter()
+            .flat_map(|detail| match google_detail_kind(detail) {
+                Some("google.rpc.RetryInfo" | "RetryInfo") => [parse(detail.get("retryDelay"), google_reset_delay), None],
+                Some("google.rpc.ErrorInfo" | "ErrorInfo") => [
+                    parse(detail.pointer("/metadata/quotaResetDelay"), google_reset_delay),
+                    parse(detail.pointer("/metadata/quotaResetTimeStamp"), google_reset_timestamp),
+                ],
+                _ => [None, None],
+            })
+            .flatten()
+            .reduce(Cooldown::merge)
     }
-    raw.pointer("/error/details")
-        .and_then(Value::as_array)?
-        .iter()
-        .flat_map(|detail| match google_detail_kind(detail) {
-            Some("google.rpc.RetryInfo" | "RetryInfo") => [google_reset_delay(&detail["retryDelay"], now), None],
-            Some("google.rpc.ErrorInfo" | "ErrorInfo") => [
-                google_reset_delay(&detail["metadata"]["quotaResetDelay"], now),
-                google_reset_timestamp(&detail["metadata"]["quotaResetTimeStamp"], now),
-            ],
-            _ => [None, None],
-        })
-        .flatten()
-        .reduce(Cooldown::merge)
+    let mut verified = true;
+    let mut reset = collect(raw, now, &mut verified);
+    if let Some(hint) = reset.as_mut() {
+        hint.verified_reset &= verified;
+    }
+    (reset, verified)
 }
 
 fn merge_quota_hints(headers: &HeaderMap, header: Option<Cooldown>, body: Option<Cooldown>) -> Option<Cooldown> {
@@ -1326,27 +1380,27 @@ async fn result(proxy: &Proxy, account: &Account, model: &str, cooldown: Option<
             current.auth_cooldown = current.auth_cooldown.max(Some(until));
         }
         Some(Backoff::Quota(until)) => {
-            apply_quota(current, model, until, now);
+            apply_quota(current, model, until, now, None);
         }
         None => {}
     }
 }
 
-async fn extend_quota(proxy: &Proxy, account: &Account, model: &str, until: Option<Cooldown>) {
-    let Some(until) = until else { return };
+async fn extend_quota(proxy: &Proxy, account: &Account, model: &str, until: Cooldown, provisional: Option<Cooldown>) {
     let mut state = proxy.state.write().await;
     if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account)) {
-        apply_quota(current, model, until, Utc::now());
+        apply_quota(current, model, until, Utc::now(), provisional);
     }
 }
 
-fn apply_quota(account: &mut Account, model: &str, until: Cooldown, now: DateTime<Utc>) {
+fn apply_quota(account: &mut Account, model: &str, until: Cooldown, now: DateTime<Utc>, provisional: Option<Cooldown>) {
+    // Only replace this reader's preliminary value; preserve independent cooldown observations.
+    let merge = |old: Cooldown| if Some(old) == provisional { until } else { old.merge(until) };
     if let Some(scope) = model_cooldown_scope(account.lane, model) {
         account.scoped_cooldowns.retain(|_, c| c.until > now);
-        let entry = account.scoped_cooldowns.entry(scope).or_insert(until);
-        *entry = entry.merge(until);
+        account.scoped_cooldowns.entry(scope).and_modify(|old| *old = merge(*old)).or_insert(until);
     } else {
-        account.cooldown = Some(account.cooldown.map_or(until, |old| old.merge(until)));
+        account.cooldown = Some(account.cooldown.map_or(until, merge));
     }
 }
 
@@ -1515,7 +1569,7 @@ impl GoogleError {
             .and_then(|n| StatusCode::from_u16(n).ok())
             .filter(|status| status.is_client_error() || status.is_server_error())
             .unwrap_or(StatusCode::BAD_GATEWAY);
-        Some((Self { status, reset: google_reset_hint(raw, Utc::now()) }, raw))
+        Some((Self { status, reset: google_reset_hint(raw, Utc::now()).0 }, raw))
     }
 
     fn backoff(self, headers: &HeaderMap, fallback: u64, now: DateTime<Utc>) -> Option<Backoff> {
@@ -1899,7 +1953,7 @@ impl Wire {
                     }
                     self.guard.1 = Some((error, self.usage, millis(self.started.elapsed())));
                 } else if let Some(Backoff::Quota(until)) = cooldown {
-                    extend_quota(&self.proxy, &self.account, &exchange.model, Some(until)).await;
+                    extend_quota(&self.proxy, &self.account, &exchange.model, until, None).await;
                 }
                 if matches!(cooldown, Some(Backoff::Quota(_))) {
                     if first_error {
