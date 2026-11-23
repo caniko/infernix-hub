@@ -251,8 +251,12 @@ impl Account {
             && self.api_key == other.api_key
             && (self.lane != Lane::Codex || (self.chatgpt_id == other.chatgpt_id && self.chatgpt_user == other.chatgpt_user))
             && (self.lane != Lane::Google || (self.project == other.project && self.base == other.base))
-            && (self.refresh.is_none() || other.refresh.is_none() || self.refresh == other.refresh)
+            && self.compatible_refresh(other)
             && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
+    }
+
+    fn compatible_refresh(&self, other: &Self) -> bool {
+        self.refresh.is_none() || other.refresh.is_none() || self.refresh == other.refresh
     }
 
     fn shares_discovery_token(&self, other: &Self) -> bool {
@@ -1277,20 +1281,23 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
                 || existing.api_key != replacement.api_key
                 || existing.base != replacement.base
             {
-                let duplicate_id = pool
-                    .accounts
-                    .values()
-                    .find(|other| other.id != id && other.shares_discovery_token(&replacement))
-                    .map(|other| other.id.clone());
+                let duplicate = pool.accounts.values().find(|other| other.id != id && other.shares_discovery_token(&replacement));
                 pool.revision += 1;
-                if let Some(duplicate_id) = duplicate_id {
+                if let Some(survivor) = duplicate.filter(|other| other.compatible_refresh(&replacement)) {
                     // Keep the account that already holds the credential and its route evidence.
+                    let duplicate_id = survivor.id.clone();
                     pool.accounts.remove(&id);
                     id = duplicate_id;
                     if let Some(survivor) = pool.accounts.get_mut(&id) {
                         merge_google_duplicate(survivor, replacement, client.is_some(), secret.is_some());
                     }
                 } else {
+                    if duplicate.is_some() {
+                        // Remember the disk token without making it available for routing.
+                        replacement.provenance_token_fp = Some(Sha256::digest(&replacement.access).into());
+                        replacement.replace_access(String::new());
+                        replacement.expires = None;
+                    }
                     replacement.provenance_enrollment = existing.provenance_enrollment.clone();
                     replacement.probe_generation = existing.probe_generation.saturating_add(1);
                     pool.insert(vec![replacement]);
@@ -1362,17 +1369,22 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         }
         pool.revision += i64::from(relabel || enriched || project_changed || rotated);
         if rotated && let Some(rotated_account) = pool.accounts.get(&id) {
-            let duplicate_id = pool
-                .accounts
-                .values()
-                .find(|other| other.id != id && other.lane == Lane::Google && other.access == rotated_account.access)
-                .map(|other| other.id.clone());
-            if let Some(duplicate_id) = duplicate_id
-                && let Some(replacement) = pool.accounts.remove(&id)
-                && let Some(survivor) = pool.accounts.get_mut(&duplicate_id)
-            {
-                // Keep the surviving route's OAuth client unless it needs to adopt the refresh token.
-                merge_google_duplicate(survivor, replacement, false, false);
+            let duplicate =
+                pool.accounts.values().find(|other| other.id != id && other.lane == Lane::Google && other.access == rotated_account.access);
+            if let Some(other) = duplicate {
+                if other.compatible_refresh(rotated_account) {
+                    let duplicate_id = other.id.clone();
+                    if let Some(replacement) = pool.accounts.remove(&id)
+                        && let Some(survivor) = pool.accounts.get_mut(&duplicate_id)
+                    {
+                        // Keep the surviving route's OAuth client unless it needs to adopt the refresh token.
+                        merge_google_duplicate(survivor, replacement, false, false);
+                    }
+                } else if let Some(account) = pool.accounts.get_mut(&id) {
+                    // Use this enrollment's own refresh token instead of retrying the shared access token.
+                    account.replace_access(String::new());
+                    account.expires = None;
+                }
             }
         }
         return;

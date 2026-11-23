@@ -5755,7 +5755,7 @@ fn provenance_reload_deduplicates_access_rotation_with_unchanged_refresh_token()
         &mut pool,
         "b",
         json!({
-            "access_token":"token-b","refresh_token":"refresh-b","client_id":"client-b",
+            "access_token":"token-b","client_id":"client-b",
             "client_secret":"secret-b","project_id":"project-b"
         }),
     );
@@ -5771,9 +5771,9 @@ fn provenance_reload_deduplicates_access_rotation_with_unchanged_refresh_token()
     assert_eq!(pool.accounts.len(), 1);
     let survivor = &pool.accounts[&b.id];
     assert_eq!(survivor.access, b.access);
-    assert_eq!(survivor.refresh, b.refresh);
-    assert_eq!(survivor.google_client, b.google_client);
-    assert_eq!(survivor.google_secret, b.google_secret);
+    assert_eq!(survivor.refresh.as_deref(), Some("refresh-a"));
+    assert_eq!(survivor.google_client.as_deref(), Some("client-a"));
+    assert_eq!(survivor.google_secret.as_deref(), Some("secret-a"));
     assert_eq!(survivor.project, b.project);
     assert_eq!(survivor.cooldown, b.cooldown);
     assert_eq!(survivor.scoped_cooldowns, b.scoped_cooldowns);
@@ -5781,6 +5781,42 @@ fn provenance_reload_deduplicates_access_rotation_with_unchanged_refresh_token()
     assert_eq!(survivor.probe_generation, b.probe_generation);
     assert!(survivor.quarantined(Utc::now()));
     assert!(!survivor.eligible(Utc::now(), "gemini-neon"));
+}
+
+#[test]
+fn provenance_reload_keeps_distinct_refresh_tokens_without_reusing_quarantined_access() {
+    for prior_refresh in ["refresh-a", "old-refresh-a"] {
+        let mut pool = Pool::default();
+        let enrollment = |access, refresh| {
+            json!({
+                "access_token":access,"refresh_token":refresh,"client_id":"client",
+                "client_secret":"secret","project_id":"project"
+            })
+        };
+        pool::add_provenance_google(&mut pool, "a", enrollment("token-a", prior_refresh));
+        pool::add_provenance_google(&mut pool, "b", enrollment("token-b", "refresh-b"));
+        let a_id = pool.accounts.values().find(|a| a.label == "a").unwrap().id.clone();
+        let b = pool.accounts.values_mut().find(|a| a.label == "b").unwrap();
+        seed_old_google_route(b);
+        let b = b.clone();
+
+        // The unchanged snapshot must not reinstall the rejected access token on a later reload.
+        for _ in 0..2 {
+            pool::add_provenance_google(&mut pool, "a", enrollment("token-b", "refresh-a"));
+            assert_eq!(pool.accounts.len(), 2);
+            let a = &pool.accounts[&a_id];
+            assert_eq!(a.refresh.as_deref(), Some("refresh-a"));
+            assert!(a.access.is_empty());
+            assert!(a.eligible(Utc::now(), "gemini-neon"));
+            let survivor = &pool.accounts[&b.id];
+            assert_eq!(survivor.refresh.as_deref(), Some("refresh-b"));
+            assert_eq!(survivor.access, b.access);
+            assert_eq!(survivor.cooldown, b.cooldown);
+            assert_eq!(survivor.scoped_cooldowns, b.scoped_cooldowns);
+            assert_eq!(survivor.last_error, b.last_error);
+            assert!(survivor.quarantined(Utc::now()));
+        }
+    }
 }
 
 #[test]
@@ -5856,7 +5892,7 @@ fn provenance_reload_does_not_mix_oauth_clients_across_refresh_tokens() {
             "a",
             json!({"access_token":"shared-access","refresh_token":refresh,"client_id":"wrong-client","client_secret":"wrong-secret"}),
         );
-        assert_eq!(pool.accounts.len(), 1);
+        assert_eq!(pool.accounts.len(), if refresh.is_some() { 2 } else { 1 });
         let b = &pool.accounts[&b_id];
         assert_eq!(b.refresh.as_deref(), Some("adopted-refresh"));
         assert_eq!(b.google_client, None);
