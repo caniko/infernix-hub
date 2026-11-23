@@ -495,6 +495,114 @@ async fn cooldown_failover_stream_usage_and_capture() {
 }
 
 #[tokio::test]
+async fn usage_windows_validates_model_diagnostics_and_does_not_change_the_pool() {
+    use contracts::providers::ApiKeyOrder;
+    use integrations::providers::antigravity::parse_antigravity_summary;
+    use pool::Cooldown;
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mock = serve(Router::new().fallback({
+        let probes = probes.clone();
+        move || async move {
+            probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            StatusCode::NOT_FOUND
+        }
+    }))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let now = Utc::now();
+    let reset = now + TimeDelta::minutes(20);
+    let model = "gemini-neon";
+    let (accounts, cursors, revision) = {
+        let mut state = proxy.state.write().await;
+        let pool = &mut state.pool;
+        assert!(pool.pick(Lane::Google, None, None, model, &[]).is_some());
+        pool.bind(Lane::Google, "test-session", "google-b.json");
+        pool.policy.api_key_order = ApiKeyOrder::SubscriptionsOnly;
+        for (name, data) in [
+            ("disabled.json", json!({"access_token":"private-token","disabled":true})),
+            ("unsupported.json", json!({"access_token":"private-token","models":["different-model"]})),
+            ("zero-weight.json", json!({"access_token":"private-token","weight":0})),
+            ("key.json", json!({"api_key":"private-token"})),
+        ] {
+            let mut data = data;
+            data["type"] = json!("google");
+            pool.insert(pool::parse_credentials(name, &data, false).unwrap());
+        }
+        let a = pool.accounts.get_mut("google-a.json").unwrap();
+        a.scoped_cooldowns.insert("gemini".into(), Cooldown { until: reset, verified_reset: true });
+        a.windows =
+            parse_antigravity_summary(&json!({"buckets":[{"bucketId":"gemini-weekly","remainingFraction":0.0,"resetTime":reset}]}), now);
+        pool.accounts.get_mut("google-b.json").unwrap().auth_cooldown = Some(now + TimeDelta::minutes(2));
+        let rows = [
+            ("disabled.json", json!(["disabled"])),
+            ("google-a.json", json!(["scoped_cooldown", "quota_window"])),
+            ("google-b.json", json!(["auth_cooldown"])),
+            ("key.json", json!(["subscriptions_only"])),
+            ("unsupported.json", json!(["unsupported_model"])),
+            ("zero-weight.json", json!(["zero_weight"])),
+        ]
+        .map(|(id, reasons)| json!({"auth_index":pool.accounts[id].auth_index,"exclusion_reasons":reasons}));
+        (rows, pool.cursors.clone(), pool.revision)
+    };
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let path = "/v8/management/usage/windows";
+    let scoped = format!("{path}?lane=google&model={model}");
+    assert_eq!(http.request("GET", &scoped).bearer_auth("inference-fixture").send().await.unwrap().status(), 401);
+    assert_eq!(http.request("GET", &format!("{path}?lane=bad")).send().await.unwrap().status(), 401);
+    for query in [
+        "lane=google",
+        "model=gemini-neon",
+        "lane=unknown&model=gemini-neon",
+        "lane=&model=gemini-neon",
+        "lane=google&model=",
+        "lane=google&model=%20",
+        "lane=google&model=gemini%20neon",
+        "lane=google&model=%0A",
+        "lane=google&model=%3B",
+        "lane=google&model=%C3%A9",
+        "lane=google&lane=google&model=gemini-neon",
+        "lane=google&model=gemini-neon&unknown=1",
+        "unknown=1",
+    ] {
+        assert_eq!(http.management("GET", &format!("{path}?{query}"), None).await.status(), 400, "{query}");
+    }
+    let legacy: Value = http.management("GET", path, None).await.json().await.unwrap();
+    assert_eq!(legacy.as_object().unwrap().keys().collect::<Vec<_>>(), ["credentials", "hub_sync_configured", "strategy"]);
+    assert_eq!(legacy["strategy"], "round-robin");
+    assert_eq!(legacy["credentials"].as_array().unwrap().len(), 8);
+    assert!(legacy["credentials"].as_array().unwrap().iter().all(|row| row["next_pick"].is_boolean()));
+
+    let response = http.management("GET", &scoped, None).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let mut response: Value = response.json().await.unwrap();
+    let at: DateTime<Utc> =
+        serde_json::from_value(response["model_eligibility"].as_object_mut().unwrap().remove("snapshot_at").unwrap()).unwrap();
+    assert!(at >= now && at <= Utc::now());
+    assert_eq!(
+        response,
+        json!({"model_eligibility":{"lane":"antigravity","wire_model":model,"supported_accounts":2,"eligible_accounts":0,
+            "verified_next_reset_at":reset,"accounts":accounts}})
+    );
+    let other: Value = http.management("GET", &format!("{path}?lane=antigravity&model=gemini-argon"), None).await.json().await.unwrap();
+    assert_eq!(other["model_eligibility"]["eligible_accounts"], 1);
+    assert_eq!(other["model_eligibility"]["verified_next_reset_at"], Value::Null);
+    assert_eq!(http.management("GET", path, None).await.json::<Value>().await.unwrap(), legacy);
+
+    let state = proxy.state.read().await;
+    assert_eq!(state.pool.cursors, cursors);
+    assert_eq!(state.pool.revision, revision);
+    assert_eq!(state.pool.bound(Lane::Google, "test-session"), Some("google-b.json"));
+    assert_eq!(state.pool.accounts["google-a.json"].scoped_cooldowns["gemini"], Cooldown { until: reset, verified_reset: true });
+    assert_eq!(state.pool.accounts["google-b.json"].auth_cooldown, Some(now + TimeDelta::minutes(2)));
+    assert!(state.usage_refreshes.is_empty());
+    assert!(state.activity.is_empty());
+    assert_eq!(probes.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn management_wire_contracts_reject_cross_origin_and_manage_pool() {
     let mock = serve(Router::new().route(
         "/api/oauth/usage",

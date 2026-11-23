@@ -8,7 +8,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path, Query, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State, rejection::QueryRejection},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -327,7 +327,25 @@ fn usage(pool: &Pool) -> Value {
     json!({"strategy":strategy_name(pool.policy.strategy), "credentials":credentials})
 }
 
-async fn windows(State(proxy): State<Arc<Proxy>>) -> Reply {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsQuery {
+    lane: Option<String>,
+    model: Option<String>,
+}
+
+async fn windows(State(proxy): State<Arc<Proxy>>, query: Result<Query<WindowsQuery>, QueryRejection>) -> Reply {
+    let Query(query) = query.map_err(|_| bad("invalid usage windows query"))?;
+    match (query.lane.as_deref(), query.model.as_deref()) {
+        (Some(lane), Some(model)) => {
+            let lane = Lane::parse(lane).ok_or_else(|| bad("unknown lane"))?;
+            let state = proxy.state.read().await;
+            let evaluation = state.pool.evaluate_model_eligibility(lane, model, Utc::now()).ok_or_else(|| bad("invalid wire model"))?;
+            return ok(json!({"model_eligibility":evaluation}));
+        }
+        (None, None) => {}
+        _ => return Err(bad("lane and model must be provided together")),
+    }
     let mut response = usage(&proxy.state.read().await.pool);
     response["hub_sync_configured"] = json!(proxy.hub_sync_configured);
     ok(response)
