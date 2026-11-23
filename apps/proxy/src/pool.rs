@@ -968,7 +968,8 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         if enrolled.is_some() && (existing.refresh != refresh || refresh.is_none()) {
             let Ok(mut replacements) = parse_credentials(&existing.name, &raw, true) else { return };
             let Some(mut replacement) = replacements.pop().filter(|a| a.id == existing.id) else { return };
-            if existing.refresh != refresh
+            // An access-only reread of the same token must not erase an enriched refresh token.
+            if (replacement.refresh.is_some() && existing.refresh != replacement.refresh)
                 || existing.access != replacement.access
                 || existing.api_key != replacement.api_key
                 || existing.base != replacement.base
@@ -983,6 +984,27 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
                     // Keep the account that already holds the credential and its route evidence.
                     pool.accounts.remove(&id);
                     id = duplicate_id;
+                    if let Some(survivor) = pool.accounts.get_mut(&id)
+                        && !survivor.api_key
+                        && !replacement.api_key
+                        && !survivor.access.is_empty()
+                        && survivor.access == replacement.access
+                    {
+                        if survivor.refresh.is_none() {
+                            survivor.refresh.clone_from(&replacement.refresh);
+                        }
+                        // Expiry belongs to the retained access token; do not replace client
+                        // credentials for a different refresh token.
+                        let fresher = replacement.expires.zip(survivor.expires).is_some_and(|(new, old)| new > old)
+                            && survivor.refresh == replacement.refresh;
+                        survivor.expires = survivor.expires.max(replacement.expires);
+                        if survivor.google_client.is_none() || (fresher && client.is_some()) {
+                            survivor.google_client = replacement.google_client;
+                        }
+                        if survivor.google_secret.is_none() || (fresher && secret.is_some()) {
+                            survivor.google_secret = replacement.google_secret;
+                        }
+                    }
                 } else {
                     replacement.provenance_enrollment = existing.provenance_enrollment.clone();
                     replacement.probe_generation = existing.probe_generation.saturating_add(1);

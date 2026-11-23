@@ -2959,6 +2959,47 @@ fn provenance_reload_deduplicates_access_token_without_clearing_cooldown() {
 }
 
 #[test]
+fn provenance_reload_keeps_the_refresh_token_and_surviving_route_evidence() {
+    let mut pool = Pool::default();
+    let expires = Utc::now().timestamp() + 3600;
+    pool::add_provenance_google(&mut pool, "a", json!({"access_token":"old-access","refresh_token":"old-refresh"}));
+    let access_only = json!({"access_token":"shared-access","expires_at":expires - 600,"client_id":"old-client","project_id":"project"});
+    pool::add_provenance_google(&mut pool, "b", access_only.clone());
+    assert_eq!(pool.accounts.len(), 2);
+    let b = pool.accounts.values_mut().find(|a| a.label == "b").unwrap();
+    assert!(b.refresh.is_none());
+    b.google_secret = None;
+    seed_old_google_route(b);
+    let b_id = b.id.clone();
+    let (cooldown, auth, scoped, reset, generation) =
+        (b.cooldown, b.auth_cooldown, b.scoped_cooldowns.clone(), b.windows[0].resets_at, b.probe_generation);
+
+    pool::add_provenance_google(
+        &mut pool,
+        "a",
+        json!({
+            "access_token":"shared-access","refresh_token":"new-refresh","expires_at":expires,
+            "client_id":"new-client","client_secret":"new-secret","project_id":"project"
+        }),
+    );
+    // Discovery may reread the survivor's access-only enrollment in the same pass.
+    pool::add_provenance_google(&mut pool, "b", access_only);
+
+    assert_eq!(pool.accounts.len(), 1);
+    let b = &pool.accounts[&b_id];
+    assert_eq!(b.refresh.as_deref(), Some("new-refresh"));
+    assert_eq!(b.expires.map(|at| at.timestamp()), Some(expires));
+    assert_eq!(b.google_client.as_deref(), Some("new-client"));
+    assert_eq!(b.google_secret.as_deref(), Some("new-secret"));
+    assert_eq!(b.cooldown, cooldown);
+    assert_eq!(b.auth_cooldown, auth);
+    assert_eq!(b.scoped_cooldowns, scoped);
+    assert_eq!(b.windows[0].resets_at, reset);
+    assert_eq!(b.probe_generation, generation);
+    assert!(!b.eligible(Utc::now(), "gemini-neon"));
+}
+
+#[test]
 fn provenance_reload_deduplicates_refresh_token_and_enriches_the_retained_route() {
     let mut pool = Pool::default();
     let enrollment = |access, refresh| json!({"access_token":access,"refresh_token":refresh});
