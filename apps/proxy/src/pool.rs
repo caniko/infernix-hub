@@ -990,18 +990,19 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
                         && !survivor.access.is_empty()
                         && survivor.access == replacement.access
                     {
-                        if survivor.refresh.is_none() {
+                        let adopting_refresh = survivor.refresh.is_none() && replacement.refresh.is_some();
+                        if adopting_refresh {
                             survivor.refresh.clone_from(&replacement.refresh);
                         }
-                        // Expiry belongs to the retained access token; do not replace client
-                        // credentials for a different refresh token.
+                        // Adopt the refresh token and its client credentials together, even
+                        // when the retained access token expires later.
                         let fresher = replacement.expires.zip(survivor.expires).is_some_and(|(new, old)| new > old)
                             && survivor.refresh == replacement.refresh;
                         survivor.expires = survivor.expires.max(replacement.expires);
-                        if survivor.google_client.is_none() || (fresher && client.is_some()) {
+                        if adopting_refresh || survivor.google_client.is_none() || (fresher && client.is_some()) {
                             survivor.google_client = replacement.google_client;
                         }
-                        if survivor.google_secret.is_none() || (fresher && secret.is_some()) {
+                        if adopting_refresh || survivor.google_secret.is_none() || (fresher && secret.is_some()) {
                             survivor.google_secret = replacement.google_secret;
                         }
                     }
@@ -1018,16 +1019,18 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
             && existing.provenance_enrollment.as_deref().is_none_or(|enrollment| enrollment == label)
             && existing.label != label
             && (existing.label == existing.name || existing.label.starts_with("local-") || existing.label.len() == 64);
-        let enriched = (existing.google_client.is_none() && client.is_some())
-            || (existing.google_secret.is_none() && secret.is_some())
+        // An access-only reread must not fill in stale credentials for an adopted refresh token.
+        let same_refresh = existing.refresh == refresh;
+        let enriched = (same_refresh
+            && ((existing.google_client.is_none() && client.is_some()) || (existing.google_secret.is_none() && secret.is_some())))
             || (existing.email.is_none() && email.is_some());
         if relabel {
             existing.label = label.to_owned();
         }
-        if existing.google_client.is_none() {
+        if same_refresh && existing.google_client.is_none() {
             existing.google_client = client;
         }
-        if existing.google_secret.is_none() {
+        if same_refresh && existing.google_secret.is_none() {
             existing.google_secret = secret;
         }
         if existing.local && existing.provenance_enrollment.is_none() {
