@@ -19,13 +19,16 @@ use domain::ports::PortError;
 use serde_json::Value;
 
 pub mod comfy;
+pub mod humanizer;
 pub mod n8n;
 pub mod paperclip;
 pub mod postiz;
 pub mod s3;
 pub mod windmill;
 
+pub use crate::fixture::DisabledHumanizer;
 pub use comfy::ComfyClient;
+pub use humanizer::HumanizerClient;
 pub use n8n::{N8nClient, N8nClientError, N8nConfig, N8nPublisher, N8nPublisherConfig, SecretString};
 pub use paperclip::{PaperclipClient, PaperclipConfig};
 pub use postiz::{PostizClient, PostizConfig};

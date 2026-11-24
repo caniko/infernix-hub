@@ -66,6 +66,19 @@ from `*_TOKEN_FILE`. Modes: `HUB_PAPERCLIP|HUB_WINDMILL|HUB_COMFY|HUB_ASSISTANT`
 `N8N_PUBLISH_PLATFORMS` + `N8N_WEBHOOK_TOKEN_FILE` add one `n8n:<platform>`
 channel each.
 
+`POST /v1/humanize` previews rewriting for operator and agent tokens without
+saving the draft. `HUB_HUMANIZER` defaults to `disabled`; it also accepts
+`fixture` or `live`. The live adapter uses `HUMANIZER_URL` (default
+`http://127.0.0.1:3000`), optional `HUMANIZER_TOKEN_FILE` (preferred) or
+`HUMANIZER_TOKEN`, and `HUMANIZER_TIMEOUT_SECS` (default 180). `HUB_HUMANIZER_AUTO_APPLY=true` enables
+verified rewriting of assistant replies before they enter review; preview
+does not require this setting. On failure the original text is used.
+
+The `/v1/personas/{id}` Soul endpoints manage memories, written/spoken voice
+exemplars, and daily persona state. Thread drafts use persona-wide memories and
+the exact thread's memories, never sandbox entries. Recall and listing can
+explicitly include sandbox; novelty checks compare against aired memories only.
+
 ## Checks
 
 ```sh

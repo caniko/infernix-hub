@@ -8,13 +8,13 @@
 use std::sync::Arc;
 
 use contracts::{
-    Direction, DraftDecisionIn, DraftReplyIn, DraftState, FollowUpIn, HandoffOut, IngestReceipt, Interaction, InteractionIn, Owner,
-    Relationship, RelationshipDetail, ReplyDraft, Role,
+    Direction, DraftDecisionIn, DraftReplyIn, DraftState, FollowUpIn, HandoffOut, HumanizeInput, IngestReceipt, Interaction, InteractionIn,
+    Owner, Relationship, RelationshipDetail, ReplyDraft, RetrieveSoulContextIn, Role, VoiceMode,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::ports::{AssistantTurn, PortError, ProviderState, Publisher, ReplyRequest};
+use crate::ports::{AssistantTurn, HumanizerVoiceExemplar, PortError, ProviderState, Publisher, ReplyRequest, VoiceOptions};
 use crate::{Actor, DResult, DomainError, Hub, OPERATOR, OPERATOR_OR_AGENT, audit, conflict, decode, decode_one, invalid, outbox};
 
 const REL_COLS: &str = "id, account_id, external_thread_id, counterpart, owner, owner_user, owner_epoch, follow_up_at, last_inbound_at, content_item_id, permalink";
@@ -243,12 +243,43 @@ pub async fn draft_assistant_reply(hub: &Hub, actor: &Actor, rel_id: Uuid) -> DR
     if interactions.is_empty() {
         return Err(conflict("no_interactions", "the thread has no messages to reply to"));
     }
-    let context = json!({
+    let soul = if let Some(id) = persona_id {
+        let query = interactions.iter().map(|i| i.body.as_str()).collect::<Vec<_>>().join("\n");
+        let start = query.ceil_char_boundary(query.len().saturating_sub(32_768));
+        Some(
+            crate::soul::retrieve_context(
+                hub,
+                actor,
+                id,
+                RetrieveSoulContextIn {
+                    query: query[start..].into(),
+                    relationship_id: Some(rel_id),
+                    include_sandbox: false,
+                    mode: VoiceMode::Written,
+                    ..Default::default()
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let mut context = json!({
         "task": "draft one reply to the latest message in the persona's voice; an operator reviews it before it is sent",
-        "persona": persona.map(|p| json!({ "name": p.name, "canon": p.canon })),
+        "persona": persona.as_ref().map(|p| json!({ "name": p.name, "canon": p.canon })),
         "relationship": { "counterpart": rel.counterpart, "account_id": rel.account_id, "permalink": rel.permalink },
         "thread": interactions,
     });
+    if let Some(soul) = &soul {
+        context["soul"] = json!({
+            "state": soul.state,
+            "memories": soul.memories.iter().map(|hit| {
+                let m = &hit.memory;
+                json!({ "id": m.id, "tier": m.tier, "subjects": m.subjects, "title": m.title, "body": m.body, "occurred_at": m.occurred_at })
+            }).collect::<Vec<_>>(),
+            "exemplars": soul.exemplars.iter().map(|e| &e.rewrite).collect::<Vec<_>>(),
+        });
+    }
     let turns: Vec<AssistantTurn> = interactions
         .iter()
         .map(|i| AssistantTurn { role: if i.direction == Direction::Inbound { "user" } else { "assistant" }.into(), body: i.body.clone() })
@@ -261,9 +292,30 @@ pub async fn draft_assistant_reply(hub: &Hub, actor: &Actor, rel_id: Uuid) -> DR
     if reply.body.trim().is_empty() {
         return Err(DomainError::Unavailable { code: "assistant_unavailable", message: "the assistant returned an empty draft".into() });
     }
+    let body = if hub.config.humanizer_auto_apply && hub.humanizer.is_enabled() {
+        let voice = soul.as_ref().map(|soul| VoiceOptions {
+            mode: VoiceMode::Written,
+            avoid: persona.as_ref().and_then(|p| p.canon.as_ref()).map(|c| c.body.avoid.clone()).unwrap_or_default(),
+            exemplars: soul
+                .exemplars
+                .iter()
+                .rev()
+                .filter_map(|e| Some(HumanizerVoiceExemplar { draft: e.draft.clone()?, rewrite: e.rewrite.clone() }))
+                .collect(),
+            reference_lines: soul.exemplars.iter().map(|e| e.rewrite.clone()).collect(),
+            ..Default::default()
+        });
+        let mut locked_facts = vec![rel.counterpart.clone()];
+        if let Some(persona) = persona {
+            locked_facts.push(persona.name);
+        }
+        hub.humanize_draft_with_voice(HumanizeInput { text: reply.body, locked_facts, ..Default::default() }, voice).await.humanized_text
+    } else {
+        reply.body
+    };
     let in_reply_to = interactions.iter().rev().find(|i| i.direction == Direction::Inbound).map(|i| i.id);
     let mut tx = hub.db.begin().await?;
-    // Ownership may have moved while the assistant was writing. A takeover and
+    // Ownership may have moved while the assistant was writing or rewriting. A takeover and
     // release back to the agent changes the epoch even though the agent owns it
     // again, so the epoch, not just the owner, decides.
     let rel = get_rel(&mut tx, rel_id, true).await?;
@@ -284,7 +336,7 @@ pub async fn draft_assistant_reply(hub: &Hub, actor: &Actor, rel_id: Uuid) -> DR
     .bind(id)
     .bind(rel_id)
     .bind(in_reply_to)
-    .bind(&reply.body)
+    .bind(&body)
     .bind(Owner::Agent.as_str())
     .bind(format!("assistant:{}", reply.model))
     .bind(rel.owner_epoch)

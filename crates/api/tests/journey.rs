@@ -1734,6 +1734,359 @@ async fn operator_asks_the_assistant_for_a_reply_draft() {
     assert_eq!(err.code(), "human_owns_conversation");
 }
 
+#[tokio::test]
+async fn humanize_preview_is_role_scoped_and_separate_from_auto_apply() {
+    let Some(h) = harness().await else { return };
+    let request = HumanizeInput {
+        text: "  Thanks @fan! #Update https://example.org/  \n".into(),
+        locked_facts: vec!["Thanks".into()],
+        ..Default::default()
+    };
+    assert_eq!(code(h.procedure.post::<_, HumanizePreview>("/humanize", &request).await.unwrap_err()), "forbidden");
+    let preview: HumanizePreview = h.agent.post("/humanize", &request).await.unwrap();
+    assert!(preview.applied && preview.judge_verified);
+    assert_eq!(preview.source_text, request.text);
+    assert_ne!(preview.humanized_text, preview.source_text);
+    assert_eq!(code(HubClient::new(&h.url, "invalid").post::<_, HumanizePreview>("/humanize", &request).await.unwrap_err()), "forbidden");
+    let status: SystemStatus = h.op.get("/status").await.unwrap();
+    assert!(status.integrations.iter().any(|i| i.name == "humanizer" && i.mode == AdapterMode::Fixture));
+    assert!(!h.hub.config.humanizer_auto_apply);
+}
+
+struct TestHumanizer {
+    result: domain::ports::PortResult<HumanizeOutput>,
+}
+
+#[async_trait::async_trait]
+impl domain::ports::Humanizer for TestHumanizer {
+    async fn humanize(&self, _: HumanizeInput) -> domain::ports::PortResult<HumanizeOutput> {
+        self.result.clone()
+    }
+}
+
+#[tokio::test]
+async fn humanize_rejections_return_exact_original() {
+    let Some(h) = harness().await else { return };
+    let request = HumanizeInput { text: " \r\noriginal ✨ @fan\t".into(), max_chars: Some(15), ..Default::default() };
+    let verified = HumanizeOutput {
+        humanized_text: "😀 @fan".into(),
+        paragraphs_processed: 1,
+        retries_used: 0,
+        fallback_paragraphs: vec![],
+        judge_verified: true,
+        paragraphs: None,
+    };
+    for (result, reason) in [
+        (Ok(HumanizeOutput { judge_verified: false, ..verified.clone() }), "judge"),
+        (Ok(HumanizeOutput { humanized_text: "😀".repeat(16), ..verified.clone() }), "max_chars"),
+        (Ok(HumanizeOutput { fallback_paragraphs: vec![0], ..verified.clone() }), "fallback"),
+        (Ok(HumanizeOutput { humanized_text: "Missing handle".into(), ..verified.clone() }), "locked fact"),
+        (Err(domain::ports::PortError::Unreachable("internal backend details".into())), "unavailable"),
+    ] {
+        let hub = domain::Hub { humanizer: Arc::new(TestHumanizer { result }), ..h.hub.clone() };
+        let preview = hub.humanize_draft(request.clone()).await;
+        assert!(!preview.applied);
+        assert_eq!(preview.source_text, request.text);
+        assert_eq!(preview.humanized_text, request.text);
+        assert!(preview.reason.unwrap().contains(reason));
+    }
+    let hub = domain::Hub { humanizer: Arc::new(TestHumanizer { result: Ok(verified) }), ..h.hub.clone() };
+    let preview = hub.humanize_draft(HumanizeInput { max_chars: Some(6), ..request }).await;
+    assert!(preview.applied, "the limit counts Unicode characters, not bytes");
+}
+
+#[tokio::test]
+async fn humanize_assistant_only_changes_verified_opt_in_drafts() {
+    let Some(h) = harness().await else { return };
+    h.add_account("test-humanize", "fixture").await;
+    let ev = InteractionIn {
+        account_id: "test-humanize".into(),
+        external_thread_id: "t-humanize".into(),
+        external_id: "m-humanize".into(),
+        direction: Direction::Inbound,
+        author: "@fan".into(),
+        body: "Still there?".into(),
+        occurred_at: Utc::now(),
+        permalink: None,
+        raw: json!({}),
+    };
+    let r: IngestReceipt = h.ingest.post("/ingest/interactions", &ev).await.unwrap();
+    let operator = actor(Role::Operator, "operator:test");
+    let original = domain::engagement::draft_assistant_reply(&h.hub, &operator, r.id).await.unwrap();
+    let config = Arc::new(domain::HubConfig { humanizer_auto_apply: true, ..(*h.hub.config).clone() });
+    let hub = domain::Hub { config, ..h.hub.clone() };
+    let rewritten = domain::engagement::draft_assistant_reply(&hub, &operator, r.id).await.unwrap();
+    assert_eq!(rewritten.body, format!("Fixture rewrite: {}", original.body));
+    assert_eq!(rewritten.state, DraftState::InReview);
+    assert_eq!(rewritten.owner_epoch, original.owner_epoch);
+    let unavailable = domain::Hub {
+        humanizer: Arc::new(TestHumanizer { result: Err(domain::ports::PortError::Unreachable("offline".into())) }),
+        ..hub.clone()
+    };
+    let unchanged = domain::engagement::draft_assistant_reply(&unavailable, &operator, r.id).await.unwrap();
+    assert_eq!(unchanged.body, original.body);
+
+    // The same epoch guard applies if ownership changes during the rewrite.
+    struct GatedHumanizer(Arc<tokio::sync::Barrier>);
+    #[async_trait::async_trait]
+    impl domain::ports::Humanizer for GatedHumanizer {
+        async fn humanize(&self, req: HumanizeInput) -> domain::ports::PortResult<HumanizeOutput> {
+            self.0.wait().await;
+            self.0.wait().await;
+            domain::ports::Humanizer::humanize(&integrations::fixture::FixtureHumanizer, req).await
+        }
+    }
+    let gate = Arc::new(tokio::sync::Barrier::new(2));
+    let hub = domain::Hub { humanizer: Arc::new(GatedHumanizer(gate.clone())), ..hub };
+    let drafting = tokio::spawn(async move { domain::engagement::draft_assistant_reply(&hub, &operator, r.id).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait()).await.expect("the humanizer is rewriting");
+    h.op.takeover(r.id).await.unwrap();
+    h.op.release_to_agent(r.id).await.unwrap();
+    gate.wait().await;
+    assert_eq!(drafting.await.unwrap().unwrap_err().code(), "owner_changed");
+    assert_eq!(h.op.relationship(r.id).await.unwrap().drafts.len(), 3);
+}
+
+#[tokio::test]
+async fn soul_routes_recall_scoped_truth_and_check_aired_novelty() {
+    let Some(h) = harness().await else { return };
+    let op = actor(Role::Operator, "operator:test");
+    let a = domain::canon::create_persona(&h.hub, &op, "Host A").await.unwrap().id;
+    let b = domain::canon::create_persona(&h.hub, &op, "Host B").await.unwrap().id;
+    let applied = domain::applied_migrations(&h.hub.db).await.unwrap();
+    assert_eq!(&applied[..19], (1..=19).collect::<Vec<_>>());
+    let memories = format!("/personas/{a}/memories");
+    let pair: SoulMemory =
+        h.op.post(&memories, &json!({"subjects":[b], "tier":"canon", "body":"The pact.", "keywords":["[Rain]"], "salience":0}))
+            .await
+            .unwrap();
+    assert!(pair.subjects.contains(&a) && pair.subjects.contains(&b));
+    let aired: SoulMemory =
+        h.op.post(&memories, &json!({"tier":"aired", "body":"Aired rain hook", "embedding":[1,0], "salience":1})).await.unwrap();
+    let sandbox: SoulMemory =
+        h.op.post(&memories, &json!({"tier":"sandbox", "body":"Secret rain hook", "keywords":["rain"]})).await.unwrap();
+    assert_eq!(
+        code(h.agent.post::<_, SoulMemory>(&memories, &json!({"tier":"canon","body":"unauthorized"})).await.unwrap_err()),
+        "forbidden"
+    );
+    let listed: Vec<SoulMemory> = h.op.get(&memories).await.unwrap();
+    assert!(listed.iter().any(|m| m.id == pair.id));
+    assert!(listed.iter().all(|m| m.id != sandbox.id));
+    for id in [a, b] {
+        let context: SoulContextOut =
+            h.op.post(&format!("/personas/{id}/memories/retrieve"), &json!({"query":"Aired [RAIN] HOOK", "embedding":[1,0]}))
+                .await
+                .unwrap();
+        assert_eq!(context.memories[0].memory.id, pair.id);
+        assert!(context.memories[0].keyword_match);
+        assert_eq!(context.memories.iter().any(|hit| hit.memory.id == aired.id), id == a);
+        assert!(context.memories.iter().all(|hit| hit.memory.id != sandbox.id));
+    }
+    // Fan/thread memory is visible only when that relationship is supplied.
+    let ev = InteractionIn {
+        account_id: "fixture-mastodon".into(),
+        external_thread_id: "t-soul-scope".into(),
+        external_id: "m-soul-scope".into(),
+        direction: Direction::Inbound,
+        author: "@fan".into(),
+        body: "Hello".into(),
+        occurred_at: Utc::now(),
+        permalink: None,
+        raw: json!({}),
+    };
+    let rel: IngestReceipt = h.ingest.post("/ingest/interactions", &ev).await.unwrap();
+    let host: Uuid =
+        domain::sqlx::query_scalar("select persona_id from accounts where id = 'fixture-mastodon'").fetch_one(&h.hub.db).await.unwrap();
+    let private: SoulMemory =
+        h.op.post(
+            &memories,
+            &json!({
+                "subjects":[host], "tier":"canon", "body":"Private rain memory", "relationship_id":rel.id
+            }),
+        )
+        .await
+        .unwrap();
+    let url = format!("/personas/{a}/memories/retrieve");
+    let context: SoulContextOut = h.op.post(&url, &json!({"query":"rain", "include_sandbox":true})).await.unwrap();
+    assert!(context.memories.iter().any(|hit| hit.memory.id == sandbox.id));
+    assert!(context.memories.iter().all(|hit| hit.memory.id != private.id));
+    let context: SoulContextOut = h.op.post(&url, &json!({"query":"rain", "relationship_id":rel.id})).await.unwrap();
+    assert!(context.memories.iter().any(|hit| hit.memory.id == private.id));
+
+    let url = format!("/personas/{a}/novelty-check");
+    let duplicate: NoveltyCheckOut = h.op.post(&url, &json!({"text":"New wording", "embedding":[2,0]})).await.unwrap();
+    assert!(!duplicate.is_novel);
+    assert_eq!(duplicate.closest_memory_id, Some(aired.id));
+    let duplicate: NoveltyCheckOut = h.op.post(&url, &json!({"text":"Aired rain hook!", "embedding":[1,0,0]})).await.unwrap();
+    assert_eq!(duplicate.max_similarity, 1.0);
+    assert!(!duplicate.is_novel);
+    let novel: NoveltyCheckOut = h.op.post(&url, &json!({"text":"The pact"})).await.unwrap();
+    assert!(novel.is_novel);
+    let global = domain::soul::check_hook_novelty(
+        &h.hub,
+        &op,
+        None,
+        NoveltyCheckIn { text: "Aired rain hook".into(), embedding: None, threshold: None },
+    )
+    .await
+    .unwrap();
+    assert_eq!(global.closest_memory_id, Some(aired.id));
+}
+
+#[derive(Default)]
+struct SoulAssistant(std::sync::Mutex<Option<serde_json::Value>>);
+
+#[async_trait::async_trait]
+impl domain::ports::Assistant for SoulAssistant {
+    async fn reply(
+        &self,
+        context: &serde_json::Value,
+        _: &[domain::ports::AssistantTurn],
+    ) -> domain::ports::PortResult<domain::ports::AssistantReply> {
+        *self.0.lock().unwrap() = Some(context.clone());
+        Ok(domain::ports::AssistantReply {
+            body: "Original reply from Juniper Vale to @fan.".into(),
+            canon_suggestion: None,
+            model: "soul-test".into(),
+        })
+    }
+}
+
+struct SoulHumanizer {
+    entered: tokio::sync::mpsc::UnboundedSender<domain::ports::HumanizeRequest>,
+    gate: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[async_trait::async_trait]
+impl domain::ports::Humanizer for SoulHumanizer {
+    async fn humanize(&self, _: HumanizeInput) -> domain::ports::PortResult<HumanizeOutput> {
+        panic!("persona drafts must use the voiced path")
+    }
+
+    async fn humanize_with_voice(
+        &self,
+        request: &domain::ports::HumanizeRequest,
+    ) -> domain::ports::PortResult<domain::ports::HumanizeResult> {
+        self.entered.send(request.clone()).unwrap();
+        if let Some(gate) = &self.gate {
+            gate.notified().await;
+        }
+        Ok(HumanizeOutput {
+            humanized_text: "Juniper Vale here. Good to hear from you, @fan.".into(),
+            paragraphs_processed: 1,
+            retries_used: 0,
+            fallback_paragraphs: Vec::new(),
+            judge_verified: true,
+            paragraphs: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn soul_reply_uses_written_voice_and_rechecks_the_epoch_after_humanizing() {
+    let Some(h) = harness().await else { return };
+    let ev = InteractionIn {
+        account_id: "fixture-mastodon".into(),
+        external_thread_id: "t-soul-voice".into(),
+        external_id: "m-soul-voice".into(),
+        direction: Direction::Inbound,
+        author: "@fan".into(),
+        body: "Is the Old Gate open?".into(),
+        occurred_at: Utc::now(),
+        permalink: None,
+        raw: json!({}),
+    };
+    let rel: IngestReceipt = h.ingest.post("/ingest/interactions", &ev).await.unwrap();
+    let persona_id: Uuid =
+        domain::sqlx::query_scalar("select persona_id from accounts where id = 'fixture-mastodon'").fetch_one(&h.hub.db).await.unwrap();
+    let memories = format!("/personas/{persona_id}/memories");
+    let first: SoulMemory =
+        h.op.post(
+            &memories,
+            &json!({
+                "tier":"canon", "keywords":["old gate"], "body":"The gate opens at five.", "relationship_id":rel.id, "embedding":[1]
+            }),
+        )
+        .await
+        .unwrap();
+    let _: SoulMemory =
+        h.op.post(
+            &memories,
+            &json!({
+                "tier":"sandbox", "keywords":["old gate"], "body":"The Secret Sandbox Gate.", "relationship_id":rel.id
+            }),
+        )
+        .await
+        .unwrap();
+    let state_url = format!("/personas/{persona_id}/state");
+    assert!(h.op.get::<Option<PersonaState>>(&state_url).await.unwrap().is_none());
+    let state: PersonaState = h.op.put(&state_url, &json!({"state_day":"2026-11-24", "mood":"focused"})).await.unwrap();
+    let latest: PersonaState =
+        h.op.put(&state_url, &json!({"state_day":"2026-11-24", "mood":"wry", "obsessions":["hills"], "extra":{"shift":2}})).await.unwrap();
+    assert_eq!(latest.id, state.id);
+    let _: PersonaState = h.op.put(&state_url, &json!({"state_day":"2026-11-23", "mood":"resting"})).await.unwrap();
+    assert_eq!(h.op.get::<Option<PersonaState>>(&state_url).await.unwrap(), Some(latest));
+
+    let exemplars = format!("/personas/{persona_id}/exemplars");
+    for line in [
+        json!({"mode":"written", "draft":"Good afternoon", "rewrite":"Still windy, I see."}),
+        json!({"mode":"written", "rewrite":"The kettle is on."}),
+        json!({"mode":"spoken", "rewrite":"Mind the microphone."}),
+    ] {
+        let exemplar: VoiceExemplar = h.op.post(&exemplars, &line).await.unwrap();
+        assert_eq!(exemplar.approved_by, "operator:operator");
+    }
+    let written: Vec<VoiceExemplar> = h.op.get(&format!("{exemplars}?mode=written")).await.unwrap();
+    assert_eq!(written.len(), 2);
+    assert!(written.iter().all(|e| e.mode == VoiceMode::Written));
+
+    let config = Arc::new(domain::HubConfig { humanizer_auto_apply: true, ..(*h.hub.config).clone() });
+    let assistant = Arc::new(SoulAssistant::default());
+    let (entered, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let hub = domain::Hub {
+        config,
+        assistant: assistant.clone(),
+        humanizer: Arc::new(SoulHumanizer { entered: entered.clone(), gate: None }),
+        ..h.hub.clone()
+    };
+    let operator = actor(Role::Operator, "operator:test");
+    let draft = domain::engagement::draft_assistant_reply(&hub, &operator, rel.id).await.unwrap();
+    assert_eq!(draft.body, "Juniper Vale here. Good to hear from you, @fan.");
+    let persisted = h.op.relationship(rel.id).await.unwrap();
+    assert_eq!(persisted.drafts[0].body, draft.body);
+    assert_eq!(draft.owner_epoch, persisted.relationship.owner_epoch);
+
+    let context = assistant.0.lock().unwrap().take().unwrap();
+    for key in ["task", "persona", "relationship", "thread"] {
+        assert!(context.get(key).is_some());
+    }
+    assert_eq!(context["soul"]["state"]["mood"], "wry");
+    assert_eq!(context["soul"]["memories"][0]["id"], json!(first.id));
+    assert!(!context.to_string().contains("Secret Sandbox Gate"));
+    assert!(!context.to_string().contains("Mind the microphone"));
+    assert!(context["soul"]["memories"][0].get("embedding").is_none());
+    let request = rx.try_recv().unwrap();
+    assert_eq!(request.text, "Original reply from Juniper Vale to @fan.");
+    assert_eq!(request.locked_facts, ["@fan", "Juniper Vale"]);
+    let voice = request.voice.unwrap();
+    assert_eq!(voice.mode, VoiceMode::Written);
+    assert_eq!(voice.avoid, ["Hype words", "Unverified claims"]);
+    assert_eq!(voice.exemplars.len(), 1);
+    assert_eq!(voice.exemplars[0].draft, "Good afternoon");
+    assert_eq!(voice.exemplars[0].rewrite, "Still windy, I see.");
+    assert!(voice.reference_lines.contains(&"The kettle is on.".into()));
+
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let hub = domain::Hub { humanizer: Arc::new(SoulHumanizer { entered, gate: Some(gate.clone()) }), ..hub };
+    let drafting = tokio::spawn(async move { domain::engagement::draft_assistant_reply(&hub, &operator, rel.id).await });
+    tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().expect("humanizer entered");
+    h.op.takeover(rel.id).await.unwrap();
+    h.op.release_to_agent(rel.id).await.unwrap();
+    gate.notify_one();
+    assert_eq!(drafting.await.unwrap().unwrap_err().code(), "owner_changed");
+    assert_eq!(h.op.relationship(rel.id).await.unwrap().drafts.len(), 1);
+}
+
 /// An assistant that only answers once the test releases it, so ownership can
 /// move while a draft is being written.
 struct GatedAssistant {

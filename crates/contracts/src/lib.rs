@@ -115,10 +115,10 @@ pub const CORRELATION_HEADER: &str = "x-correlation-id";
 pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
 macro_rules! wire_enum {
-    ($(#[$m:meta])* $name:ident { $($variant:ident = $wire:literal),+ $(,)? }) => {
+    ($(#[$m:meta])* $name:ident { $($(#[$v:meta])* $variant:ident = $wire:literal),+ $(,)? }) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        pub enum $name { $(#[serde(rename = $wire)] $variant),+ }
+        pub enum $name { $($(#[$v])* #[serde(rename = $wire)] $variant),+ }
 
         impl $name {
             pub const ALL: &'static [$name] = &[$($name::$variant),+];
@@ -149,6 +149,15 @@ wire_enum!(
 wire_enum!(CanonState { Proposed = "proposed", Accepted = "accepted", Rejected = "rejected", Superseded = "superseded" });
 wire_enum!(ProjectKind { Solo = "solo", Group = "group" });
 wire_enum!(CanonSource { Operator = "operator", Chat = "chat", News = "news", Agent = "agent" });
+wire_enum!(MemoryTier { Canon = "canon", Aired = "aired", Sandbox = "sandbox" });
+wire_enum!(
+    #[derive(Default)]
+    VoiceMode {
+        Spoken = "spoken",
+        #[default]
+        Written = "written",
+    }
+);
 wire_enum!(ContentState { Idea = "idea", Brief = "brief", Producing = "producing", Selecting = "selecting", Review = "review", Approved = "approved", Scheduled = "scheduled", Published = "published", Archived = "archived" });
 wire_enum!(GenerationState { Requested = "requested", Dispatched = "dispatched", Running = "running", Succeeded = "succeeded", Failed = "failed", Cancelling = "cancelling", Cancelled = "cancelled", OutcomeUnknown = "outcome_unknown" });
 wire_enum!(AttemptKind {
@@ -200,6 +209,43 @@ pub struct ApiError {
 }
 
 // ── System ──────────────────────────────────────────────────────────────────
+
+/// Synchronous rewrite input. The caller cannot opt out of judging or request
+/// a callback.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanizeInput {
+    pub text: String,
+    #[serde(default)]
+    pub locked_facts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_of_n: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HumanizeOutput {
+    pub humanized_text: String,
+    pub paragraphs_processed: usize,
+    pub retries_used: usize,
+    pub fallback_paragraphs: Vec<usize>,
+    pub judge_verified: bool,
+    /// Backend-provided paragraph diagnostics, absent on older servers.
+    pub paragraphs: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HumanizePreview {
+    pub applied: bool,
+    pub source_text: String,
+    /// The accepted rewrite, or the exact source text when not applied.
+    pub humanized_text: String,
+    pub judge_verified: bool,
+    pub fallback_paragraphs: Vec<usize>,
+    pub paragraphs: Option<Vec<serde_json::Value>>,
+    pub reason: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntegrationStatus {
@@ -373,6 +419,128 @@ pub struct Persona {
     pub pending_proposals: i64,
     #[serde(default)]
     pub reference_asset_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoulMemory {
+    pub id: Uuid,
+    pub subjects: Vec<Uuid>,
+    pub tier: MemoryTier,
+    pub relationship_id: Option<Uuid>,
+    pub title: String,
+    pub body: String,
+    pub keywords: Vec<String>,
+    pub salience: f32,
+    pub embedding: Option<Vec<f32>>,
+    pub occurred_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateSoulMemoryIn {
+    /// Additional cast members. The persona in the route is always included.
+    #[serde(default)]
+    pub subjects: Vec<Uuid>,
+    pub tier: MemoryTier,
+    pub relationship_id: Option<Uuid>,
+    #[serde(default)]
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    pub salience: Option<f32>,
+    pub embedding: Option<Vec<f32>>,
+    pub occurred_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetrieveSoulContextIn {
+    #[serde(default)]
+    pub query: String,
+    /// Include this thread's memories in addition to persona-wide memories.
+    pub relationship_id: Option<Uuid>,
+    pub embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    pub include_sandbox: bool,
+    #[serde(default)]
+    pub mode: VoiceMode,
+    /// Maximum memory hits (default 8, clamped to 1–50).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoulMemoryHit {
+    pub memory: SoulMemory,
+    pub keyword_match: bool,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoulContextOut {
+    pub state: Option<PersonaState>,
+    pub memories: Vec<SoulMemoryHit>,
+    pub exemplars: Vec<VoiceExemplar>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceExemplar {
+    pub id: Uuid,
+    pub persona_id: Uuid,
+    pub mode: VoiceMode,
+    pub draft: Option<String>,
+    pub rewrite: String,
+    pub embedding: Option<Vec<f32>>,
+    pub approved_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateVoiceExemplarIn {
+    pub mode: VoiceMode,
+    pub draft: Option<String>,
+    pub rewrite: String,
+    pub embedding: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersonaState {
+    pub id: Uuid,
+    pub persona_id: Uuid,
+    pub state_day: chrono::NaiveDate,
+    pub mood: String,
+    pub obsessions: Vec<Value>,
+    pub ruptures: Vec<Value>,
+    pub extra: serde_json::Map<String, Value>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpsertPersonaStateIn {
+    pub state_day: chrono::NaiveDate,
+    #[serde(default)]
+    pub mood: String,
+    #[serde(default)]
+    pub obsessions: Vec<Value>,
+    #[serde(default)]
+    pub ruptures: Vec<Value>,
+    #[serde(default)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoveltyCheckIn {
+    pub text: String,
+    pub embedding: Option<Vec<f32>>,
+    /// A similarity at or above this threshold is non-novel (default 0.82).
+    pub threshold: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoveltyCheckOut {
+    pub is_novel: bool,
+    pub max_similarity: f32,
+    pub closest_memory_id: Option<Uuid>,
+    pub closest_title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

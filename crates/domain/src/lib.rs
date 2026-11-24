@@ -17,6 +17,7 @@ pub mod content;
 pub mod engagement;
 pub mod feeds;
 pub mod hash;
+mod humanizer;
 pub mod look;
 pub mod mail;
 pub mod mail_bi;
@@ -30,6 +31,7 @@ pub mod projects;
 pub mod providers;
 pub mod release;
 pub mod renewals;
+pub mod soul;
 pub mod system;
 
 #[cfg(test)]
@@ -88,6 +90,8 @@ pub struct HubConfig {
     pub company_id: String,
     /// Adapter name → (mode, verification, detail) for the status report.
     pub integrations: Vec<contracts::IntegrationStatus>,
+    /// Opt in to applying verified rewrites to assistant engagement drafts.
+    pub humanizer_auto_apply: bool,
     /// How early a timer may fire relative to `due_at` (clock skew).
     pub dispatch_early_secs: i64,
     /// How long after `due_at` a dispatch is still within its window.
@@ -117,6 +121,7 @@ pub struct Hub {
     pub publisher: Arc<dyn ports::Publisher>,
     pub assets: Arc<dyn ports::AssetStore>,
     pub assistant: Arc<dyn ports::Assistant>,
+    pub humanizer: Arc<dyn ports::Humanizer>,
     pub gpu_peer: Arc<dyn ports::GpuPeer>,
     /// Publishing channels keyed by `accounts.transport`; dispatch uses only
     /// the transport frozen into the release action.

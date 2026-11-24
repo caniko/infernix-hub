@@ -55,6 +55,9 @@ unused_port!(AssetStore {
 unused_port!(Assistant {
     reply(_context: &Value, _turns: &[AssistantTurn]) -> PortResult<AssistantReply>;
 });
+unused_port!(Humanizer {
+    humanize(_req: HumanizeInput) -> PortResult<HumanizeOutput>;
+});
 unused_port!(GpuPeer {
     busy(_url: &str) -> PortResult<bool>;
 });
@@ -89,6 +92,7 @@ async fn mail_calendar_postgres() {
         publisher: unused.clone(),
         assets: unused.clone(),
         assistant: unused.clone(),
+        humanizer: unused.clone(),
         gpu_peer: unused,
         channels: Default::default(),
         pipelines: Default::default(),

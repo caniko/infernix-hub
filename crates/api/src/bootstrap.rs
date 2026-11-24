@@ -1,19 +1,24 @@
 //! Configuration from the environment, adapter selection and registry seeding.
 //!
-//! Each integration is independently `fixture` or `live`. Secrets are read
-//! from `*_TOKEN_FILE` paths (systemd credentials / agenix), never from argv,
-//! and never leave the server.
+//! Each integration is configured independently. Secrets are read from
+//! `*_TOKEN_FILE` paths (systemd credentials / agenix), never from argv.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use contracts::{AccountCapabilities, AdapterMode, ExpiryKind, IntegrationStatus, Verification};
 use domain::ports;
 use domain::{Hub, HubConfig};
-use integrations::fixture::{FixtureAssistant, FixtureComfy, FixtureGpuPeer, FixturePaperclip, FixturePublisher, FixtureWindmill};
+use integrations::fixture::{
+    DisabledHumanizer, FixtureAssistant, FixtureComfy, FixtureGpuPeer, FixtureHumanizer, FixturePaperclip, FixturePublisher,
+    FixtureWindmill,
+};
+use integrations::humanizer::HttpHumanizer;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -66,6 +71,8 @@ pub struct Settings {
     pub comfy: AdapterMode,
     pub publisher: AdapterMode,
     pub assistant: AdapterMode,
+    pub humanizer: AdapterMode,
+    pub humanizer_auto_apply: bool,
     /// Pack enablement and per-pack JSON config (id -> object).
     pub packs_config: Option<PathBuf>,
     /// Do not start the outbox worker with `serve`.
@@ -77,7 +84,11 @@ fn env(key: &str) -> Option<String> {
 }
 
 fn mode(key: &str) -> anyhow::Result<AdapterMode> {
-    let v = env(key).unwrap_or_else(|| "fixture".into());
+    mode_or(key, "fixture")
+}
+
+fn mode_or(key: &str, default: &str) -> anyhow::Result<AdapterMode> {
+    let v = env(key).unwrap_or_else(|| default.into());
     AdapterMode::parse(&v).with_context(|| format!("{key} must be fixture|live|disabled, got {v}"))
 }
 
@@ -117,6 +128,8 @@ impl Settings {
             comfy: mode("HUB_COMFY")?,
             publisher: mode("HUB_PUBLISHER")?,
             assistant: mode("HUB_ASSISTANT")?,
+            humanizer: mode_or("HUB_HUMANIZER", "disabled")?,
+            humanizer_auto_apply: matches!(env("HUB_HUMANIZER_AUTO_APPLY").as_deref(), Some("1" | "true")),
             packs_config: env("HUB_PACKS_CONFIG").map(PathBuf::from),
             no_worker: matches!(env("HUB_NO_WORKER").as_deref(), Some("1" | "true")),
         })
@@ -145,6 +158,8 @@ impl Settings {
             comfy: AdapterMode::Fixture,
             publisher: AdapterMode::Fixture,
             assistant: AdapterMode::Fixture,
+            humanizer: AdapterMode::Fixture,
+            humanizer_auto_apply: false,
             packs_config: None,
             no_worker: false,
         }
@@ -348,6 +363,19 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         )),
         _ => Arc::new(FixtureAssistant),
     };
+    let humanizer: Arc<dyn ports::Humanizer> = match s.humanizer {
+        AdapterMode::Live => {
+            let url = env("HUMANIZER_URL").unwrap_or_else(|| "http://127.0.0.1:3000".into());
+            let token = env("HUMANIZER_TOKEN_FILE").map(|_| secret("HUMANIZER_TOKEN")).transpose()?.or_else(|| env("HUMANIZER_TOKEN"));
+            let timeout = env("HUMANIZER_TIMEOUT_SECS")
+                .map(|v| v.parse::<NonZeroU64>().context("HUMANIZER_TIMEOUT_SECS must be a positive integer"))
+                .transpose()?
+                .map(|secs| Duration::from_secs(secs.get()));
+            Arc::new(HttpHumanizer::new(&url, token, timeout)?)
+        }
+        AdapterMode::Fixture => Arc::new(FixtureHumanizer),
+        AdapterMode::Disabled => Arc::new(DisabledHumanizer),
+    };
 
     let seed: Option<Seed> = match &s.seed_file {
         Some(p) => Some(serde_json::from_str(&std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)?),
@@ -378,7 +406,14 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
             status("comfyui", s.comfy, Verification::ContractVerified, "0.37.0; checked against server source"),
             status("publisher", s.publisher, Verification::Built, "Postiz adapter built from public docs; Postiz not deployed"),
             status("assistant", s.assistant, Verification::ContractVerified, "llama-swap OpenAI-compatible endpoint"),
+            status(
+                "humanizer",
+                s.humanizer,
+                Verification::ContractVerified,
+                if s.humanizer == AdapterMode::Disabled { "disabled" } else { "humanizer-rs synchronous rewrite endpoint" },
+            ),
         ],
+        humanizer_auto_apply: s.humanizer_auto_apply,
         dispatch_early_secs: 30,
         dispatch_window_secs: 15 * 60,
         fleet_issues: s.fleet_issues.clone(),
@@ -450,6 +485,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         comfy,
         publisher,
         assistant,
+        humanizer,
         gpu_peer,
         assets: Arc::new(integrations::store::LocalAssetStore::new(&s.asset_dir)),
         channels: Arc::new(channels),

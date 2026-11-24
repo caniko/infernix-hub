@@ -462,6 +462,29 @@
     "/v1/canon/{id}/comments": {
       "post": {"operationId": "canon_comment", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CanonCommentIn"}}}}, "responses": {"200": {"description": "CanonRevision"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
     },
+    "/v1/personas/{id}/memories": {
+      "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+      "get": {"operationId": "soul_memories", "parameters": [{"in": "query", "name": "include_sandbox", "schema": {"type": "boolean", "default": false}}], "responses": {"200": {"description": "Recent SoulMemory entries"}}, "security": [{"bearer": []}], "x-roles": "operator|agent"},
+      "post": {"operationId": "create_soul_memory", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["tier", "body"], "properties": {"subjects": {"type": "array", "items": {"type": "string", "format": "uuid"}}, "tier": {"type": "string", "enum": ["canon", "aired", "sandbox"]}, "relationship_id": {"type": ["string", "null"], "format": "uuid"}, "title": {"type": "string"}, "body": {"type": "string"}, "keywords": {"type": "array", "items": {"type": "string"}}, "salience": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "embedding": {"type": ["array", "null"], "items": {"type": "number"}}, "occurred_at": {"type": ["string", "null"], "format": "date-time"}}}}}}, "responses": {"200": {"description": "SoulMemory"}}, "security": [{"bearer": []}], "x-roles": "operator"}
+    },
+    "/v1/personas/{id}/memories/retrieve": {
+      "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+      "post": {"operationId": "retrieve_soul_context", "description": "Recall persona-wide and optionally exact-thread memories. Literal, case-insensitive keyword triggers rank first. Sandbox is opt-in.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"query": {"type": "string"}, "relationship_id": {"type": ["string", "null"], "format": "uuid"}, "embedding": {"type": ["array", "null"], "items": {"type": "number"}}, "include_sandbox": {"type": "boolean", "default": false}, "mode": {"type": "string", "enum": ["spoken", "written"], "default": "written"}, "limit": {"type": ["integer", "null"], "default": 8}}}}}}, "responses": {"200": {"description": "SoulContextOut (state, ranked memories, exemplars)"}}, "security": [{"bearer": []}], "x-roles": "operator|agent"}
+    },
+    "/v1/personas/{id}/novelty-check": {
+      "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+      "post": {"operationId": "check_hook_novelty", "description": "Compare a hook to the persona's aired memories only.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}, "embedding": {"type": ["array", "null"], "items": {"type": "number"}}, "threshold": {"type": ["number", "null"], "minimum": 0, "maximum": 1, "default": 0.82}}}}}}, "responses": {"200": {"description": "NoveltyCheckOut (novelty flag, max similarity, closest memory ID and title)"}}, "security": [{"bearer": []}], "x-roles": "operator|agent"}
+    },
+    "/v1/personas/{id}/exemplars": {
+      "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+      "get": {"operationId": "voice_exemplars", "parameters": [{"in": "query", "name": "mode", "schema": {"type": "string", "enum": ["spoken", "written"]}}], "responses": {"200": {"description": "Recent VoiceExemplar entries"}}, "security": [{"bearer": []}], "x-roles": "operator|agent"},
+      "post": {"operationId": "create_voice_exemplar", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["mode", "rewrite"], "properties": {"mode": {"type": "string", "enum": ["spoken", "written"]}, "draft": {"type": ["string", "null"]}, "rewrite": {"type": "string"}, "embedding": {"type": ["array", "null"], "items": {"type": "number"}}}}}}}, "responses": {"200": {"description": "VoiceExemplar approved by the authenticated operator"}}, "security": [{"bearer": []}], "x-roles": "operator"}
+    },
+    "/v1/personas/{id}/state": {
+      "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+      "get": {"operationId": "persona_state", "responses": {"200": {"description": "Most recent PersonaState or null"}}, "security": [{"bearer": []}], "x-roles": "operator|agent"},
+      "put": {"operationId": "upsert_persona_state", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["state_day"], "properties": {"state_day": {"type": "string", "format": "date"}, "mood": {"type": "string"}, "obsessions": {"type": "array"}, "ruptures": {"type": "array"}, "extra": {"type": "object"}}}}}}, "responses": {"200": {"description": "PersonaState for the specified day"}}, "security": [{"bearer": []}], "x-roles": "operator"}
+    },
     "/v1/personas/{id}/profile": {
       "put": {"operationId": "set_profile", "parameters": [{"in": "path", "name": "id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IndividualProfile"}}}}, "responses": {"200": {"description": "Persona"}}, "security": [{"bearer": []}], "x-roles": "see domain command"}
     },
@@ -2875,6 +2898,55 @@
           }
         ],
         "x-roles": "see domain command"
+      }
+    },
+    "/v1/humanize": {
+      "post": {
+        "operationId": "humanize",
+        "description": "Preview a judged rewrite without saving it. When applied is false, humanized_text is the exact source text.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["text"],
+                "properties": {
+                  "text": {"type": "string"},
+                  "locked_facts": {"type": "array", "items": {"type": "string"}},
+                  "max_chars": {"type": ["integer", "null"], "minimum": 1},
+                  "best_of_n": {"type": ["integer", "null"], "minimum": 1, "maximum": 64}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "See hub_contracts::HumanizePreview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["applied", "source_text", "humanized_text", "judge_verified", "fallback_paragraphs", "paragraphs", "reason"],
+                  "properties": {
+                    "applied": {"type": "boolean"},
+                    "source_text": {"type": "string"},
+                    "humanized_text": {"type": "string"},
+                    "judge_verified": {"type": "boolean"},
+                    "fallback_paragraphs": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                    "paragraphs": {"type": ["array", "null"], "items": {}},
+                    "reason": {"type": ["string", "null"]}
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {"description": "Invalid request or unauthorized caller"}
+        },
+        "security": [{"bearer": []}],
+        "x-roles": "operator, agent"
       }
     },
     "/v1/status": {

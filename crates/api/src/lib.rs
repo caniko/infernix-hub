@@ -139,6 +139,7 @@ pub fn router(state: AppState) -> Router {
 pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>) -> Router {
     let mut v1 = Router::new()
         .route("/status", get(status))
+        .route("/humanize", post(humanize))
         .route("/fleet/status", get(fleet_status))
         .route("/secrets", get(secrets))
         .route("/system/pause", post(set_pause))
@@ -166,6 +167,11 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/projects/{id}/members/{persona_id}", axum::routing::put(put_project_member).delete(remove_project_member))
         .route("/projects/{id}/accounts", axum::routing::put(set_project_accounts))
         .route("/personas/{id}/canon", get(canon_list).post(canon_propose))
+        .route("/personas/{id}/memories", get(soul_memories).post(create_soul_memory))
+        .route("/personas/{id}/memories/retrieve", post(retrieve_soul_context))
+        .route("/personas/{id}/novelty-check", post(check_hook_novelty))
+        .route("/personas/{id}/exemplars", get(voice_exemplars).post(create_voice_exemplar))
+        .route("/personas/{id}/state", get(persona_state).put(upsert_persona_state))
         .route("/personas/{id}/profile", axum::routing::put(set_profile))
         .route("/personas/{id}/canon-draft", post(draft_canon))
         .route("/personas/{id}/look", get(individual_look))
@@ -497,6 +503,11 @@ async fn openapi() -> impl IntoResponse {
 
 async fn status(State(s): State<AppState>, Caller(a): Caller) -> R<SystemStatus> {
     call!(a, domain::system::status(&s.hub, &a))
+}
+
+async fn humanize(State(s): State<AppState>, Caller(a): Caller, Json(input): Json<HumanizeInput>) -> R<HumanizePreview> {
+    a.require(domain::OPERATOR_OR_AGENT).map_err(err(&a))?;
+    Ok(Json(s.hub.humanize_draft(input).await))
 }
 
 /// Why the fleet snapshot could not be served. The codes are stable: the
@@ -837,6 +848,74 @@ async fn create_persona(State(s): State<AppState>, Caller(a): Caller, Json(b): J
 }
 async fn canon_list(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<Vec<CanonRevision>> {
     call!(a, domain::canon::list(&s.hub, &a, id))
+}
+#[derive(Deserialize)]
+struct SoulMemoriesQ {
+    #[serde(default)]
+    include_sandbox: bool,
+}
+async fn soul_memories(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Query(q): Query<SoulMemoriesQ>,
+) -> R<Vec<SoulMemory>> {
+    call!(a, domain::soul::list_memories(&s.hub, &a, id, q.include_sandbox))
+}
+async fn create_soul_memory(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<CreateSoulMemoryIn>,
+) -> R<SoulMemory> {
+    call!(a, domain::soul::create_memory(&s.hub, &a, id, b))
+}
+async fn retrieve_soul_context(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<RetrieveSoulContextIn>,
+) -> R<SoulContextOut> {
+    call!(a, domain::soul::retrieve_context(&s.hub, &a, id, b))
+}
+async fn check_hook_novelty(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<NoveltyCheckIn>,
+) -> R<NoveltyCheckOut> {
+    call!(a, domain::soul::check_hook_novelty(&s.hub, &a, Some(id), b))
+}
+#[derive(Deserialize)]
+struct VoiceExemplarsQ {
+    mode: Option<VoiceMode>,
+}
+async fn voice_exemplars(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Query(q): Query<VoiceExemplarsQ>,
+) -> R<Vec<VoiceExemplar>> {
+    call!(a, domain::soul::list_voice_exemplars(&s.hub, &a, id, q.mode))
+}
+async fn create_voice_exemplar(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<CreateVoiceExemplarIn>,
+) -> R<VoiceExemplar> {
+    call!(a, domain::soul::create_voice_exemplar(&s.hub, &a, id, b))
+}
+async fn persona_state(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>) -> R<Option<PersonaState>> {
+    call!(a, domain::soul::latest_persona_state(&s.hub, &a, id))
+}
+async fn upsert_persona_state(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Path(id): Path<Uuid>,
+    Json(b): Json<UpsertPersonaStateIn>,
+) -> R<PersonaState> {
+    call!(a, domain::soul::upsert_persona_state(&s.hub, &a, id, b))
 }
 async fn set_profile(State(s): State<AppState>, Caller(a): Caller, Path(id): Path<Uuid>, Json(b): Json<IndividualProfile>) -> R<Persona> {
     call!(a, domain::canon::set_profile(&s.hub, &a, id, b))

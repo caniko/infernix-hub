@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+pub use contracts::{HumanizeInput, HumanizeOutput, HumanizeOutput as HumanizeResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -394,6 +395,69 @@ pub struct AssistantReply {
 pub trait Assistant: Send + Sync {
     /// `context` carries the brief, accepted canon and linked Paperclip work.
     async fn reply(&self, context: &Value, turns: &[AssistantTurn]) -> PortResult<AssistantReply>;
+}
+
+/// Synchronous humanizer-rs wire request. The Hub preview DTO is separate.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HumanizeRequest {
+    pub text: String,
+    pub locked_facts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_of_n: Option<u8>,
+    pub allow_q3_fallback: bool,
+    pub skip_judge: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<VoiceOptions>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct VoiceOptions {
+    pub mode: contracts::VoiceMode,
+    pub avoid: Vec<String>,
+    pub exemplars: Vec<HumanizerVoiceExemplar>,
+    pub reference_lines: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_similarity_band: Option<[f32; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spoken: Option<SpokenConstraints>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HumanizerVoiceExemplar {
+    pub draft: String,
+    pub rewrite: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SpokenConstraints {
+    pub max_sentence_words: Option<usize>,
+    pub min_words: Option<usize>,
+    pub max_words: Option<usize>,
+    pub forbid_parentheses: bool,
+    pub forbid_urls: bool,
+}
+
+impl Default for SpokenConstraints {
+    fn default() -> Self {
+        Self { max_sentence_words: Some(28), min_words: None, max_words: None, forbid_parentheses: true, forbid_urls: true }
+    }
+}
+
+#[async_trait]
+pub trait Humanizer: Send + Sync {
+    /// Rewrite a draft synchronously and report the judge result.
+    async fn humanize(&self, req: HumanizeInput) -> PortResult<HumanizeOutput>;
+
+    /// Voice-aware rewrite, using the strict humanizer-rs wire options.
+    async fn humanize_with_voice(&self, _req: &HumanizeRequest) -> PortResult<HumanizeResult> {
+        Err(PortError::Unsupported("humanizer voice options are unavailable".into()))
+    }
+
+    fn is_enabled(&self) -> bool {
+        true
+    }
 }
 
 // ── Shared-GPU peers ────────────────────────────────────────────────────────

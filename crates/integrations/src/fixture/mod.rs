@@ -7,12 +7,14 @@ use std::sync::{Mutex, MutexGuard};
 
 mod assistant;
 mod comfy;
+mod humanizer;
 mod paperclip;
 mod publisher;
 mod windmill;
 
 pub use assistant::FixtureAssistant;
 pub use comfy::FixtureComfy;
+pub use humanizer::{DisabledHumanizer, FixtureHumanizer};
 pub use paperclip::FixturePaperclip;
 pub use publisher::{FixturePublisher, PublishMode};
 pub use windmill::{FixturePipeline, FixtureWindmill, WindmillState};
