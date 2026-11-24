@@ -1,0 +1,33 @@
+summary: Preview a verified draft rewrite
+description: >-
+  Calls the configured humanizer synchronously at f/fleetix_hub/humanizer_url
+  (defaults to http://127.0.0.1:3000). f/fleetix_hub/humanizer_token is required
+  for non-loopback URLs.
+  Returns the original text if the rewrite cannot be applied. Does not save,
+  schedule, or publish the draft.
+version: 1
+kind: script
+lock: ""
+tag: hub
+schema:
+  $schema: "https://json-schema.org/draft/2020-12/schema"
+  type: object
+  properties:
+    text:
+      type: string
+    locked_facts:
+      description: Literal facts to preserve in the draft
+      type: array
+      items:
+        type: string
+      default: []
+    max_chars:
+      description: Maximum accepted rewrite length in Unicode characters
+      type: integer
+      minimum: 1
+    best_of_n:
+      type: integer
+      minimum: 1
+      maximum: 64
+  required:
+    - text
