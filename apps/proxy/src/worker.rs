@@ -214,8 +214,11 @@ async fn bind_unix(path: &Path) -> Result<Listener> {
         }
         let metadata = fs::symlink_metadata(dir)?;
         let mode = metadata.mode();
+        // In an unprivileged user namespace (such as a Nix build sandbox), `/`
+        // belongs to unmapped host root (overflowuid) while still enforcing
+        // directory and non-writable mode checks below.
         ensure!(
-            metadata.is_dir() && (metadata.uid() == 0 || metadata.uid() == uid),
+            metadata.is_dir() && (dir == Path::new("/") || metadata.uid() == 0 || metadata.uid() == uid),
             "worker socket ancestry must consist of trusted directories (no symlinks)"
         );
         ensure!(mode & 0o022 == 0 || mode & 0o1000 != 0, "worker socket ancestry is writable by other users");
