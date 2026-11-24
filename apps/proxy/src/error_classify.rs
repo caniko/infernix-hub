@@ -129,8 +129,11 @@ fn google_array_error(
             }
             let wrapped = item.get("error").or_else(|| item.pointer("/response/error"));
             let code = numeric_code(wrapped.unwrap_or(item));
-            (wrapped.is_some_and(Value::is_object) || (wrapped.is_none() && code.is_some()))
-                .then(|| classify(Lane::Google, code.or(status), item, "", html, source, secrets))
+            (wrapped.is_some_and(Value::is_object)
+                || (wrapped.is_none()
+                    && (text(item, &["status"]).is_some_and(|s| !s.trim().eq_ignore_ascii_case("OK"))
+                        || ["code", "details", "message"].iter().any(|key| item.get(key).is_some()))))
+            .then(|| classify(Lane::Google, code.or(status), item, "", html, source, secrets))
         })
         // A quota entry must not hide an account-level rejection in the same response.
         .min_by_key(|error| match error {
@@ -457,13 +460,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn google_array_client_error_overrides_forbidden_http_status() {
-        let error = http(Lane::Google, 403, "[]", Inference).unwrap();
-        assert_eq!(error.kind, PermissionDenied);
-        for body in
-            [r#"[{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]"#, r#"[{},[{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]]"#]
-        {
-            assert!(http(Lane::Google, 403, body, Inference).is_none(), "{body}");
+    fn google_array_uses_structured_errors_before_forbidden_http_status() {
+        for (body, expected) in [
+            ("[]", Some(PermissionDenied)),
+            (r#"[{"status":"RESOURCE_EXHAUSTED"}]"#, Some(QuotaExhausted)),
+            (r#"[{"code":"RESOURCE_EXHAUSTED"}]"#, Some(QuotaExhausted)),
+            (r#"[{"details":[{"@type":"google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED"}]}]"#, Some(QuotaExhausted)),
+            (r#"[{"message":"Verify your account to continue."}]"#, Some(VerificationRequired)),
+            (r#"[{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]"#, None),
+            (r#"[{},[{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]]"#, None),
+            (r#"[{"status":"OK"},{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]"#, None),
+            (r#"[{"status":" "},{"status":null},{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]"#, None),
+        ] {
+            assert_eq!(http(Lane::Google, 403, body, Inference).map(|error| error.kind), expected, "{body}");
         }
     }
 
