@@ -240,6 +240,19 @@ in {
         default = "127.0.0.1:8317";
         description = "Loopback bind address for fleetix-agent-proxy.";
       };
+      workerListener = {
+        enable = lib.mkEnableOption "the OAuth-only Codex worker socket";
+        unixSocket = lib.mkOption {
+          type = lib.types.str;
+          default = "%t/fleetix-agent-proxy/worker.sock";
+          description = "Private Unix socket for scoped workers (systemd specifiers are expanded).";
+        };
+        allowedModels = lib.mkOption {
+          type = lib.types.listOf (lib.types.strMatching "[A-Za-z0-9._:/-]+");
+          default = [];
+          description = "Exact Codex model names permitted on the worker socket; required when enabled.";
+        };
+      };
       discoverLocal = lib.mkOption {
         type = lib.types.bool;
         default = true;
@@ -349,6 +362,10 @@ in {
                 ]
                 ++ lib.optionals (proxyCfg.authDir != null) ["--auth-dir" (lib.escapeShellArg proxyCfg.authDir)]
                 ++ lib.optional proxyCfg.discoverLocal "--discover-local"
+                ++ lib.optionals proxyCfg.workerListener.enable (
+                  ["--worker-unix-socket" (lib.escapeShellArg proxyCfg.workerListener.unixSocket)]
+                  ++ lib.concatMap (model: ["--worker-allowed-models" (lib.escapeShellArg model)]) proxyCfg.workerListener.allowedModels
+                )
                 ++ lib.optionals (proxyCfg.registerT3Code && !useDeclarativeT3Registration) [
                   "--register-t3code"
                   "--t3code-home"

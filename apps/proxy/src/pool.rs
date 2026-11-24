@@ -748,6 +748,27 @@ struct AccountEligibility<'a> {
     exclusion_reasons: Vec<&'static str>,
 }
 
+pub(crate) struct AccountFilter<'a> {
+    pub lane: Lane,
+    pub model: &'a str,
+    pub required_project: Option<&'a str>,
+    pub subscriptions_only: bool,
+}
+
+impl<'a> AccountFilter<'a> {
+    pub(crate) fn shared(lane: Lane, model: &'a str, required_project: Option<&'a str>) -> Self {
+        Self { lane, model, required_project, subscriptions_only: false }
+    }
+
+    pub(crate) fn allows(&self, account: &Account) -> bool {
+        account.lane == self.lane && (!self.subscriptions_only || !account.api_key)
+    }
+
+    pub(crate) fn supports(&self, pool: &Pool, account: &Account) -> bool {
+        self.allows(account) && pool.supports(account, self.lane, self.model, self.required_project)
+    }
+}
+
 #[derive(Default)]
 pub struct Pool {
     pub accounts: BTreeMap<String, Account>,
@@ -892,8 +913,8 @@ impl Pool {
         a.lane == lane && self.support_exclusion(a, model, required_project).is_none()
     }
 
-    fn supported<'a>(&'a self, lane: Lane, model: &'a str, required_project: Option<&'a str>) -> impl Iterator<Item = &'a Account> {
-        self.accounts.values().filter(move |a| self.supports(a, lane, model, required_project))
+    fn supported<'a>(&'a self, filter: &'a AccountFilter<'a>) -> impl Iterator<Item = &'a Account> {
+        self.accounts.values().filter(move |a| filter.supports(self, a))
     }
 
     pub(crate) fn evaluate_model_eligibility<'a>(
@@ -978,30 +999,21 @@ impl Pool {
         self.evaluate_model_eligibility(Lane::Google, model, required_project, now)?.verified_next_reset_at
     }
 
-    pub fn next_reset(&self, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.supported(lane, model, required_project)
-            .filter(|a| !a.quarantined(now))
-            .filter_map(|a| a.quota_limited_until(now, model))
-            .min()
+    pub fn next_reset(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.supported(filter).filter(|a| !a.quarantined(now)).filter_map(|a| a.quota_limited_until(now, filter.model)).min()
     }
 
-    pub fn all_quota_limited(&self, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> bool {
-        let mut accounts = self.supported(lane, model, required_project).peekable();
-        accounts.peek().is_some() && accounts.all(|a| !a.quarantined(now) && a.quota_limited_until(now, model).is_some())
+    pub fn all_quota_limited(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> bool {
+        let mut accounts = self.supported(filter).peekable();
+        accounts.peek().is_some() && accounts.all(|a| !a.quarantined(now) && a.quota_limited_until(now, filter.model).is_some())
     }
 
-    pub(crate) fn has_eligible_account(&self, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> bool {
-        self.supported(lane, model, required_project).any(|a| a.eligible(now, model))
+    pub(crate) fn has_eligible_account(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> bool {
+        self.supported(filter).any(|a| a.eligible(now, filter.model))
     }
 
-    pub(crate) fn uniform_quarantine_kind(
-        &self,
-        lane: Lane,
-        model: &str,
-        required_project: Option<&str>,
-        now: DateTime<Utc>,
-    ) -> Option<AccountErrorKind> {
-        let mut kinds = self.supported(lane, model, required_project).map(|a| a.active_quarantine(now).map(|err| err.kind));
+    pub(crate) fn uniform_quarantine_kind(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> Option<AccountErrorKind> {
+        let mut kinds = self.supported(filter).map(|a| a.active_quarantine(now).map(|err| err.kind));
         let kind = kinds.next()??;
         kinds.all(|other| other == Some(kind)).then_some(kind)
     }
@@ -1019,13 +1031,24 @@ impl Pool {
     pub fn pick(
         &mut self,
         lane: Lane,
-        (session, parent): (Option<&str>, Option<&str>),
+        affinity: (Option<&str>, Option<&str>),
         model: &str,
         required_project: Option<&str>,
         tried: &[String],
         now: DateTime<Utc>,
     ) -> Option<Account> {
-        let eligible = |a: &&Account| self.supports(a, lane, model, required_project) && a.eligible(now, model) && !tried.contains(&a.id);
+        self.pick_for(&AccountFilter::shared(lane, model, required_project), affinity, tried, now)
+    }
+
+    pub(crate) fn pick_for(
+        &mut self,
+        filter: &AccountFilter<'_>,
+        (session, parent): (Option<&str>, Option<&str>),
+        tried: &[String],
+        now: DateTime<Utc>,
+    ) -> Option<Account> {
+        let AccountFilter { lane, model, .. } = *filter;
+        let eligible = |a: &&Account| filter.supports(self, a) && a.eligible(now, model) && !tried.contains(&a.id);
         if let Some(a) = self.preferred(lane).and_then(|id| self.accounts.get(id)).filter(eligible) {
             return Some(a.clone());
         }
@@ -1034,7 +1057,10 @@ impl Pool {
         if options.iter().any(|a| a.api_key == keys_first) {
             options.retain(|a| a.api_key == keys_first);
         }
-        let sticky = session.and_then(|id| self.bound(lane, id)).or_else(|| parent.and_then(|id| self.bound(lane, id)));
+        let bound = |session| {
+            self.bound(lane, session).filter(|id| !filter.subscriptions_only || self.accounts.get(*id).is_some_and(|a| filter.allows(a)))
+        };
+        let sticky = session.and_then(bound).or_else(|| parent.and_then(bound));
         if let Some(a) = sticky.and_then(|id| options.iter().find(|a| a.id == id)) {
             return Some((*a).clone());
         }

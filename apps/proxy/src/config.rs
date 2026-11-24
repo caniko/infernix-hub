@@ -122,7 +122,7 @@ pub fn secret_file(path: &Path) -> Result<String> {
     validate_secret(&read_text(path)?.context("secret file not found")?)
 }
 
-fn validate_secret(raw: &str) -> Result<String> {
+pub(crate) fn validate_secret(raw: &str) -> Result<String> {
     let secret = raw.trim();
     ensure!(!secret.is_empty() && secret.bytes().all(|b| b.is_ascii_graphic()), "invalid secret");
     Ok(secret.to_owned())

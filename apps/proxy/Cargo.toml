@@ -18,6 +18,7 @@ hex.workspace = true
 integrations.workspace = true
 reqwest.workspace = true
 ring.workspace = true
+rustix = { version = "1", features = ["process"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

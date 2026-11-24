@@ -6,6 +6,7 @@ mod management;
 mod pool;
 mod router;
 pub mod verify;
+pub mod worker;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
