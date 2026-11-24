@@ -34,7 +34,9 @@ fn fmt_compact_axis(metric: Metric, value: f64) -> String {
     match metric {
         Metric::CacheHitRate => format!("{value:.0}%"),
         Metric::Cost => {
-            if value >= 100.0 {
+            if value == 0.0 {
+                "$0".into()
+            } else if value >= 100.0 {
                 format!("${value:.0}")
             } else if value >= 1.0 {
                 format!("${value:.2}")
@@ -389,8 +391,30 @@ impl TimePlotBox {
 }
 
 #[component]
-pub(super) fn TimeAxis(plot: TimePlotBox, view: TimeBounds) -> Element {
+pub(super) fn TimeAxis(plot: TimePlotBox, view: TimeBounds, #[props(default)] date_only: bool) -> Element {
     let width = plot.right - plot.left;
+    if date_only {
+        let midnight = view.start.date_naive().and_time(chrono::NaiveTime::MIN).and_utc();
+        let first = if midnight < view.start { midnight + TimeDelta::days(1) } else { midnight };
+        let count = (view.end - first).num_days() + 1;
+        let limit = (width / 64.0).floor().max(1.0) as usize;
+        let stride = (count.max(1) as usize).div_ceil(limit);
+        return rsx! {
+            g { class: "time-axis", pointer_events: "none",
+                for day in (0..count).step_by(stride) {
+                    {
+                        let at = first + TimeDelta::days(day);
+                        let x = plot.x(view, at);
+                        let anchor = if x > plot.right - 26.0 { "end" } else { "middle" };
+                        rsx! {
+                            line { x1: "{x}", x2: "{x}", y1: "{plot.top}", y2: "{plot.bottom}", class: "chart-gridline subtle time-gridline" }
+                            text { x: "{x}", y: "{plot.bottom + 17.0}", text_anchor: anchor, "{at.format(\"%b %d\")}" }
+                        }
+                    }
+                }
+            }
+        };
+    }
     let ticks = if width < 340.0 {
         5
     } else if width < 600.0 || view.end - view.start < TimeDelta::minutes(6) {
@@ -1067,6 +1091,7 @@ impl Metric {
 #[derive(Clone, PartialEq)]
 struct BarItem {
     label: String,
+    window: String,
     value: Option<f64>,
     requests: u64,
     failures: u64,
@@ -1078,149 +1103,259 @@ struct BarItem {
 
 pub(super) const NO_RANGE_DATA: &str = "No data for selected range";
 
+pub(super) fn bucket_badge(seconds: Option<u64>) -> Option<&'static str> {
+    match seconds {
+        Some(3600) => Some("Hourly · 24h"),
+        Some(10800) => Some("3-hour · 7d"),
+        Some(86400) => Some("Daily"),
+        _ => None,
+    }
+}
+
+fn bucket_label(at: DateTime<Utc>, seconds: u64) -> String {
+    let format = match seconds {
+        3600 => "%H:%M",
+        10800 if at.time() != chrono::NaiveTime::MIN => "%b %d %H:%M",
+        _ => "%b %d",
+    };
+    at.format(format).to_string()
+}
+
+fn bucket_window(at: DateTime<Utc>, seconds: u64) -> String {
+    let format = if seconds == 86400 { "%Y-%m-%d" } else { "%b %d %H:%M" };
+    let start = at.format(format);
+    let end = at + TimeDelta::seconds(seconds as i64);
+    let end = end.format(if seconds != 86400 && end.date_naive() == at.date_naive() { "%H:%M" } else { format });
+    format!("{start} → {end} UTC")
+}
+
+fn trend_buckets(mut points: Vec<ActivityTrendPoint>, bucket_seconds: Option<u64>) -> (u64, Vec<ActivityTrendPoint>) {
+    let seconds = bucket_seconds.filter(|s| matches!(s, 3600 | 10800 | 86400)).unwrap_or(86400);
+    points.sort_by_key(|p| p.bucket_start);
+    if bucket_seconds.is_some() {
+        // Adaptive reports are already dense, including buckets with no requests.
+        return (seconds, points);
+    }
+    let mut dense = Vec::<ActivityTrendPoint>::with_capacity(points.len());
+    for mut p in points {
+        if let Some(previous) = dense.last() {
+            let days = (p.bucket_start - previous.bucket_start).num_days();
+            if (2..=400).contains(&days) {
+                let start = previous.bucket_start;
+                dense.extend((1..days).map(|offset| ActivityTrendPoint {
+                    bucket_start: start + TimeDelta::days(offset),
+                    label: String::new(),
+                    requests: 0,
+                    failures: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    cache_hit_rate: 0.0,
+                    cache_hit_rate_observed: None,
+                    thinking_tokens: 0,
+                    api_equivalent_cost_usd: 0.0,
+                }));
+            }
+        }
+        p.cache_hit_rate_observed =
+            p.cache_hit_rate_observed.or_else(|| effective_cache_hit_rate(p.input_tokens, p.cache_read_tokens, p.cache_hit_rate));
+        dense.push(p);
+    }
+    (seconds, dense)
+}
+
+fn activity_plot(width: f64) -> TimePlotBox {
+    TimePlotBox { left: 48.0, right: width - 12.0, top: 16.0, bottom: 146.0 }
+}
+
+fn chart_y(plot: TimePlotBox, fraction: f64) -> f64 {
+    plot.bottom - (plot.bottom - plot.top) * fraction.clamp(0.0, 1.0)
+}
+
 #[component]
-fn InteractiveBars(label: &'static str, metric: Metric, items: Vec<BarItem>) -> Element {
+fn ActivityGrid(plot: TimePlotBox, ticks: Vec<String>) -> Element {
+    rsx! {
+        for (i, tick) in ticks.iter().enumerate() {
+            {
+                let y = chart_y(plot, i as f64 / (ticks.len() - 1) as f64);
+                rsx! {
+                    line { x1: "{plot.left}", x2: "{plot.right}", y1: "{y}", y2: "{y}",
+                        class: if i == 0 { "chart-gridline" } else { "chart-gridline subtle" } }
+                    text { x: "{plot.left - 6.0}", y: "{y + 3.5}", text_anchor: "end", "{tick}" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn BucketTicks(plot: TimePlotBox, labels: Vec<String>, #[props(default)] rhythm: bool) -> Element {
+    let width = plot.right - plot.left;
+    let step = width / labels.len().max(1) as f64;
+    // Leave room for a centered date at either edge and at least 8px between labels.
+    let pitch = if labels.iter().any(|s| s.len() > 6) { 84.0 } else { 52.0 };
+    let margin = if pitch > 52.0 { 38.0 } else { 23.0 };
+    let stride = if rhythm && step >= 10.0 {
+        4
+    } else if rhythm && step >= 7.0 {
+        6
+    } else {
+        (pitch / step).ceil() as usize
+    }
+    .max(1);
+    rsx! {
+        for (i, label) in labels.iter().enumerate() {
+            {
+                let x = plot.left + (i as f64 + 0.5) * step;
+                if x + margin > plot.right + 12.0 || i % stride != 0 {
+                    rsx! {}
+                } else {
+                    rsx! {
+                        line { x1: "{x}", x2: "{x}", y1: "{plot.bottom}", y2: "{plot.bottom + 4.0}", class: "chart-gridline" }
+                        text { x: "{x}", y: "{plot.bottom + 17.0}", text_anchor: "middle", "{label}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn step_bucket(e: KeyboardEvent, mut active: Signal<Option<usize>>, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let i = match e.key() {
+        Key::Named(NamedKey::ArrowLeft) => active.peek().map_or(count - 1, |i| i.saturating_sub(1)),
+        Key::Named(NamedKey::ArrowRight) => active.peek().map_or(0, |i| (i + 1).min(count - 1)),
+        _ => return,
+    };
+    e.prevent_default();
+    active.set(Some(i));
+}
+
+#[component]
+fn BucketHit(plot: TimePlotBox, index: usize, count: usize, mut active: Signal<Option<usize>>) -> Element {
+    let step = (plot.right - plot.left) / count as f64;
+    rsx! { rect { class: "chart-hit", x: "{plot.left + index as f64 * step}", y: "{plot.top}",
+        width: "{step}", height: "{plot.bottom - plot.top + 20.0}", fill: "transparent",
+        onmouseenter: move |_| active.set(Some(index)),
+    } }
+}
+
+#[component]
+fn ActivityReadout(right: bool, heading: String, fields: Vec<(&'static str, String)>) -> Element {
+    rsx! {
+        div { class: if right { "activity-readout right" } else { "activity-readout" },
+            strong { "{heading}" }
+            dl { for (label, value) in fields { dt { "{label}" } dd { "{value}" } } }
+        }
+    }
+}
+
+#[component]
+pub(super) fn ShareBar(label: String, value: f64, total: f64, #[props(default = "of listed total")] scale_label: &'static str) -> Element {
+    let share = (total.is_finite() && total > 0.0 && value.is_finite()).then(|| (value / total).clamp(0.0, 1.0) * 100.0);
+    rsx! {
+        span { class: "share-bar-cell",
+            span { "{label}" }
+            if let Some(pct) = share {
+                span { class: "share-bar-track", aria_hidden: "true", title: "{pct:.1}% {scale_label}",
+                    span { style: "width: {pct:.2}%" }
+                }
+                span { class: "sr-only", ", {pct:.1}% {scale_label}" }
+            }
+        }
+    }
+}
+
+#[component]
+fn InteractiveBars(label: &'static str, metric: Metric, items: Vec<BarItem>, #[props(default)] rhythm: bool) -> Element {
     let mut hovered = use_signal(|| None::<usize>);
-    let grad_prefix = use_hook(|| Uuid::new_v4().simple().to_string());
-    let accent_grad_id = format!("chart-bar-accent-{grad_prefix}");
-    let cache_grad_id = format!("chart-bar-cache-{grad_prefix}");
-    let view_w = 620.0_f64;
-    let plot_left = 48.0_f64;
-    let plot_right = 604.0_f64;
-    let plot_top = 18.0_f64;
-    let plot_bottom = 132.0_f64;
-    let plot_w = plot_right - plot_left;
-    let plot_h = plot_bottom - plot_top;
-    let scale =
-        if metric == Metric::CacheHitRate { 100.0 } else { items.iter().filter_map(|p| p.value).fold(0.0, f64::max).max(f64::EPSILON) };
-    let step = plot_w / items.len().max(1) as f64;
+    let measure = use_time_plot_measure();
+    let width = (measure.width)().max(100.0);
+    let plot = activity_plot(width);
+    let (plot_left, plot_bottom) = (plot.left, plot.bottom);
+    let count = items.len();
+    let step = (plot.right - plot_left) / count.max(1) as f64;
     let unit = metric.label();
-    let active_idx = hovered().filter(|&i| i < items.len());
-    let grad_url = if metric == Metric::CacheHitRate { format!("url(#{cache_grad_id})") } else { format!("url(#{accent_grad_id})") };
-    let readout = active_idx.map(|i| {
-        let p = &items[i];
-        format!(
-            "{} · {} · {} req · {} tok · {} cache",
-            p.label,
-            metric.format_value(p.value),
-            fmt_count(p.requests),
-            fmt_count(p.tokens),
-            fmt_hit_pct(p.cache_hit_rate)
-        )
-    });
+    let active_idx = hovered().filter(|&i| i < count);
+    let peak = items.iter().enumerate().filter_map(|(i, p)| Some((i, p.value?))).max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)));
+    let peak_idx = peak.filter(|&(_, v)| v > 0.0 || metric == Metric::CacheHitRate).map(|(i, _)| i);
+    let max = peak.map_or(0.0, |(_, v)| v);
+    let scale = match metric {
+        Metric::CacheHitRate => 100.0,
+        Metric::Cost => max.max(0.002),
+        _ => (max / 2.0).ceil().max(1.0) * 2.0,
+    };
+    let height = plot_bottom + 24.0;
     rsx! {
         if items.is_empty() {
             p { class: "form-help", "{NO_RANGE_DATA}" }
         } else {
             figure { class: "provider-chart chart-stage",
-                div { class: "chart-header",
-                    figcaption { "{label} · {unit}" }
-                    span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
-                        {readout.as_deref().unwrap_or("Hover a bar to inspect")}
-                    }
-                }
-                svg {
-                    view_box: "0 0 620 156",
-                    role: "img",
-                    "aria-label": "{label}, {unit}. Data table follows.",
-                    onmouseleave: move |_| hovered.set(None),
-                    defs {
-                        linearGradient { id: "{accent_grad_id}", x1: "0", y1: "0", x2: "0", y2: "1",
-                            stop { offset: "0%", stop_color: "var(--honey)", stop_opacity: "0.95" }
-                            stop { offset: "100%", stop_color: "var(--honey)", stop_opacity: "0.45" }
-                        }
-                        linearGradient { id: "{cache_grad_id}", x1: "0", y1: "0", x2: "0", y2: "1",
-                            stop { offset: "0%", stop_color: "var(--ok)", stop_opacity: "0.95" }
-                            stop { offset: "100%", stop_color: "var(--ok)", stop_opacity: "0.45" }
-                        }
-                    }
-                    for frac in [0.0, 0.5, 1.0] {
-                        {
-                            let gy = plot_bottom - plot_h * frac;
-                            let tick = fmt_compact_axis(metric, scale * frac);
-                            rsx! {
-                                line {
-                                    x1: "{plot_left}",
-                                    x2: "{plot_right}",
-                                    y1: "{gy:.2}",
-                                    y2: "{gy:.2}",
-                                    class: if frac == 0.0 { "chart-gridline" } else { "chart-gridline subtle" },
-                                }
-                                text { x: "{plot_left - 6.0}", y: "{gy + 3.5:.2}", text_anchor: "end", "{tick}" }
-                            }
-                        }
-                    }
-                    for (i, item) in items.iter().enumerate() {
-                        {
-                            let col_x = plot_left + i as f64 * step;
-                            let bar_w = (step * 0.78).max(2.0);
-                            let bar_x = col_x + (step - bar_w) / 2.0;
-                            let height = (plot_h * item.value.unwrap_or_default() / scale).clamp(0.0, plot_h);
-                            let bar_y = plot_bottom - height;
-                            let is_active = active_idx == Some(i);
-                            rsx! {
-                                if is_active {
-                                    rect { x: "{col_x:.2}", y: "{plot_top}", width: "{step:.2}", height: "{plot_h}", class: "chart-col-highlight", pointer_events: "none" }
-                                }
-                                if item.value.is_some() {
-                                    rect {
-                                        x: "{bar_x:.2}",
-                                        y: "{bar_y:.2}",
-                                        width: "{bar_w:.2}",
-                                        height: "{height:.2}",
-                                        rx: "2.5",
-                                        fill: "{grad_url}",
-                                        class: if is_active { "chart-bar chart-bar-active" } else { "chart-bar" },
-                                        pointer_events: "none",
-                                    }
-                                }
-                                rect {
-                                    x: "{col_x:.2}",
-                                    y: "{plot_top}",
-                                    width: "{step:.2}",
-                                    height: "{plot_h}",
-                                    fill: "transparent",
-                                    class: "chart-hit",
-                                    onmouseenter: move |_| hovered.set(Some(i)),
-                                    title { "{item.label} · {unit}: {metric.format_value(item.value)}" }
-                                }
-                            }
-                        }
-                    }
-                    text { x: "{plot_left}", y: "149", "{items.first().map(|p| p.label.as_str()).unwrap_or_default()}" }
-                    if items.len() > 2 {
-                        text { x: "{(plot_left + plot_right) / 2.0:.1}", y: "149", text_anchor: "middle", "{items[items.len() / 2].label}" }
-                    }
-                    text { x: "{plot_right}", y: "149", text_anchor: "end", "{items.last().map(|p| p.label.as_str()).unwrap_or_default()}" }
-                    if let Some(i) = active_idx {
+                figcaption { class: "chart-header",
+                    span { "{label} · {unit}" }
+                    if let Some(i) = peak_idx {
                         {
                             let item = &items[i];
-                            let cx = plot_left + (i as f64 + 0.5) * step;
-                            let height = (plot_h * item.value.unwrap_or_default() / scale).clamp(0.0, plot_h);
-                            let cy = plot_bottom - height;
-                            let fail_part = if item.failures > 0 { format!(" · {} fail", fmt_count(item.failures)) } else { String::new() };
-                            let spec = TooltipSpec {
-                                x: cx,
-                                y: cy,
-                                crosshair_x: Some(cx),
-                                y_top: plot_top,
-                                y_bottom: plot_bottom,
-                                view_w,
-                                title: format!("{} · {}", item.label, metric.format_value(item.value)),
-                                detail: format!("{} req{fail_part} · {} tok", fmt_count(item.requests), fmt_count(item.tokens)),
-                                subdetail: Some(format!("Cache {} ({} read) · ${:.4}", fmt_hit_pct(item.cache_hit_rate), fmt_count(item.cache_read), item.cost_usd)),
-                            };
-                            rsx! { SvgTooltip { spec } }
+                            let time = item.window.split_once(" → ").map_or(item.window.as_str(), |(start, _)| start);
+                            let suffix = match metric { Metric::Requests => " req", Metric::Tokens => " tok", _ => "" };
+                            rsx! { span { class: "activity-peak mono", "Peak: {time} · {metric.format_value(item.value)}{suffix}" } }
+                        }
+                    }
+                }
+                div { class: "activity-plot", tabindex: "0", role: "group",
+                    aria_label: "{label}, {unit}. Use left and right arrows to inspect. Data table follows.",
+                    onkeydown: move |e| step_bucket(e, hovered, count),
+                    onblur: move |_| hovered.set(None),
+                    onmouseleave: move |_| hovered.set(None),
+                    onmounted: move |e| measure.mount(e),
+                    onresize: move |_| measure.refresh(),
+                    svg { width: "100%", height: "{height}", view_box: "0 0 {width} {height}", preserve_aspect_ratio: "none", "aria-hidden": "true",
+                        ActivityGrid { plot, ticks: [0.0, 0.5, 1.0].map(|f| fmt_compact_axis(metric, scale * f)).to_vec() }
+                        BucketTicks { plot, labels: items.iter().map(|p| p.label.clone()).collect(), rhythm }
+                        for (i, item) in items.iter().enumerate() {
+                            {
+                                let x = plot_left + (i as f64 + 0.5) * step;
+                                let bar_w = (step * 0.74).min(34.0);
+                                let y = chart_y(plot, item.value.unwrap_or_default() / scale);
+                                let peak_class = if peak_idx == Some(i) { "peak" } else { "" };
+                                rsx! {
+                                    if item.value.is_some() {
+                                        rect { x: "{x - bar_w / 2.0}", y: "{y}", width: "{bar_w}", height: "{plot_bottom - y}", rx: "2",
+                                            class: "activity-bar {peak_class}" }
+                                    }
+                                    if rhythm && item.failures > 0 {
+                                        circle { cx: "{x}", cy: "{(y - 5.0).max(4.0)}", r: "2.4", class: "chart-outlier" }
+                                    }
+                                    if active_idx == Some(i) { TimeCrosshair { plot, x } }
+                                    BucketHit { plot, index: i, count, active: hovered }
+                                }
+                            }
+                        }
+                    }
+                    div { role: "status",
+                        if let Some(i) = active_idx {
+                            {
+                                let item = &items[i];
+                                rsx! { ActivityReadout { right: i < count / 2, heading: item.window.clone(), fields: vec![
+                                    ("Requests", fmt_count(item.requests)), ("Tokens", fmt_count(item.tokens)),
+                                    ("API-equivalent USD", format!("${:.4}", item.cost_usd)), ("Failures", fmt_count(item.failures)),
+                                    ("Cache hit", fmt_hit_pct(item.cache_hit_rate)), ("Cache read", fmt_count(item.cache_read)),
+                                ] } }
+                            }
                         }
                     }
                 }
                 details { summary { "Data table" }
-                    Table { label, headers: &["Period", "Value", "Requests", "Tokens", "Cache hit %", "API-equivalent USD"],
+                    Table { label, headers: &["Period", "Value", "Requests", "Tokens", "Failures", "Cache hit %", "API-equivalent USD"],
                         rows: items.iter().map(|p| vec![
-                            p.label.clone(),
+                            p.window.clone(),
                             metric.format_value(p.value),
                             fmt_count(p.requests),
                             fmt_count(p.tokens),
+                            fmt_count(p.failures),
                             fmt_hit_pct(p.cache_hit_rate),
                             format!("${:.4}", p.cost_usd),
                         ]).collect()
@@ -1232,47 +1367,34 @@ fn InteractiveBars(label: &'static str, metric: Metric, items: Vec<BarItem>) -> 
 }
 
 #[component]
-pub(super) fn ActivityTrendChart(points: Vec<ActivityTrendPoint>, metric: Metric) -> Element {
-    let mut points = points;
-    points.sort_by_key(|p| p.bucket_start);
-    // Hub daily buckets use UTC dates and %m-%d labels. Leave longer spans sparse.
-    let fill_gaps = points
-        .first()
-        .zip(points.last())
-        .is_some_and(|(first, last)| last.bucket_start.date_naive() - first.bucket_start.date_naive() <= TimeDelta::days(400));
-    let mut items = Vec::with_capacity(points.len());
-    let mut previous_day = None;
-    for p in points {
-        let day = p.bucket_start.date_naive();
-        if fill_gaps && let Some(previous) = previous_day {
-            for offset in 1..day.signed_duration_since(previous).num_days() {
-                items.push(BarItem {
-                    label: (previous + TimeDelta::days(offset)).format("%m-%d").to_string(),
-                    value: metric.value(0, 0, 0.0, None),
-                    requests: 0,
-                    failures: 0,
-                    tokens: 0,
-                    cache_read: 0,
-                    cache_hit_rate: None,
-                    cost_usd: 0.0,
-                });
+pub(super) fn ActivityTrendChart(
+    points: Vec<ActivityTrendPoint>,
+    metric: Metric,
+    #[props(default)] bucket_seconds: Option<u64>,
+) -> Element {
+    let (seconds, points) = trend_buckets(points, bucket_seconds);
+    let items = points
+        .into_iter()
+        .map(|p| {
+            let tokens = p.input_tokens.saturating_add(p.output_tokens);
+            BarItem {
+                label: bucket_label(p.bucket_start, seconds),
+                window: bucket_window(p.bucket_start, seconds),
+                value: metric.value(p.requests, tokens, p.api_equivalent_cost_usd, p.cache_hit_rate_observed),
+                requests: p.requests,
+                failures: p.failures,
+                tokens,
+                cache_read: p.cache_read_tokens,
+                cache_hit_rate: p.cache_hit_rate_observed,
+                cost_usd: p.api_equivalent_cost_usd,
             }
-        }
-        previous_day = Some(day);
-        let tokens = p.input_tokens.saturating_add(p.output_tokens);
-        let cache_hit_rate = effective_cache_hit_rate(p.input_tokens, p.cache_read_tokens, p.cache_hit_rate);
-        items.push(BarItem {
-            label: p.label,
-            value: metric.value(p.requests, tokens, p.api_equivalent_cost_usd, cache_hit_rate),
-            requests: p.requests,
-            failures: p.failures,
-            tokens,
-            cache_read: p.cache_read_tokens,
-            cache_hit_rate,
-            cost_usd: p.api_equivalent_cost_usd,
-        });
-    }
-    rsx! { InteractiveBars { label: "Daily activity", metric, items } }
+        })
+        .collect();
+    rsx! { InteractiveBars { label: "Activity over time (UTC)", metric, items } }
+}
+
+fn local_hour(hour: u8) -> String {
+    format!("{} {}", if hour.is_multiple_of(12) { 12 } else { hour % 12 }, if hour < 12 { "AM" } else { "PM" })
 }
 
 #[component]
@@ -1285,10 +1407,11 @@ pub(super) fn ActivityRhythmChart(points: Vec<RhythmBucket>, metric: Metric) -> 
             Some(p) => {
                 let cache_hit_rate = effective_cache_hit_rate(p.input_tokens, p.cache_read_tokens, p.cache_hit_rate);
                 BarItem {
-                    label: format!("{h:02}:00"),
+                    label: local_hour(h),
+                    window: local_hour(h),
                     value: metric.value(p.requests, p.tokens, p.api_equivalent_cost_usd, cache_hit_rate),
                     requests: p.requests,
-                    failures: 0,
+                    failures: p.failures,
                     tokens: p.tokens,
                     cache_read: p.cache_read_tokens,
                     cache_hit_rate,
@@ -1296,7 +1419,8 @@ pub(super) fn ActivityRhythmChart(points: Vec<RhythmBucket>, metric: Metric) -> 
                 }
             }
             None => BarItem {
-                label: format!("{h:02}:00"),
+                label: local_hour(h),
+                window: local_hour(h),
                 value: metric.value(0, 0, 0.0, None),
                 requests: 0,
                 failures: 0,
@@ -1307,225 +1431,90 @@ pub(super) fn ActivityRhythmChart(points: Vec<RhythmBucket>, metric: Metric) -> 
             },
         })
         .collect();
-    rsx! { InteractiveBars { label: "Local-hour rhythm", metric, items } }
-}
-
-#[derive(Clone, PartialEq)]
-enum CacheHover {
-    Point(usize),
-    Segment(usize),
+    rsx! { InteractiveBars { label: "By local hour", metric, items, rhythm: true } }
 }
 
 #[component]
-pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>) -> Element {
-    let mut hovered = use_signal(|| None::<CacheHover>);
-    let grad_id = use_hook(|| format!("chart-cache-area-{}", Uuid::new_v4().simple()));
-    let grad_url = format!("url(#{grad_id})");
-    let view_w = 620.0_f64;
-    let plot_left = 44.0_f64;
-    let plot_right = 604.0_f64;
-    let plot_top = 16.0_f64;
-    let plot_bottom = 134.0_f64;
-    let plot_h = plot_bottom - plot_top;
-    let mut points = points;
-    points.sort_by_key(|p| p.bucket_start);
-    let n = points.len();
-    let px = |i: usize| match (points.first(), points.last()) {
-        (Some(first), Some(last)) if first.bucket_start != last.bucket_start => {
-            let elapsed = (points[i].bucket_start - first.bucket_start).as_seconds_f64();
-            let span = (last.bucket_start - first.bucket_start).as_seconds_f64();
-            plot_left + (plot_right - plot_left) * elapsed / span
-        }
-        _ => (plot_left + plot_right) / 2.0,
-    };
-    let py = |rate: f64| plot_bottom - plot_h * rate.clamp(0.0, 1.0);
-    let rates: Vec<_> = points.iter().map(|p| effective_cache_hit_rate(p.input_tokens, p.cache_read_tokens, p.cache_hit_rate)).collect();
-    let plotted: Vec<_> = rates.iter().enumerate().filter_map(|(i, rate)| Some((i, (*rate)?))).collect();
-    let (weighted_rate, total_in) = plotted.iter().fold((0.0, 0.0), |(sum, total), &(i, rate)| {
-        let input = points[i].input_tokens as f64;
-        (sum + rate * input, total + input)
-    });
-    let avg_rate = (total_in > 0.0).then(|| weighted_rate / total_in);
-
-    // Use the same runs for visible paths and interactive segments.
-    let runs = plotted.chunk_by(|&(a, _), &(b, _)| b == a + 1 && points[b].bucket_start - points[a].bucket_start <= TimeDelta::hours(36));
-    let mut lines = Vec::new();
-    let mut areas = Vec::new();
-    let mut segments = Vec::new();
-    for run in runs {
-        let coords = run.iter().map(|&(i, rate)| format!("{:.2} {:.2}", px(i), py(rate))).collect::<Vec<_>>().join(" L");
-        lines.push(format!("M{coords}"));
-        if let [first, .., last] = run {
-            areas.push(format!("M{:.2} {plot_bottom:.2} L{coords} L{:.2} {plot_bottom:.2} Z", px(first.0), px(last.0)));
-        }
-        segments.extend(run.windows(2).map(|pair| (pair[0], pair[1])));
-    }
-    let line_d = lines.join(" ");
-    let active = hovered();
-    let (readout, tooltip_spec) = match active {
-        Some(CacheHover::Point(i)) => rates.get(i).copied().map(|rate| {
-            let p = &points[i];
-            let hit_pct = fmt_hit_pct(rate);
-            let readout = format!(
-                "{} · {} hit · {} read / {} in · {} write",
-                p.label,
-                hit_pct,
-                fmt_count(p.cache_read_tokens),
-                fmt_count(p.input_tokens),
-                fmt_count(p.cache_write_tokens),
-            );
-            let spec = TooltipSpec {
-                x: px(i),
-                y: rate.map_or(plot_bottom, py),
-                crosshair_x: Some(px(i)),
-                y_top: plot_top,
-                y_bottom: plot_bottom,
-                view_w,
-                title: format!("{} · {hit_pct} cache hit", p.label),
-                detail: format!("{} read / {} input tokens", fmt_count(p.cache_read_tokens), fmt_count(p.input_tokens)),
-                subdetail: Some(format!("{} write · {} req", fmt_count(p.cache_write_tokens), fmt_count(p.requests))),
-            };
-            (readout, spec)
-        }),
-        Some(CacheHover::Segment(i)) => segments.get(i).map(|&((a, from), (b, to))| {
-            let delta = (to - from) * 100.0;
-            let mx = (px(a) + px(b)) / 2.0;
-            let my = (py(from) + py(to)) / 2.0;
-            let title = format!("{} → {}", points[a].label, points[b].label);
-            let detail = format!("{} → {} ({delta:+.1} pp)", fmt_hit_pct(Some(from)), fmt_hit_pct(Some(to)));
-            let readout = format!("{title} · {detail}");
-            let spec = TooltipSpec {
-                x: mx,
-                y: my,
-                crosshair_x: Some(mx),
-                y_top: plot_top,
-                y_bottom: plot_bottom,
-                view_w,
-                title,
-                detail,
-                subdetail: Some(format!("Mean overall: {}", fmt_hit_pct(avg_rate))),
-            };
-            (readout, spec)
-        }),
-        None => None,
-    }
-    .unzip();
+pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>, #[props(default)] bucket_seconds: Option<u64>) -> Element {
+    let mut active = use_signal(|| None::<usize>);
+    let measure = use_time_plot_measure();
+    let (seconds, points) = trend_buckets(points, bucket_seconds);
+    let count = points.len();
+    let width = (measure.width)().max(100.0);
+    let plot = activity_plot(width);
+    let height = plot.bottom + 24.0;
+    let step = (plot.right - plot.left) / count.max(1) as f64;
+    let px = |i: usize| plot.left + (i as f64 + 0.5) * step;
+    let max_input = points.iter().map(|p| p.input_tokens).max().unwrap_or_default().max(1) as f64;
+    let observed = active().filter(|&i| i < count);
     rsx! {
-        if plotted.is_empty() {
+        if points.is_empty() {
             p { class: "form-help", "{NO_RANGE_DATA}" }
         } else {
             figure { class: "provider-chart chart-stage",
-                div { class: "chart-header",
-                    figcaption { "Daily cache hit rate (%) · avg {fmt_hit_pct(avg_rate)}" }
-                    span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
-                        {readout.as_deref().unwrap_or("Hover a line segment or point to inspect")}
-                    }
+                figcaption { class: "chart-header",
+                    span { "Cache hit rate (%) · UTC" }
+                    span { class: "chart-legend-item activity-volume-key", title: "Bar height relative to the busiest input-token bucket",
+                        span { class: "chart-swatch" } "Input volume" }
                 }
-                svg {
-                    view_box: "0 0 620 156",
-                    role: "img",
-                    "aria-label": "Daily cache hit rate percentage over time.",
-                    onmouseleave: move |_| hovered.set(None),
-                    defs {
-                        linearGradient { id: "{grad_id}", x1: "0", y1: "0", x2: "0", y2: "1",
-                            stop { offset: "0%", stop_color: "var(--ok)", stop_opacity: "0.28" }
-                            stop { offset: "100%", stop_color: "var(--ok)", stop_opacity: "0.02" }
+                if !points.iter().any(|p| p.cache_hit_rate_observed.is_some()) {
+                    p { class: "form-help", "No observed cache hit rate in this range." }
+                }
+                div { class: "activity-plot", tabindex: "0", role: "group",
+                    aria_label: "Cache hit rate and input volume. Use left and right arrows to inspect. Data table follows.",
+                    onkeydown: move |e| step_bucket(e, active, count),
+                    onblur: move |_| active.set(None),
+                    onmouseleave: move |_| active.set(None),
+                    onmounted: move |e| measure.mount(e),
+                    onresize: move |_| measure.refresh(),
+                    svg { width: "100%", height: "{height}", view_box: "0 0 {width} {height}", preserve_aspect_ratio: "none", "aria-hidden": "true",
+                        ActivityGrid { plot, ticks: vec!["0%".into(), "50%".into(), "100%".into()] }
+                        BucketTicks { plot, labels: points.iter().map(|p| bucket_label(p.bucket_start, seconds)).collect() }
+                        for (i, p) in points.iter().enumerate().filter(|(_, p)| p.input_tokens > 0) {
+                            {
+                                let bar_w = (step * 0.74).min(34.0);
+                                let y = chart_y(plot, p.input_tokens as f64 / max_input);
+                                rsx! { rect { x: "{px(i) - bar_w / 2.0}", y: "{y}", width: "{bar_w}", height: "{plot.bottom - y}", rx: "2", class: "activity-volume-bar" } }
+                            }
+                        }
+                        for (i, pair) in points.windows(2).enumerate() {
+                            if let Some((a, b)) = pair[0].cache_hit_rate_observed.zip(pair[1].cache_hit_rate_observed)
+                                && pair[1].bucket_start - pair[0].bucket_start == TimeDelta::seconds(seconds as i64) {
+                                line { x1: "{px(i)}", x2: "{px(i + 1)}", y1: "{chart_y(plot, a)}", y2: "{chart_y(plot, b)}",
+                                    class: "chart-line chart-cache-line activity-cache-segment" }
+                            }
+                        }
+                        if let Some(i) = observed { TimeCrosshair { plot, x: px(i) } }
+                        for (i, p) in points.iter().enumerate() {
+                            if let Some(rate) = p.cache_hit_rate_observed {
+                                circle { cx: "{px(i)}", cy: "{chart_y(plot, rate)}", r: if observed == Some(i) { "4.5" } else { "2.6" },
+                                    class: if observed == Some(i) { "chart-cache-dot active" } else { "chart-cache-dot" } }
+                            }
+                        }
+                        for i in 0..count {
+                            BucketHit { plot, index: i, count, active }
                         }
                     }
-                    for pct in [0.0, 25.0, 50.0, 75.0, 100.0] {
-                        {
-                            let gy = py(pct / 100.0);
-                            rsx! {
-                                line {
-                                    x1: "{plot_left}",
-                                    x2: "{plot_right}",
-                                    y1: "{gy:.2}",
-                                    y2: "{gy:.2}",
-                                    class: if pct == 0.0 || pct == 100.0 { "chart-gridline" } else { "chart-gridline subtle" },
-                                }
-                                if pct == 0.0 || pct == 50.0 || pct == 100.0 {
-                                    text { x: "{plot_left - 6.0}", y: "{gy + 3.5:.2}", text_anchor: "end", "{pct:.0}%" }
+                    div { role: "status",
+                        if let Some(i) = observed {
+                            {
+                                let p = &points[i];
+                                rsx! {
+                                    ActivityReadout { right: i < count / 2, heading: bucket_window(p.bucket_start, seconds), fields: vec![
+                                        ("Cache hit", p.cache_hit_rate_observed.map_or_else(|| "N/A · no input".into(), |r| fmt_hit_pct(Some(r)))),
+                                        ("Read / input tokens", format!("{} / {}", fmt_count(p.cache_read_tokens), fmt_count(p.input_tokens))),
+                                        ("Cache write tokens", fmt_count(p.cache_write_tokens)),
+                                    ] }
                                 }
                             }
                         }
-                    }
-                    if let Some(avg_rate) = avg_rate {
-                        line {
-                            x1: "{plot_left}",
-                            x2: "{plot_right}",
-                            y1: "{py(avg_rate):.2}",
-                            y2: "{py(avg_rate):.2}",
-                            class: "chart-cache-avg",
-                        }
-                    }
-                    for d in areas {
-                        path { d: "{d}", fill: "{grad_url}", pointer_events: "none" }
-                    }
-                    path { class: "chart-line chart-cache-line", d: "{line_d}", pointer_events: "none" }
-                    for (i, &((a, from), (b, to))) in segments.iter().enumerate() {
-                        {
-                            let x1 = px(a);
-                            let y1 = py(from);
-                            let x2 = px(b);
-                            let y2 = py(to);
-                            let is_seg = active == Some(CacheHover::Segment(i));
-                            rsx! {
-                                if is_seg {
-                                    line { x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}", class: "chart-line chart-cache-line chart-segment-active", pointer_events: "none" }
-                                }
-                                line {
-                                    x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}",
-                                    class: "chart-hit",
-                                    stroke: "transparent",
-                                    stroke_width: "12",
-                                    onmouseenter: move |_| hovered.set(Some(CacheHover::Segment(i))),
-                                    onmouseleave: move |_| hovered.set(None),
-                                }
-                            }
-                        }
-                    }
-                    for (i, &rate) in rates.iter().enumerate() {
-                        {
-                            let p = &points[i];
-                            let cx = px(i);
-                            let cy = rate.map_or(plot_bottom, py);
-                            let is_pt = active == Some(CacheHover::Point(i));
-                            rsx! {
-                                if rate.is_some() {
-                                    circle {
-                                        cx: "{cx:.2}",
-                                        cy: "{cy:.2}",
-                                        r: if is_pt { "4.4" } else { "2.8" },
-                                        class: if is_pt { "chart-cache-dot active" } else { "chart-cache-dot" },
-                                        pointer_events: "none",
-                                    }
-                                }
-                                circle {
-                                    cx: "{cx:.2}",
-                                    cy: "{cy:.2}",
-                                    r: "8",
-                                    fill: "transparent",
-                                    class: "chart-hit",
-                                    onmouseenter: move |_| hovered.set(Some(CacheHover::Point(i))),
-                                    onmouseleave: move |_| hovered.set(None),
-                                    title { "{p.label} · {fmt_hit_pct(rate)}" }
-                                }
-                            }
-                        }
-                    }
-                    text { x: "{plot_left}", y: "149", "{points.first().map(|p| p.label.as_str()).unwrap_or_default()}" }
-                    if n > 2 {
-                        text { x: "{px(n / 2):.1}", y: "149", text_anchor: "middle", "{points[n / 2].label}" }
-                    }
-                    text { x: "{plot_right}", y: "149", text_anchor: "end", "{points.last().map(|p| p.label.as_str()).unwrap_or_default()}" }
-                    if let Some(spec) = tooltip_spec {
-                        SvgTooltip { spec }
                     }
                 }
                 details { summary { "Data table" }
-                    Table { label: "Daily cache hit rate", headers: &["Day", "Cache hit %", "Cache read", "Input tokens"],
-                        rows: points.iter().zip(&rates).map(|(p, rate)| vec![
-                            p.label.clone(), fmt_hit_pct(*rate), fmt_count(p.cache_read_tokens), fmt_count(p.input_tokens),
+                    Table { label: "Cache hit rate by bucket", headers: &["Period", "Cache hit %", "Cache read", "Input tokens", "Cache write"],
+                        rows: points.iter().map(|p| vec![
+                            bucket_window(p.bucket_start, seconds), fmt_hit_pct(p.cache_hit_rate_observed),
+                            fmt_count(p.cache_read_tokens), fmt_count(p.input_tokens), fmt_count(p.cache_write_tokens),
                         ]).collect()
                     }
                 }
@@ -1535,15 +1524,35 @@ pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>) -> Element {
 }
 
 #[component]
-pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Element {
+pub(super) fn HeatmapScale(metric: Metric) -> Element {
+    rsx! {
+        div { class: "activity-heat-scale", aria_label: "Heatmap color scale: less to more",
+            span { "Less" }
+            for step in [0.12, 0.36, 0.65, 1.0] {
+                span { class: if metric == Metric::CacheHitRate { "chart-heat-swatch cache" } else { "chart-heat-swatch" },
+                    style: "opacity: {step}", aria_hidden: "true" }
+            }
+            span { "More" }
+        }
+    }
+}
+
+#[component]
+pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric, #[props(default)] covered_weekdays: Vec<u8>) -> Element {
     let mut hovered = use_signal(|| None::<(usize, usize)>);
-    if cells.is_empty() {
+    let measure = use_time_plot_measure();
+    let hatch = use_hook(|| format!("activity-outside-{}", Uuid::new_v4().simple()));
+    let width = (measure.width)().max(100.0);
+    let step = (width - 38.0) / 24.0;
+    let in_scope = |day| covered_weekdays.is_empty() || covered_weekdays.contains(&(day as u8));
+    if cells.is_empty() && covered_weekdays.is_empty() {
         return rsx! { p { class: "form-help", "{NO_RANGE_DATA}" } };
     }
     let unit = metric.label();
     let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     let cell_map: BTreeMap<_, _> = cells
         .iter()
+        .filter(|c| in_scope(usize::from(c.day_of_week)))
         .map(|c| {
             let rate = effective_cache_hit_rate(c.input_tokens, c.cache_read_tokens, c.cache_hit_rate);
             let value = metric.value(c.requests, c.tokens, c.api_equivalent_cost_usd, rate);
@@ -1559,44 +1568,33 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Elemen
     let value_at = |d, h| cell_map.get(&(d, h)).map_or(empty_value, |&(_, _, value)| value);
     let active = hovered();
     let cell_class = if metric == Metric::CacheHitRate { "chart-heat-cache" } else { "chart-bar chart-solid" };
-    let readout = active.map(|(d, h)| {
-        if let Some(&(c, rate, value)) = cell_map.get(&(d, h)) {
-            format!(
-                "{} {h:02}:00 · {} · {} req · {} tok · {} cache",
-                days[d],
-                metric.format_value(value),
-                fmt_count(c.requests),
-                fmt_count(c.tokens),
-                fmt_hit_pct(rate),
-            )
-        } else {
-            format!("{} {h:02}:00 · {} (no activity)", days[d], metric.format_value(empty_value))
-        }
-    });
     rsx! {
         figure { class: "provider-chart chart-stage",
-            div { class: "chart-header",
-                figcaption { "Activity by weekday and local hour · {unit}" }
-                span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
-                    {readout.as_deref().unwrap_or("Hover a cell to inspect")}
-                }
-            }
+            figcaption { "By weekday and local hour · {unit}" }
             div { class: "chart-legend",
-                span { class: "muted", "Low" }
-                for step in [0.14, 0.34, 0.56, 0.78, 1.0] {
-                    span { class: if metric == Metric::CacheHitRate { "chart-heat-swatch cache" } else { "chart-heat-swatch" }, style: "opacity: {step}" }
+                if !covered_weekdays.is_empty() && covered_weekdays.len() < days.len() {
+                    span { class: "chart-legend-item", span { class: "chart-heat-swatch outside" } "Outside selected window" }
                 }
-                span { class: "muted", "Peak ({fmt_compact_axis(metric, max)})" }
+                if metric == Metric::CacheHitRate {
+                    span { class: "chart-legend-item", span { class: "chart-heat-swatch na" } "N/A · no input" }
+                }
             }
-            svg {
-                view_box: "0 0 616 184",
+            div { class: "activity-plot",
+                onmounted: move |e| measure.mount(e),
+                onresize: move |_| measure.refresh(),
+                svg {
+                width: "100%", height: "154", view_box: "0 0 {width} 154", preserve_aspect_ratio: "none",
                 role: "img",
                 "aria-label": "Seven by twenty-four activity heatmap. Data table follows.",
                 onmouseleave: move |_| hovered.set(None),
-                for hour in [0, 3, 6, 9, 12, 15, 18, 21, 23] {
+                defs { pattern { id: "{hatch}", width: "5", height: "5", pattern_units: "userSpaceOnUse",
+                    path { d: "M-1 1L1 -1 M0 5L5 0 M4 6L6 4", class: "activity-heat-hatch" }
+                } }
+                for hour in (0..24).step_by(if step >= 18.0 { 3 } else { 6 }) {
                     text {
-                        x: "{36 + 24 * hour}",
+                        x: "{35.0 + step * (hour as f64 + 0.5)}",
                         y: "12",
+                        text_anchor: "middle",
                         class: if active.is_some_and(|(_, h)| h == hour) { "chart-axis-active" } else { "" },
                         "{hour:02}"
                     }
@@ -1604,7 +1602,7 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Elemen
                 for (d, day) in days.into_iter().enumerate() {
                     text {
                         x: "2",
-                        y: "{34 + 22 * d}",
+                        y: "{30 + 18 * d}",
                         class: if active.is_some_and(|(ad, _)| ad == d) { "chart-axis-active" } else { "" },
                         "{day}"
                     }
@@ -1613,19 +1611,26 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Elemen
                             let value = value_at(d, h);
                             let intensity = value.unwrap_or_default();
                             let is_active = active == Some((d, h));
-                            let cx = 36 + 24 * h;
-                            let cy = 20 + 22 * d;
+                            let cx = 35.0 + step * h as f64;
+                            let cy = 18 + 18 * d;
+                            let outside = !in_scope(d);
+                            let state = if outside { "activity-heat-outside" } else if value.is_none() { "activity-heat-na" } else { cell_class };
+                            let active_class = if is_active { "chart-cell-active" } else { "" };
+                            let description = if outside { "Outside selected window".into() } else if value.is_none() {
+                                "N/A · no input tokens".into()
+                            } else { format!("{unit}: {}", metric.format_value(value)) };
                             rsx! {
                                 rect {
                                     x: "{cx}",
                                     y: "{cy}",
-                                    width: "21",
-                                    height: "19",
-                                    rx: "3",
-                                    class: if is_active { "{cell_class} chart-cell-active chart-hit" } else { "{cell_class} chart-hit" },
-                                    opacity: if intensity <= 0.0 { 0.12 } else { 0.24 + 0.76 * (intensity / max).clamp(0.0, 1.0) },
+                                    width: "{(step - 2.0).max(1.0)}",
+                                    height: "16",
+                                    rx: "2",
+                                    class: "{state} {active_class} chart-hit",
+                                    fill: if outside { format!("url(#{hatch})") } else { String::new() },
+                                    opacity: if outside || value.is_none() { 1.0 } else { 0.12 + 0.88 * (intensity / max).clamp(0.0, 1.0) },
                                     onmouseenter: move |_| hovered.set(Some((d, h))),
-                                    title { "{day} {h:02}:00 · {unit}: {metric.format_value(value)}" }
+                                    title { "{day} {h:02}:00 · {description}" }
                                 }
                             }
                         }
@@ -1633,7 +1638,11 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Elemen
                 }
                 if let Some((d, h)) = active {
                     {
-                        let (detail, subdetail) = if let Some(&(c, rate, _)) = cell_map.get(&(d, h)) {
+                        let (detail, subdetail) = if !in_scope(d) {
+                            ("Outside selected window".into(), None)
+                        } else if value_at(d, h).is_none() {
+                            ("N/A · no input tokens".into(), None)
+                        } else if let Some(&(c, rate, _)) = cell_map.get(&(d, h)) {
                             (
                                 format!("{} req · {} tok", fmt_count(c.requests), fmt_count(c.tokens)),
                                 Some(format!("Cache {} · ${:.4}", fmt_hit_pct(rate), c.api_equivalent_cost_usd)),
@@ -1642,18 +1651,21 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Elemen
                             ("No recorded requests".into(), None)
                         };
                         let spec = TooltipSpec {
-                            x: 36.0 + 24.0 * h as f64 + 10.5,
-                            y: 20.0 + 22.0 * d as f64 + 9.5,
+                            x: 35.0 + step * (h as f64 + 0.5),
+                            y: 26.0 + 18.0 * d as f64,
                             crosshair_x: None,
                             y_top: 20.0,
-                            y_bottom: 174.0,
-                            view_w: 616.0,
-                            title: format!("{} {h:02}:00 · {}", days[d], metric.format_value(value_at(d, h))),
+                            y_bottom: 144.0,
+                            view_w: width,
+                            title: if in_scope(d) && value_at(d, h).is_some() {
+                                format!("{} {h:02}:00 · {}", days[d], metric.format_value(value_at(d, h)))
+                            } else { format!("{} {h:02}:00", days[d]) },
                             detail,
                             subdetail,
                         };
                         rsx! { SvgTooltip { spec } }
                     }
+                }
                 }
             }
             if cells.is_empty() { p { class: "muted", "No activity observations in this scope." } }
@@ -1675,203 +1687,112 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Elemen
     }
 }
 
-#[derive(Clone, PartialEq)]
-enum DriftHover {
-    Day(usize),
-    Segment(usize),
+fn drift_date(date: &str) -> Option<DateTime<Utc>> {
+    Some(chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?.and_time(chrono::NaiveTime::MIN).and_utc())
 }
 
 #[component]
-pub(super) fn DriftBandChart(days: Vec<DriftDayPoint>, markers: Vec<DriftMarker>) -> Element {
-    let mut hovered = use_signal(|| None::<DriftHover>);
-    let view_w = 620.0_f64;
-    let plot_left = 48.0_f64;
-    let plot_right = 604.0_f64;
-    let plot_top = 16.0_f64;
-    let plot_bottom = 140.0_f64;
-    let max = days.iter().flat_map(|d| [d.thinking_per_reply, d.baseline_high.unwrap_or(0.0)]).fold(1.0, f64::max);
-    let n = days.len();
-    let dx = |i: usize| {
-        if n <= 1 { (plot_left + plot_right) / 2.0 } else { plot_left + (plot_right - plot_left) * i as f64 / (n - 1) as f64 }
+pub(super) fn DriftBandChart(days: Vec<DriftDayPoint>, markers: Vec<DriftMarker>, #[props(default)] ttft: bool) -> Element {
+    let mut active = use_signal(|| None::<usize>);
+    let measure = use_time_plot_measure();
+    let mut dated: Vec<_> = days.iter().filter_map(|day| Some((drift_date(&day.date)?, day))).collect();
+    dated.sort_by_key(|(at, _)| *at);
+    let Some(((first, _), (last, _))) = dated.first().zip(dated.last()) else {
+        return rsx! { p { class: "form-help", "No dated observations in this scope." } };
     };
-    let dy = |v: f64| plot_bottom - (plot_bottom - plot_top) * (v / max).clamp(0.0, 1.0);
-    let band_path = |range: &[(usize, &DriftDayPoint)]| {
-        let high = range.iter().map(|(i, d)| format!("{:.2},{:.2}", dx(*i), dy(d.baseline_high.unwrap_or_default())));
-        let low = range.iter().rev().map(|(i, d)| format!("{:.2},{:.2}", dx(*i), dy(d.baseline_low.unwrap_or_default())));
-        high.chain(low).collect::<Vec<_>>().join(" ")
-    };
-    let trend_d = days
-        .iter()
-        .enumerate()
-        .map(|(i, d)| format!("{}{:.2} {:.2}", if i == 0 { 'M' } else { 'L' }, dx(i), dy(d.thinking_per_reply)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let indexed: Vec<_> = days.iter().enumerate().collect();
-    let groups = indexed.split(|(_, d)| d.baseline_low.is_none() || d.baseline_high.is_none());
-    let active = hovered();
-    let readout = match active {
-        Some(DriftHover::Day(i)) if i < n => {
-            let d = &days[i];
-            let band = match (d.baseline_low, d.baseline_median_thinking, d.baseline_high) {
-                (Some(lo), Some(med), Some(hi)) => format!("normal {lo:.0}–{med:.0}–{hi:.0}"),
-                _ => "baseline building".into(),
-            };
-            let tag = if d.outlier { " · OUTLIER" } else { "" };
-            Some(format!("{} · {:.1} tok/reply ({} replies) · {band}{tag}", d.date, d.thinking_per_reply, d.replies))
-        }
-        Some(DriftHover::Segment(i)) if i + 1 < n => {
-            let a = &days[i];
-            let b = &days[i + 1];
-            let delta = b.thinking_per_reply - a.thinking_per_reply;
-            Some(format!("{} → {} · {:.1} → {:.1} tok/reply ({delta:+.1})", a.date, b.date, a.thinking_per_reply, b.thinking_per_reply))
-        }
-        _ => None,
-    };
-    let tooltip_spec = match active {
-        Some(DriftHover::Day(i)) if i < n => {
-            let d = &days[i];
-            let marker = markers.iter().find(|m| m.date == d.date).map(|m| m.label.clone());
-            let band = match (d.baseline_low, d.baseline_median_thinking, d.baseline_high) {
-                (Some(lo), Some(med), Some(hi)) => format!("Normal: {lo:.0}–{med:.0}–{hi:.0}"),
-                _ => "Insufficient baseline coverage".into(),
-            };
-            let sub = match (d.outlier, marker) {
-                (true, Some(m)) => Some(format!("Outlier · {m}")),
-                (true, None) => Some("Outlier vs 14-day baseline".into()),
-                (false, Some(m)) => Some(format!("Change: {m}")),
-                (false, None) => Some(band.clone()),
-            };
-            Some(TooltipSpec {
-                x: dx(i),
-                y: dy(d.thinking_per_reply),
-                crosshair_x: Some(dx(i)),
-                y_top: plot_top,
-                y_bottom: plot_bottom,
-                view_w,
-                title: format!("{} · {:.1} tok/reply", d.date, d.thinking_per_reply),
-                detail: format!("{} replies · {band}", d.replies),
-                subdetail: sub.filter(|s| s != &band),
-            })
-        }
-        Some(DriftHover::Segment(i)) if i + 1 < n => {
-            let a = &days[i];
-            let b = &days[i + 1];
-            let delta = b.thinking_per_reply - a.thinking_per_reply;
-            let mx = (dx(i) + dx(i + 1)) / 2.0;
-            let my = (dy(a.thinking_per_reply) + dy(b.thinking_per_reply)) / 2.0;
-            Some(TooltipSpec {
-                x: mx,
-                y: my,
-                crosshair_x: Some(mx),
-                y_top: plot_top,
-                y_bottom: plot_bottom,
-                view_w,
-                title: format!("{} → {}", a.date, b.date),
-                detail: format!("{:.1} → {:.1} tok/reply ({delta:+.1})", a.thinking_per_reply, b.thinking_per_reply),
-                subdetail: Some(format!("{} → {} replies", a.replies, b.replies)),
-            })
-        }
-        _ => None,
-    };
+    let view = TimeBounds { start: *first - TimeDelta::hours(12), end: *last + TimeDelta::hours(12) };
+    let width = (measure.width)().max(100.0);
+    let plot = activity_plot(width);
+    let height = plot.bottom + 24.0;
+    let x = |at| plot.x(view, at);
+    let value =
+        |d: &DriftDayPoint| (if ttft { d.median_ttft_ms } else { Some(d.thinking_per_reply) }).filter(|v| v.is_finite() && *v >= 0.0);
+    let max = dated.iter().flat_map(|(_, d)| [value(d), if ttft { None } else { d.baseline_high }]).flatten().fold(1.0, f64::max);
+    let y = |v: f64| chart_y(plot, v / max);
+    let half_day = (x(*first + TimeDelta::hours(12)) - x(*first) - 0.5).clamp(0.0, 15.0);
+    let show_median = !ttft && dated.iter().any(|(_, d)| d.baseline_median_thinking.is_some());
+    let show_band = !ttft && dated.iter().any(|(_, d)| d.baseline_low.zip(d.baseline_high).is_some());
+    let show_outlier = !ttft && dated.iter().any(|(_, d)| d.outlier);
+    let markers: Vec<_> = markers.iter().filter_map(|m| Some((drift_date(&m.date)?, m))).filter(|(at, _)| view.contains(*at)).collect();
+    let count = dated.len();
+    let selected = active().filter(|&i| i < count);
+    let label = if ttft { "Daily median TTFT (ms)" } else { "Daily thinking tokens per reply" };
     rsx! {
         figure { class: "provider-chart chart-stage",
-            div { class: "chart-header",
-                figcaption { "Thinking tokens per reply · preceding 14-day normal band and median" }
-                span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
-                    {readout.as_deref().unwrap_or("Hover a day or segment to inspect")}
-                }
-            }
+            figcaption { "{label} · UTC" }
             div { class: "chart-legend",
                 span { class: "chart-legend-item", span { class: "chart-swatch" } "Observed" }
-                span { class: "chart-legend-item", span { class: "chart-swatch band" } "14d normal band" }
-                span { class: "chart-legend-item", span { class: "chart-swatch reset" } "Median / change" }
-                span { class: "chart-legend-item", span { class: "chart-swatch outlier" } "Outlier" }
+                if show_median { span { class: "chart-legend-item", span { class: "chart-swatch drift-median" } "14d median" } }
+                if show_band { span { class: "chart-legend-item", span { class: "chart-swatch band" } "Normal band" } }
+                if !markers.is_empty() { span { class: "chart-legend-item", span { class: "chart-swatch reset" } "Client change" } }
+                if show_outlier { span { class: "chart-legend-item", span { class: "chart-swatch outlier" } "Outlier" } }
             }
-            svg {
-                view_box: "0 0 620 164",
-                role: "img",
-                "aria-label": "Daily thinking tokens, normal band, median, outliers and change markers. Daily data table follows.",
-                onmouseleave: move |_| hovered.set(None),
-                for frac in [0.0, 0.5, 1.0] {
-                    {
-                        let gy = plot_bottom - (plot_bottom - plot_top) * frac;
-                        rsx! {
-                            line {
-                                x1: "{plot_left}",
-                                x2: "{plot_right}",
-                                y1: "{gy:.2}",
-                                y2: "{gy:.2}",
-                                class: if frac == 0.0 { "chart-gridline" } else { "chart-gridline subtle" },
-                            }
-                            text { x: "{plot_left - 6.0}", y: "{gy + 3.5:.2}", text_anchor: "end", "{max * frac:.0}" }
-                        }
-                    }
-                }
-                for group in groups.filter(|group| !group.is_empty()) {
-                    polygon { class: "chart-band", points: band_path(group), pointer_events: "none" }
-                }
-                if n >= 2 {
-                    path { class: "chart-line chart-drift-line", d: "{trend_d}", pointer_events: "none" }
-                }
-                for i in 0..n.saturating_sub(1) {
-                    {
-                        let x1 = dx(i);
-                        let y1 = dy(days[i].thinking_per_reply);
-                        let x2 = dx(i + 1);
-                        let y2 = dy(days[i + 1].thinking_per_reply);
-                        let is_seg = active == Some(DriftHover::Segment(i));
-                        rsx! {
-                            if is_seg {
-                                line { x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}", class: "chart-line chart-drift-line chart-segment-active", pointer_events: "none" }
-                            }
-                            line {
-                                x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}",
-                                class: "chart-hit",
-                                stroke: "transparent",
-                                stroke_width: "12",
-                                onmouseenter: move |_| hovered.set(Some(DriftHover::Segment(i))),
-                            }
-                        }
-                    }
-                }
-                for (i, day) in days.iter().enumerate() {
-                    {
-                        let cx = dx(i);
-                        let cy = dy(day.thinking_per_reply);
-                        let is_day = active == Some(DriftHover::Day(i));
-                        rsx! {
-                            if let Some(marker) = markers.iter().find(|m| m.date == day.date) {
-                                line { x1: "{cx:.2}", x2: "{cx:.2}", y1: "{plot_top}", y2: "{plot_bottom}", class: "chart-reset", title { "{marker.label}" } }
+            if ttft && !dated.iter().any(|(_, d)| value(d).is_some()) {
+                p { class: "form-help", "No observed TTFT in this scope." }
+            }
+            div { class: "activity-plot", tabindex: "0", role: "group",
+                aria_label: "{label}. Use left and right arrows to inspect. Daily data table follows.",
+                onkeydown: move |e| step_bucket(e, active, count),
+                onblur: move |_| active.set(None),
+                onmouseleave: move |_| active.set(None),
+                onmounted: move |e| measure.mount(e),
+                onresize: move |_| measure.refresh(),
+                svg { width: "100%", height: "{height}", view_box: "0 0 {width} {height}", preserve_aspect_ratio: "none", "aria-hidden": "true",
+                    TimeAxis { plot, view, date_only: true }
+                    ActivityGrid { plot, ticks: [0.0, 0.5, 1.0].map(|f| fmt_compact_axis(Metric::Tokens, max * f)).to_vec() }
+                    if !ttft {
+                        for (at, day) in dated.iter().copied() {
+                            if let Some((low, high)) = day.baseline_low.zip(day.baseline_high) {
+                                rect { x: "{x(at) - half_day}", width: "{half_day * 2.0}", y: "{y(high)}", height: "{(y(low) - y(high)).max(1.0)}", class: "chart-band" }
                             }
                             if let Some(median) = day.baseline_median_thinking {
-                                line { x1: "{cx - 4.0:.2}", x2: "{cx + 4.0:.2}", y1: "{dy(median):.2}", y2: "{dy(median):.2}", class: "chart-median", pointer_events: "none" }
+                                line { x1: "{x(at) - half_day}", x2: "{x(at) + half_day}", y1: "{y(median)}", y2: "{y(median)}", class: "chart-median" }
                             }
-                            circle {
-                                cx: "{cx:.2}",
-                                cy: "{cy:.2}",
-                                r: if is_day { "5" } else if day.outlier { "4.2" } else { "2.8" },
-                                class: if day.outlier { "chart-outlier" } else { "chart-bar chart-solid" },
-                                pointer_events: "none",
-                            }
-                            circle {
-                                cx: "{cx:.2}",
-                                cy: "{cy:.2}",
-                                r: "8",
-                                fill: "transparent",
-                                class: "chart-hit",
-                                onmouseenter: move |_| hovered.set(Some(DriftHover::Day(i))),
-                                title { "{day.date} · {day.thinking_per_reply:.1} thinking tokens per reply" }
+                        }
+                    }
+                    for (at, marker) in &markers {
+                        line { x1: "{x(*at)}", x2: "{x(*at)}", y1: "{plot.top}", y2: "{plot.bottom}", class: "chart-reset", title { "{marker.label}" } }
+                    }
+                    for pair in dated.windows(2) {
+                        if let Some((a, b)) = value(pair[0].1).zip(value(pair[1].1)) && pair[1].0 - pair[0].0 == TimeDelta::days(1) {
+                            line { x1: "{x(pair[0].0)}", x2: "{x(pair[1].0)}", y1: "{y(a)}", y2: "{y(b)}", class: "chart-line chart-drift-line" }
+                        }
+                    }
+                    for (i, (at, day)) in dated.iter().copied().enumerate() {
+                        {
+                            let cx = x(at);
+                            let left = x(at - TimeDelta::hours(12));
+                            let right = x(at + TimeDelta::hours(12));
+                            let outlier = !ttft && day.outlier;
+                            rsx! {
+                                if selected == Some(i) { TimeCrosshair { plot, x: cx } }
+                                if let Some(v) = value(day) {
+                                    circle { cx: "{cx}", cy: "{y(v)}", r: if selected == Some(i) || outlier { "4.5" } else { "2.8" },
+                                        class: if outlier { "chart-outlier" } else { "chart-solid" } }
+                                }
+                                rect { x: "{left}", y: "{plot.top}", width: "{right - left}", height: "{plot.bottom - plot.top + 20.0}",
+                                    fill: "transparent", class: "chart-hit", onmouseenter: move |_| active.set(Some(i)),
+                                    onmouseleave: move |_| active.set(None) }
                             }
                         }
                     }
                 }
-                text { x: "{plot_left}", y: "156", "{days.first().map(|d| d.date.as_str()).unwrap_or_default()}" }
-                if n > 2 {
-                    text { x: "{(plot_left + plot_right) / 2.0:.1}", y: "156", text_anchor: "middle", "{days[n / 2].date}" }
-                }
-                text { x: "{plot_right}", y: "156", text_anchor: "end", "{days.last().map(|d| d.date.as_str()).unwrap_or_default()}" }
-                if let Some(spec) = tooltip_spec {
-                    SvgTooltip { spec }
+                div { role: "status",
+                    if let Some(i) = selected {
+                        {
+                            let (at, d) = dated[i];
+                            let observed = value(d).map_or_else(|| "Not observed".into(), |v| if ttft { format!("{v:.1} ms") } else { format!("{v:.1} tokens/reply") });
+                            let mut fields = vec![("Observed", observed), ("Replies", fmt_count(d.replies))];
+                            if !ttft {
+                                if let Some(median) = d.baseline_median_thinking { fields.push(("14d median", format!("{median:.1}"))); }
+                                if let Some((low, high)) = d.baseline_low.zip(d.baseline_high) { fields.push(("Normal band", format!("{low:.1}–{high:.1}"))); }
+                                let judgment = if d.outlier { "Outlier" } else if d.judgeable { "Not an outlier" } else { "Insufficient coverage" };
+                                fields.push(("Judgment", judgment.into()));
+                            }
+                            for (_, marker) in markers.iter().filter(|(time, _)| *time == at) { fields.push(("Client change", marker.label.clone())); }
+                            rsx! { ActivityReadout { right: view.fraction(at) < 0.5, heading: d.date.clone(), fields } }
+                        }
+                    }
                 }
             }
         }
@@ -1880,7 +1801,87 @@ pub(super) fn DriftBandChart(days: Vec<DriftDayPoint>, markers: Vec<DriftMarker>
 
 #[cfg(test)]
 mod tests {
+    use dioxus::dioxus_core::{AttributeValue, Mutation, Mutations};
+
     use super::*;
+
+    fn svg_attribute_values<'a>(rendered: &'a Mutations, attr: &str) -> Vec<&'a str> {
+        rendered
+            .edits
+            .iter()
+            .filter_map(|edit| match edit {
+                Mutation::SetAttribute { name, value: AttributeValue::Text(value), .. } if name == attr => Some(value.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn adaptive_trend_labels_match_bucket_width() {
+        let at = DateTime::UNIX_EPOCH + TimeDelta::hours(9);
+        assert_eq!(bucket_badge(Some(3600)), Some("Hourly · 24h"));
+        assert_eq!(bucket_badge(Some(10800)), Some("3-hour · 7d"));
+        assert_eq!(bucket_badge(Some(86400)), Some("Daily"));
+        assert_eq!(bucket_label(at, 3600), "09:00");
+        assert_eq!(bucket_label(DateTime::UNIX_EPOCH, 10800), "Jan 01");
+        assert_eq!(bucket_label(at, 10800), "Jan 01 09:00");
+        assert_eq!(bucket_label(at, 86400), "Jan 01");
+    }
+
+    #[test]
+    fn adaptive_cache_preserves_none_and_scales_volume_independently() {
+        fn app() -> Element {
+            let mut points = vec![daily_point(0, 100), daily_point(1, 0), daily_point(2, 200)];
+            points[0].cache_hit_rate_observed = Some(0.6);
+            points[1].cache_read_tokens = 0;
+            points[2].cache_hit_rate_observed = Some(0.0);
+            rsx! { CacheHitRateChart { points, bucket_seconds: Some(86400) } }
+        }
+        let mutations = VirtualDom::new(app).rebuild_to_vec();
+        let heights = svg_attribute_values(&mutations, "height");
+        assert!(heights.contains(&"65")); // Half the input of the highest-volume bucket.
+        assert!(heights.contains(&"130"));
+        assert!(!heights.contains(&"0")); // No empty volume rectangle for the unobserved bucket.
+        let rendered = format!("{mutations:?}");
+        assert!(rendered.contains("activity-volume-bar"));
+        assert_eq!(rendered.matches("chart-cache-dot").count(), 2);
+        assert!(rendered.contains("60.0%"));
+        assert!(rendered.contains("0.0%"));
+        assert!(rendered.contains("—"));
+        assert!(!rendered.contains("activity-cache-segment"));
+    }
+
+    #[test]
+    fn drift_does_not_connect_calendar_gaps_or_apply_thinking_baseline_to_ttft() {
+        fn app() -> Element {
+            let day = |date: &str, median_ttft_ms| DriftDayPoint {
+                date: date.into(),
+                replies: 30,
+                thinking_per_reply: 42.0,
+                output_per_reply: 80.0,
+                no_thinking_share: 0.0,
+                median_ttft_ms,
+                failure_rate: 0.0,
+                baseline_median_thinking: Some(40.0),
+                baseline_low: Some(30.0),
+                baseline_high: Some(50.0),
+                judgeable: true,
+                outlier: false,
+            };
+            let days = vec![day("2026-11-01", Some(200.0)), day("2026-11-02", None), day("2026-11-09", Some(260.0))];
+            let markers = vec![DriftMarker { date: "2026-11-06".into(), label: "Updated client".into(), kind: "client_version".into() }];
+            rsx! {
+                DriftBandChart { days: days.clone(), markers: markers.clone() }
+                DriftBandChart { days, markers, ttft: true }
+            }
+        }
+        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        assert_eq!(rendered.matches("chart-drift-line").count(), 1);
+        assert_eq!(rendered.matches("14d median").count(), 1);
+        assert_eq!(rendered.matches("Normal band").count(), 1);
+        assert_eq!(rendered.matches("Updated client").count(), 2);
+        assert!(rendered.contains("Daily median TTFT (ms)"));
+    }
 
     #[test]
     fn unavailable_quota_is_not_zero_and_measured_zero_is_valid() {
@@ -2039,7 +2040,7 @@ mod tests {
             rsx! { CacheHitRateChart { points: vec![daily_point(0, 100)] } }
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
-        assert!(rendered.contains("1970-01-01 · 80.0%"));
+        assert!(rendered.contains("80.0%"));
     }
 
     #[test]
@@ -2047,12 +2048,12 @@ mod tests {
         fn app() -> Element {
             rsx! {
                 ActivityTrendChart { points: vec![], metric: Metric::Requests }
-                CacheHitRateChart { points: vec![daily_point(0, 0)] }
+                CacheHitRateChart { points: vec![] }
             }
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
         assert_eq!(rendered.matches("No data for selected range").count(), 2);
-        assert!(!rendered.contains("Hover"));
+        assert!(!rendered.contains("left and right arrows"));
     }
 
     #[test]
@@ -2061,8 +2062,9 @@ mod tests {
             rsx! { CacheHitRateChart { points: vec![daily_point(0, 100), daily_point(1, 0), daily_point(2, 100)] } }
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
-        assert!(rendered.contains("M44.00 39.60 M604.00 39.60"));
-        assert!(rendered.contains("1970-01-02 · —"));
+        assert_eq!(rendered.matches("chart-cache-dot").count(), 2);
+        assert!(!rendered.contains("activity-cache-segment"));
+        assert!(rendered.contains("1970-01-02 → 1970-01-03 UTC"));
     }
 
     #[test]
@@ -2070,23 +2072,26 @@ mod tests {
         fn app() -> Element {
             rsx! { CacheHitRateChart { points: vec![daily_point(0, 100), daily_point(1, 100), daily_point(3, 100), daily_point(4, 100)] } }
         }
-        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
-        assert!(rendered.contains("M44.00 39.60 L184.00 39.60 M464.00 39.60 L604.00 39.60"));
+        let mutations = VirtualDom::new(app).rebuild_to_vec();
+        let ends = svg_attribute_values(&mutations, "x2");
+        let count = |x| ends.iter().filter(|&&v| v == x).count();
+        assert_eq!(count("216"), 2); // Axis tick and line segment end.
+        assert_eq!(count("328"), 1); // Missing bucket gets an axis tick, not a line segment.
+        assert_eq!(count("552"), 2);
+        let rendered = format!("{mutations:?}");
+        assert!(rendered.contains("1970-01-03 → 1970-01-04 UTC"));
     }
 
     #[test]
     fn daily_activity_sorts_buckets_and_displays_missing_days() {
         fn app() -> Element {
-            let mut points = vec![daily_point(2, 200), daily_point(0, 100)];
-            for point in &mut points {
-                point.label = point.bucket_start.format("%m-%d").to_string();
-            }
+            let points = vec![daily_point(2, 200), daily_point(0, 100)];
             rsx! { ActivityTrendChart { points, metric: Metric::CacheHitRate } }
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
-        let first = rendered.find("01-01 · Cache hit rate (%): 80.0%").unwrap();
-        let missing = rendered.find("01-02 · Cache hit rate (%): —").expect("missing day should have a slot");
-        let last = rendered.find("01-03 · Cache hit rate (%): 40.0%").unwrap();
+        let first = rendered.find("1970-01-01 → 1970-01-02 UTC").unwrap();
+        let missing = rendered.find("1970-01-02 → 1970-01-03 UTC").expect("missing day should have a slot");
+        let last = rendered.find("1970-01-03 → 1970-01-04 UTC").unwrap();
         assert!(first < missing && missing < last);
     }
 
@@ -2230,7 +2235,7 @@ mod tests {
                     } }
                 CacheHitRateChart { points: trend.clone() }
                 ActivityTrendChart { points: trend, metric: Metric::CacheHitRate }
-                ActivityHeatmap { cells, metric: Metric::CacheHitRate }
+                ActivityHeatmap { cells, metric: Metric::CacheHitRate, covered_weekdays: vec![0] }
                 DriftBandChart { days: drift_days, markers: vec![] }
             }
         }
@@ -2239,9 +2244,13 @@ mod tests {
         assert!(rendered.contains("Showing newest 4,000 samples"));
         assert!(rendered.contains("55.0% left"));
         assert!(!rendered.contains("Estimated projection data table"));
-        assert!(rendered.contains("chart-readout"));
+        assert!(rendered.contains("activity-peak"));
         assert!(rendered.contains("chart-hit"));
-        assert!(rendered.contains("Daily cache hit rate (%)"));
+        assert!(rendered.contains("Cache hit rate (%) · UTC"));
         assert!(rendered.contains("Cache hit rate (%)"));
+        assert!(rendered.contains("14d median"));
+        assert!(rendered.contains("Normal band"));
+        assert!(rendered.contains("Tue 00:00 · Outside selected window"));
+        assert!(rendered.contains("Mon 00:00 · N/A · no input tokens"));
     }
 }

@@ -251,7 +251,7 @@ fn OverviewBoard(
                 }
             }
         }
-        div { class: "compact-kpi-grid", style: "grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr));",
+        div { class: "compact-kpi-grid activity-kpis",
             article { class: "glass-card stat-card", title: unpriced.clone(),
                 span { class: "label-tech", "API-equivalent cost" }
                 strong { class: "value", "{usd(report.api_equivalent_cost_usd)}" }
@@ -274,17 +274,24 @@ fn OverviewBoard(
         div { class: "activity-board", "data-default-layout": if default_layout { "true" } else { "false" },
             for tile in rows.iter().filter(|tile| tile.visible) {
                 article { key: "{tile.id}", class: "glass-card stack activity-span-{tile.span.clamp(1, 3)}", "data-tile": "{tile.kind}",
-                    h2 { "{tile_name(&tile.kind)}" }
+                    div { class: "row activity-tile-header",
+                        h2 { "{tile_name(&tile.kind)}" }
+                        if matches!(tile.kind.as_str(), "trend" | "cache")
+                            && let Some(label) = bucket_badge(report.bucket_seconds) {
+                            Chip { label: label.to_string(), tone: Some("amber".to_string()) }
+                        }
+                        if tile.kind == "heatmap" { HeatmapScale { metric: Metric::parse(&tile.metric) } }
+                    }
                     {
                         let metric = Metric::parse(&tile.metric);
                         match tile.kind.as_str() {
-                            "trend" => rsx! { ActivityTrendChart { points: report.trend.clone(), metric } },
-                            "heatmap" => rsx! { ActivityHeatmap { cells: report.heatmap.clone(), metric } },
-                            "rhythm" => rsx! { ActivityRhythmChart { points: report.rhythm.clone(), metric } },
-                            "cache" if report.trend.is_empty() || hit_rate.is_none() => rsx! { p { class: "form-help", "{NO_RANGE_DATA}" } },
-                            "cache" => rsx! {
-                                div { class: "cache-summary stack",
-                                    div { class: "spread",
+                            "trend" => rsx! { ActivityTrendChart { points: report.trend.clone(), metric, bucket_seconds: report.bucket_seconds } },
+                            "heatmap" => rsx! { ActivityHeatmap { cells: report.heatmap.clone(), metric, covered_weekdays: report.covered_weekdays.clone() } },
+                             "rhythm" => rsx! { ActivityRhythmChart { points: report.rhythm.clone(), metric } },
+                             "cache" => rsx! {
+                                 CacheHitRateChart { points: report.trend.clone(), bucket_seconds: report.bucket_seconds }
+                                 div { class: "cache-summary stack",
+                                    div { class: "row cache-summary-head",
                                         strong { class: "mono", "{hit_pct} cache hit rate" }
                                         span { class: "muted", "{usd(report.cache_savings_usd)} estimated savings" }
                                     }
@@ -297,7 +304,6 @@ fn OverviewBoard(
                                     p { class: "muted",
                                         "{fmt_count(report.cache_read_tokens)} read · {fmt_count(report.cache_write_tokens)} write · {fmt_count(report.input_tokens.saturating_sub(report.cache_read_tokens))} uncached input"
                                     }
-                                    CacheHitRateChart { points: report.trend.clone() }
                                 }
                             },
                             "models" => breakdown("Models", &report.by_model),
@@ -341,21 +347,66 @@ fn tile_name(kind: &str) -> &str {
 
 fn breakdown(label: &'static str, list: &[BreakdownRow]) -> Element {
     let mask = try_consume_context::<PanelState>().is_some_and(|p| p.settings.read().mask_emails);
-    rsx! { Table { label, headers: &["Group", "Requests", "Failed", "Tokens", "Output", "Cache read", "Cache hit %", "Thinking", "API-equivalent USD", "Unpriced"],
-    rows: list.iter().map(|r| {
+    let requests = list.iter().map(|r| r.requests as f64).sum();
+    let tokens = list.iter().map(|r| r.total_tokens as f64).sum();
+    let cost = list.iter().map(|r| r.api_equivalent_cost_usd).sum();
+    let rows = list.iter().map(|r| {
         let input = if r.input_tokens > 0 { r.input_tokens } else { r.total_tokens.saturating_sub(r.output_tokens) };
-        vec![
-            if label == "Accounts" && mask && r.label.contains('@') { mask_email(&r.label) } else { r.label.clone() },
-            fmt_count(r.requests), fmt_count(r.failures), fmt_count(r.total_tokens), fmt_count(r.output_tokens),
-            fmt_count(r.cache_read_tokens), fmt_hit_pct(effective_cache_hit_rate(input, r.cache_read_tokens, r.cache_hit_rate)),
-            fmt_count(r.thinking_tokens), usd(r.api_equivalent_cost_usd), fmt_count(r.unpriced_requests)
-        ]
-    }).collect() } }
+        let group = if label == "Accounts" && mask && r.label.contains('@') { mask_email(&r.label) } else { r.label.clone() };
+        rsx! {
+            tr { key: "{r.key}",
+                th { scope: "row", "{group}" }
+                td { ShareBar { label: fmt_count(r.requests), value: r.requests as f64, total: requests } }
+                td { ShareBar { label: fmt_count(r.total_tokens), value: r.total_tokens as f64, total: tokens } }
+                td { ShareBar { label: usd(r.api_equivalent_cost_usd), value: r.api_equivalent_cost_usd, total: cost } }
+                td { "{fmt_count(r.failures)}" }
+                td { "{fmt_count(r.output_tokens)}" }
+                td { "{fmt_count(r.cache_read_tokens)}" }
+                td { "{fmt_hit_pct(effective_cache_hit_rate(input, r.cache_read_tokens, r.cache_hit_rate))}" }
+                td { "{fmt_count(r.thinking_tokens)}" }
+                td { "{fmt_count(r.unpriced_requests)}" }
+            }
+        }
+    });
+    rsx! { BreakdownTable { label, headers: &["Group", "Requests", "Tokens", "API-equivalent USD", "Failed", "Output",
+    "Cache read", "Cache hit %", "Thinking", "Unpriced"], empty: list.is_empty(), children: rsx! { for row in rows { {row} } } } }
+}
+
+#[component]
+fn BreakdownTable(label: &'static str, headers: &'static [&'static str], empty: bool, children: Element) -> Element {
+    rsx! {
+        if empty {
+            p { class: "muted", "No rows for {label}." }
+        } else {
+            div { class: "provider-table activity-table", tabindex: "0", role: "region", aria_label: label,
+                table {
+                    caption { class: "sr-only", "{label}" }
+                    thead { tr { for header in headers { th { scope: "col", "{header}" } } } }
+                    tbody { {children} }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_buckets_follow_numeric_ranges() {
+        let mut labels = ["2k–8k", "501–2k", "8k+", "0 (no thinking)", "1–500"];
+        labels.sort_by_key(|label| thinking_bucket_order(label));
+        assert_eq!(labels, ["0 (no thinking)", "1–500", "501–2k", "2k–8k", "8k+"]);
+        assert_eq!(thinking_bucket_order("0"), 0);
+    }
+
+    #[test]
+    fn drift_status_distinguishes_coverage_from_a_verdict() {
+        assert_eq!(drift_status(false, 0), "Baseline warming up (needs ≥5 prior qualifying days)");
+        assert_eq!(drift_status(true, 0), "Within normal band");
+        assert_eq!(drift_status(true, 2), "Drift detected (2 outlier days)");
+    }
 
     #[test]
     fn empty_overview_shows_recovery_instead_of_kpis_and_tiles() {
@@ -403,36 +454,92 @@ mod tests {
 fn Compare(scope: ActivityScope) -> Element {
     let client = use_context::<HubClient>();
     let mut baseline = use_signal(String::new);
+    let latency_client = client.clone();
+    let latency_scope = scope.clone();
+    let latency = use_resource(move || {
+        let (client, scope) = (latency_client.clone(), latency_scope.clone());
+        async move { timed_for(Duration::from_secs(25), client.activity_drift(&scope)).await }
+    });
     let data = use_resource(move || {
         let client = client.clone();
         let scope = ActivityScope { baseline_key: optional(&baseline()), ..scope.clone() };
         async move { timed_for(Duration::from_secs(25), client.activity_compare(&scope)).await }
     });
     let result = data.read();
-    rsx! { section { class: "glass-card stack",
+    let latency_result = latency.read();
+    let latency_by_model: BTreeMap<_, _> = latency_result
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .into_iter()
+        .flat_map(|report| &report.series)
+        .filter_map(|s| {
+            let median = median_daily_ttft(&s.days)?;
+            Some(((s.model.as_str(), s.effort.as_deref()), median))
+        })
+        .collect();
+    rsx! { section { class: "glass-card stack activity-comparisons",
         h2 { "Model / effort comparison" }
         p { class: "muted", "API list-price estimates, not billing. Task and retry metrics depend on retained detail." }
         {read_view(result.as_ref(), |report| {
             let mut options = vec![(String::new(), "Automatic".into())];
             options.extend(report.rows.iter().map(|r| (r.key.clone(), r.key.clone())));
+            let ttft = |r: &CompareRow| latency_by_model.get(&(r.model.as_str(), r.effort.as_deref())).copied();
+            let baseline_ttft = report.rows.iter().find(|r| Some(&r.key) == report.baseline_key.as_ref()).and_then(ttft);
+            let max_ttft = report.rows.iter().filter_map(ttft).fold(0.0, f64::max);
+            let total_cost = report.rows.iter().map(|r| r.api_equivalent_cost_usd).sum();
             rsx! {
                 Choice { label: "Baseline", value: baseline(), options, change: move |v| baseline.set(v) }
                 p { "Effective baseline: {text(&report.baseline_key)} · pricing as of {report.price_as_of}" }
-                Table { label: "Model and effort comparison", headers: &[
-                    "Model", "Effort", "$/1M input", "$/1M output", "$/1M cache read", "$/1M cache write (5m)", "Cost USD", "Requests", "Failed",
+                p { class: "form-help",
+                    "Bars show share of total listed cost and time to first token (TTFT) relative to the slowest row. TTFT is the median of the observed daily medians."
+                    if latency_result.is_none() { " Loading latency…" }
+                    else if latency_result.as_ref().is_some_and(Result::is_err) { " Latency could not be loaded." }
+                }
+                BreakdownTable { label: "Model and effort comparison", empty: report.rows.is_empty(), headers: &[
+                    "Model", "Effort", "Cost USD", "Typical daily TTFT (ms)", "Requests", "Failed",
                     "Mean cost/req", "Cost/1M tokens", "Cache hit %", "Failed cost %", "Thinking/output %", "Fast/flex %", "Root tasks",
                     "Median task $", "Mean task $", "P90 task $", "Median tokens/task", "Median req/task", "Mixed tasks %", "Other models %", "Subagent $",
-                    "Baseline cost ×", "Baseline req cost ×", "Baseline cache Δ pp", "Detail coverage %"
-                ], rows: report.rows.iter().map(|r| vec![
-                    r.model.clone(), text(&r.effort), number(r.price.as_ref().map(|p| p.input_per_m)), number(r.price.as_ref().map(|p| p.output_per_m)),
-                    number(r.price.as_ref().map(|p| p.cache_read_per_m)), number(r.price.as_ref().map(|p| p.cache_write_5m_per_m)),
-                    usd(r.api_equivalent_cost_usd), r.requests.to_string(), r.failures.to_string(), money(r.mean_cost_per_request), money(r.cost_per_m_tokens),
-                    number(Some(r.cache_hit_pct)), number(Some(r.failed_cost_share_pct)), number(Some(r.thinking_output_share_pct)), number(Some(r.fast_flex_share_pct)),
-                    r.root_tasks.to_string(), money(r.median_task_cost), money(r.mean_task_cost), money(r.p90_task_cost),
-                    r.median_tokens_per_task.map_or_else(|| "—".into(), |n| n.to_string()), r.median_requests_per_task.map_or_else(|| "—".into(), |n| n.to_string()),
-                    number(Some(r.mixed_task_share_pct)), number(Some(r.other_model_share_pct)), usd(r.subagent_cost_usd),
-                    number(r.baseline_cost_multiple), number(r.baseline_req_cost_multiple), number(r.baseline_cache_pp_delta), number(Some(r.detail_coverage_pct))
-                ]).collect() }
+                    "Baseline cache Δ pp", "Detail coverage %", "$/1M input", "$/1M output", "$/1M cache read", "$/1M cache write (5m)"
+                ],
+                    for r in &report.rows {
+                        {
+                            let latency = ttft(r);
+                            let latency_multiple = latency.zip(baseline_ttft.filter(|n| *n > 0.0)).map(|(a, b)| a / b);
+                            rsx! {
+                                tr { key: "{r.key}",
+                                    th { scope: "row", "{r.model}" }
+                                    td { "{text(&r.effort)}" }
+                                    td { div { class: "comparison-value",
+                                        ShareBar { label: usd(r.api_equivalent_cost_usd), value: r.api_equivalent_cost_usd, total: total_cost }
+                                        {baseline_delta(r.baseline_cost_multiple)}
+                                    } }
+                                    td {
+                                        if let Some(ms) = latency {
+                                            div { class: "comparison-value",
+                                                ShareBar { label: number(Some(ms)), value: ms, total: max_ttft, scale_label: "of slowest listed value" }
+                                                {baseline_delta(latency_multiple)}
+                                            }
+                                        } else { "—" }
+                                    }
+                                    td { "{fmt_count(r.requests)}" }
+                                    td { "{fmt_count(r.failures)}" }
+                                    td { div { class: "comparison-value", "{money(r.mean_cost_per_request)}" {baseline_delta(r.baseline_req_cost_multiple)} } }
+                                    for cell in [
+                                        money(r.cost_per_m_tokens), number(Some(r.cache_hit_pct)), number(Some(r.failed_cost_share_pct)),
+                                        number(Some(r.thinking_output_share_pct)), number(Some(r.fast_flex_share_pct)), fmt_count(r.root_tasks),
+                                        money(r.median_task_cost), money(r.mean_task_cost), money(r.p90_task_cost),
+                                        r.median_tokens_per_task.map_or_else(|| "—".into(), fmt_count),
+                                        r.median_requests_per_task.map_or_else(|| "—".into(), fmt_count),
+                                        number(Some(r.mixed_task_share_pct)), number(Some(r.other_model_share_pct)), usd(r.subagent_cost_usd),
+                                        number(r.baseline_cache_pp_delta), number(Some(r.detail_coverage_pct)),
+                                        number(r.price.as_ref().map(|p| p.input_per_m)), number(r.price.as_ref().map(|p| p.output_per_m)),
+                                        number(r.price.as_ref().map(|p| p.cache_read_per_m)), number(r.price.as_ref().map(|p| p.cache_write_5m_per_m)),
+                                    ] { td { "{cell}" } }
+                                }
+                            }
+                        }
+                    }
+                }
                 details { summary { "Reference price catalog ({report.price_catalog.len()})" }
                     Table { label: "Reference price catalog", headers: &["Model", "Pattern", "Effective date", "Currency", "Input / 1M", "Output / 1M", "Cache read / 1M", "Cache write 5m / 1M", "Source"],
                         rows: report.price_catalog.iter().map(|p| vec![
@@ -445,10 +552,34 @@ fn Compare(scope: ActivityScope) -> Element {
     } }
 }
 
+fn median_daily_ttft(days: &[DriftDayPoint]) -> Option<f64> {
+    let mut samples: Vec<_> = days.iter().filter_map(|d| d.median_ttft_ms).filter(|v| v.is_finite() && *v >= 0.0).collect();
+    samples.sort_by(f64::total_cmp);
+    let mid = samples.len() / 2;
+    let upper = *samples.get(mid)?;
+    Some(if samples.len().is_multiple_of(2) { f64::midpoint(samples[mid - 1], upper) } else { upper })
+}
+
+fn baseline_delta(multiple: Option<f64>) -> Element {
+    let Some(pct) = multiple.map(|m| ((m - 1.0) * 100.0).round()).filter(|p| p.is_finite()) else { return rsx! {} };
+    let (delta, tone) = if pct == 0.0 { ("0%".into(), "muted") } else { (format!("{pct:+.0}%"), if pct > 0.0 { "bad" } else { "ok" }) };
+    rsx! { span { class: "chip {tone}", title: "Change versus selected baseline", aria_label: "{delta} versus selected baseline", "{delta}" } }
+}
+
+fn drift_status(has_judgment: bool, outliers: u64) -> String {
+    match (has_judgment, outliers) {
+        (_, 1) => "Drift detected (1 outlier day)".into(),
+        (_, n) if n > 1 => format!("Drift detected ({n} outlier days)"),
+        (true, _) => "Within normal band".into(),
+        _ => "Baseline warming up (needs ≥5 prior qualifying days)".into(),
+    }
+}
+
 #[component]
 fn Drift(scope: ActivityScope, providers: Vec<ProviderSummary>) -> Element {
     let client = use_context::<HubClient>();
     let panel = use_context::<PanelState>();
+    let mut ttft = use_signal(|| false);
     let query = scope.clone();
     let data = use_resource(move || {
         let (client, scope) = (client.clone(), query.clone());
@@ -459,20 +590,24 @@ fn Drift(scope: ActivityScope, providers: Vec<ProviderSummary>) -> Element {
     let allowed = probe_providers(&providers, &scope, ProviderCapability::RunCanary);
     rsx! { section { class: "glass-card stack",
         h2 { "Model / effort drift" }
-        p { class: "muted", "Judgments require ≥30 replies/day and ≥5 valid prior days in a 14-day reference window. Client changes are context, not proof of cause." }
+        p { class: "muted", "Thinking drift judgments require ≥30 replies/day and ≥5 qualifying prior days. Status reflects the detector’s tolerance around the reference band. TTFT is observed latency only; client changes show context, not cause." }
+        div { class: "segmented", role: "group", aria_label: "Drift metric",
+            button { class: "seg-btn", aria_pressed: !ttft(), onclick: move |_| ttft.set(false), "Thinking tokens" }
+            button { class: "seg-btn", aria_pressed: ttft(), onclick: move |_| ttft.set(true), "Median TTFT" }
+        }
         {read_view(result.as_ref(), |report| rsx! {
             if report.series.is_empty() { p { class: "muted", "No drift series in this scope." } }
             for s in &report.series {
                 article { key: "{s.model}-{s.effort.as_deref().unwrap_or_default()}", class: "provider-inset stack",
                     h3 { "{s.model} · {text(&s.effort)}" }
-                    p { "{s.summary} · {s.outlier_days} outlier days" }
-                    DriftBandChart { days: s.days.clone(), markers: report.markers.clone() }
+                    if !ttft() { p { "{drift_status(s.days.iter().any(|d| d.judgeable), s.outlier_days)}" } }
+                    DriftBandChart { days: s.days.clone(), markers: report.markers.clone(), ttft: ttft() }
                     details { summary { "Daily drift measurements" }
                         Table { label: "Daily drift", headers: &["Date", "Replies", "Thinking/reply", "Output/reply", "No thinking %", "Median TTFT (ms)", "Failure %", "Normal low", "Normal median", "Normal high", "Judgment"],
                             rows: s.days.iter().map(|d| vec![ d.date.clone(), d.replies.to_string(), number(Some(d.thinking_per_reply)), number(Some(d.output_per_reply)),
                                 number(Some(d.no_thinking_share * 100.0)), number(d.median_ttft_ms), number(Some(d.failure_rate * 100.0)), number(d.baseline_low),
                                 number(d.baseline_median_thinking), number(d.baseline_high),
-                                if d.outlier { "Outlier" } else if d.judgeable { "Within band" } else { "Insufficient coverage" }.into()
+                                if d.outlier { "Outlier" } else if d.judgeable { "Not an outlier" } else { "Insufficient coverage" }.into()
                             ]).collect() }
                     }
                 }
@@ -608,8 +743,8 @@ fn Thinking(scope: ActivityScope, providers: Vec<ProviderSummary>) -> Element {
             p { class: "gateprompt", role: "status", "{r.verdict}" }
             p { "{fmt_count(r.total_turns)} turns · {fmt_count(r.thinking_tokens)} thinking tokens · {usd(r.thinking_cost_usd)} estimated thinking cost" }
             p { class: "muted", "{r.method_note}" }
-            {thinking_buckets("Thinking buckets", &r.buckets)}
-            {thinking_buckets("Effort kinds", &r.kinds)}
+            {thinking_buckets("Thinking buckets", "Bucket", &r.buckets)}
+            {thinking_buckets("Effort kinds", "Effort", &r.kinds)}
             Table { label: "Savings alternatives (estimates)", headers: &["Alternative", "Target model", "Effort", "Estimated cost", "Estimated savings", "Estimated savings %"],
                 rows: r.alternatives.iter().map(|a| vec![format!("Estimate · {}", a.label), a.target_model.clone(), text(&a.target_effort),
                     usd(a.estimated_cost_usd), usd(a.estimated_savings_usd), number(Some(a.estimated_savings_pct))]).collect() }
@@ -622,9 +757,39 @@ fn Thinking(scope: ActivityScope, providers: Vec<ProviderSummary>) -> Element {
     } }
 }
 
-fn thinking_buckets(label: &'static str, rows: &[ThinkingBucket]) -> Element {
-    rsx! { Table { label, headers: &["Bucket", "Turns", "Thinking", "Output", "Estimated thinking cost"],
-    rows: rows.iter().map(|b| vec![b.label.clone(), fmt_count(b.turns), fmt_count(b.thinking_tokens), fmt_count(b.output_tokens), usd(b.estimated_thinking_cost_usd)]).collect() } }
+fn thinking_bucket_order(label: &str) -> usize {
+    match label {
+        "0" | "0 (no thinking)" => 0,
+        "1–500" => 1,
+        "501–2k" => 501,
+        "2k–8k" => 2001,
+        "8k+" => 8001,
+        _ => usize::MAX,
+    }
+}
+
+fn thinking_buckets(label: &'static str, group: &'static str, rows: &[ThinkingBucket]) -> Element {
+    let total = rows.iter().map(|b| b.estimated_thinking_cost_usd).sum();
+    let mut rows: Vec<_> = rows.iter().collect();
+    let headers: &'static [&'static str] = if group == "Bucket" {
+        rows.sort_by_key(|b| thinking_bucket_order(&b.label));
+        &["Bucket", "Turns", "Thinking", "Output", "Estimated thinking cost"]
+    } else {
+        &["Effort", "Turns", "Thinking", "Output", "Estimated thinking cost"]
+    };
+    rsx! {
+        BreakdownTable { label, empty: rows.is_empty(), headers,
+            for b in rows {
+                tr { key: "{b.label}",
+                    th { scope: "row", "{b.label}" }
+                    td { "{fmt_count(b.turns)}" }
+                    td { "{fmt_count(b.thinking_tokens)}" }
+                    td { "{fmt_count(b.output_tokens)}" }
+                    td { ShareBar { label: usd(b.estimated_thinking_cost_usd), value: b.estimated_thinking_cost_usd, total } }
+                }
+            }
+        }
+    }
 }
 
 #[component]
