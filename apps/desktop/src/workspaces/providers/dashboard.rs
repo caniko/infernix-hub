@@ -201,16 +201,22 @@ fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
                         horizon_default: prefs.forecast_horizon_hours,
                     } }}
                 }
-                if provider.pools.is_empty() { p { class: "muted", if has_quota { "No pool readings yet." } else { "No quota reported" } } }
-                for pool in provider.pools.iter().filter(|p| !is_extra(p.kind)) {
-                    PoolWindow { key: "{pool.window_key}:{pool.scope_model:?}", pool: pool.clone(),
-                        forecast: meter_forecast(&forecasts, None, &pool.window_key, pool.scope_model.as_deref()) }
-                }
-                if provider.pools.iter().any(|p| is_extra(p.kind)) {
-                    details { summary { "Model and spend windows" }
-                        for pool in provider.pools.iter().filter(|p| is_extra(p.kind)) {
+                if provider.pools.is_empty() {
+                    p { class: "muted", if has_quota { "No pool readings yet." } else { "No quota reported" } }
+                } else {
+                    div { class: "stack quota-meter-group",
+                        div { class: "row quota-meters-header", h3 { "Quota meters" } QuotaMeterKey {} }
+                        for pool in provider.pools.iter().filter(|p| !is_extra(p.kind)) {
                             PoolWindow { key: "{pool.window_key}:{pool.scope_model:?}", pool: pool.clone(),
                                 forecast: meter_forecast(&forecasts, None, &pool.window_key, pool.scope_model.as_deref()) }
+                        }
+                        if provider.pools.iter().any(|p| is_extra(p.kind)) {
+                            details { summary { "Model and spend windows" }
+                                for pool in provider.pools.iter().filter(|p| is_extra(p.kind)) {
+                                    PoolWindow { key: "{pool.window_key}:{pool.scope_model:?}", pool: pool.clone(),
+                                        forecast: meter_forecast(&forecasts, None, &pool.window_key, pool.scope_model.as_deref()) }
+                                }
+                            }
                         }
                     }
                 }
@@ -232,6 +238,16 @@ fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
                     RollingStarter { provider: provider.clone() }
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn QuotaMeterKey() -> Element {
+    rsx! {
+        div { class: "quota-meter-key form-help",
+            span { class: "quota-pace-key", span { aria_hidden: "true", "│ " } "Window pace" }
+            span { class: "quota-projected-key", span { aria_hidden: "true", "▒ " } "Projected end" }
         }
     }
 }
@@ -329,7 +345,7 @@ fn AccountSummary(
     forecasts: Rc<Vec<QuotaForecast>>,
 ) -> Element {
     rsx! {
-        section { class: "provider-inset stack",
+        section { class: "provider-inset stack quota-meter-group",
             div { class: "row",
                 div { style: "flex: 1 1 12rem; min-width: 0;", AccountIdentity { provider: provider.clone(), account: account.clone(), mask } }
                 div { class: "row",
@@ -345,6 +361,7 @@ fn AccountSummary(
             if account.windows.is_empty() {
                 p { class: "muted", "No quota reported · {fmt_count(account.success_count)} successes · {fmt_count(account.failure_count)} failures" }
             }
+            QuotaMeterKey {}
             for window in account.windows.iter().filter(|w| !is_extra(w.kind)) {
                 QuotaLimitBar { key: "{window.window_key}:{window.scope_model:?}", window: window.clone(),
                     forecast: meter_forecast(&forecasts, Some(&account.id), &window.window_key, window.scope_model.as_deref()) }
@@ -441,7 +458,7 @@ fn QuotaPanel(provider: ProviderSummary, account: Option<ModelAccount>, lookback
     let future = available && show_forecast();
     let mask = panel.settings.read().mask_emails;
     rsx! {
-        div { class: "form-grid-2", style: "grid-template-columns: repeat(auto-fit, minmax(min(100%, 5.75rem), 1fr)); gap: 4px 6px;",
+        div { class: "form-grid-2 quota-controls",
             Choice { label: "Window", value: chosen.clone(), options: windows.into_iter().collect(), change: move |v| window.set(v) }
             Choice { label: "History", value: range().to_string(), options: pairs(&[("6", "6h"), ("12", "12h"), ("24", "24h"), ("48", "48h"), ("168", "7d")]), change: move |v: String| if let Ok(n) = v.parse() { range.set(n); } }
             Choice { label: "Drain lookback", value: lookback().to_string(), options: pairs(LOOKBACK), change: move |v: String| if let Ok(n) = v.parse() { lookback.set(n); } }

@@ -993,6 +993,18 @@ select.input option { background: var(--card); color: var(--text); }
 .quota-forecast-toggle input { margin: 0; }
 .quota-forecast-toggle:has(input:disabled) { color: var(--text-dim); }
 .quota-forecast-toggle small { font-size: 11px; }
+.quota-controls.form-grid-2 {
+  grid-template-columns: minmax(0, 2fr) repeat(4, minmax(0, 1fr)); gap: 6px 8px;
+}
+.quota-controls > .provider-field { min-width: 0; }
+.quota-meters-header { justify-content: space-between; }
+.quota-meter-key { white-space: nowrap; }
+.quota-meter-key > span { display: none; }
+.quota-meter-group:has(> .quota-window .quota-pace, > details[open] .quota-pace) .quota-pace-key,
+.quota-meter-group:has(> .quota-window .quota-projected-end, > details[open] .quota-projected-end) .quota-projected-key { display: inline; }
+.quota-meter-group:not(:has(> .quota-window :is(.quota-pace, .quota-projected-end),
+                          > details[open] :is(.quota-pace, .quota-projected-end))) .quota-meter-key { display: none; }
+.quota-meter-group:has(> .quota-window .quota-pace, > details[open] .quota-pace) .quota-projected-key::before { content: " · "; }
 .quota-decision { padding: 6px 0 9px; color: var(--text-muted); font-size: 12px; }
 .quota-decision strong { color: var(--text); font-size: 15px; }
 .quota-series-chips { gap: 5px; }
@@ -1040,22 +1052,25 @@ select.input option { background: var(--card); color: var(--text); }
 }
 .quota-readout li small { grid-column: 2 / -1; color: var(--text-muted); }
 .quota-readout li small.quota-risk { color: var(--bad); }
-.activity-board { display: grid; gap: 12px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.activity-board { display: grid; align-items: start; gap: 12px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .activity-board > * { min-width: 0; }
 .activity-span-2 { grid-column: span 2; }
 .activity-span-3 { grid-column: span 3; }
 .activity-tile-header { justify-content: space-between; }
 .activity-kpis .stat-card > span:not(.label-tech) { color: var(--text-muted); font-size: 12px; }
 .cache-summary-head { justify-content: space-between; gap: 4px 10px; }
+.cache-summary > p { font-size: 12px; }
 .activity-plot { position: relative; min-width: 0; border-radius: 4px; }
 .activity-plot > svg { display: block; width: 100%; }
 .provider-chart .activity-plot text { font-size: 11px; }
 .activity-peak { color: var(--focus); font-size: 11px; }
+.provider-chart .activity-peak-label { fill: var(--focus); paint-order: stroke; stroke: var(--panel); stroke-width: 3px; }
+.chart-inspect { margin-inline-start: auto; white-space: nowrap; }
 .activity-bar { fill: color-mix(in srgb, var(--honey) 62%, var(--elevated)); }
 .activity-bar.peak { fill: var(--focus); }
-.activity-volume-bar { fill: var(--honey); opacity: .21; }
-.activity-volume-key, .activity-heat-scale { color: var(--text-muted); font-size: 11px; }
-.activity-volume-key .chart-swatch { height: 8px; background: color-mix(in srgb, var(--honey) 34%, var(--elevated)); }
+.activity-volume-bar { fill: var(--honey); opacity: .48; }
+.provider-chart .activity-volume-label { fill: var(--text-muted); }
+.activity-heat-scale { color: var(--text-muted); font-size: 11px; white-space: nowrap; }
 .activity-readout {
   position: absolute; z-index: 2; inset: 4px auto auto 4px; pointer-events: none;
   width: max-content; max-width: calc(100% - 8px); padding: 8px 10px;
@@ -1075,13 +1090,19 @@ select.input option { background: var(--card); color: var(--text); }
 .activity-heat-na { fill: var(--panel); stroke: var(--text-dim); stroke-opacity: .5; stroke-dasharray: 2 2; }
 .chart-heat-swatch.na { background: var(--panel); border: 1px dashed var(--text-dim); }
 .chart-swatch.drift-median { background: var(--info); height: 2px; }
+.chart-marker-dot { fill: var(--info); }
 .activity-table { min-width: 0; }
 :is(.activity-table, .activity-comparisons .provider-table) :is(th, td) {
   min-width: 72px; white-space: nowrap; overflow-wrap: normal; vertical-align: middle;
 }
 .activity-table tbody th { color: var(--text); background: inherit; font-weight: 600; }
 .activity-table th:first-child { min-width: 112px; }
-.activity-comparisons .activity-table :is(th, td):nth-child(4) { min-width: 200px; }
+.comparison-baseline { max-width: 320px; }
+.activity-comparisons > .activity-table :is(th, td) { min-width: 0; }
+.activity-comparisons > .activity-table :is(th, td):first-child {
+  width: 26%; min-width: 112px; white-space: normal; overflow-wrap: anywhere;
+}
+.activity-comparisons > .activity-table :is(th, td):nth-child(2) { white-space: normal; overflow-wrap: anywhere; }
 .activity-comparisons details .provider-table td:last-child {
   min-width: 12rem; white-space: normal; overflow-wrap: break-word;
 }
@@ -1090,9 +1111,10 @@ select.input option { background: var(--card); color: var(--text); }
   flex: 0 0 3rem; height: 4px; overflow: hidden; border-radius: 3px; background: var(--elevated);
 }
 .share-bar-track > span { display: block; height: 100%; background: color-mix(in srgb, var(--honey) 84%, var(--text-dim)); }
-.comparison-value { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.comparison-value > .share-bar-cell { flex: 1; }
-.comparison-value > .chip { justify-content: center; min-width: 5ch; }
+.share-bar-labeled { display: grid; grid-template-columns: minmax(9ch, max-content) minmax(3rem, 7rem) 6ch; justify-content: start; }
+.share-bar-labeled .share-bar-track > .nonzero { min-width: 3px; }
+.share-bar-percent { color: var(--text-muted); text-align: end; }
+.thinking-costs td:last-child { width: 38%; }
 .provider-logs { max-height: 340px; overflow: auto; padding: 8px; background: var(--bg); border-radius: 6px; }
 .provider-logs p { font-size: 12px; }
 .provider-trace { list-style: none; margin: 0; padding: 0; }
@@ -1109,6 +1131,11 @@ select.input option { background: var(--card); color: var(--text); }
   .activity-span-2, .activity-span-3 { grid-column: auto; }
 }
 @media (max-width: 900px) {
+  .quota-controls.form-grid-2 { grid-template-columns: minmax(0, 2fr) repeat(2, minmax(0, 1fr)); }
+  .quota-controls > :last-child { grid-column: span 2; }
+  .quota-plots.multiples {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, max(225px, calc((100% - 12px) / 2))), 1fr));
+  }
   .activity-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .activity-kpis .stat-card { padding: 8px 10px; gap: 3px; }
 }

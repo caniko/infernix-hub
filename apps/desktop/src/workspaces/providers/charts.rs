@@ -226,7 +226,7 @@ pub(super) fn Meter(
                             class: if risk { "quota-hatch bad" } else { "quota-hatch" } }
                     }
                 }
-                rect { x: "{end}", y: "2", width: "{width - end}", height: "6", fill: "url(#{hatch})" }
+                rect { x: "{end}", y: "2", width: "{width - end}", height: "6", fill: "url(#{hatch})", class: "quota-projected-end" }
             }
             if let (Some(pace), Some(label)) = (pace, &pace_label) {
                 {
@@ -382,20 +382,82 @@ impl TimePlotBox {
     pub(super) fn x(self, view: TimeBounds, at: DateTime<Utc>) -> f64 {
         self.left + (self.right - self.left) * view.fraction(at)
     }
+}
 
-    pub(super) fn axis_padding(self, view: TimeBounds) -> f64 {
-        let day_line = if view.end - view.start > TimeDelta::hours(48) { 13.0 } else { 0.0 };
-        let stagger = if self.right - self.left < 220.0 { 14.0 + day_line } else { 0.0 };
-        33.0 + day_line + stagger
+fn midnight(at: DateTime<Utc>) -> DateTime<Utc> {
+    at.date_naive().and_time(chrono::NaiveTime::MIN).and_utc()
+}
+
+fn time_ticks(view: TimeBounds, width: f64, compact: bool, dates: bool) -> Vec<(DateTime<Utc>, String)> {
+    let count = if compact || width < 200.0 {
+        3
+    } else if width < 360.0 && dates {
+        4
+    } else {
+        5
+    };
+    let crosses_midnight = view.start.date_naive() != view.end.date_naive();
+    let labels = |times: &[DateTime<Utc>]| {
+        times
+            .iter()
+            .enumerate()
+            .map(|(i, &at)| {
+                let rollover = i == 0 || at.date_naive() != times[i - 1].date_naive();
+                let format = if dates {
+                    "%b %d"
+                } else if crosses_midnight && rollover {
+                    "%b %d %H:%M"
+                } else {
+                    "%H:%M"
+                };
+                (at, at.format(format).to_string())
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut times = vec![view.start, view.end];
+    let boundaries: Vec<_> = (1..=2).map(|day| midnight(view.start) + TimeDelta::days(day)).filter(|&at| !dates && at < view.end).collect();
+    let mut regular: Vec<_> = (1..count - 1)
+        .map(|i| view.at(f64::from(i) / f64::from(count - 1)))
+        .map(|at| if dates { midnight(at + TimeDelta::hours(12)) } else { at })
+        .collect();
+    // Keep rollover ticks first, and fill gaps rather than clustering regular ticks around midnight.
+    regular.sort_by_key(|at| std::cmp::Reverse(times.iter().chain(&boundaries).map(|anchor| (*anchor - *at).abs()).min()));
+    for at in boundaries.into_iter().chain(regular) {
+        if times.len() == count as usize {
+            break;
+        }
+        let index = times.partition_point(|&t| t < at);
+        if index == 0 || index == times.len() || times[index] == at || (dates && times.iter().any(|t| t.date_naive() == at.date_naive())) {
+            continue;
+        }
+        times.insert(index, at);
+        let ticks = labels(&times);
+        let fits = ticks.windows(2).enumerate().all(|(i, pair)| {
+            let label_width = |label: &str| label.len() as f64 * 6.7;
+            let left = label_width(&pair[0].1) * if i == 0 { 1.0 } else { 0.5 };
+            let right = label_width(&pair[1].1) * if i + 2 == ticks.len() { 1.0 } else { 0.5 };
+            (view.fraction(pair[1].0) - view.fraction(pair[0].0)) * width >= left + right + 6.0
+        });
+        if !fits {
+            times.remove(index);
+        }
     }
+    labels(&times)
 }
 
 #[component]
-pub(super) fn TimeAxis(plot: TimePlotBox, view: TimeBounds, #[props(default)] date_only: bool) -> Element {
+pub(super) fn TimeAxis(
+    plot: TimePlotBox,
+    view: TimeBounds,
+    #[props(default)] date_only: bool,
+    #[props(default)] compact: bool,
+    #[props(default = 24.0)] label_offset: f64,
+    #[props(default)] grid: bool,
+) -> Element {
     let width = plot.right - plot.left;
     if date_only {
-        let midnight = view.start.date_naive().and_time(chrono::NaiveTime::MIN).and_utc();
-        let first = if midnight < view.start { midnight + TimeDelta::days(1) } else { midnight };
+        let first = midnight(view.start);
+        let first = if first < view.start { first + TimeDelta::days(1) } else { first };
         let count = (view.end - first).num_days() + 1;
         let limit = (width / 64.0).floor().max(1.0) as usize;
         let stride = (count.max(1) as usize).div_ceil(limit);
@@ -415,33 +477,18 @@ pub(super) fn TimeAxis(plot: TimePlotBox, view: TimeBounds, #[props(default)] da
             }
         };
     }
-    let ticks = if width < 340.0 {
-        5
-    } else if width < 600.0 || view.end - view.start < TimeDelta::minutes(6) {
-        6
-    } else {
-        7
-    };
-    let multiday = view.end - view.start > TimeDelta::hours(48);
+    let ticks = time_ticks(view, width, compact, view.end - view.start > TimeDelta::hours(48));
+    let (y1, y2) = if grid { (plot.top, plot.bottom) } else { (plot.bottom, plot.bottom + 4.0) };
     rsx! {
         g { class: "time-axis", pointer_events: "none",
-            for i in 0..ticks {
+            for (i, (at, label)) in ticks.iter().enumerate() {
                 {
-                    let fraction = f64::from(i) / f64::from(ticks - 1);
-                    let at = view.at(fraction);
-                    let day_label = at.format("%b %d");
-                    let clock_label = at.format("%H:%M");
-                    let x = plot.left + width * fraction;
-                    let stagger = if width < 220.0 && i % 2 == 1 { if multiday { 27.0 } else { 14.0 } } else { 0.0 };
-                    let day_y = plot.bottom + 24.0 + stagger;
-                    let time_y = day_y + if multiday { 13.0 } else { 0.0 };
-                    let anchor = if i == 0 { "start" } else if i == ticks - 1 { "end" } else { "middle" };
+                    let x = plot.x(view, *at);
+                    let anchor = if i == 0 { "start" } else if i == ticks.len() - 1 { "end" } else { "middle" };
                     rsx! {
-                        line { x1: "{x}", x2: "{x}", y1: "{plot.top}", y2: "{plot.bottom}", class: "chart-gridline subtle time-gridline" }
-                        if multiday {
-                            text { x: "{x}", y: "{day_y}", text_anchor: anchor, "{day_label}" }
-                        }
-                        text { x: "{x}", y: "{time_y}", text_anchor: anchor, "{clock_label}" }
+                        line { x1: "{x}", x2: "{x}", y1: "{y1}", y2: "{y2}",
+                            class: if grid { "chart-gridline subtle time-gridline" } else { "chart-gridline" } }
+                        text { x: "{x}", y: "{plot.bottom + label_offset}", text_anchor: anchor, "{label}" }
                     }
                 }
             }
@@ -704,6 +751,10 @@ pub(super) fn QuotaHistoryChart(
     }
 }
 
+fn quota_defaults_to_multiples(pool: bool, series: usize) -> bool {
+    pool && series > 6
+}
+
 #[component]
 fn QuotaExplorer(
     series: Rc<Vec<QuotaSeries>>,
@@ -714,14 +765,14 @@ fn QuotaExplorer(
 ) -> Element {
     let scrub = use_time_scrub();
     let mut focus = use_signal(|| None::<QuotaSeriesKey>);
-    let mut multiples = use_signal(|| series.len() >= 10);
+    let mut multiples = use_signal(|| None);
     let future = full.end > as_of;
     use_effect(use_reactive((&future,), move |_| scrub.reset()));
     let focus_key = focus.read();
     let selected = series.iter().position(|s| focus_key.as_ref() == Some(&s.key));
     let view = scrub.bounds(full);
     let has_layout_choice = pool && series.len() >= 4;
-    let small = has_layout_choice && multiples();
+    let small = has_layout_choice && multiples().unwrap_or_else(|| quota_defaults_to_multiples(pool, series.len()));
     let summary = selected.or_else(|| (series.len() == 1).then_some(0));
     let keyboard_times = sorted.clone();
     if series.is_empty() {
@@ -766,8 +817,8 @@ fn QuotaExplorer(
         div { class: "row quota-plot-controls",
             if has_layout_choice {
                 div { class: "segmented", role: "group", aria_label: "Quota chart layout",
-                    button { class: "seg-btn", aria_pressed: !small, onclick: move |_| { multiples.set(false); scrub.clear(); }, "Overlay" }
-                    button { class: "seg-btn", aria_pressed: small, onclick: move |_| { multiples.set(true); scrub.clear(); }, "Small multiples" }
+                    button { class: "seg-btn", aria_pressed: !small, onclick: move |_| { multiples.set(Some(false)); scrub.clear(); }, "Overlay" }
+                    button { class: "seg-btn", aria_pressed: small, onclick: move |_| { multiples.set(Some(true)); scrub.clear(); }, "Small multiples" }
                 }
             }
             if view != full {
@@ -775,6 +826,9 @@ fn QuotaExplorer(
             }
             if future {
                 span { class: "chart-legend-item", span { class: "chart-swatch dashed" } "Forecast (estimate)" }
+            }
+            if series.iter().any(|s| s.resets.iter().any(|&at| view.contains(at))) {
+                span { class: "chart-legend-item", "◆ Reset" }
             }
             span { class: "form-help", "Hover or focus chart and use ←/→ · wheel or +/− to zoom · drag to pan · 0 to reset" }
         }
@@ -911,7 +965,7 @@ fn QuotaPlot(
     let width = (measure.width)().max(100.0);
     let plot = TimePlotBox { left: 38.0, right: width - 8.0, top: 22.0, bottom: if single.is_some() { 94.0 } else { 158.0 } };
     let view = scrub.bounds(full);
-    let height = plot.bottom + plot.axis_padding(full);
+    let height = plot.bottom + 33.0;
     let active = scrub.active().filter(|at| view.contains(*at));
     let active_x = active.map(|at| plot.x(view, at));
     let panel = single.unwrap_or(0);
@@ -944,7 +998,7 @@ fn QuotaPlot(
                     if show_future {
                         rect { x: "{now_x}", y: "{plot.top}", width: "{plot.right - now_x}", height: "{plot.bottom - plot.top}", class: "quota-future" }
                     }
-                    TimeAxis { plot, view }
+                    TimeAxis { plot, view, compact: single.is_some(), grid: true }
                     for pct in [0.0, 25.0, 50.0, 75.0, 100.0] {
                         {
                             let y = quota_y(plot, pct);
@@ -1090,7 +1144,6 @@ impl Metric {
 
 #[derive(Clone, PartialEq)]
 struct BarItem {
-    label: String,
     window: String,
     value: Option<f64>,
     requests: u64,
@@ -1102,6 +1155,7 @@ struct BarItem {
 }
 
 pub(super) const NO_RANGE_DATA: &str = "No data for selected range";
+const INSPECT: &str = "Hover or ←/→ to inspect";
 
 pub(super) fn bucket_badge(seconds: Option<u64>) -> Option<&'static str> {
     match seconds {
@@ -1112,13 +1166,8 @@ pub(super) fn bucket_badge(seconds: Option<u64>) -> Option<&'static str> {
     }
 }
 
-fn bucket_label(at: DateTime<Utc>, seconds: u64) -> String {
-    let format = match seconds {
-        3600 => "%H:%M",
-        10800 if at.time() != chrono::NaiveTime::MIN => "%b %d %H:%M",
-        _ => "%b %d",
-    };
-    at.format(format).to_string()
+fn bucket_bounds(points: &[ActivityTrendPoint], seconds: u64) -> Option<TimeBounds> {
+    Some(TimeBounds { start: points.first()?.bucket_start, end: points.last()?.bucket_start + TimeDelta::seconds(seconds as i64) })
 }
 
 fn bucket_window(at: DateTime<Utc>, seconds: u64) -> String {
@@ -1190,25 +1239,21 @@ fn ActivityGrid(plot: TimePlotBox, ticks: Vec<String>) -> Element {
 }
 
 #[component]
-fn BucketTicks(plot: TimePlotBox, labels: Vec<String>, #[props(default)] rhythm: bool) -> Element {
+fn RhythmTicks(plot: TimePlotBox, labels: Vec<String>) -> Element {
     let width = plot.right - plot.left;
     let step = width / labels.len().max(1) as f64;
-    // Leave room for a centered date at either edge and at least 8px between labels.
-    let pitch = if labels.iter().any(|s| s.len() > 6) { 84.0 } else { 52.0 };
-    let margin = if pitch > 52.0 { 38.0 } else { 23.0 };
-    let stride = if rhythm && step >= 10.0 {
+    let stride = if step >= 10.0 {
         4
-    } else if rhythm && step >= 7.0 {
+    } else if step >= 7.0 {
         6
     } else {
-        (pitch / step).ceil() as usize
-    }
-    .max(1);
+        (52.0 / step).ceil() as usize
+    };
     rsx! {
         for (i, label) in labels.iter().enumerate() {
             {
                 let x = plot.left + (i as f64 + 0.5) * step;
-                if x + margin > plot.right + 12.0 || i % stride != 0 {
+                if x + 23.0 > plot.right + 12.0 || i % stride != 0 {
                     rsx! {}
                 } else {
                     rsx! {
@@ -1254,23 +1299,39 @@ fn ActivityReadout(right: bool, heading: String, fields: Vec<(&'static str, Stri
 }
 
 #[component]
-pub(super) fn ShareBar(label: String, value: f64, total: f64, #[props(default = "of listed total")] scale_label: &'static str) -> Element {
+pub(super) fn ShareBar(
+    label: String,
+    value: f64,
+    total: f64,
+    #[props(default = "of listed total")] scale_label: &'static str,
+    #[props(default)] show_share: bool,
+) -> Element {
     let share = (total.is_finite() && total > 0.0 && value.is_finite()).then(|| (value / total).clamp(0.0, 1.0) * 100.0);
     rsx! {
-        span { class: "share-bar-cell",
+        span { class: if show_share { "share-bar-cell share-bar-labeled" } else { "share-bar-cell" },
             span { "{label}" }
             if let Some(pct) = share {
                 span { class: "share-bar-track", aria_hidden: "true", title: "{pct:.1}% {scale_label}",
-                    span { style: "width: {pct:.2}%" }
+                    span { class: if pct > 0.0 { "nonzero" } else { "" }, style: "width: {pct:.2}%" }
                 }
-                span { class: "sr-only", ", {pct:.1}% {scale_label}" }
+                if show_share {
+                    span { class: "share-bar-percent", aria_label: "{pct:.1}% {scale_label}", "{pct:.1}%" }
+                } else {
+                    span { class: "sr-only", ", {pct:.1}% {scale_label}" }
+                }
             }
         }
     }
 }
 
 #[component]
-fn InteractiveBars(label: &'static str, metric: Metric, items: Vec<BarItem>, #[props(default)] rhythm: bool) -> Element {
+fn InteractiveBars(
+    label: &'static str,
+    metric: Metric,
+    items: Vec<BarItem>,
+    #[props(default)] rhythm: bool,
+    #[props(default)] time: Option<TimeBounds>,
+) -> Element {
     let mut hovered = use_signal(|| None::<usize>);
     let measure = use_time_plot_measure();
     let width = (measure.width)().max(100.0);
@@ -1304,6 +1365,10 @@ fn InteractiveBars(label: &'static str, metric: Metric, items: Vec<BarItem>, #[p
                             rsx! { span { class: "activity-peak mono", "Peak: {time} · {metric.format_value(item.value)}{suffix}" } }
                         }
                     }
+                    if rhythm && items.iter().any(|item| item.failures > 0) {
+                        span { class: "chart-legend-item form-help", span { class: "chart-swatch outlier", aria_hidden: "true" } "Failed requests" }
+                    }
+                    span { class: "chart-inspect form-help", "{INSPECT}" }
                 }
                 div { class: "activity-plot", tabindex: "0", role: "group",
                     aria_label: "{label}, {unit}. Use left and right arrows to inspect. Data table follows.",
@@ -1314,7 +1379,11 @@ fn InteractiveBars(label: &'static str, metric: Metric, items: Vec<BarItem>, #[p
                     onresize: move |_| measure.refresh(),
                     svg { width: "100%", height: "{height}", view_box: "0 0 {width} {height}", preserve_aspect_ratio: "none", "aria-hidden": "true",
                         ActivityGrid { plot, ticks: [0.0, 0.5, 1.0].map(|f| fmt_compact_axis(metric, scale * f)).to_vec() }
-                        BucketTicks { plot, labels: items.iter().map(|p| p.label.clone()).collect(), rhythm }
+                        if let Some(view) = time {
+                            TimeAxis { plot, view, label_offset: 17.0 }
+                        } else if rhythm {
+                            RhythmTicks { plot, labels: items.iter().map(|p| p.window.clone()).collect() }
+                        }
                         for (i, item) in items.iter().enumerate() {
                             {
                                 let x = plot_left + (i as f64 + 0.5) * step;
@@ -1373,12 +1442,12 @@ pub(super) fn ActivityTrendChart(
     #[props(default)] bucket_seconds: Option<u64>,
 ) -> Element {
     let (seconds, points) = trend_buckets(points, bucket_seconds);
+    let time = bucket_bounds(&points, seconds);
     let items = points
         .into_iter()
         .map(|p| {
             let tokens = p.input_tokens.saturating_add(p.output_tokens);
             BarItem {
-                label: bucket_label(p.bucket_start, seconds),
                 window: bucket_window(p.bucket_start, seconds),
                 value: metric.value(p.requests, tokens, p.api_equivalent_cost_usd, p.cache_hit_rate_observed),
                 requests: p.requests,
@@ -1390,7 +1459,7 @@ pub(super) fn ActivityTrendChart(
             }
         })
         .collect();
-    rsx! { InteractiveBars { label: "Activity over time (UTC)", metric, items } }
+    rsx! { InteractiveBars { label: "Activity over time (UTC)", metric, items, time } }
 }
 
 fn local_hour(hour: u8) -> String {
@@ -1407,7 +1476,6 @@ pub(super) fn ActivityRhythmChart(points: Vec<RhythmBucket>, metric: Metric) -> 
             Some(p) => {
                 let cache_hit_rate = effective_cache_hit_rate(p.input_tokens, p.cache_read_tokens, p.cache_hit_rate);
                 BarItem {
-                    label: local_hour(h),
                     window: local_hour(h),
                     value: metric.value(p.requests, p.tokens, p.api_equivalent_cost_usd, cache_hit_rate),
                     requests: p.requests,
@@ -1419,7 +1487,6 @@ pub(super) fn ActivityRhythmChart(points: Vec<RhythmBucket>, metric: Metric) -> 
                 }
             }
             None => BarItem {
-                label: local_hour(h),
                 window: local_hour(h),
                 value: metric.value(0, 0, 0.0, None),
                 requests: 0,
@@ -1439,23 +1506,25 @@ pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>, #[props(default
     let mut active = use_signal(|| None::<usize>);
     let measure = use_time_plot_measure();
     let (seconds, points) = trend_buckets(points, bucket_seconds);
+    let Some(view) = bucket_bounds(&points, seconds) else {
+        return rsx! { p { class: "form-help", "{NO_RANGE_DATA}" } };
+    };
     let count = points.len();
     let width = (measure.width)().max(100.0);
-    let plot = activity_plot(width);
-    let height = plot.bottom + 24.0;
+    let plot = TimePlotBox { bottom: 118.0, ..activity_plot(width) };
+    let volume = TimePlotBox { top: plot.bottom + 22.0, bottom: plot.bottom + 46.0, ..plot };
+    let inspection = TimePlotBox { bottom: volume.bottom, ..plot };
+    let height = volume.bottom + 24.0;
     let step = (plot.right - plot.left) / count.max(1) as f64;
     let px = |i: usize| plot.left + (i as f64 + 0.5) * step;
-    let max_input = points.iter().map(|p| p.input_tokens).max().unwrap_or_default().max(1) as f64;
+    let max_input = points.iter().map(|p| p.input_tokens).max().unwrap_or_default() as f64;
+    let volume_peak = fmt_compact_axis(Metric::Tokens, max_input);
     let observed = active().filter(|&i| i < count);
     rsx! {
-        if points.is_empty() {
-            p { class: "form-help", "{NO_RANGE_DATA}" }
-        } else {
             figure { class: "provider-chart chart-stage",
                 figcaption { class: "chart-header",
                     span { "Cache hit rate (%) · UTC" }
-                    span { class: "chart-legend-item activity-volume-key", title: "Bar height relative to the busiest input-token bucket",
-                        span { class: "chart-swatch" } "Input volume" }
+                    span { class: "chart-inspect form-help", "{INSPECT}" }
                 }
                 if !points.iter().any(|p| p.cache_hit_rate_observed.is_some()) {
                     p { class: "form-help", "No observed cache hit rate in this range." }
@@ -1469,12 +1538,13 @@ pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>, #[props(default
                     onresize: move |_| measure.refresh(),
                     svg { width: "100%", height: "{height}", view_box: "0 0 {width} {height}", preserve_aspect_ratio: "none", "aria-hidden": "true",
                         ActivityGrid { plot, ticks: vec!["0%".into(), "50%".into(), "100%".into()] }
-                        BucketTicks { plot, labels: points.iter().map(|p| bucket_label(p.bucket_start, seconds)).collect() }
+                        TimeAxis { plot: volume, view, label_offset: 17.0 }
+                        line { x1: "{volume.left}", x2: "{volume.right}", y1: "{volume.bottom}", y2: "{volume.bottom}", class: "chart-gridline" }
                         for (i, p) in points.iter().enumerate().filter(|(_, p)| p.input_tokens > 0) {
                             {
                                 let bar_w = (step * 0.74).min(34.0);
-                                let y = chart_y(plot, p.input_tokens as f64 / max_input);
-                                rsx! { rect { x: "{px(i) - bar_w / 2.0}", y: "{y}", width: "{bar_w}", height: "{plot.bottom - y}", rx: "2", class: "activity-volume-bar" } }
+                                let y = chart_y(volume, p.input_tokens as f64 / max_input);
+                                rsx! { rect { x: "{px(i) - bar_w / 2.0}", y: "{y}", width: "{bar_w}", height: "{volume.bottom - y}", rx: "2", class: "activity-volume-bar" } }
                             }
                         }
                         for (i, pair) in points.windows(2).enumerate() {
@@ -1484,7 +1554,8 @@ pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>, #[props(default
                                     class: "chart-line chart-cache-line activity-cache-segment" }
                             }
                         }
-                        if let Some(i) = observed { TimeCrosshair { plot, x: px(i) } }
+                        if let Some(i) = observed { TimeCrosshair { plot: inspection, x: px(i) } }
+                        text { x: "{volume.left}", y: "{volume.top - 5.0}", class: "activity-volume-label", "Input volume · peak {volume_peak} tok" }
                         for (i, p) in points.iter().enumerate() {
                             if let Some(rate) = p.cache_hit_rate_observed {
                                 circle { cx: "{px(i)}", cy: "{chart_y(plot, rate)}", r: if observed == Some(i) { "4.5" } else { "2.6" },
@@ -1492,7 +1563,7 @@ pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>, #[props(default
                             }
                         }
                         for i in 0..count {
-                            BucketHit { plot, index: i, count, active }
+                            BucketHit { plot: inspection, index: i, count, active }
                         }
                     }
                     div { role: "status",
@@ -1519,20 +1590,27 @@ pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>, #[props(default
                     }
                 }
             }
-        }
     }
 }
 
 #[component]
-pub(super) fn HeatmapScale(metric: Metric) -> Element {
+fn HeatmapScale(metric: Metric, max: f64) -> Element {
+    let peak = fmt_compact_axis(metric, max);
+    let unit = match metric {
+        Metric::Requests => " req",
+        Metric::Tokens => " tok",
+        _ => "",
+    };
     rsx! {
-        div { class: "activity-heat-scale", aria_label: "Heatmap color scale: less to more",
+        div { class: "activity-heat-scale", aria_label: "Heatmap color scale: zero to {peak}{unit}",
+            span { class: "mono", "0" }
             span { "Less" }
             for step in [0.12, 0.36, 0.65, 1.0] {
                 span { class: if metric == Metric::CacheHitRate { "chart-heat-swatch cache" } else { "chart-heat-swatch" },
                     style: "opacity: {step}", aria_hidden: "true" }
             }
             span { "More" }
+            span { class: "mono", "{peak}{unit}" }
         }
     }
 }
@@ -1559,18 +1637,17 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric, #[props(d
             ((usize::from(c.day_of_week), usize::from(c.hour)), (c, rate, value))
         })
         .collect();
-    let max = if metric == Metric::CacheHitRate {
-        100.0
-    } else {
-        cell_map.values().filter_map(|&(_, _, v)| v).fold(0.0, f64::max).max(f64::EPSILON)
-    };
+    let max = cell_map.values().filter_map(|&(_, _, v)| v).fold(0.0, f64::max);
     let empty_value = metric.value(0, 0, 0.0, None);
     let value_at = |d, h| cell_map.get(&(d, h)).map_or(empty_value, |&(_, _, value)| value);
     let active = hovered();
     let cell_class = if metric == Metric::CacheHitRate { "chart-heat-cache" } else { "chart-bar chart-solid" };
     rsx! {
         figure { class: "provider-chart chart-stage",
-            figcaption { "By weekday and local hour · {unit}" }
+            figcaption { class: "chart-header",
+                span { "By weekday and local hour · {unit}" }
+                HeatmapScale { metric, max }
+            }
             div { class: "chart-legend",
                 if !covered_weekdays.is_empty() && covered_weekdays.len() < days.len() {
                     span { class: "chart-legend-item", span { class: "chart-heat-swatch outside" } "Outside selected window" }
@@ -1628,7 +1705,8 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric, #[props(d
                                     rx: "2",
                                     class: "{state} {active_class} chart-hit",
                                     fill: if outside { format!("url(#{hatch})") } else { String::new() },
-                                    opacity: if outside || value.is_none() { 1.0 } else { 0.12 + 0.88 * (intensity / max).clamp(0.0, 1.0) },
+                                     opacity: if outside || value.is_none() { 1.0 } else if intensity == 0.0 { 0.04 }
+                                         else { 0.12 + 0.88 * (intensity / max).clamp(0.0, 1.0) },
                                     onmouseenter: move |_| hovered.set(Some((d, h))),
                                     title { "{day} {h:02}:00 · {description}" }
                                 }
@@ -1691,6 +1769,13 @@ fn drift_date(date: &str) -> Option<DateTime<Utc>> {
     Some(chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?.and_time(chrono::NaiveTime::MIN).and_utc())
 }
 
+fn drift_ticks(peak: f64) -> [f64; 3] {
+    let target = (peak / 2.0).max(1.0);
+    let decade = 10.0_f64.powf(target.log10().floor());
+    let step = decade * [1.0, 2.0, 2.5, 5.0, 10.0].into_iter().find(|n| *n >= target / decade).unwrap_or(10.0);
+    [0.0, step, 2.0 * step]
+}
+
 #[component]
 pub(super) fn DriftBandChart(days: Vec<DriftDayPoint>, markers: Vec<DriftMarker>, #[props(default)] ttft: bool) -> Element {
     let mut active = use_signal(|| None::<usize>);
@@ -1707,19 +1792,31 @@ pub(super) fn DriftBandChart(days: Vec<DriftDayPoint>, markers: Vec<DriftMarker>
     let x = |at| plot.x(view, at);
     let value =
         |d: &DriftDayPoint| (if ttft { d.median_ttft_ms } else { Some(d.thinking_per_reply) }).filter(|v| v.is_finite() && *v >= 0.0);
-    let max = dated.iter().flat_map(|(_, d)| [value(d), if ttft { None } else { d.baseline_high }]).flatten().fold(1.0, f64::max);
-    let y = |v: f64| chart_y(plot, v / max);
+    let peak = dated.iter().filter_map(|&(at, d)| Some((at, value(d)?))).max_by(|a, b| a.1.total_cmp(&b.1));
+    let high = dated.iter().filter_map(|(_, d)| d.baseline_high.filter(|v| v.is_finite())).fold(0.0, f64::max);
+    let ticks = drift_ticks(peak.map_or(0.0, |(_, v)| v).max(if ttft { 0.0 } else { high }));
+    let y = |v: f64| chart_y(plot, v / ticks[2]);
     let half_day = (x(*first + TimeDelta::hours(12)) - x(*first) - 0.5).clamp(0.0, 15.0);
     let show_median = !ttft && dated.iter().any(|(_, d)| d.baseline_median_thinking.is_some());
     let show_band = !ttft && dated.iter().any(|(_, d)| d.baseline_low.zip(d.baseline_high).is_some());
     let show_outlier = !ttft && dated.iter().any(|(_, d)| d.outlier);
     let markers: Vec<_> = markers.iter().filter_map(|m| Some((drift_date(&m.date)?, m))).filter(|(at, _)| view.contains(*at)).collect();
-    let count = dated.len();
+    let targets: Vec<_> = markers
+        .iter()
+        .map(|&(at, _)| (at, None))
+        .chain(dated.iter().map(|&(at, day)| (at, Some(day))))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    let count = targets.len();
     let selected = active().filter(|&i| i < count);
     let label = if ttft { "Daily median TTFT (ms)" } else { "Daily thinking tokens per reply" };
     rsx! {
         figure { class: "provider-chart chart-stage",
-            figcaption { "{label} · UTC" }
+            figcaption { class: "chart-header",
+                span { "{label} · UTC" }
+                span { class: "chart-inspect form-help", "{INSPECT}" }
+            }
             div { class: "chart-legend",
                 span { class: "chart-legend-item", span { class: "chart-swatch" } "Observed" }
                 if show_median { span { class: "chart-legend-item", span { class: "chart-swatch drift-median" } "14d median" } }
@@ -1739,7 +1836,7 @@ pub(super) fn DriftBandChart(days: Vec<DriftDayPoint>, markers: Vec<DriftMarker>
                 onresize: move |_| measure.refresh(),
                 svg { width: "100%", height: "{height}", view_box: "0 0 {width} {height}", preserve_aspect_ratio: "none", "aria-hidden": "true",
                     TimeAxis { plot, view, date_only: true }
-                    ActivityGrid { plot, ticks: [0.0, 0.5, 1.0].map(|f| fmt_compact_axis(Metric::Tokens, max * f)).to_vec() }
+                    ActivityGrid { plot, ticks: ticks.map(|tick| if tick.fract() != 0.0 { format!("{tick:.1}") } else { fmt_compact_axis(Metric::Tokens, tick) }).to_vec() }
                     if !ttft {
                         for (at, day) in dated.iter().copied() {
                             if let Some((low, high)) = day.baseline_low.zip(day.baseline_high) {
@@ -1751,46 +1848,61 @@ pub(super) fn DriftBandChart(days: Vec<DriftDayPoint>, markers: Vec<DriftMarker>
                         }
                     }
                     for (at, marker) in &markers {
-                        line { x1: "{x(*at)}", x2: "{x(*at)}", y1: "{plot.top}", y2: "{plot.bottom}", class: "chart-reset", title { "{marker.label}" } }
+                        line { x1: "{x(*at)}", x2: "{x(*at)}", y1: "{plot.top - 6.0}", y2: "{plot.bottom}", class: "chart-reset", title { "{marker.label}" } }
+                        circle { cx: "{x(*at)}", cy: "{plot.top - 6.0}", r: "2.5", class: "chart-marker-dot" }
                     }
                     for pair in dated.windows(2) {
                         if let Some((a, b)) = value(pair[0].1).zip(value(pair[1].1)) && pair[1].0 - pair[0].0 == TimeDelta::days(1) {
                             line { x1: "{x(pair[0].0)}", x2: "{x(pair[1].0)}", y1: "{y(a)}", y2: "{y(b)}", class: "chart-line chart-drift-line" }
                         }
                     }
-                    for (i, (at, day)) in dated.iter().copied().enumerate() {
+                    for (i, (at, day)) in targets.iter().copied().enumerate() {
                         {
                             let cx = x(at);
                             let left = x(at - TimeDelta::hours(12));
                             let right = x(at + TimeDelta::hours(12));
-                            let outlier = !ttft && day.outlier;
+                            let outlier = !ttft && day.is_some_and(|d| d.outlier);
                             rsx! {
                                 if selected == Some(i) { TimeCrosshair { plot, x: cx } }
-                                if let Some(v) = value(day) {
+                                if let Some(v) = day.and_then(value) {
                                     circle { cx: "{cx}", cy: "{y(v)}", r: if selected == Some(i) || outlier { "4.5" } else { "2.8" },
                                         class: if outlier { "chart-outlier" } else { "chart-solid" } }
                                 }
-                                rect { x: "{left}", y: "{plot.top}", width: "{right - left}", height: "{plot.bottom - plot.top + 20.0}",
+                                rect { x: "{left}", y: "{plot.top - 9.0}", width: "{right - left}", height: "{plot.bottom - plot.top + 29.0}",
                                     fill: "transparent", class: "chart-hit", onmouseenter: move |_| active.set(Some(i)),
                                     onmouseleave: move |_| active.set(None) }
                             }
+                        }
+                    }
+                    if let Some((at, peak)) = peak {
+                        {
+                            let cx = x(at);
+                            let cy = y(peak);
+                            let align_right = cx > (plot.left + plot.right) / 2.0;
+                            let label_x = if align_right { cx - 6.0 } else { cx + 6.0 };
+                            let label_y = if cy < plot.top + 14.0 { cy + 13.0 } else { cy - 6.0 };
+                            rsx! { text { class: "activity-peak-label", pointer_events: "none", x: "{label_x}", y: "{label_y}",
+                                text_anchor: if align_right { "end" } else { "start" }, "Peak {peak:.1}" } }
                         }
                     }
                 }
                 div { role: "status",
                     if let Some(i) = selected {
                         {
-                            let (at, d) = dated[i];
-                            let observed = value(d).map_or_else(|| "Not observed".into(), |v| if ttft { format!("{v:.1} ms") } else { format!("{v:.1} tokens/reply") });
-                            let mut fields = vec![("Observed", observed), ("Replies", fmt_count(d.replies))];
-                            if !ttft {
-                                if let Some(median) = d.baseline_median_thinking { fields.push(("14d median", format!("{median:.1}"))); }
-                                if let Some((low, high)) = d.baseline_low.zip(d.baseline_high) { fields.push(("Normal band", format!("{low:.1}–{high:.1}"))); }
-                                let judgment = if d.outlier { "Outlier" } else if d.judgeable { "Not an outlier" } else { "Insufficient coverage" };
-                                fields.push(("Judgment", judgment.into()));
+                            let (at, day) = targets[i];
+                            let mut fields = Vec::new();
+                            if let Some(d) = day {
+                                let observed = value(d).map_or_else(|| "Not observed".into(), |v| if ttft { format!("{v:.1} ms") } else { format!("{v:.1} tokens/reply") });
+                                fields.extend([("Observed", observed), ("Replies", fmt_count(d.replies))]);
+                                if !ttft {
+                                    if let Some(median) = d.baseline_median_thinking { fields.push(("14d median", format!("{median:.1}"))); }
+                                    if let Some((low, high)) = d.baseline_low.zip(d.baseline_high) { fields.push(("Normal band", format!("{low:.1}–{high:.1}"))); }
+                                    let judgment = if d.outlier { "Outlier" } else if d.judgeable { "Not an outlier" } else { "Insufficient coverage" };
+                                    fields.push(("Judgment", judgment.into()));
+                                }
                             }
                             for (_, marker) in markers.iter().filter(|(time, _)| *time == at) { fields.push(("Client change", marker.label.clone())); }
-                            rsx! { ActivityReadout { right: view.fraction(at) < 0.5, heading: d.date.clone(), fields } }
+                            rsx! { ActivityReadout { right: view.fraction(at) < 0.5, heading: at.format("%Y-%m-%d").to_string(), fields } }
                         }
                     }
                 }
@@ -1817,15 +1929,39 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_trend_labels_match_bucket_width() {
-        let at = DateTime::UNIX_EPOCH + TimeDelta::hours(9);
+    fn time_axes_label_midnight_and_keep_the_closing_date() {
+        let start = DateTime::UNIX_EPOCH + TimeDelta::hours(10);
+        let view = TimeBounds { start, end: start + TimeDelta::days(1) };
         assert_eq!(bucket_badge(Some(3600)), Some("Hourly · 24h"));
         assert_eq!(bucket_badge(Some(10800)), Some("3-hour · 7d"));
         assert_eq!(bucket_badge(Some(86400)), Some("Daily"));
-        assert_eq!(bucket_label(at, 3600), "09:00");
-        assert_eq!(bucket_label(DateTime::UNIX_EPOCH, 10800), "Jan 01");
-        assert_eq!(bucket_label(at, 10800), "Jan 01 09:00");
-        assert_eq!(bucket_label(at, 86400), "Jan 01");
+        let ticks = time_ticks(view, 260.0, true, false);
+        assert_eq!(ticks.len(), 3);
+        assert_eq!(ticks[0], (view.start, "Jan 01 10:00".into()));
+        assert_eq!(ticks[1], (DateTime::UNIX_EPOCH + TimeDelta::days(1), "Jan 02 00:00".into()));
+        assert_eq!(ticks[2], (view.end, "10:00".into()));
+        assert_eq!(
+            time_ticks(view, 1000.0, false, false).into_iter().map(|(_, label)| label).collect::<Vec<_>>(),
+            ["Jan 01 10:00", "16:00", "Jan 02 00:00", "04:00", "10:00"]
+        );
+        let wide = TimeBounds { start, end: start + TimeDelta::days(7) };
+        let dates = time_ticks(wide, 300.0, false, true);
+        assert!((4..=5).contains(&dates.len()));
+        assert_eq!(dates.last(), Some(&(wide.end, "Jan 08".into())));
+    }
+
+    #[test]
+    fn quota_pool_defaults_to_multiples_only_above_six_series() {
+        assert!(!quota_defaults_to_multiples(true, 6));
+        assert!(quota_defaults_to_multiples(true, 7));
+        assert!(!quota_defaults_to_multiples(false, 12));
+    }
+
+    #[test]
+    fn drift_ticks_cover_the_data_with_round_intervals() {
+        assert_eq!(drift_ticks(1884.0), [0.0, 1000.0, 2000.0]);
+        assert_eq!(drift_ticks(42.0), [0.0, 25.0, 50.0]);
+        assert_eq!(drift_ticks(0.0), [0.0, 1.0, 2.0]);
     }
 
     #[test]
@@ -1839,8 +1975,8 @@ mod tests {
         }
         let mutations = VirtualDom::new(app).rebuild_to_vec();
         let heights = svg_attribute_values(&mutations, "height");
-        assert!(heights.contains(&"65")); // Half the input of the highest-volume bucket.
-        assert!(heights.contains(&"130"));
+        assert!(heights.contains(&"12")); // Half the input of the highest-volume bucket.
+        assert!(heights.contains(&"24"));
         assert!(!heights.contains(&"0")); // No empty volume rectangle for the unobserved bucket.
         let rendered = format!("{mutations:?}");
         assert!(rendered.contains("activity-volume-bar"));
@@ -1880,6 +2016,7 @@ mod tests {
         assert_eq!(rendered.matches("14d median").count(), 1);
         assert_eq!(rendered.matches("Normal band").count(), 1);
         assert_eq!(rendered.matches("Updated client").count(), 2);
+        assert!(rendered.contains("Peak 260.0"));
         assert!(rendered.contains("Daily median TTFT (ms)"));
     }
 
@@ -2075,9 +2212,9 @@ mod tests {
         let mutations = VirtualDom::new(app).rebuild_to_vec();
         let ends = svg_attribute_values(&mutations, "x2");
         let count = |x| ends.iter().filter(|&&v| v == x).count();
-        assert_eq!(count("216"), 2); // Axis tick and line segment end.
-        assert_eq!(count("328"), 1); // Missing bucket gets an axis tick, not a line segment.
-        assert_eq!(count("552"), 2);
+        assert_eq!(count("216"), 1); // Line segment end at the bucket's center.
+        assert_eq!(count("328"), 0); // Missing bucket gets no line segment.
+        assert_eq!(count("552"), 1);
         let rendered = format!("{mutations:?}");
         assert!(rendered.contains("1970-01-03 → 1970-01-04 UTC"));
     }

@@ -280,7 +280,6 @@ fn OverviewBoard(
                             && let Some(label) = bucket_badge(report.bucket_seconds) {
                             Chip { label: label.to_string(), tone: Some("amber".to_string()) }
                         }
-                        if tile.kind == "heatmap" { HeatmapScale { metric: Metric::parse(&tile.metric) } }
                     }
                     {
                         let metric = Metric::parse(&tile.metric);
@@ -302,7 +301,8 @@ fn OverviewBoard(
                                         }
                                     }
                                     p { class: "muted",
-                                        "{fmt_count(report.cache_read_tokens)} read · {fmt_count(report.cache_write_tokens)} write · {fmt_count(report.input_tokens.saturating_sub(report.cache_read_tokens))} uncached input"
+                                         "{fmt_count(report.cache_read_tokens)} read · {fmt_count(report.cache_write_tokens)} write · "
+                                         span { class: "nowrap-unit", "{fmt_count(report.input_tokens.saturating_sub(report.cache_read_tokens))} uncached input" }
                                     }
                                 }
                             },
@@ -397,15 +397,15 @@ mod tests {
     fn thinking_buckets_follow_numeric_ranges() {
         let mut labels = ["2k–8k", "501–2k", "8k+", "0 (no thinking)", "1–500"];
         labels.sort_by_key(|label| thinking_bucket_order(label));
-        assert_eq!(labels, ["0 (no thinking)", "1–500", "501–2k", "2k–8k", "8k+"]);
-        assert_eq!(thinking_bucket_order("0"), 0);
+        assert_eq!(labels.map(thinking_bucket_label), ["0", "1–500", "501–2,000", "2,001–8,000", "8,001+"]);
+        assert_eq!(thinking_bucket_label("custom"), "custom");
     }
 
     #[test]
     fn drift_status_distinguishes_coverage_from_a_verdict() {
-        assert_eq!(drift_status(false, 0), "Baseline warming up (needs ≥5 prior qualifying days)");
-        assert_eq!(drift_status(true, 0), "Within normal band");
-        assert_eq!(drift_status(true, 2), "Drift detected (2 outlier days)");
+        assert_eq!(drift_status(false, 0, 3), "Baseline warming up · 3 of 5 qualifying days");
+        assert_eq!(drift_status(true, 0, 6), "Within normal band");
+        assert_eq!(drift_status(true, 2, 6), "Drift detected (2 outlier days)");
     }
 
     #[test]
@@ -488,7 +488,9 @@ fn Compare(scope: ActivityScope) -> Element {
             let max_ttft = report.rows.iter().filter_map(ttft).fold(0.0, f64::max);
             let total_cost = report.rows.iter().map(|r| r.api_equivalent_cost_usd).sum();
             rsx! {
-                Choice { label: "Baseline", value: baseline(), options, change: move |v| baseline.set(v) }
+                div { class: "comparison-baseline",
+                    Choice { label: "Baseline", value: baseline(), options, change: move |v| baseline.set(v) }
+                }
                 p { "Effective baseline: {text(&report.baseline_key)} · pricing as of {report.price_as_of}" }
                 p { class: "form-help",
                     "Bars show share of total listed cost and time to first token (TTFT) relative to the slowest row. TTFT is the median of the observed daily medians."
@@ -496,11 +498,34 @@ fn Compare(scope: ActivityScope) -> Element {
                     else if latency_result.as_ref().is_some_and(Result::is_err) { " Latency could not be loaded." }
                 }
                 BreakdownTable { label: "Model and effort comparison", empty: report.rows.is_empty(), headers: &[
-                    "Model", "Effort", "Cost USD", "Typical daily TTFT (ms)", "Requests", "Failed",
-                    "Mean cost/req", "Cost/1M tokens", "Cache hit %", "Failed cost %", "Thinking/output %", "Fast/flex %", "Root tasks",
-                    "Median task $", "Mean task $", "P90 task $", "Median tokens/task", "Median req/task", "Mixed tasks %", "Other models %", "Subagent $",
-                    "Baseline cache Δ pp", "Detail coverage %", "$/1M input", "$/1M output", "$/1M cache read", "$/1M cache write (5m)"
+                    "Model", "Effort", "Reqs", "Est. cost (% share)", "vs base", "Median TTFT", "Fail %"
                 ],
+                    for r in &report.rows {
+                        tr { key: "{r.key}",
+                            th { scope: "row", "{r.model}" }
+                            td { "{text(&r.effort)}" }
+                            td { "{fmt_count(r.requests)}" }
+                            td { ShareBar { label: usd(r.api_equivalent_cost_usd), value: r.api_equivalent_cost_usd, total: total_cost, show_share: true } }
+                            td { {baseline_delta(r.baseline_cost_multiple)} }
+                            td {
+                                if let Some(ms) = ttft(r) {
+                                    ShareBar { label: format!("{ms:.1} ms"), value: ms, total: max_ttft, scale_label: "of slowest listed value" }
+                                } else { "—" }
+                            }
+                            td {
+                                if r.requests > 0 { "{r.failures as f64 * 100.0 / r.requests as f64:.1}%" }
+                                else { "—" }
+                            }
+                        }
+                    }
+                }
+                details { summary { "Mean cost, latency deltas and other diagnostics" }
+                    BreakdownTable { label: "Comparison diagnostics", empty: report.rows.is_empty(), headers: &[
+                        "Model", "Effort", "Failed reqs", "TTFT vs base", "Mean cost/req", "Mean cost vs base",
+                        "Cost/1M tokens", "Cache hit %", "Failed cost %", "Thinking/output %", "Fast/flex %", "Root tasks",
+                        "Median task $", "Mean task $", "P90 task $", "Median tokens/task", "Median req/task", "Mixed tasks %", "Other models %", "Subagent $",
+                        "Baseline cache Δ pp", "Detail coverage %", "$/1M input", "$/1M output", "$/1M cache read", "$/1M cache write (5m)"
+                    ],
                     for r in &report.rows {
                         {
                             let latency = ttft(r);
@@ -509,21 +534,10 @@ fn Compare(scope: ActivityScope) -> Element {
                                 tr { key: "{r.key}",
                                     th { scope: "row", "{r.model}" }
                                     td { "{text(&r.effort)}" }
-                                    td { div { class: "comparison-value",
-                                        ShareBar { label: usd(r.api_equivalent_cost_usd), value: r.api_equivalent_cost_usd, total: total_cost }
-                                        {baseline_delta(r.baseline_cost_multiple)}
-                                    } }
-                                    td {
-                                        if let Some(ms) = latency {
-                                            div { class: "comparison-value",
-                                                ShareBar { label: number(Some(ms)), value: ms, total: max_ttft, scale_label: "of slowest listed value" }
-                                                {baseline_delta(latency_multiple)}
-                                            }
-                                        } else { "—" }
-                                    }
-                                    td { "{fmt_count(r.requests)}" }
                                     td { "{fmt_count(r.failures)}" }
-                                    td { div { class: "comparison-value", "{money(r.mean_cost_per_request)}" {baseline_delta(r.baseline_req_cost_multiple)} } }
+                                    td { {baseline_delta(latency_multiple)} }
+                                    td { "{money(r.mean_cost_per_request)}" }
+                                    td { {baseline_delta(r.baseline_req_cost_multiple)} }
                                     for cell in [
                                         money(r.cost_per_m_tokens), number(Some(r.cache_hit_pct)), number(Some(r.failed_cost_share_pct)),
                                         number(Some(r.thinking_output_share_pct)), number(Some(r.fast_flex_share_pct)), fmt_count(r.root_tasks),
@@ -539,6 +553,7 @@ fn Compare(scope: ActivityScope) -> Element {
                             }
                         }
                     }
+                }
                 }
                 details { summary { "Reference price catalog ({report.price_catalog.len()})" }
                     Table { label: "Reference price catalog", headers: &["Model", "Pattern", "Effective date", "Currency", "Input / 1M", "Output / 1M", "Cache read / 1M", "Cache write 5m / 1M", "Source"],
@@ -566,12 +581,12 @@ fn baseline_delta(multiple: Option<f64>) -> Element {
     rsx! { span { class: "chip {tone}", title: "Change versus selected baseline", aria_label: "{delta} versus selected baseline", "{delta}" } }
 }
 
-fn drift_status(has_judgment: bool, outliers: u64) -> String {
+fn drift_status(has_judgment: bool, outliers: u64, qualifying: usize) -> String {
     match (has_judgment, outliers) {
         (_, 1) => "Drift detected (1 outlier day)".into(),
         (_, n) if n > 1 => format!("Drift detected ({n} outlier days)"),
         (true, _) => "Within normal band".into(),
-        _ => "Baseline warming up (needs ≥5 prior qualifying days)".into(),
+        _ => format!("Baseline warming up · {qualifying} of 5 qualifying days"),
     }
 }
 
@@ -600,7 +615,9 @@ fn Drift(scope: ActivityScope, providers: Vec<ProviderSummary>) -> Element {
             for s in &report.series {
                 article { key: "{s.model}-{s.effort.as_deref().unwrap_or_default()}", class: "provider-inset stack",
                     h3 { "{s.model} · {text(&s.effort)}" }
-                    if !ttft() { p { "{drift_status(s.days.iter().any(|d| d.judgeable), s.outlier_days)}" } }
+                    if !ttft() {
+                        p { "{drift_status(s.days.iter().any(|d| d.judgeable), s.outlier_days, s.days.iter().filter(|d| d.replies >= 30).count())}" }
+                    }
                     DriftBandChart { days: s.days.clone(), markers: report.markers.clone(), ttft: ttft() }
                     details { summary { "Daily drift measurements" }
                         Table { label: "Daily drift", headers: &["Date", "Replies", "Thinking/reply", "Output/reply", "No thinking %", "Median TTFT (ms)", "Failure %", "Normal low", "Normal median", "Normal high", "Judgment"],
@@ -749,7 +766,7 @@ fn Thinking(scope: ActivityScope, providers: Vec<ProviderSummary>) -> Element {
                 rows: r.alternatives.iter().map(|a| vec![format!("Estimate · {}", a.label), a.target_model.clone(), text(&a.target_effort),
                     usd(a.estimated_cost_usd), usd(a.estimated_savings_usd), number(Some(a.estimated_savings_pct))]).collect() }
             if !allowed.is_empty() { ThinkingProbe { providers: allowed.clone(), model_default: r.selected_model.clone(), effort_default: r.selected_effort.clone() } }
-            h3 { "Executed Thinking Tests" }
+            h3 { "Thinking probe history" }
             Table { label: "Thinking test runs", headers: &["Ran", "Baseline", "Effort", "Comparison", "Compare effort", "Turns", "Judge", "Equivalence", "Measured cost Δ %", "Status"],
                 rows: r.test_runs.iter().map(|t| vec![fmt_dt(t.ran_at), t.baseline_model.clone(), t.baseline_effort.clone(), t.compare_model.clone(), text(&t.compare_effort),
                     t.sampled_turns.to_string(), text(&t.judge_model), number(t.equivalence_rate), number(t.measured_cost_delta_pct), t.status.clone()]).collect() }
@@ -758,13 +775,23 @@ fn Thinking(scope: ActivityScope, providers: Vec<ProviderSummary>) -> Element {
 }
 
 fn thinking_bucket_order(label: &str) -> usize {
-    match label {
-        "0" | "0 (no thinking)" => 0,
+    match thinking_bucket_label(label) {
+        "0" => 0,
         "1–500" => 1,
-        "501–2k" => 501,
-        "2k–8k" => 2001,
-        "8k+" => 8001,
+        "501–2,000" => 501,
+        "2,001–8,000" => 2001,
+        "8,001+" => 8001,
         _ => usize::MAX,
+    }
+}
+
+fn thinking_bucket_label(label: &str) -> &str {
+    match label {
+        "0 (no thinking)" => "0",
+        "501–2k" => "501–2,000",
+        "2k–8k" => "2,001–8,000",
+        "8k+" => "8,001+",
+        _ => label,
     }
 }
 
@@ -773,21 +800,24 @@ fn thinking_buckets(label: &'static str, group: &'static str, rows: &[ThinkingBu
     let mut rows: Vec<_> = rows.iter().collect();
     let headers: &'static [&'static str] = if group == "Bucket" {
         rows.sort_by_key(|b| thinking_bucket_order(&b.label));
-        &["Bucket", "Turns", "Thinking", "Output", "Estimated thinking cost"]
+        &["Bucket", "Turns", "Thinking", "Output", "Est. cost (% of thinking)"]
     } else {
-        &["Effort", "Turns", "Thinking", "Output", "Estimated thinking cost"]
+        &["Effort", "Turns", "Thinking", "Output", "Est. cost (% of thinking)"]
     };
     rsx! {
+        div { class: "thinking-costs",
         BreakdownTable { label, empty: rows.is_empty(), headers,
             for b in rows {
                 tr { key: "{b.label}",
-                    th { scope: "row", "{b.label}" }
+                    th { scope: "row", if group == "Bucket" { "{thinking_bucket_label(&b.label)}" } else { "{b.label}" } }
                     td { "{fmt_count(b.turns)}" }
                     td { "{fmt_count(b.thinking_tokens)}" }
                     td { "{fmt_count(b.output_tokens)}" }
-                    td { ShareBar { label: usd(b.estimated_thinking_cost_usd), value: b.estimated_thinking_cost_usd, total } }
+                    td { ShareBar { label: usd(b.estimated_thinking_cost_usd), value: b.estimated_thinking_cost_usd, total,
+                        scale_label: "of listed thinking cost", show_share: true } }
                 }
             }
+        }
         }
     }
 }
@@ -802,7 +832,7 @@ fn ThinkingProbe(providers: Vec<ProviderSummary>, model_default: Option<String>,
     let mut count = use_signal(|| String::from("6"));
     let parsed = count().parse::<u32>().ok().filter(|n| (1..=100).contains(n));
     rsx! { article { class: "provider-inset stack",
-        h3 { "Thinking test" }
+        h3 { "Thinking probe checks" }
         p { class: "muted", "An explicit paid/quota-consuming probe; judge scores are not ground truth." }
         div { class: "row",
             Choice { label: "Provider", value: id(), options: provider_choices(&providers), change: move |v| id.set(v) }
