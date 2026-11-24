@@ -298,65 +298,58 @@ pub fn ProvidersView() -> Element {
     let all = loaded.data.unwrap_or_default();
     let selection = selected.cloned();
     let scoped: Vec<_> = all.iter().filter(|row| selection.is_empty() || row.descriptor.id == selection).cloned().collect();
+    let section = tab();
+    let show_provider_filters = section < 4;
+    let view_key = if section == 2 { "" } else { &selection };
     let settings = panel.settings.cloned();
-    let refreshable: Vec<_> = scoped.iter().filter(|p| supports(p, None, ProviderCapability::RefreshQuota)).cloned().collect();
-    let refresh_client = client.clone();
     let mask_client = client.clone();
     let sort_client = client.clone();
     rsx! {
         main { class: "work providers-work stack",
-            header { class: "glass-card providers-toolbar stack",
-                div { class: "row", role: "group", aria_label: "Provider",
-                    span { class: "label-tech", "Provider" }
-                    button { class: "btn btn-glass provider-pill", aria_pressed: selection.is_empty(), onclick: move |_| selected.set(String::new()), "All" }
-                    for provider in &all {
-                        {
-                            let id = provider.descriptor.id.clone();
-                            rsx! { button {
-                                key: "{id}", class: "btn btn-glass provider-pill", aria_pressed: id == selection,
-                                onclick: move |_| selected.set(id.clone()), "{provider.descriptor.label}"
-                            } }
-                        }
-                    }
-                    div { class: "spacer" }
-                    Check { label: "Mask emails", value: settings.mask_emails, disabled: !settings_ready(),
-                        change: move |value| {
-                            panel.settings.write().mask_emails = value;
-                            if panel.operator() && settings_ready() {
-                                schedule_toolbar_settings_save(panel, mask_client.clone());
-                            }
-                        } }
-                    Choice { label: "Account sort", value: sort_key(settings.account_sort), options: pairs(SORTS),
-                        change: move |value: String| {
-                            let order = sort_order(&value);
-                            panel.settings.write().account_sort = order;
-                            if panel.operator() && settings_ready() {
-                                schedule_toolbar_settings_save(panel, sort_client.clone());
-                            }
-                        } }
-                    button { class: "btn btn-glass", onclick: move |_| panel.changed(), "Reload provider data" }
-                    button {
-                        class: "btn btn-primary", disabled: refreshable.is_empty() || (panel.busy)() || inventory_stale || !panel.operator(),
-                        title: "Ask supported providers to collect fresh quota",
-                        onclick: move |_| {
-                            let Some(busy) = panel.begin() else { return; };
-                            let targets = refreshable.clone();
-                            let client = refresh_client.clone();
-                            spawn(async move {
-                                let _busy = busy;
-                                for provider in targets {
-                                    execute_operation(panel, &client, &provider.descriptor.id, None, None,
-                                        ProviderCommand::Quota(QuotaCommand::RefreshQuota { account_id: None })).await;
-                                }
-                            });
-                        },
-                        "Refresh"
+            header { class: "glass-card providers-toolbar stack", style: "padding: 8px 12px; gap: 6px;",
+                nav { class: "tab-bar", style: "padding-top: 0; border-top: 0;", aria_label: "AI Usage sections",
+                    for (i, label) in TABS.into_iter().enumerate() {
+                        button { key: "{label}", class: if section == i { "tab-btn active" } else { "tab-btn" },
+                            aria_current: if section == i { "page" } else { "false" }, onclick: move |_| tab.set(i), "{label}" }
                     }
                 }
-                nav { class: "row", aria_label: "AI Usage sections",
-                    for (i, label) in TABS.into_iter().enumerate() {
-                        button { key: "{label}", class: "btn btn-glass provider-pill",
-                            aria_current: if tab() == i { "page" } else { "false" }, onclick: move |_| tab.set(i), "{label}" }
+                if show_provider_filters {
+                    div { class: "provider-bar", role: "group", aria_label: "Provider filter",
+                        button { class: "filter-chip", aria_pressed: selection.is_empty(), onclick: move |_| selected.set(String::new()), "All" }
+                        for provider in &all {
+                            {
+                                let id = provider.descriptor.id.clone();
+                                rsx! { button {
+                                    key: "{id}", class: "filter-chip", aria_pressed: id == selection,
+                                    onclick: move |_| selected.set(id.clone()), "{provider.descriptor.label}"
+                                } }
+                            }
+                        }
+                    }
+                }
+                if section < 5 {
+                    div { class: "row",
+                        if section < 2 {
+                            Choice { label: "Account sort", value: sort_key(settings.account_sort), options: pairs(SORTS),
+                                change: move |value: String| {
+                                    panel.settings.write().account_sort = sort_order(&value);
+                                    if panel.operator() && settings_ready() {
+                                        schedule_toolbar_settings_save(panel, sort_client.clone());
+                                    }
+                                } }
+                        }
+                        if show_provider_filters {
+                            Check { label: "Mask emails", value: settings.mask_emails, disabled: !settings_ready(),
+                                change: move |value| {
+                                    panel.settings.write().mask_emails = value;
+                                    if panel.operator() && settings_ready() {
+                                        schedule_toolbar_settings_save(panel, mask_client.clone());
+                                    }
+                                } }
+                        }
+                        if section != 2 {
+                            button { class: "btn secondary", title: "Reload provider data from the hub", onclick: move |_| panel.changed(), "Reload" }
+                        }
                     }
                 }
             }
@@ -413,21 +406,23 @@ pub fn ProvidersView() -> Element {
                     }
                 }
             }
-            for provider in scoped.iter().filter(|row| row.descriptor.health == ProviderHealth::Offline) {
-                p { key: "{provider.descriptor.id}", class: "monitoring-error", role: "status",
-                    {format!("{} offline — {}", provider.descriptor.label, provider.descriptor.status_message.as_deref().unwrap_or("last observation only"))}
+            if show_provider_filters {
+                for provider in scoped.iter().filter(|row| row.descriptor.health == ProviderHealth::Offline) {
+                    p { key: "{provider.descriptor.id}", class: "monitoring-error", role: "status",
+                        {format!("{} offline — {}", provider.descriptor.label, provider.descriptor.status_message.as_deref().unwrap_or("last observation only"))}
+                    }
                 }
+                if loaded.loading { Loading { text: "Loading model providers…".to_string() } }
             }
-            if loaded.loading { Loading { text: "Loading model providers…".to_string() } }
-            if !loaded.loading && scoped.is_empty() && !inventory_stale && matches!(tab(), 0 | 1 | 3) {
+            if !loaded.loading && scoped.is_empty() && !inventory_stale && matches!(section, 0 | 1 | 3) {
                 EmptyState { title: "No providers in this view.".to_string(), hint: Some("Select All or register a provider with the hub.".into()) }
             }
-            // Remount scoped data when the provider changes; never flash the previous provider's detail.
-            {rsx! { div { key: "{selection}", class: "stack",
-                match tab() {
-                    0 => rsx! { dashboard::Dashboard { providers: scoped, stale: inventory_stale } },
+            // Activity keys its results separately so provider changes retain the other filters.
+            {rsx! { div { key: "{view_key}", class: "stack",
+                match section {
+                    0 => rsx! { dashboard::Dashboard { providers: scoped, stale: inventory_stale, all_providers: selection.is_empty() } },
                     1 => rsx! { accounts::Accounts { providers: scoped } },
-                    2 => rsx! { activity::Activity { providers: all, selected: optional(&selection) } },
+                    2 => rsx! { activity::Activity { providers: all, selected } },
                     3 => rsx! { routing::Routing { providers: scoped } },
                     4 => rsx! { data_settings::DataExport {} },
                     _ => rsx! { data_settings::SettingsHelp { providers: all, ready: settings_ready() } },
@@ -487,6 +482,7 @@ fn OperationButton(
     #[props(optional)] revision: Option<i64>,
     #[props(default)] confirm: bool,
     #[props(default)] disabled: bool,
+    #[props(optional)] tone: Option<&'static str>,
 ) -> Element {
     let panel = use_context::<PanelState>();
     let client = use_context::<HubClient>();
@@ -495,10 +491,11 @@ fn OperationButton(
         return rsx! {};
     }
     let confirming = armed.read().as_ref() == Some(&command);
+    let tone = tone.unwrap_or(if confirming { "danger" } else { "secondary" });
     rsx! {
         span { class: "row",
             button {
-                class: if confirming { "btn btn-danger-ghost" } else { "btn btn-glass" },
+                class: "btn {tone}",
                 disabled: disabled || (panel.busy)(),
                 onclick: move |_| {
                     if confirm && armed.peek().as_ref() != Some(&command) {
@@ -516,7 +513,7 @@ fn OperationButton(
                 if confirming { "Confirm: {label}" } else { "{label}" }
             }
             if confirming {
-                button { class: "btn btn-glass", onclick: move |_| armed.set(None), "Cancel" }
+                button { class: "btn ghost", onclick: move |_| armed.set(None), "Cancel" }
             }
         }
     }
@@ -643,9 +640,15 @@ fn pairs(options: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 #[component]
-fn Choice(label: &'static str, #[props(into)] value: String, options: Vec<(String, String)>, change: EventHandler<String>) -> Element {
+fn Choice(
+    label: &'static str,
+    #[props(into)] value: String,
+    options: Vec<(String, String)>,
+    #[props(optional)] description_id: Option<String>,
+    change: EventHandler<String>,
+) -> Element {
     rsx! { label { class: "provider-field", span { "{label}" }
-        select { class: "input", value: "{value}", onchange: move |e| change.call(e.value()),
+        select { class: "input", value: "{value}", aria_describedby: description_id, onchange: move |e| change.call(e.value()),
             for (key, text) in options { option { key: "{key}", value: "{key}", "{text}" } }
         }
     } }
@@ -656,17 +659,24 @@ fn Field(
     label: &'static str,
     #[props(into)] value: String,
     #[props(default = "text")] kind: &'static str,
+    #[props(optional)] description_id: Option<String>,
     change: EventHandler<String>,
 ) -> Element {
     rsx! { label { class: "provider-field", span { "{label}" }
-        input { class: "input", r#type: kind, value: "{value}", oninput: move |e| change.call(e.value()) }
+        input { class: "input", r#type: kind, value: "{value}", aria_describedby: description_id, oninput: move |e| change.call(e.value()) }
     } }
 }
 
 #[component]
-fn Check(label: &'static str, value: bool, #[props(default)] disabled: bool, change: EventHandler<bool>) -> Element {
+fn Check(
+    label: &'static str,
+    value: bool,
+    #[props(default)] disabled: bool,
+    #[props(optional)] description_id: Option<String>,
+    change: EventHandler<bool>,
+) -> Element {
     rsx! { label { class: "row provider-check",
-        input { r#type: "checkbox", checked: value, disabled, onchange: move |e| change.call(e.checked()) }
+        input { r#type: "checkbox", checked: value, disabled, aria_describedby: description_id, onchange: move |e| change.call(e.checked()) }
         "{label}"
     } }
 }
@@ -720,6 +730,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn account_sort_keeps_the_active_login_first() {
+        let provider: ProviderSummary = serde_json::from_value(serde_json::json!({
+            "descriptor": {
+                "id": "test", "label": "Test", "family": "test",
+                "mode": "fixture", "verification": "built"
+            },
+            "account_count": 3, "enabled_accounts": 3, "pools": [],
+            "accounts": [
+                {"id": "z", "provider_id": "test", "source_account_id": "z", "display_name": "Zulu", "is_active": true},
+                {"id": "b", "provider_id": "test", "source_account_id": "b", "display_name": "Bravo"},
+                {"id": "a", "provider_id": "test", "source_account_id": "a", "display_name": "Alpha", "is_next_pick": true}
+            ]
+        }))
+        .unwrap();
+        let rows = dashboard::sorted_accounts(&provider, AccountSortOrder::Name, false);
+        assert_eq!(rows.iter().map(|account| account.id.as_str()).collect::<Vec<_>>(), ["z", "a", "b"]);
+    }
+
+    #[test]
     fn unknown_read_only_provider_renders_without_quota_controls() {
         fn app() -> Element {
             use_context_provider(|| HubClient::new("http://127.0.0.1:1", ""));
@@ -769,7 +798,7 @@ mod tests {
                 next_pick_account_id: None,
             };
             rsx! {
-                dashboard::Dashboard { providers: vec![provider.clone()], stale: false }
+                dashboard::Dashboard { providers: vec![provider.clone()], stale: false, all_providers: true }
                 OperationButton { provider, label: "Must not render",
                     command: ProviderCommand::Quota(QuotaCommand::RefreshQuota { account_id: None }) }
             }
@@ -777,6 +806,7 @@ mod tests {
         let output = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
         assert!(output.contains("Future provider"));
         assert!(output.contains("Not observed"));
+        assert!(output.contains("Future provider · No quota reading · Not observed"));
         assert!(!output.contains("Must not render"));
     }
 

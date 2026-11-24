@@ -22,7 +22,7 @@ const PALETTE: &[(&str, &str)] = &[
     ("elevated", "--elevated"),
     ("border", "--border"),
     ("text", "--text"),
-    ("textMuted", "--text-2"),
+    ("textMuted", "--text-muted"),
     ("accent", "--honey"),
     ("focus", "--focus"),
     ("ok", "--ok"),
@@ -122,6 +122,10 @@ fn parse_theme_json(body: &str) -> Result<(String, Option<Rgba>), String> {
         }
         declarations.push_str(&format!("{variable}:{color};"));
     }
+    if bg.is_some_and(|rgba| !is_dark_rgb(rgba)) {
+        declarations
+            .push_str("--color-scheme: light;--text-dim:var(--text-muted);--line-subtle:color-mix(in srgb,var(--text) 12%,transparent);");
+    }
     let css = if declarations.is_empty() { String::new() } else { format!(":root{{{declarations}}}") };
     Ok((css, bg))
 }
@@ -196,7 +200,13 @@ mod tests {
     #[test]
     fn palette_overrides_accept_only_hex_colors() {
         let css = overrides_from_json(r##"{"bg": "#f7f4ec", "textMuted": "#123ABC", "accent": "#a86f00"}"##).unwrap();
-        assert_eq!(css, ":root{--bg:#f7f4ec;--text-2:#123ABC;--honey:#a86f00;}");
+        assert_eq!(
+            css,
+            concat!(
+                ":root{--bg:#f7f4ec;--text-muted:#123ABC;--honey:#a86f00;",
+                "--color-scheme: light;--text-dim:var(--text-muted);--line-subtle:color-mix(in srgb,var(--text) 12%,transparent);}"
+            )
+        );
 
         // Injection, wrong shapes and unknown keys are dropped, not escaped.
         let hostile = r##"{"bg": "red;} body{display:none", "panel": "#12345", "card": "#gggggg", "text": 7, "mystery": "#ffffff"}"##;
@@ -215,5 +225,12 @@ mod tests {
         assert_eq!(parse_hex_rgba("not-hex"), None);
         assert!(is_dark_rgb(DEFAULT_BG_RGBA));
         assert!(!is_dark_rgb((0xf7, 0xf4, 0xec, 255)));
+    }
+
+    #[test]
+    fn native_controls_follow_the_palette() {
+        assert!(THEME_CSS.contains(":root, input, textarea, select, button { color-scheme: var(--color-scheme, dark); }"));
+        assert!(overrides_from_json(r##"{"bg":"#f7f4ec"}"##).unwrap().contains("--color-scheme: light;"));
+        assert!(!overrides_from_json(r##"{"bg":"#181714"}"##).unwrap().contains("--color-scheme: light;"));
     }
 }

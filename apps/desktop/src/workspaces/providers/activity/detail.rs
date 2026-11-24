@@ -24,10 +24,9 @@ const REQUEST_COLUMNS: &[(RequestSort, &str)] = &[
 ];
 
 #[component]
-pub(super) fn Requests(scope: ActivityScope, providers: Vec<ProviderSummary>) -> Element {
+pub(super) fn Requests(scope: ActivityScope, providers: Vec<ProviderSummary>, on_reset: EventHandler<()>) -> Element {
     let client = use_context::<HubClient>();
     let panel = use_context::<PanelState>();
-    let mut failed = use_signal(|| scope.outcome.as_deref() == Some("failed"));
     let mut cursors = use_signal(|| vec![None::<String>]);
     let mut selected = use_signal(|| None::<Uuid>);
     let mut sort = use_signal(|| (RequestSort::Time, true));
@@ -45,7 +44,6 @@ pub(super) fn Requests(scope: ActivityScope, providers: Vec<ProviderSummary>) ->
         let (client, mut scope) = (client.clone(), scope.clone());
         let _ = refresh();
         scope.cursor = cursors.read().last().cloned().flatten();
-        scope.outcome = failed().then(|| "failed".into());
         scope.limit = Some(50);
         async move { timed(client.activity_requests(&scope)).await }
     });
@@ -56,9 +54,7 @@ pub(super) fn Requests(scope: ActivityScope, providers: Vec<ProviderSummary>) ->
             h2 { "Requests" }
             p { class: "muted", "Only retained requests are listed; Totals may cover dates whose request details have expired." }
             div { class: "row",
-                Choice { label: "Request outcome", value: if failed() { "failed" } else { "" }, options: pairs(&[("", "All"), ("failed", "Failed")]),
-                    change: move |v: String| { failed.set(v == "failed"); cursors.set(vec![None]); selected.set(None); } }
-                button { class: "btn btn-glass", onclick: move |_| refresh += 1, "Refresh requests" }
+                button { class: "btn ghost", onclick: move |_| refresh += 1, "Refresh requests" }
                 Check { label: "Live first page (15s)", value: live(), change: move |v| live.set(v) }
             }
             {read_view(result.as_ref(), |page| {
@@ -83,7 +79,7 @@ pub(super) fn Requests(scope: ActivityScope, providers: Vec<ProviderSummary>) ->
                 let next = page.next_cursor.clone();
                 rsx! {
                     p { "{page.total_matched} matching · page {cursors.read().len()} · sorting within each day on this page" }
-                    if days.is_empty() { p { class: "muted", "No matching retained requests." } }
+                    if days.is_empty() { ActivityEmpty { message: "No matching retained requests.", on_reset } }
                     for (Reverse(day), rows) in days {
                         div { key: "{day}", class: "provider-table", tabindex: "0", role: "region", aria_label: "Requests · {day}",
                             table {
@@ -152,13 +148,13 @@ fn RequestInspector(id: Uuid, providers: Vec<ProviderSummary>, operator: bool, c
             h2 { "Request Inspector" }
             button { class: "btn btn-glass", onclick: move |_| close.call(()), "Close" }
         }
-        p { class: "mono muted", "{id}" }
+        p { class: "muted", "Exchange ID: " code { "{id}" } }
         {read_view(result.as_ref(), |detail| {
             let r = &detail.exchange;
             let hit_label = fmt_hit_pct(request_cache_hit_rate(r.input_tokens, r.cache_read_tokens));
             rsx! {
                 p { "{r.client} · {activity_source_label(r.source)} · {activity_purpose_label(r.purpose)} · {text(&r.transport)} · {fmt_dt(r.occurred_at)}" }
-                p { "Provider {r.provider_id} · Account {text(&r.account_id)} · Session {text(&r.session_id)} · Moved from {text(&r.moved_from_account_id)}" }
+                p { "Provider {r.provider_id} · Account {text(&r.account_id)} · Session ID: {text(&r.session_id)} · Moved from {text(&r.moved_from_account_id)}" }
                 p { "Requested {r.requested_model} → effective {r.effective_model} · effort {text(&r.effort)} · {r.outcome} · HTTP {maybe_i64(r.status_code.map(i64::from))}" }
                 p { "Latency {maybe_i64(r.latency_ms)} ms · TTFT {maybe_i64(r.ttft_ms)} ms · API-equivalent {money(r.api_equivalent_cost_usd)}" }
                 p { "Input {fmt_signed_count(r.input_tokens)} · Output {fmt_signed_count(r.output_tokens)} · Cache read {fmt_signed_count(r.cache_read_tokens)} ({hit_label}) · Cache write {fmt_signed_count(r.cache_write_tokens)} · Thinking {fmt_signed_count(r.thinking_tokens)}" }
@@ -202,7 +198,7 @@ fn RequestInspector(id: Uuid, providers: Vec<ProviderSummary>, operator: bool, c
 }
 
 #[component]
-pub(super) fn Traces(scope: ActivityScope, pin: EventHandler<EvalSeed>) -> Element {
+pub(super) fn Traces(scope: ActivityScope, on_reset: EventHandler<()>, pin: EventHandler<EvalSeed>) -> Element {
     let client = use_context::<HubClient>();
     let mut cursors = use_signal(|| vec![None::<String>]);
     let mut chosen = use_signal(|| None::<String>);
@@ -220,7 +216,7 @@ pub(super) fn Traces(scope: ActivityScope, pin: EventHandler<EvalSeed>) -> Eleme
                 let next = page.next_cursor.clone();
                 rsx! {
                     p { "Unassigned exchanges: {page.unassigned_exchanges} · page {cursors.read().len()}" }
-                    if page.items.is_empty() { p { class: "muted", "No traces in this scope." } }
+                    if page.items.is_empty() { ActivityEmpty { message: "No traces in this scope.", on_reset } }
                     for trace in &page.items {
                         {
                             let id = trace.session_id.clone();

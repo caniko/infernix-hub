@@ -1284,7 +1284,7 @@ pub struct RoutingPolicy {
     pub preferred_account_id: Option<String>,
     #[serde(default = "default_cooldown_secs")]
     pub failover_cooldown_secs: u64,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub switch_on_server_error: bool,
     #[serde(default)]
     pub near_reset_wait_secs: u64,
@@ -1310,7 +1310,7 @@ impl Default for RoutingPolicy {
             session_affinity_secs: default_affinity_secs(),
             preferred_account_id: None,
             failover_cooldown_secs: default_cooldown_secs(),
-            switch_on_server_error: true,
+            switch_on_server_error: default_true(),
             near_reset_wait_secs: 0,
             first_byte_timeout_secs: default_first_byte_secs(),
         }

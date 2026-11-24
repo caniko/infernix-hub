@@ -10,6 +10,14 @@ use contracts::{
 #[cfg(test)]
 pub const TONES: &[&str] = &["ok", "warn", "bad", "info", "muted", "amber", "sage", "error"];
 
+pub fn news_source(source: &str) -> &str {
+    match source {
+        "n8n:rss-studio" => "Studio RSS feed",
+        "windmill:f/news/scrape" => "Windmill news scraper",
+        _ => source,
+    }
+}
+
 pub fn content_state(state: ContentState) -> (&'static str, &'static str) {
     match state {
         ContentState::Idea => ("Idea", "muted"),
@@ -110,6 +118,14 @@ pub fn canon_state(state: CanonState) -> (&'static str, &'static str) {
         CanonState::Accepted => ("Accepted", "ok"),
         CanonState::Rejected => ("Rejected", "bad"),
         CanonState::Superseded => ("Superseded", "muted"),
+    }
+}
+
+pub fn author(author: &str) -> &str {
+    match author {
+        "ingest:n8n" => "n8n import",
+        "operator:operator" => "Operator",
+        _ => author,
     }
 }
 

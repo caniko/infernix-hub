@@ -6,10 +6,27 @@ use super::{charts::*, *};
 
 pub(super) const LOOKBACK: &[(&str, &str)] = &[("3", "3h"), ("6", "6h"), ("12", "12h"), ("24", "24h")];
 pub(super) const HORIZON: &[(&str, &str)] = &[("6", "6h"), ("12", "12h"), ("24", "24h"), ("48", "48h")];
+pub(super) const NEXT_PICK_HINT: &str = "Next pick for routing (cached; not model-scoped)";
 
 #[component]
-pub(super) fn Dashboard(providers: Vec<ProviderSummary>, stale: bool) -> Element {
+pub(super) fn Dashboard(providers: Vec<ProviderSummary>, stale: bool, all_providers: bool) -> Element {
     rsx! {
+        if all_providers && !providers.is_empty() {
+            div { class: "row", role: "group", aria_label: "Provider quota summary",
+                for provider in &providers {
+                    {
+                        let quota = pool_quota_summary(&provider.pools);
+                        let (health, tone) = provider_health(provider.descriptor.health, stale);
+                        rsx! {
+                            span { key: "{provider.descriptor.id}", class: "chip provider-pill {tone}",
+                                style: "white-space: normal; overflow-wrap: anywhere;",
+                                "{provider.descriptor.label} · {quota} · {health}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
         div { class: "provider-grid",
             for provider in providers {
                 ProviderCard { key: "{provider.descriptor.id}", provider, stale }
@@ -22,12 +39,45 @@ fn is_extra(kind: QuotaWindowKind) -> bool {
     matches!(kind, QuotaWindowKind::ModelScoped | QuotaWindowKind::Spend)
 }
 
-fn status(provider: &ProviderSummary, account: &ModelAccount) -> AccountStatus {
+fn provider_health(health: ProviderHealth, stale: bool) -> (&'static str, &'static str) {
+    match health {
+        ProviderHealth::Healthy if stale => ("Healthy (last known)", "muted"),
+        ProviderHealth::Healthy => ("Healthy", "ok"),
+        ProviderHealth::Degraded => ("Degraded", "warn"),
+        ProviderHealth::Offline => ("Offline", "bad"),
+        ProviderHealth::Unobserved => ("Not observed", "muted"),
+    }
+}
+
+fn pool_quota_summary(pools: &[PoolWindowSummary]) -> String {
+    pools
+        .iter()
+        .filter(|pool| !is_extra(pool.kind))
+        .filter_map(|pool| {
+            let (left, _) = quota_values(QuotaObservationState::Measured, pool.weighted_remaining_percent, pool.weighted_used_percent);
+            left.map(|left| (pool, left))
+        })
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map_or_else(
+            || "No quota reading".into(),
+            |(pool, left)| {
+                let estimate = if pool.is_estimate { "≈" } else { "" };
+                format!("{estimate}{left:.1}% left ({})", window_label(&pool.label))
+            },
+        )
+}
+
+pub(super) fn is_next_pick(provider: &ProviderSummary, account: &ModelAccount) -> bool {
+    let reported = account.is_next_pick || provider.next_pick_account_id.as_ref() == Some(&account.id);
+    reported && account_status(account, true) == AccountStatus::NextPick
+}
+
+fn account_status(account: &ModelAccount, is_next_pick: bool) -> AccountStatus {
     AccountStatus::resolve_with_error(
         account.enabled,
         account.cooldown_until,
         Utc::now(),
-        account.is_next_pick || provider.next_pick_account_id.as_ref() == Some(&account.id),
+        is_next_pick,
         account.enrollment_state == EnrollmentState::Error || (account.last_error.is_none() && account.status == AccountStatus::Error),
         account.last_error.as_ref(),
     )
@@ -52,7 +102,7 @@ pub(super) fn sorted_accounts(provider: &ProviderSummary, sort: AccountSortOrder
     };
     let mut rows: Vec<_> = provider.accounts.iter().collect();
     rows.sort_by(|a, b| {
-        let primary = match sort {
+        let primary = b.is_active.cmp(&a.is_active).then_with(|| match sort {
             AccountSortOrder::SoonestReset => {
                 next_reset(a).map_or((true, None), |v| (false, Some(v))).cmp(&next_reset(b).map_or((true, None), |v| (false, Some(v))))
             }
@@ -63,7 +113,7 @@ pub(super) fn sorted_accounts(provider: &ProviderSummary, sort: AccountSortOrder
                 _ => Ordering::Equal,
             },
             AccountSortOrder::Name => Ordering::Equal,
-        };
+        });
         primary.then_with(|| account_name(a, mask).to_lowercase().cmp(&account_name(b, mask).to_lowercase())).then_with(|| a.id.cmp(&b.id))
     });
     rows
@@ -77,69 +127,84 @@ fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
     let id = &provider.descriptor.id;
     let selected_id = selected.cloned();
     let account = selected_id.as_ref().and_then(|id| provider.accounts.iter().find(|a| &a.id == id));
-    let (health, tone) = match provider.descriptor.health {
-        ProviderHealth::Healthy if stale => ("Healthy (last known)", "muted"),
-        ProviderHealth::Healthy => ("Healthy", "ok"),
-        ProviderHealth::Degraded => ("Degraded", "warn"),
-        ProviderHealth::Offline => ("Offline", "bad"),
-        ProviderHealth::Unobserved => ("Not observed", "muted"),
-    };
+    let (health, tone) = provider_health(provider.descriptor.health, stale);
     let (mode, mode_tone) = crate::labels::adapter_mode(provider.descriptor.mode);
     let (verification, verification_tone) = crate::labels::verification(provider.descriptor.verification);
+    let fixture_announced =
+        provider.descriptor.mode == contracts::AdapterMode::Fixture
+            && panel.status.read().data.as_ref().is_some_and(|s| {
+                s.fixture_mode && !s.integrations.iter().any(|integration| integration.mode == contracts::AdapterMode::Live)
+            });
     let has_quota = provider.descriptor.evidence_kinds.contains(&EvidenceKind::QuotaWindows)
         || !provider.pools.is_empty()
         || provider.accounts.iter().any(|a| !a.windows.is_empty());
+    let count = provider.account_count;
+    let account_label = if count == 1 { "account" } else { "accounts" };
     rsx! {
-        section { class: "glass-card stack provider-card",
-            div { class: "spread",
-                h2 { "{provider.descriptor.label}" }
-                Chip { label: health.to_string(), tone: Some(tone.to_string()) }
-            }
-            div { class: "row",
-                Chip { label: mode.to_string(), tone: Some(mode_tone.to_string()) }
-                Chip { label: verification.to_string(), tone: Some(verification_tone.to_string()) }
-                span { class: "muted", "{provider.enabled_accounts} enabled / {provider.account_count} accounts" }
-            }
-            p { class: "muted", "{provider.descriptor.family} · observed {date(provider.descriptor.last_observed_at)}" }
-            if let Some(message) = &provider.descriptor.status_message { p { "{message}" } }
-            if has_quota { p { class: "muted", "Cached quota and pool readings · not evaluated for a specific model." } }
-            if provider.pools.is_empty() { p { class: "muted", if has_quota { "No pool readings yet." } else { "Quota windows not reported." } } }
-            for pool in provider.pools.iter().filter(|p| !is_extra(p.kind)) {
-                PoolWindow { key: "{pool.window_key}", pool: pool.clone() }
-            }
-            if provider.pools.iter().any(|p| is_extra(p.kind)) {
-                details { summary { "Model and spend windows" }
-                    for pool in provider.pools.iter().filter(|p| is_extra(p.kind)) {
-                        PoolWindow { key: "{pool.window_key}", pool: pool.clone() }
-                    }
-                }
-            }
-            if has_quota || account.is_some() {
+        section { class: "glass-card provider-card stack", style: "padding: 12px; gap: 8px;",
+            div { class: "stack", style: "gap: 4px;",
                 div { class: "row",
-                    h3 { if let Some(a) = account { "{account_name(a, prefs.mask_emails)} · Quota history" } else { "Pool · Quota history" } }
-                    if account.is_some() {
-                        button { class: "btn btn-glass", onclick: move |_| selected.set(None), "Back to Pool" }
+                    h2 { "{provider.descriptor.label}" }
+                    if provider.descriptor.health == ProviderHealth::Unobserved {
+                        span { class: "form-help", "{health}" }
+                    } else {
+                        Chip { label: health.to_string(), tone: Some(tone.to_string()) }
                     }
                 }
-                {rsx! { QuotaPanel {
-                    key: "{id}-{selected_id.as_deref().unwrap_or_default()}",
-                    provider: provider.clone(), account: account.cloned(), lookback_default: prefs.drain_lookback_hours,
-                    horizon_default: prefs.forecast_horizon_hours,
-                } }}
-            }
-            if !provider.accounts.is_empty() {
-                h3 { "Accounts" }
-                for account in sorted_accounts(&provider, prefs.account_sort, prefs.mask_emails) {
-                    {
-                        let account_id = account.id.clone();
-                        rsx! { AccountSummary { key: "{account.id}", provider: provider.clone(), account: account.clone(), mask: prefs.mask_emails,
-                            chart: move |_| selected.set(Some(account_id.clone())) } }
+                div { class: "row",
+                    if !fixture_announced { Chip { label: mode.to_string(), tone: Some(mode_tone.to_string()) } }
+                    if !fixture_announced || provider.descriptor.verification != contracts::Verification::FixtureTested {
+                        Chip { label: verification.to_string(), tone: Some(verification_tone.to_string()) }
+                    }
+                    span { class: "form-help", "{count} {account_label} · {provider.enabled_accounts} enabled" }
+                    if let Some(observed) = provider.descriptor.last_observed_at {
+                        span { class: "form-help", "Observed " span { class: "nowrap-unit", "{fmt_dt(observed)}" } }
                     }
                 }
+                if let Some(message) = &provider.descriptor.status_message { p { "{message}" } }
             }
-            if supports(&provider, None, ProviderCapability::StartRollingWindow)
-                || provider.accounts.iter().any(|a| a.rolling_starter.is_some()) {
-                RollingStarter { provider: provider.clone() }
+            div { class: "stack", style: "gap: 6px;",
+                if has_quota { p { class: "muted", "Cached quota and pool readings · not evaluated for a specific model." } }
+                if has_quota || account.is_some() {
+                    div { class: "row",
+                        h3 { if let Some(a) = account { "{account_name(a, prefs.mask_emails)} · History & Forecast" } else { "Pool · History & Forecast" } }
+                        if account.is_some() {
+                            button { class: "btn ghost btn-xs", onclick: move |_| selected.set(None), "Back to Pool" }
+                        }
+                    }
+                    {rsx! { QuotaPanel {
+                        key: "{id}-{selected_id.as_deref().unwrap_or_default()}",
+                        provider: provider.clone(), account: account.cloned(), lookback_default: prefs.drain_lookback_hours,
+                        horizon_default: prefs.forecast_horizon_hours,
+                    } }}
+                }
+                if provider.pools.is_empty() { p { class: "muted", if has_quota { "No pool readings yet." } else { "Quota windows not reported." } } }
+                for pool in provider.pools.iter().filter(|p| !is_extra(p.kind)) {
+                    PoolWindow { key: "{pool.window_key}", pool: pool.clone() }
+                }
+                if provider.pools.iter().any(|p| is_extra(p.kind)) {
+                    details { summary { "Model and spend windows" }
+                        for pool in provider.pools.iter().filter(|p| is_extra(p.kind)) {
+                            PoolWindow { key: "{pool.window_key}", pool: pool.clone() }
+                        }
+                    }
+                }
+                OperationButton { provider: provider.clone(), label: "Collect pool quota", disabled: stale,
+                    command: ProviderCommand::Quota(QuotaCommand::RefreshQuota { account_id: None }) }
+                if !provider.accounts.is_empty() {
+                    h3 { "Accounts" }
+                    for account in sorted_accounts(&provider, prefs.account_sort, prefs.mask_emails) {
+                        {
+                            let account_id = account.id.clone();
+                            rsx! { AccountSummary { key: "{account.id}", provider: provider.clone(), account: account.clone(), mask: prefs.mask_emails,
+                                chart: move |_| selected.set(Some(account_id.clone())) } }
+                        }
+                    }
+                }
+                if supports(&provider, None, ProviderCapability::StartRollingWindow)
+                    || provider.accounts.iter().any(|a| a.rolling_starter.is_some()) {
+                    RollingStarter { provider: provider.clone() }
+                }
             }
         }
     }
@@ -147,49 +212,75 @@ fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
 
 #[component]
 fn PoolWindow(pool: PoolWindowSummary) -> Element {
+    let weight_label = match pool.capacity_basis.as_str() {
+        "equal_entitlements" => "Equal weights",
+        "plan_tier_multiplier" | "plan_multiplier" => "Plan-tier weights",
+        _ => "Provider-defined weights",
+    };
     rsx! {
-        div { class: "quota-window",
-            strong { "{pool.label}" }
+        div { class: "quota-window", style: "padding-block: 4px;",
+            strong { "{window_label(&pool.label)}" }
             if let (Some(left), Some(used)) = quota_values(QuotaObservationState::Measured, pool.weighted_remaining_percent, pool.weighted_used_percent) {
                 Meter { left, used }
-            } else { Chip { label: "Not observed".to_string(), tone: None } }
+            } else { span { class: "form-help", "Not observed" } }
             p { class: "muted",
                 if pool.is_estimate { "Estimated pool · " }
-                "{pool.included_accounts}/{pool.eligible_accounts} eligible accounts observed · {pool.capacity_basis} · {reset_label(pool.next_reset_at)}"
+                "{pool.included_accounts}/{pool.eligible_accounts} eligible accounts observed · "
+                span { title: "{pool.capacity_basis}", "{weight_label}" }
+                " · " ResetTime { at: pool.next_reset_at }
             }
         }
     }
 }
 
 #[component]
-pub(super) fn AccountIdentity(provider: ProviderSummary, account: ModelAccount, mask: bool) -> Element {
-    let (label, tone) = match status(&provider, &account) {
+pub(super) fn AccountIdentity(
+    provider: ProviderSummary,
+    account: ModelAccount,
+    mask: bool,
+    #[props(default)] show_last_used: bool,
+) -> Element {
+    // Next pick is a routing hint, not an account health state.
+    let (label, tone) = match account_status(&account, false) {
         AccountStatus::Disabled => ("Disabled", "muted"),
         AccountStatus::Limited => ("Limited", "warn"),
-        AccountStatus::NextPick => ("Next pick (cached; not model-scoped)", "info"),
         AccountStatus::Error => ("Error", "bad"),
-        AccountStatus::Ready => ("Ready", "ok"),
+        _ if account.is_active => ("Active", "info"),
+        _ => ("Ready", "ok"),
+    };
+    let credential = match account.enrollment_state {
+        EnrollmentState::Selected if account.is_active => None,
+        EnrollmentState::Error if label == "Error" => None,
+        state => Some(enrollment_state_label(state)),
     };
     let email = if mask {
         account.masked_email.clone().or_else(|| account.email.as_deref().map(mask_email))
     } else {
         account.email.clone().or_else(|| account.masked_email.clone())
     };
+    let name = account_name(&account, mask);
+    let capacity = account.tier_multiplier.map(|tier| format!("{tier}×"));
     let message = account.status_message.clone().or_else(|| account.last_error.as_ref().map(AccountError::summary));
     let hint = account.last_error.as_ref().and_then(|error| error.action_hint.as_deref());
     rsx! {
         div { class: "row",
-            strong { "{account_name(&account, mask)}" }
-            Chip { label: label.to_string(), tone: Some(tone.to_string()) }
-            Chip { label: enrollment_state_label(account.enrollment_state).to_string(), tone: Some("muted".to_string()) }
-            if account.is_active { Chip { label: "Active".to_string(), tone: Some("info".to_string()) } }
-            if account.is_preferred { Chip { label: "Preferred".to_string(), tone: Some("info".to_string()) } }
+            strong { "{name}" }
+            span { title: is_next_pick(&provider, &account).then_some(NEXT_PICK_HINT),
+                Chip { label: label.to_string(), tone: Some(tone.to_string()) }
+            }
+            if let Some(credential) = credential {
+                Chip { label: credential.to_string(), tone: Some("muted".to_string()) }
+            }
         }
         div { class: "row muted",
-            if let Some(email) = email { span { "{email}" } }
+            if let Some(email) = email.filter(|email| *email != name) { span { "{email}" } }
             if let Some(plan) = &account.plan { span { "{plan}" } }
-            if let Some(tier) = account.tier_multiplier { span { "{tier}× capacity" } }
-            if label == "Limited" { span { "Cooldown until {date(account.cooldown_until)}" } }
+            if let Some(capacity) = capacity.filter(|tier| !account.plan.as_deref().is_some_and(|plan| plan.split_whitespace().any(|part| part == tier))) {
+                span { "{capacity} capacity" }
+            }
+            if account.is_preferred { span { class: "form-help", "Preferred for routing" } }
+            if show_last_used { span { class: "form-help", "Last used: " span { class: "nowrap-unit", "{date(account.last_used_at)}" } } }
+            if label == "Limited" { span { "Cooldown until " span { class: "nowrap-unit", "{date(account.cooldown_until)}" } } }
             if let Some(message) = &message { span { "{message}" } }
             if let Some(hint) = hint { span { "{hint}" } }
         }
@@ -200,8 +291,8 @@ pub(super) fn AccountIdentity(provider: ProviderSummary, account: ModelAccount, 
 fn AccountSummary(provider: ProviderSummary, account: ModelAccount, mask: bool, chart: EventHandler<()>) -> Element {
     rsx! {
         section { class: "provider-inset stack",
-            div { class: "spread",
-                div { AccountIdentity { provider: provider.clone(), account: account.clone(), mask } }
+            div { class: "row",
+                div { style: "flex: 1 1 12rem; min-width: 0;", AccountIdentity { provider: provider.clone(), account: account.clone(), mask } }
                 div { class: "row",
                     if !account.windows.is_empty() || provider.descriptor.evidence_kinds.contains(&EvidenceKind::QuotaWindows) {
                         button { class: "btn btn-glass", onclick: move |_| chart.call(()), "Chart" }
@@ -227,7 +318,11 @@ fn AccountSummary(provider: ProviderSummary, account: ModelAccount, mask: bool, 
             }
             if let Some(grant) = &account.reset_grant {
                 details { summary { "Reset credits / grants · {grant.available_count} available" }
-                    p { if grant.applicable { "Applicable" } else { "Not applicable" } " · expires {date(grant.expires_at)} · checked {date(Some(grant.checked_at))}" }
+                    p {
+                        if grant.applicable { "Applicable" } else { "Not applicable" }
+                        " · expires " span { class: "nowrap-unit", "{date(grant.expires_at)}" }
+                        " · checked " span { class: "nowrap-unit", "{fmt_dt(grant.checked_at)}" }
+                    }
                     p { {format!("Scope: {} · Clears: {} · Weekly credit-back: {}", grant.scope.as_deref().unwrap_or("—"), grant.cleared_windows.join(", "), grant.weekly_credit_back)} }
                     if let Some(reason) = &grant.unavailable_reason { p { "{reason}" } }
                     OperationButton { provider, account: account.clone(), label: "Claim Reset Credit", confirm: true,
@@ -249,13 +344,15 @@ fn QuotaPanel(provider: ProviderSummary, account: Option<ModelAccount>, lookback
     let mut horizon = use_signal(|| horizon_default);
     let mut range = use_signal(|| 24u32);
     let windows: BTreeMap<String, String> = if let Some(account) = &account {
-        account.windows.iter().map(|w| (w.window_key.clone(), w.label.clone())).collect()
+        account.windows.iter().map(|w| (w.window_key.clone(), window_label(&w.label).to_string())).collect()
     } else {
         provider
             .pools
             .iter()
-            .map(|w| (w.window_key.clone(), w.label.clone()))
-            .chain(provider.accounts.iter().flat_map(|a| a.windows.iter().map(|w| (w.window_key.clone(), w.label.clone()))))
+            .map(|w| (w.window_key.clone(), window_label(&w.label).to_string()))
+            .chain(
+                provider.accounts.iter().flat_map(|a| a.windows.iter().map(|w| (w.window_key.clone(), window_label(&w.label).to_string()))),
+            )
             .collect()
     };
     let mut window = use_signal(String::new);
@@ -285,13 +382,12 @@ fn QuotaPanel(provider: ProviderSummary, account: Option<ModelAccount>, lookback
     let result = data.read();
     let mask = panel.settings.read().mask_emails;
     rsx! {
-        div { class: "row",
+        div { class: "form-grid-2", style: "grid-template-columns: repeat(auto-fit, minmax(min(100%, 5.75rem), 1fr)); gap: 4px 6px;",
             Choice { label: "Window", value: chosen.clone(), options: windows.into_iter().collect(), change: move |v| window.set(v) }
             Choice { label: "History", value: range().to_string(), options: pairs(&[("6", "6h"), ("12", "12h"), ("24", "24h"), ("48", "48h"), ("168", "7d")]), change: move |v: String| if let Ok(n) = v.parse() { range.set(n); } }
             Choice { label: "Drain lookback", value: lookback().to_string(), options: pairs(LOOKBACK), change: move |v: String| if let Ok(n) = v.parse() { lookback.set(n); } }
             Choice { label: "Forecast horizon", value: horizon().to_string(), options: pairs(HORIZON), change: move |v: String| if let Ok(n) = v.parse() { horizon.set(n); } }
         }
-        if account.is_none() { p { class: "muted", "Pool history shows separate account measurements, not an average of incompatible quota windows." } }
         {read_view(result.as_ref(), |data| {
             let Some((submitted, report)) = data else { return rsx! { p { class: "muted", "No quota window observed yet." } }; };
             if *submitted != current_query { return rsx! { Loading { text: "Loading quota range…".to_string() } }; }
@@ -310,9 +406,10 @@ fn QuotaPanel(provider: ProviderSummary, account: Option<ModelAccount>, lookback
                 QuotaHistoryChart { samples: report.samples.clone(), forecasts, resets, names: names.clone(),
                     from: report.as_of - TimeDelta::hours(range().into()), until: report.as_of + TimeDelta::hours(horizon().into()) }
                 details { summary { "Past Windows" }
+                    if account.is_none() { p { class: "form-help", "Pool history plots each account separately; incompatible quota windows aren’t averaged." } }
                     Table { label: "Past windows", headers: &["Account", "Window", "Started", "Ended", "Peak used %", "Exhausted", "Early replacement", "Samples"],
                         rows: report.past_windows.iter().rev().map(|w| vec![
-                            names.get(&w.account_id).cloned().unwrap_or_else(|| w.account_id.clone()), w.label.clone(), fmt_dt(w.started_at),
+                            names.get(&w.account_id).cloned().unwrap_or_else(|| w.account_id.clone()), window_label(&w.label).to_string(), fmt_dt(w.started_at),
                             fmt_dt(w.ended_at), number(w.peak_used_percent), date(w.exhausted_at), if w.early_replaced { "Yes" } else { "No" }.into(), w.sample_count.to_string()
                         ]).collect() }
                 }
@@ -340,7 +437,9 @@ fn RollingStarter(provider: ProviderSummary) -> Element {
             p { class: "muted", "Opt-in starter sends real requests and consumes quota." }
             for account in provider.accounts.iter().filter(|a| a.rolling_starter.is_some()) {
                 if let Some(s) = &account.rolling_starter {
-                    p { key: "{account.id}", "{account_name(account, mask)} · " if s.enabled { "Enabled" } else { "Off" } " · last start {date(s.last_started_at)} · next {date(s.next_scheduled_start_at)}"
+                    p { key: "{account.id}", "{account_name(account, mask)} · " if s.enabled { "Enabled" } else { "Off" }
+                        " · last start " span { class: "nowrap-unit", "{date(s.last_started_at)}" }
+                        " · next " span { class: "nowrap-unit", "{date(s.next_scheduled_start_at)}" }
                         if let Some(error) = &s.last_error { " · {error}" }
                     }
                 }
@@ -391,5 +490,31 @@ fn RollingEditor(provider: ProviderSummary, initial: RollingWindowStarterConfig,
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_summary_uses_the_lowest_observed_regular_window() {
+        let session = PoolWindowSummary {
+            provider_id: "test".into(),
+            window_key: "session".into(),
+            label: "Session".into(),
+            kind: QuotaWindowKind::Session,
+            eligible_accounts: 1,
+            included_accounts: 1,
+            weighted_used_percent: Some(65.0),
+            weighted_remaining_percent: None,
+            capacity_basis: "equal_entitlements".into(),
+            next_reset_at: None,
+            forecast: None,
+            is_estimate: true,
+        };
+        let weekly = PoolWindowSummary { kind: QuotaWindowKind::Weekly, weighted_remaining_percent: Some(70.0), ..session.clone() };
+        let spend = PoolWindowSummary { kind: QuotaWindowKind::Spend, weighted_remaining_percent: Some(0.0), ..session.clone() };
+        assert_eq!(pool_quota_summary(&[weekly, spend, session]), "≈35.0% left (Session)");
     }
 }

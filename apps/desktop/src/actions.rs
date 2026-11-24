@@ -32,7 +32,7 @@ pub fn static_entries() -> Vec<PaletteEntry> {
     let mut entries: Vec<PaletteEntry> = Workspace::ALL
         .iter()
         .map(|workspace| PaletteEntry {
-            label: format!("Go to {}", workspace.label()),
+            label: workspace.label().into(),
             hint: workspace.hint().to_string(),
             kind: "navigate",
             action: Action::Workspace(*workspace),
@@ -40,19 +40,19 @@ pub fn static_entries() -> Vec<PaletteEntry> {
         .collect();
     entries.push(PaletteEntry {
         label: "Toggle inspector".into(),
-        hint: "technical ids, payload hash, history".into(),
+        hint: "Show or hide the selected item’s details".into(),
         kind: "command",
         action: Action::ToggleInspector,
     });
     entries.push(PaletteEntry {
         label: "Refresh now".into(),
-        hint: "reload all workspaces from the hub".into(),
+        hint: "Reload all workspaces from the hub".into(),
         kind: "command",
         action: Action::Refresh,
     });
     entries.push(PaletteEntry {
         label: "Refresh fleet status".into(),
-        hint: "re-read the snapshot now (every 30s otherwise)".into(),
+        hint: "Read the fleet snapshot without waiting for the next refresh".into(),
         kind: "command",
         action: Action::RefreshFleet,
     });
@@ -60,9 +60,18 @@ pub fn static_entries() -> Vec<PaletteEntry> {
 }
 
 pub fn search_entry(hit: &SearchHit) -> PaletteEntry {
+    let subject = match hit.subject_type.as_str() {
+        "content" | "content_item" => "Content item",
+        "news" | "news_item" => "News item",
+        "persona" => "Persona",
+        "relationship" => "Relationship",
+        "release" | "release_revision" => "Release",
+        "generation" | "generation_request" => "Generation request",
+        _ => "Hub item",
+    };
     PaletteEntry {
         label: hit.title.clone(),
-        hint: format!("{} · {}", hit.subject_type, short_hash(&hit.subject_id.to_string())),
+        hint: subject.into(),
         kind: "search",
         action: Action::OpenSubject(hit.subject_type.clone(), hit.subject_id),
     }
