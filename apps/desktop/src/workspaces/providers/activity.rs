@@ -7,9 +7,10 @@ use super::{charts::*, dashboard::account_name, data_settings::Archive, routing:
 mod detail;
 mod evals;
 
-const TABS: [&str; 8] = ["Overview", "Compare", "Requests", "Traces", "Drift", "Totals", "Thinking", "Evals"];
+const TABS: [&str; 8] = ["Overview", "Comparisons", "Drift", "Totals", "Thinking", "Requests", "Traces", "Evals"];
 const METRICS: &[(&str, &str)] =
     &[("requests", "Requests"), ("tokens", "Tokens"), ("cost", "API-equivalent cost"), ("cache_hit", "Cache hit rate")];
+const DEFAULT_RANGE_DAYS: u32 = 1;
 
 fn usd(value: f64) -> String {
     format!("${value:.4}")
@@ -30,71 +31,116 @@ struct EvalSeed {
 }
 
 #[component]
-pub(super) fn Activity(providers: Vec<ProviderSummary>, selected: Option<String>) -> Element {
+pub(super) fn Activity(providers: Vec<ProviderSummary>, mut selected: Signal<String>) -> Element {
     let panel = use_context::<PanelState>();
     let mut tab = use_signal(|| 0usize);
     let board = use_signal(|| None::<Vec<BoardTile>>);
     let mut seed = use_signal(|| None::<EvalSeed>);
-    let mut range = use_signal(|| 1u32);
-    let mut filters =
-        use_signal(|| ActivityScope { provider_id: selected.clone(), source: Some(ActivitySource::Proxy), ..Default::default() });
-    let mut request = use_signal(|| activity_scope(filters.cloned(), 1));
+    let mut range = use_signal(|| DEFAULT_RANGE_DAYS);
+    let mut applied_range = use_signal(|| DEFAULT_RANGE_DAYS);
+    let mut show_more = use_signal(|| false);
+    let mut filters = use_signal(|| ActivityScope { provider_id: optional(&selected.peek()), ..default_filters() });
+    let mut request = use_signal(|| activity_scope(filters.cloned(), DEFAULT_RANGE_DAYS));
     let mut filter_revision = use_signal(|| 0u64);
+    use_effect(move || {
+        let provider_id = optional(&selected());
+        let mut applied = request.peek().clone();
+        if applied.provider_id != provider_id {
+            applied.provider_id = provider_id.clone();
+            applied.account_id = None;
+            request.set(applied);
+            let mut draft = filters.write();
+            draft.provider_id = provider_id;
+            draft.account_id = None;
+            filter_revision += 1;
+        }
+    });
     let draft = filters();
     let scope = request();
-    let active: Vec<_> = providers.iter().filter(|p| draft.provider_id.as_ref().is_none_or(|id| id == &p.descriptor.id)).collect();
+    let selection = optional(&selected());
+    let evals = tab() == 7;
+    let active = providers.iter().filter(|p| selection.as_ref().is_none_or(|id| id == &p.descriptor.id));
     let mask = panel.settings.read().mask_emails;
-    let mut provider_options = vec![(String::new(), "All providers".into())];
-    provider_options.extend(providers.iter().map(|p| (p.descriptor.id.clone(), p.descriptor.label.clone())));
     let mut account_options = vec![(String::new(), "All accounts".into())];
-    account_options.extend(active.iter().flat_map(|p| p.accounts.iter().map(|a| (a.id.clone(), account_name(a, mask)))));
+    account_options.extend(active.flat_map(|p| p.accounts.iter().map(|a| (a.id.clone(), account_name(a, mask)))));
     let mut dirty_check = draft.clone();
     dirty_check.from = scope.from;
     dirty_check.tz_offset_mins = scope.tz_offset_mins;
-    let changed = dirty_check != scope || scope.from.is_some_and(|f| (Utc::now() - f).num_hours() / 24 != i64::from(range()));
+    let changed = dirty_check != scope || applied_range() != range();
+    let secondary_count = [&scope.account_id, &scope.client, &scope.model, &scope.effort, &scope.outcome, &scope.search]
+        .into_iter()
+        .filter(|value| value.is_some())
+        .count();
+    let on_reset = move |_| {
+        let default_scope = default_filters();
+        filters.set(default_scope.clone());
+        request.set(activity_scope(default_scope, DEFAULT_RANGE_DAYS));
+        selected.set(String::new());
+        range.set(DEFAULT_RANGE_DAYS);
+        applied_range.set(DEFAULT_RANGE_DAYS);
+        show_more.set(false);
+        filter_revision += 1;
+    };
     rsx! {
         section { class: "glass-card stack",
-            nav { class: "row", aria_label: "Activity sections",
+            div { class: "tab-bar", role: "group", aria_label: "Activity views",
                 for (i, label) in TABS.into_iter().enumerate() {
-                    button { key: "{label}", class: "btn btn-glass provider-pill", aria_current: if tab() == i { "page" } else { "false" },
+                    button { key: "{label}", class: if tab() == i { "tab-btn active" } else { "tab-btn" }, aria_pressed: tab() == i,
                         onclick: move |_| { if i == 7 { seed.set(None); } tab.set(i); }, "{label}" }
                 }
             }
             div { class: "row",
-                Choice { label: "Range", value: range().to_string(), options: pairs(&[("1", "24h"), ("7", "7d"), ("30", "30d"), ("90", "90d")]), change: move |s: String| if let Ok(v) = s.parse() { range.set(v); } }
-                Choice { label: "Source", value: match draft.source { Some(ActivitySource::LocalImport) => "local", Some(ActivitySource::All) => "all", _ => "proxy" },
-                    options: pairs(&[("proxy", "Proxy"), ("local", "Local Import"), ("all", "All")]),
-                    change: move |s: String| filters.write().source = Some(match s.as_str() { "local" => ActivitySource::LocalImport, "all" => ActivitySource::All, _ => ActivitySource::Proxy }) }
-                Choice { label: "Provider", value: draft.provider_id.unwrap_or_default(), options: provider_options,
-                    change: move |s: String| { let mut f = filters.write(); f.provider_id = optional(&s); f.account_id = None; } }
-                Choice { label: "Account", value: draft.account_id.unwrap_or_default(), options: account_options,
-                    change: move |s: String| filters.write().account_id = optional(&s) }
-                Field { label: "Client", value: draft.client.unwrap_or_default(), change: move |s: String| filters.write().client = optional(&s) }
-                Field { label: "Model substring", value: draft.model.unwrap_or_default(), change: move |s: String| filters.write().model = optional(&s) }
-                Field { label: "Effort", value: draft.effort.unwrap_or_default(), change: move |s: String| filters.write().effort = optional(&s) }
-                Choice { label: "Outcome", value: draft.outcome.unwrap_or_default(), options: pairs(&[("", "All"), ("failed", "Failed")]),
-                    change: move |s: String| filters.write().outcome = optional(&s) }
-                Field { label: "Search", kind: "search", value: draft.search.unwrap_or_default(), change: move |s: String| filters.write().search = optional(&s) }
-                button { class: if changed { "btn btn-primary" } else { "btn btn-glass" }, onclick: move |_| {
+                if !evals {
+                    Choice { label: "Range", value: range().to_string(), options: pairs(&[("1", "24h"), ("7", "7d"), ("30", "30d"), ("90", "90d")]), change: move |s: String| if let Ok(v) = s.parse() { range.set(v); } }
+                    Choice { label: "Source", value: match draft.source { Some(ActivitySource::LocalImport) => "local", Some(ActivitySource::All) => "all", _ => "proxy" },
+                        options: pairs(&[("proxy", "Proxy"), ("local", "Local Import"), ("all", "All")]),
+                        change: move |s: String| filters.write().source = Some(match s.as_str() { "local" => ActivitySource::LocalImport, "all" => ActivitySource::All, _ => ActivitySource::Proxy }) }
+                }
+                if !evals {
+                    button { class: "btn secondary", aria_expanded: show_more(), aria_controls: "activity-more-filters",
+                        onclick: move |_| show_more.toggle(), "More filters ({secondary_count})" }
+                }
+                button { class: if changed { "btn primary" } else { "btn secondary" }, onclick: move |_| {
                     request.set(activity_scope(filters.cloned(), range()));
+                    applied_range.set(range());
                     filter_revision += 1;
-                }, "Apply filters / reload" }
+                }, if changed { "Apply filters" } else { "Reload activity" } }
             }
-            if tab() == 7 { p { class: "muted", "Eval cases are saved separately from the activity time range." } }
+            div { id: "activity-more-filters", hidden: evals || !show_more(),
+                if !evals && show_more() {
+                    div { class: "row",
+                        Choice { label: "Account", value: draft.account_id.unwrap_or_default(), options: account_options,
+                            change: move |s: String| filters.write().account_id = optional(&s) }
+                        Field { label: "Client", value: draft.client.unwrap_or_default(), change: move |s: String| filters.write().client = optional(&s) }
+                        Field { label: "Model substring", value: draft.model.unwrap_or_default(), change: move |s: String| filters.write().model = optional(&s) }
+                        Field { label: "Effort", value: draft.effort.unwrap_or_default(), change: move |s: String| filters.write().effort = optional(&s) }
+                        Choice { label: "Outcome", value: draft.outcome.unwrap_or_default(), options: pairs(&[("", "All"), ("failed", "Failed")]),
+                            change: move |s: String| filters.write().outcome = optional(&s) }
+                        Field { label: "Search", kind: "search", value: draft.search.unwrap_or_default(), change: move |s: String| filters.write().search = optional(&s) }
+                    }
+                }
+            }
+            if evals { p { class: "form-help", "Eval cases are saved separately from the activity time range." } }
         }
         {rsx! { div { key: "{filter_revision}", class: "stack",
-            match tab() {
-                    0 => rsx! { Overview { scope, board, on_compare: move |_| tab.set(1) } },
-                1 => rsx! { Compare { scope } },
-                2 => rsx! { detail::Requests { scope, providers } },
-                3 => rsx! { detail::Traces { scope, pin: move |value| { seed.set(Some(value)); tab.set(7); } } },
-                4 => rsx! { Drift { scope, providers } },
-                5 => rsx! { Totals { scope } },
-                6 => rsx! { Thinking { scope, providers } },
-                _ => rsx! { evals::Evals { providers, scoped_provider: scope.provider_id, seed: seed() } },
+            if scope.provider_id == selection {
+                match tab() {
+                    0 => rsx! { Overview { scope, board, on_reset, on_compare: move |_| tab.set(1) } },
+                    1 => rsx! { Compare { scope } },
+                    2 => rsx! { Drift { scope, providers } },
+                    3 => rsx! { Totals { scope } },
+                    4 => rsx! { Thinking { scope, providers } },
+                    5 => rsx! { detail::Requests { scope, providers, on_reset } },
+                    6 => rsx! { detail::Traces { scope, on_reset, pin: move |value| { seed.set(Some(value)); tab.set(7); } } },
+                    _ => rsx! { evals::Evals { providers, scoped_provider: scope.provider_id, seed: seed() } },
+                }
             }
         } }}
     }
+}
+
+fn default_filters() -> ActivityScope {
+    ActivityScope { source: Some(ActivitySource::Proxy), ..Default::default() }
 }
 
 fn activity_scope(mut scope: ActivityScope, days: u32) -> ActivityScope {
@@ -104,19 +150,67 @@ fn activity_scope(mut scope: ActivityScope, days: u32) -> ActivityScope {
 }
 
 #[component]
-fn Overview(scope: ActivityScope, board: Signal<Option<Vec<BoardTile>>>, on_compare: EventHandler<()>) -> Element {
-    let client = use_context::<HubClient>();
-    let data = use_resource(move || {
-        let (client, scope) = (client.clone(), scope.clone());
-        async move { timed(client.activity_overview(&scope)).await }
-    });
-    let result = data.read();
-    read_view(result.as_ref(), |report| rsx! { OverviewBoard { report: report.clone(), board, on_compare } })
+fn ActivityEmpty(message: &'static str, #[props(optional)] hint: Option<&'static str>, on_reset: EventHandler<()>) -> Element {
+    rsx! {
+        div { class: "empty-hero", style: "max-width: none;",
+            p { role: "status", strong { "{message}" } }
+            if let Some(hint) = hint { p { class: "form-help", "{hint}" } }
+            button { class: "btn primary empty-actions", onclick: move |_| on_reset.call(()), "Reset filters" }
+        }
+    }
 }
 
 #[component]
-fn OverviewBoard(report: ActivityOverview, board: Signal<Option<Vec<BoardTile>>>, on_compare: EventHandler<()>) -> Element {
-    let rows = board.cloned().unwrap_or_else(|| {
+fn Overview(
+    scope: ActivityScope,
+    board: Signal<Option<Vec<BoardTile>>>,
+    on_reset: EventHandler<()>,
+    on_compare: EventHandler<()>,
+) -> Element {
+    let client = use_context::<HubClient>();
+    let history_client = client.clone();
+    let panel = use_context::<PanelState>();
+    let data = use_resource(move || {
+        let _ = (panel.epoch)();
+        let (client, scope) = (client.clone(), scope.clone());
+        async move { timed(client.activity_overview(&scope)).await }
+    });
+    let history = use_resource(move || {
+        let empty = data.read().as_ref().is_some_and(|result| result.as_ref().is_ok_and(|report| report.requests == 0));
+        let client = history_client.clone();
+        async move {
+            if !empty {
+                return None;
+            }
+            let probe = ActivityScope { from: Some(DateTime::UNIX_EPOCH), limit: Some(1), ..Default::default() };
+            timed(client.activity_requests(&probe)).await.ok().map(|page| !page.items.is_empty())
+        }
+    });
+    let has_history = history.cloned().flatten();
+    let result = data.read();
+    read_view(result.as_ref(), |report| rsx! { OverviewBoard { report: report.clone(), board, has_history, on_reset, on_compare } })
+}
+
+#[component]
+fn OverviewBoard(
+    report: ActivityOverview,
+    board: Signal<Option<Vec<BoardTile>>>,
+    has_history: Option<bool>,
+    on_reset: EventHandler<()>,
+    on_compare: EventHandler<()>,
+) -> Element {
+    let mut configure = use_signal(|| false);
+    if report.requests == 0 {
+        let (message, hint) = if has_history == Some(false) {
+            ("No activity recorded yet", "New requests will appear here when the hub records activity.")
+        } else {
+            ("No requests matched the current filters", "Reset the filters, choose a longer range, or select All sources.")
+        };
+        return rsx! { ActivityEmpty { message, hint, on_reset } };
+    }
+    let custom_tiles = board.cloned();
+    let default_layout = custom_tiles.is_none();
+    let rows = custom_tiles.unwrap_or_else(|| {
         let mut tiles = report.board_tiles.clone();
         if !tiles.iter().any(|t| t.kind == "model_effort") {
             tiles.push(BoardTile { id: "model_effort".into(), kind: "model_effort".into(), metric: "cost".into(), span: 1, visible: true });
@@ -127,7 +221,37 @@ fn OverviewBoard(report: ActivityOverview, board: Signal<Option<Vec<BoardTile>>>
     let hit_rate = effective_cache_hit_rate(report.input_tokens, report.cache_read_tokens, report.cache_hit_rate);
     let hit_pct = fmt_hit_pct(hit_rate);
     rsx! {
-        div { class: "stat-row",
+        div { class: "row",
+            h2 { "Activity overview" }
+            button { class: "btn secondary", aria_expanded: configure(), aria_controls: "activity-tile-options",
+                onclick: move |_| configure.toggle(), "Configure overview tiles" }
+        }
+        div { id: "activity-tile-options", hidden: !configure(),
+            if configure() {
+                div { class: "provider-inset",
+                    for (i, tile) in rows.iter().enumerate() {
+                        {
+                            let visible_rows = rows.clone();
+                            let span_rows = rows.clone();
+                            let metric_rows = rows.clone();
+                            rsx! {
+                                div { key: "{tile.id}", class: "row quota-window",
+                                    strong { "{tile_name(&tile.kind)}" }
+                                    Check { label: "Visible", value: tile.visible, change: move |v| edit_tile(board, &visible_rows, i, |tile| tile.visible = v) }
+                                    Choice { label: "Columns", value: tile.span.to_string(), options: pairs(&[("1", "1"), ("2", "2"), ("3", "3")]),
+                                        change: move |v: String| if let Ok(span) = v.parse() { edit_tile(board, &span_rows, i, |tile| tile.span = span); } }
+                                    if matches!(tile.kind.as_str(), "trend" | "heatmap" | "rhythm") {
+                                        Choice { label: "Metric", value: tile.metric.clone(), options: pairs(METRICS),
+                                            change: move |v| edit_tile(board, &metric_rows, i, |tile| tile.metric = v) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        div { class: "compact-kpi-grid", style: "grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr));",
             article { class: "glass-card stat-card", title: unpriced.clone(),
                 span { class: "label-tech", "API-equivalent cost" }
                 strong { class: "value", "{usd(report.api_equivalent_cost_usd)}" }
@@ -146,31 +270,10 @@ fn OverviewBoard(report: ActivityOverview, board: Signal<Option<Vec<BoardTile>>>
                 span { "{fmt_count(report.cache_read_tokens)} / {fmt_count(report.input_tokens)} input" }
                 span { "{usd(report.cache_savings_usd)} estimated savings" }
             }
-            article { class: "glass-card stat-card", span { class: "label-tech", "Traffic coverage" }
-                span { "{fmt_count(report.matched_proxy_requests)} matched proxy" }
-                span { "{fmt_count(report.bypassed_local_requests)} bypassed local" }
-            }
         }
-        p { class: "muted", "Price catalog as of {report.price_as_of} · {report.cache_write_assumption} · detail retention {report.detail_retention_days} days." }
-        details { class: "glass-card", summary { "Configure overview tiles" }
-            for (i, tile) in rows.iter().enumerate() {
-                {let visible_rows = rows.clone(); let span_rows = rows.clone(); let metric_rows = rows.clone(); rsx! {
-                div { key: "{tile.id}", class: "row quota-window",
-                    strong { "{tile_name(&tile.kind)}" }
-                    Check { label: "Visible", value: tile.visible, change: move |v| edit_tile(board, &visible_rows, i, |tile| tile.visible = v) }
-                    Choice { label: "Columns", value: tile.span.to_string(), options: pairs(&[("1", "1"), ("2", "2"), ("3", "3")]),
-                        change: move |v: String| if let Ok(span) = v.parse() { edit_tile(board, &span_rows, i, |tile| tile.span = span); } }
-                    if matches!(tile.kind.as_str(), "trend" | "heatmap" | "rhythm") {
-                        Choice { label: "Metric", value: tile.metric.clone(), options: pairs(METRICS),
-                            change: move |v| edit_tile(board, &metric_rows, i, |tile| tile.metric = v) }
-                    }
-                }
-                }}
-            }
-        }
-        div { class: "activity-board",
+        div { class: "activity-board", "data-default-layout": if default_layout { "true" } else { "false" },
             for tile in rows.iter().filter(|tile| tile.visible) {
-                article { key: "{tile.id}", class: "glass-card stack activity-span-{tile.span.clamp(1, 3)}",
+                article { key: "{tile.id}", class: "glass-card stack activity-span-{tile.span.clamp(1, 3)}", "data-tile": "{tile.kind}",
                     h2 { "{tile_name(&tile.kind)}" }
                     {
                         let metric = Metric::parse(&tile.metric);
@@ -178,6 +281,7 @@ fn OverviewBoard(report: ActivityOverview, board: Signal<Option<Vec<BoardTile>>>
                             "trend" => rsx! { ActivityTrendChart { points: report.trend.clone(), metric } },
                             "heatmap" => rsx! { ActivityHeatmap { cells: report.heatmap.clone(), metric } },
                             "rhythm" => rsx! { ActivityRhythmChart { points: report.rhythm.clone(), metric } },
+                            "cache" if report.trend.is_empty() || hit_rate.is_none() => rsx! { p { class: "form-help", "{NO_RANGE_DATA}" } },
                             "cache" => rsx! {
                                 div { class: "cache-summary stack",
                                     div { class: "spread",
@@ -206,6 +310,10 @@ fn OverviewBoard(report: ActivityOverview, board: Signal<Option<Vec<BoardTile>>>
                     }
                 }
             }
+        }
+        details { summary { "Traffic coverage, pricing and retention" }
+            p { class: "form-help", "{fmt_count(report.matched_proxy_requests)} matched proxy · {fmt_count(report.bypassed_local_requests)} bypassed local" }
+            p { class: "form-help", "Price catalog as of {report.price_as_of} · {report.cache_write_assumption} · detail retention {report.detail_retention_days} days." }
         }
     }
 }
@@ -248,6 +356,32 @@ fn breakdown(label: &'static str, list: &[BreakdownRow]) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_overview_shows_recovery_instead_of_kpis_and_tiles() {
+        fn app() -> Element {
+            let board = use_signal(|| None);
+            let report: ActivityOverview = serde_json::from_value(serde_json::json!({
+                "api_equivalent_cost_usd": 0.0, "unpriced_requests": 0, "unpriced_models": [],
+                "price_as_of": "", "cache_write_assumption": "", "total_tokens": 0,
+                "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                "thinking_tokens": 0, "requests": 0, "failures": 0, "cache_hit_rate": 0.0,
+                "cache_savings_usd": 0.0, "matched_proxy_requests": 0, "bypassed_local_requests": 0,
+                "trend": [], "heatmap": [], "rhythm": [], "by_model": [], "by_account": [],
+                "by_client": [], "by_model_effort": [], "detail_retention_days": 7,
+                "board_tiles": [
+                    {"id": "trend", "kind": "trend", "metric": "requests", "span": 1, "visible": true}
+                ]
+            }))
+            .unwrap();
+            rsx! { OverviewBoard { report, board, has_history: Some(true), on_reset: |_| {}, on_compare: |_| {} } }
+        }
+        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        assert!(rendered.contains("No requests matched the current filters"));
+        assert!(rendered.contains("Reset filters"));
+        assert!(!rendered.contains("compact-kpi-grid"));
+        assert!(!rendered.contains("activity-board"));
+    }
 
     #[test]
     fn legacy_breakdown_uses_total_minus_output_for_cache_hit_rate() {

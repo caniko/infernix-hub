@@ -1,8 +1,4 @@
-//! Calendar: publication intents grouped by UTC day and account.
-//!
-//! `/v1/intents` carries delivery state and attempts, but not the release's
-//! approval state (only `release_revision_id`). The header states that gap; the
-//! provenance doc records the contract request.
+//! Calendar: scheduled posts grouped by UTC day and account.
 
 use chrono::NaiveDate;
 use contracts::client::HubClient;
@@ -13,7 +9,7 @@ use crate::{
     components::{Chip, EmptyState, ErrorCard, Loading},
     format, labels,
     shell::ContextItem,
-    state::{Store, Workspace},
+    state::{Loaded, Store, Workspace},
 };
 
 #[component]
@@ -23,6 +19,7 @@ pub fn CalendarView() -> Element {
     let intents = (store.intents).cloned();
     let accounts = (store.accounts).cloned();
     let mut account_filter = use_signal(|| Option::<String>::None);
+    let mut refreshing = use_signal(|| false);
     let filter = account_filter();
 
     let index_client = client.clone();
@@ -50,20 +47,50 @@ pub fn CalendarView() -> Element {
             .data
             .as_ref()
             .and_then(|items| items.iter().find(|account| account.id == id))
-            .map(|account| format!("{} · {}", account.handle, account.platform))
-            .unwrap_or_else(|| id.to_string())
+            .map(|account| format!("{} · {}", account.handle, platform_label(&account.platform)))
+            .unwrap_or_else(|| "Unknown account".to_string())
+    };
+    let scope_account = filter.as_deref().map(account_label).unwrap_or_else(|| "All accounts".to_string());
+    let scope_dates = match (groups.first(), groups.last()) {
+        (Some((first, _)), Some((last, _))) if first != last => format!("{} — {} · UTC", day_heading(first), day_heading(last)),
+        (Some((day, _)), _) => format!("{} · UTC", day_heading(day)),
+        _ => "All dates · UTC".to_string(),
+    };
+    let refresh_client = client.clone();
+    let refresh = move |_| {
+        if refreshing() {
+            return;
+        }
+        refreshing.set(true);
+        let client = refresh_client.clone();
+        spawn(async move {
+            let mut schedule = store.intents;
+            match api::timed(client.intents()).await {
+                Ok(items) => {
+                    schedule.set(Loaded::ready(items));
+                    store.clear_release_index();
+                    if let Some(content) = (store.content).cloned().data {
+                        api::load_release_index(store, client, &content).await;
+                    }
+                }
+                Err(error) => schedule.write().failed(error),
+            }
+            refreshing.set(false);
+        });
     };
 
     rsx! {
         aside { class: "context", aria_label: "Calendar accounts",
             div { class: "context-head",
-                h2 { "Accounts" }
-                span { class: "label-tech", "{accounts.data.as_ref().map(|v| v.len()).unwrap_or(0)}" }
+                h2 { class: "row",
+                    "Accounts"
+                    span { class: "badge-count", "{accounts.data.as_ref().map_or(0, Vec::len)}" }
+                }
             }
             div { class: "context-list",
                 ContextItem {
                     title: "All accounts".to_string(),
-                    meta: format!("{} intents", intents.data.as_ref().map(|v| v.len()).unwrap_or(0)),
+                    meta: post_count(intents.data.as_ref().map_or(0, Vec::len)),
                     active: filter.is_none(),
                     on_select: move |_| account_filter.set(None),
                 }
@@ -72,7 +99,9 @@ pub fn CalendarView() -> Element {
                         ContextItem {
                             key: "{account.id}",
                             title: account.handle.clone(),
-                            meta: format!("{} · {}", account.platform, account.transport),
+                            meta: format!("{} · {}", platform_label(&account.platform), post_count(
+                                intents.data.as_deref().unwrap_or_default().iter().filter(|intent| intent.account_id == account.id).count()
+                            )),
                             active: filter.as_ref() == Some(&account.id),
                             on_select: {
                                 let id = account.id.clone();
@@ -84,22 +113,16 @@ pub fn CalendarView() -> Element {
             }
         }
         main { class: "work",
-            div { class: "work-head",
+            div { class: "work-head content-bounded",
                 div {
-                    h1 { "Calendar" }
-                    p { class: "hint", "Intents grouped by UTC day and account. Delivery state comes from /v1/intents; approval state is resolved from a bounded release index." }
+                    h1 { "Scheduled posts by day" }
+                    p { class: "form-help", "{scope_account} · {scope_dates}" }
                 }
                 div { class: "spacer" }
                 button {
-                    class: "btn btn-glass",
-                    onclick: move |_| {
-                        store.clear_release_index();
-                        if let Some(content) = (store.content).cloned().data {
-                            let client = client.clone();
-                            spawn(async move { api::load_release_index(store, client, &content).await; });
-                        }
-                    },
-                    "Refresh index"
+                    class: "btn secondary",
+                    disabled: refreshing(), onclick: refresh,
+                    if refreshing() { "Refreshing…" } else { "Refresh schedule" }
                 }
             }
             if let Some(error) = intents.error.clone() {
@@ -109,12 +132,15 @@ pub fn CalendarView() -> Element {
                 ErrorCard { code: error.code, message: error.message }
             }
             match intents.data.clone() {
-                None if intents.error.is_none() => rsx! { Loading { text: "Loading intents…".to_string() } },
+                None if intents.error.is_none() => rsx! { Loading { text: "Loading schedule…".to_string() } },
                 None => rsx! {},
                 Some(_) if filtered.is_empty() => rsx! {
                     EmptyState {
-                        title: "No publication intents.".to_string(),
-                        hint: Some("Approved releases become intents when scheduled in Studio.".to_string()),
+                        title: "Nothing scheduled".to_string(),
+                        hint: Some("Schedule an approved release in Studio to see it here.".to_string()),
+                        actions: rsx! {
+                            button { class: "btn primary", onclick: move |_| store.set_workspace(Workspace::Studio), "Schedule in Studio" }
+                        },
                     }
                 },
                 Some(_) => rsx! {
@@ -122,16 +148,16 @@ pub fn CalendarView() -> Element {
                         {
                             let day_count: usize = accounts.iter().map(|(_, list)| list.len()).sum();
                             rsx! {
-                        section { class: "calendar-day", key: "{day}",
+                        section { class: "calendar-day content-bounded", key: "{day}",
                             div { class: "spread",
                                 h2 { "{day_heading(&day)}" }
-                                span { class: "label-tech", "{day_count} intents" }
+                                span { class: "label-tech", "{post_count(day_count)}" }
                             }
                             for (account_id, list) in accounts {
                                 div { class: "glass-card calendar-account", key: "{day}-{account_id}",
                                     div { class: "spread",
                                         span { "{account_label(&account_id)}" }
-                                        span { class: "label-tech", "{list.len()} intent(s)" }
+                                        span { class: "label-tech", "{post_count(list.len())}" }
                                     }
                                     for intent in list {
                                         {
@@ -158,7 +184,7 @@ pub fn CalendarView() -> Element {
                                                         button {
                                                             class: "btn btn-glass btn-xs",
                                                             onclick: move |_| crate::actions::open_subject(store, "content", content_id),
-                                                            "Open content"
+                                                            "Open in Studio"
                                                         }
                                                     }
                                                     if let Some(url) = intent.provider_url.clone() {
@@ -181,7 +207,7 @@ pub fn CalendarView() -> Element {
                                                                 spawn(async move {
                                                                     match api::timed(client.cancel_intent(intent_id)).await {
                                                                         Ok(intent) => {
-                                                                            store.notify(true, format!("Intent {} is {}.", format::short_hash(&intent.id.to_string()), intent.state));
+                                                                             store.notify(true, format!("Scheduled post is now {}.", intent.state));
                                                                             api::refresh_base(store, client).await;
                                                                         }
                                                                         Err(error) => store.notify(false, format!("{} — {}", error.code, error.message)),
@@ -224,4 +250,16 @@ pub fn CalendarView() -> Element {
 
 fn day_heading(day: &str) -> String {
     NaiveDate::parse_from_str(day, "%Y-%m-%d").map(format::fmt_day).unwrap_or_else(|_| day.to_string())
+}
+
+fn post_count(count: usize) -> String {
+    if count == 1 { "1 post".to_string() } else { format!("{count} posts") }
+}
+
+fn platform_label(platform: &str) -> &str {
+    match platform {
+        "mastodon" => "Mastodon",
+        "bluesky" => "Bluesky",
+        _ => platform,
+    }
 }

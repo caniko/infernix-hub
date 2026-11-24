@@ -244,17 +244,6 @@ pub async fn load_release_index(store: Store, client: HubClient, content: &[Cont
     }
 }
 
-pub async fn load_search(store: Store, client: HubClient, query: String) {
-    if query.trim().len() < 2 {
-        store.set_search(Loaded::ready(Vec::new()));
-        return;
-    }
-    match timed(client.search(&query)).await {
-        Ok(hits) => put(store.search, hits),
-        Err(error) => keep(store.search, error),
-    }
-}
-
 /// The notification feed: one `all` snapshot, then the change feed held open on
 /// the server. This is not another 1.5s poll: `wait` blocks until a row changes,
 /// and the echoed cursor is what keeps a reconnect from skipping a change.

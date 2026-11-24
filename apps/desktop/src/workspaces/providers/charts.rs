@@ -105,13 +105,22 @@ fn freshness(w: &QuotaWindow) -> (&'static str, &'static str) {
     }
 }
 
-pub(super) fn reset_label(at: Option<DateTime<Utc>>) -> String {
+pub(super) fn window_label(label: &str) -> &str {
+    // Older fixture observations embed observation state in the window name.
+    [" · measured zero", " · never observed", " · unavailable"].iter().find_map(|suffix| label.strip_suffix(suffix)).unwrap_or(label)
+}
+
+#[component]
+pub(super) fn ResetTime(at: Option<DateTime<Utc>>) -> Element {
     let Some(at) = at else {
-        return "Reset not observed".into();
+        return rsx! { "Reset not observed" };
     };
-    let minutes = (at - Utc::now()).num_minutes();
-    let when = fmt_dt(at);
-    if at <= Utc::now() { format!("Reset was due · {when}") } else { format!("Resets in {}h {}m · {when}", minutes / 60, minutes % 60) }
+    let now = Utc::now();
+    let minutes = (at - now).num_minutes();
+    rsx! {
+        if at <= now { "Reset was due" } else { "Resets in {minutes / 60}h {minutes % 60}m" }
+        " · " span { class: "nowrap-unit", "{fmt_dt(at)}" }
+    }
 }
 
 #[component]
@@ -119,16 +128,16 @@ pub(super) fn QuotaLimitBar(window: QuotaWindow) -> Element {
     let (remaining, used) = quota_values(window.observation_state, window.remaining_percent, window.used_percent);
     let (label, tone) = freshness(&window);
     let status_label = quota_status_label(window.status);
-    let meta = match reset_cadence_label(window.cadence) {
-        Some(cadence) => format!("{} · {cadence} · observed {}", reset_label(window.resets_at), date(window.observed_at)),
-        None => format!("{} · observed {}", reset_label(window.resets_at), date(window.observed_at)),
-    };
     rsx! {
         div { class: "quota-window",
             div { class: "row",
-                strong { "{window.label}" }
+                strong { "{window_label(&window.label)}" }
                 if let Some(model) = &window.scope_model { span { class: "muted", "{model}" } }
-                Chip { label: label.to_string(), tone: Some(tone.to_string()) }
+                if window.observation_state == QuotaObservationState::NeverObserved {
+                    span { class: "form-help", "{label}" }
+                } else {
+                    Chip { label: label.to_string(), tone: Some(tone.to_string()) }
+                }
                 if let Some(status) = status_label { span { class: "muted", "{status}" } }
             }
             if let (Some(left), Some(used)) = (remaining, used) {
@@ -140,7 +149,11 @@ pub(super) fn QuotaLimitBar(window: QuotaWindow) -> Element {
                 && let Some(amount) = window.used_amount {
                 p { {format!("{} / {} {}", number(Some(amount)), number(window.limit_amount), window.currency.as_deref().unwrap_or_else(|| quota_unit_label(window.unit)))} }
             }
-            p { class: "muted", "{meta}" }
+            p { class: "muted",
+                ResetTime { at: window.resets_at }
+                if let Some(cadence) = reset_cadence_label(window.cadence) { " · {cadence}" }
+                if let Some(observed) = window.observed_at { " · observed " span { class: "nowrap-unit", "{fmt_dt(observed)}" } }
+            }
             if let Some(reason) = &window.error_reason { p { class: "muted", "{reason}" } }
         }
     }
@@ -156,12 +169,16 @@ pub(super) fn Meter(left: f64, used: f64) -> Element {
     } else {
         "quota-left"
     };
+    let used_caption = if used == 0.0 { "0% used".to_string() } else { format!("{used:.1}% used") };
     rsx! {
+        div { class: "row",
+            strong { class: "mono nowrap-unit", "{left:.1}% left" }
+            span { class: "form-help nowrap-unit", "{used_caption}" }
+        }
         svg { class: "quota-meter", view_box: "0 0 100 6", preserve_aspect_ratio: "none", "aria-hidden": "true",
             rect { width: "100", height: "6", rx: "3", class: "quota-track" }
             rect { width: "{width}", height: "6", rx: "3", class: "{fill_class}" }
         }
-        span { class: "mono", "{left:.1}% left · {used:.1}% used" }
     }
 }
 
@@ -359,9 +376,14 @@ pub(super) fn QuotaHistoryChart(
     rsx! {
         figure { class: "provider-chart chart-stage",
             div { class: "chart-header",
-                figcaption { "Remaining quota (%) · {fmt_dt(from)} → {fmt_dt(until)}" }
-                span { class: if active.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
-                    {active.as_ref().map_or_else(|| "Hover a line, segment, or point to inspect".to_owned(), QuotaHover::readout)}
+                figcaption {
+                    "Remaining quota (%) · " span { class: "nowrap-unit", "{fmt_dt(from)}" }
+                    " → " span { class: "nowrap-unit", "{fmt_dt(until)}" }
+                }
+                if let Some(active) = &active {
+                    span { class: "chart-readout active mono", "{active.readout()}" }
+                } else if !series_list.is_empty() || !forecasts.is_empty() || !reset_times.is_empty() {
+                    span { class: "form-help", "Hover a line, segment, or point to inspect" }
                 }
             }
             if !series_list.is_empty() || !forecasts.is_empty() {
@@ -693,6 +715,8 @@ struct BarItem {
     cost_usd: f64,
 }
 
+pub(super) const NO_RANGE_DATA: &str = "No data for selected range";
+
 #[component]
 fn InteractiveBars(label: &'static str, metric: Metric, items: Vec<BarItem>) -> Element {
     let mut hovered = use_signal(|| None::<usize>);
@@ -724,16 +748,16 @@ fn InteractiveBars(label: &'static str, metric: Metric, items: Vec<BarItem>) -> 
         )
     });
     rsx! {
-        figure { class: "provider-chart chart-stage",
-            div { class: "chart-header",
-                figcaption { "{label} · {unit}" }
-                span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
-                    {readout.as_deref().unwrap_or("Hover a bar to inspect")}
+        if items.is_empty() {
+            p { class: "form-help", "{NO_RANGE_DATA}" }
+        } else {
+            figure { class: "provider-chart chart-stage",
+                div { class: "chart-header",
+                    figcaption { "{label} · {unit}" }
+                    span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
+                        {readout.as_deref().unwrap_or("Hover a bar to inspect")}
+                    }
                 }
-            }
-            if items.is_empty() {
-                p { class: "muted", "No observations for this filter." }
-            } else {
                 svg {
                     view_box: "0 0 620 156",
                     role: "img",
@@ -1026,16 +1050,16 @@ pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>) -> Element {
     }
     .unzip();
     rsx! {
-        figure { class: "provider-chart chart-stage",
-            div { class: "chart-header",
-                figcaption { "Daily cache hit rate (%) · avg {fmt_hit_pct(avg_rate)}" }
-                span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
-                    {readout.as_deref().unwrap_or("Hover a line segment or point to inspect")}
+        if plotted.is_empty() {
+            p { class: "form-help", "{NO_RANGE_DATA}" }
+        } else {
+            figure { class: "provider-chart chart-stage",
+                div { class: "chart-header",
+                    figcaption { "Daily cache hit rate (%) · avg {fmt_hit_pct(avg_rate)}" }
+                    span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
+                        {readout.as_deref().unwrap_or("Hover a line segment or point to inspect")}
+                    }
                 }
-            }
-            if points.is_empty() {
-                p { class: "muted", "No cache observations in this range." }
-            } else {
                 svg {
                     view_box: "0 0 620 156",
                     role: "img",
@@ -1152,6 +1176,9 @@ pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>) -> Element {
 #[component]
 pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Element {
     let mut hovered = use_signal(|| None::<(usize, usize)>);
+    if cells.is_empty() {
+        return rsx! { p { class: "form-help", "{NO_RANGE_DATA}" } };
+    }
     let unit = metric.label();
     let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     let cell_map: BTreeMap<_, _> = cells
@@ -1501,6 +1528,28 @@ mod tests {
     }
 
     #[test]
+    fn quota_bar_distinguishes_zero_usage_from_no_observation() {
+        fn app() -> Element {
+            let daily: QuotaWindow = serde_json::from_value(serde_json::json!({
+                "window_key": "daily", "label": "Daily · measured zero", "used_percent": 0.0,
+                "observation_state": "measured"
+            }))
+            .unwrap();
+            let monthly: QuotaWindow = serde_json::from_value(serde_json::json!({
+                "window_key": "monthly", "label": "Monthly · never observed"
+            }))
+            .unwrap();
+            rsx! { QuotaLimitBar { window: daily } QuotaLimitBar { window: monthly } }
+        }
+        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        assert!(rendered.find("100.0% left").unwrap() < rendered.find("0% used").unwrap());
+        assert!(rendered.contains("\"0% used\""));
+        assert!(rendered.contains("Not observed"));
+        assert!(!rendered.contains("measured zero"));
+        assert!(!rendered.contains("never observed"));
+    }
+
+    #[test]
     fn quota_lines_break_only_after_four_hours() {
         let start = DateTime::UNIX_EPOCH;
         let end = start + TimeDelta::hours(12);
@@ -1544,6 +1593,19 @@ mod tests {
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
         assert!(rendered.contains("1970-01-01 · 80.0%"));
+    }
+
+    #[test]
+    fn empty_activity_charts_show_no_range_data_without_hover_controls() {
+        fn app() -> Element {
+            rsx! {
+                ActivityTrendChart { points: vec![], metric: Metric::Requests }
+                CacheHitRateChart { points: vec![daily_point(0, 0)] }
+            }
+        }
+        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        assert_eq!(rendered.matches("No data for selected range").count(), 2);
+        assert!(!rendered.contains("Hover"));
     }
 
     #[test]

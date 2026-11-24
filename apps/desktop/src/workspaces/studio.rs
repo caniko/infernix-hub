@@ -9,6 +9,7 @@ use contracts::{
     CancelOut, ChatMessageIn, FreezeReleaseIn, GenerateIn, LinkApprovalIn, ReleaseState, ScheduleIn, SelectAssetIn, TimingScope,
 };
 use dioxus::prelude::*;
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
@@ -23,11 +24,34 @@ use crate::{
     state::{Loaded, Store, Workspace},
 };
 
+fn generation_prompt(inputs: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(inputs).ok()?;
+    value.get("prompt")?.as_str().map(str::to_owned)
+}
+
+fn set_generation_prompt(inputs: &str, prompt: String) -> Option<String> {
+    let mut value: Value = serde_json::from_str(inputs).ok()?;
+    *value.get_mut("prompt").filter(|value| value.is_string())? = Value::String(prompt);
+    serde_json::to_string_pretty(&value).ok()
+}
+
+fn workflow_label(name: &str) -> &str {
+    match name {
+        "moss-look-img2img" => "Moss look · image to image",
+        "moss-look-img2img-final" => "Moss look · final image to image",
+        "moss-look-txt2img" => "Moss look · text to image",
+        "poster-txt2img" => "Poster · text to image",
+        "swatch" => "Swatch",
+        _ => name,
+    }
+}
+
 #[component]
 pub fn StudioView() -> Element {
     let store = use_context::<Store>();
     let client = use_context::<HubClient>();
     let content = (store.content).cloned();
+    let content_count = content.data.as_ref().map_or(0, Vec::len);
     let detail = (store.content_detail).cloned();
     let selected_id = (store.selected_content).cloned();
     let detail_error = detail.error.clone();
@@ -35,7 +59,7 @@ pub fn StudioView() -> Element {
 
     let mut workflow_id = use_signal(|| Option::<Uuid>::None);
     let mut variants = use_signal(|| "4".to_string());
-    let mut gen_inputs = use_signal(String::new);
+    let mut gen_inputs = use_signal(HashMap::<Uuid, String>::new);
     let mut four_up = use_signal(|| false);
     let mut alt = use_signal(HashMap::<Uuid, String>::new);
     let mut release_text = use_signal(String::new);
@@ -48,13 +72,8 @@ pub fn StudioView() -> Element {
     let mut decision_note = use_signal(String::new);
     let mut initialized_for = use_signal(|| Option::<Uuid>::None);
     let draft = settings.cloned();
-    let frozen_json = serde_json::to_string_pretty(&settings_base.cloned()).unwrap_or_default();
-
-    use_effect(move || {
-        if workflow_id.cloned().is_none() {
-            workflow_id.set((store.workflows).cloned().data.and_then(|items| items.first().map(|w| w.id)));
-        }
-    });
+    let workflows = (store.workflows).cloned();
+    let accounts = (store.accounts).cloned();
 
     use_effect(move || {
         let Some(id) = (store.selected_content).cloned() else { return };
@@ -62,16 +81,7 @@ pub fn StudioView() -> Element {
         if detail.item.id != id || initialized_for.cloned() == Some(id) {
             return;
         }
-        // Prefill only inputs the selected workflow binds; anything else is
-        // rejected by the hub as `unknown_input`.
-        let brief = &detail.item.brief;
-        let has_prompt = (store.workflows)
-            .cloned()
-            .data
-            .and_then(|ws| ws.into_iter().find(|w| Some(w.id) == workflow_id.cloned()))
-            .is_some_and(|w| w.bindings.get("prompt").is_some());
-        let prompt = if brief.visual_direction.trim().is_empty() { detail.item.title.clone() } else { brief.visual_direction.clone() };
-        gen_inputs.set(if has_prompt { serde_json::json!({ "prompt": prompt }) } else { serde_json::json!({}) }.to_string());
+        gen_inputs.write().clear();
         release_text.set(String::new());
         not_before.set(format::default_local(Utc::now()));
         not_after.set(format::default_local(Utc::now() + ChronoDuration::hours(24)));
@@ -98,18 +108,19 @@ pub fn StudioView() -> Element {
     });
 
     let client_generate = client.clone();
-    let generate = move |_| {
+    let generate = move |workflow_id: Uuid, default_inputs: &str| {
         let Some(content_id) = (store.selected_content).cloned() else { return };
-        let Some(workflow_id) = workflow_id.cloned() else {
-            store.notify(false, "Select a workflow before generating.");
+        if initialized_for() != Some(content_id) {
             return;
-        };
+        }
         let variant_count: i32 = variants.cloned().parse().unwrap_or(0);
         if !(1..=8).contains(&variant_count) {
             store.notify(false, "Variants must be between 1 and 8.");
             return;
         }
-        let inputs: serde_json::Value = match serde_json::from_str(&gen_inputs.cloned()) {
+        let drafts = gen_inputs.read();
+        let raw = drafts.get(&workflow_id).map_or(default_inputs, String::as_str);
+        let inputs: Value = match serde_json::from_str(raw) {
             Ok(value) => value,
             Err(error) => {
                 store.notify(false, format!("Inputs must be valid JSON: {error}"));
@@ -297,7 +308,7 @@ pub fn StudioView() -> Element {
         aside { class: "context", aria_label: "Content items",
             div { class: "context-head",
                 h2 { "Content" }
-                span { class: "label-tech", "{content.data.as_ref().map(|v| v.len()).unwrap_or(0)} items" }
+                span { class: "form-help nowrap-unit", if content_count == 1 { "1 item" } else { "{content_count} items" } }
             }
             div { class: "context-list",
                 match content.data.clone() {
@@ -343,9 +354,33 @@ pub fn StudioView() -> Element {
                             .cloned()
                             .data
                             .and_then(|ps| ps.into_iter().find(|p| p.id == item.persona_id).map(|p| p.name))
-                            .unwrap_or_else(|| format::short_hash(&item.persona_id.to_string()));
-                        let reviewable = detail.releases.iter().find(|r| r.state == ReleaseState::Draft).cloned();
+                            .unwrap_or_else(|| "Individual unavailable".to_string());
+                        let reviewable = detail.releases.iter().find(|r| r.state == ReleaseState::Draft).map(|r| r.id);
                         let approved = detail.releases.iter().find(|r| r.state == ReleaseState::Approved).cloned();
+                        let review_hint = if latest_release.as_ref().is_some_and(|r| r.state == ReleaseState::InReview) {
+                            "The latest release is already in review."
+                        } else if accounts.data.as_ref().is_some_and(Vec::is_empty) {
+                            "A publishing account is required to save a release draft."
+                        } else {
+                            "In Release, enter post text, choose an account, then click Save release draft."
+                        };
+                        let request_count = detail.generations.len();
+                        let selected_workflow = workflows.data.as_ref().and_then(|items| {
+                            items.iter().find(|workflow| Some(workflow.id) == workflow_id()).or_else(|| items.first())
+                        });
+                        let generation_workflow_id = selected_workflow.map(|workflow| workflow.id);
+                        let has_prompt = selected_workflow.is_some_and(|workflow| workflow.bindings.get("prompt").is_some());
+                        let default_inputs = if has_prompt {
+                            let visual = &item.brief.visual_direction;
+                            let prompt = if visual.trim().is_empty() { &item.title } else { visual };
+                            serde_json::json!({ "prompt": prompt }).to_string()
+                        } else {
+                            "{}".to_string()
+                        };
+                        let inputs = generation_workflow_id
+                            .filter(|_| initialized_for() == Some(item.id))
+                            .and_then(|id| gen_inputs.read().get(&id).cloned())
+                            .unwrap_or_else(|| default_inputs.clone());
                         rsx! {
                             div { class: "work-head",
                                 div {
@@ -353,72 +388,116 @@ pub fn StudioView() -> Element {
                                     p { class: "hint", "{persona_name} · updated {format::fmt_dt(item.updated_at)}" }
                                 }
                                 div { class: "spacer" }
-                                Chip { label: state_label.to_string(), tone: Some(state_tone.to_string()) }
-                                {
-                                    let review_release = reviewable.clone();
-                                    rsx! {
+                                 if item.state != contracts::ContentState::Brief {
+                                     Chip { label: state_label.to_string(), tone: Some(state_tone.to_string()) }
+                                 }
+                                div { class: "form-field", style: "justify-items: start;",
+                                    div { class: "row",
                                         button {
-                                            class: "btn btn-glass",
-                                            disabled: review_release.is_none(),
+                                            class: "btn secondary",
+                                            style: reviewable.is_none().then_some("opacity: 1; color: var(--text-muted); border-color: var(--border);"),
+                                            disabled: reviewable.is_none(),
+                                            aria_describedby: reviewable.is_none().then_some("studio-review-help"),
                                             onclick: move |_| {
-                                                if let Some(release) = review_release.clone() {
-                                                    request_review(release.id);
+                                                if let Some(id) = reviewable {
+                                                    request_review(id);
                                                 }
                                             },
                                             "Request review"
                                         }
-                                    }
-                                }
-                            }
-                            Panel { title: "Brief".to_string(), caption: Some("frozen at creation".to_string()),
-                                div { class: "kv-grid",
-                                    div { class: "kv", span { class: "k", "Angle" }, span { class: "v", "{item.brief.angle}" } }
-                                    div { class: "kv", span { class: "k", "Audience" }, span { class: "v", "{item.brief.audience}" } }
-                                    div { class: "kv", span { class: "k", "Copy" }, span { class: "v", "{item.brief.copy_direction}" } }
-                                    div { class: "kv", span { class: "k", "Visual" }, span { class: "v", "{item.brief.visual_direction}" } }
-                                }
-                            }
-                            Panel { title: "Generation".to_string(), caption: Some(format!("{} request(s)", detail.generations.len())),
-                                if let Some(error) = (store.workflows).cloned().error {
-                                    ErrorCard { code: error.code, message: error.message }
-                                } else if (store.workflows).cloned().data.is_none() {
-                                    Loading { text: "Loading workflows…".to_string() }
-                                }
-                                div { class: "form-grid",
-                                    div { class: "field-row",
-                                        label { class: "label-tech", r#for: "studio-workflow", "Workflow" }
-                                        select {
-                                            id: "studio-workflow",
-                                            class: "input",
-                                            value: "{workflow_id.cloned().map(|id| id.to_string()).unwrap_or_default()}",
-                                            onchange: move |e| workflow_id.set(e.value().parse().ok()),
-                                            if let Some(workflows) = (store.workflows).cloned().data {
-                                                if workflows.is_empty() {
-                                                    option { value: "", "No workflows registered" }
-                                                }
-                                                for workflow in workflows {
-                                                    option { key: "{workflow.id}", value: "{workflow.id}", "{workflow.name} · v{workflow.version}" }
-                                                }
+                                        if reviewable.is_none() {
+                                            button {
+                                                class: "btn secondary",
+                                                aria_controls: "studio-release-section",
+                                                aria_describedby: "studio-review-help",
+                                                onclick: move |_| {
+                                                    let _ = document::eval(
+                                                        "const section = document.getElementById('studio-release-section');
+                                                        if (section) {
+                                                            section.focus({ preventScroll: true });
+                                                            const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+                                                            section.scrollIntoView({ behavior: reduced ? 'instant' : 'smooth', block: 'start' });
+                                                        }",
+                                                    );
+                                                },
+                                                "Go to Release ↓"
                                             }
                                         }
                                     }
-                                    div { class: "field-row",
-                                        label { class: "label-tech", r#for: "studio-variants", "Variants" }
-                                        input {
-                                            id: "studio-variants", class: "input", r#type: "number",
-                                            min: "1", max: "8", value: "{variants}",
-                                            oninput: move |e| variants.set(e.value()),
+                                    if reviewable.is_none() {
+                                        p { class: "form-help", id: "studio-review-help", "{review_hint}" }
+                                    }
+                                }
+                            }
+                            Panel { title: "Brief".to_string(), caption: None,
+                                 dl { class: "glass-card form-grid-2", style: "margin: 0;",
+                                    for (label, value) in [
+                                        ("Angle", item.brief.angle.as_str()),
+                                        ("Audience", item.brief.audience.as_str()),
+                                        ("Copy direction", item.brief.copy_direction.as_str()),
+                                        ("Visual direction", item.brief.visual_direction.as_str()),
+                                    ] {
+                                        div { class: "kv-item", key: "{label}",
+                                            dt { class: "kv-label", "{label}" }
+                                             dd { class: "kv-value", style: "white-space: pre-wrap;", if value.trim().is_empty() { "—" } else { "{value}" } }
                                         }
                                     }
-                                    div { class: "field-row",
-                                        label { class: "label-tech", r#for: "studio-inputs", "Inputs (JSON)" }
-                                        textarea {
-                                            id: "studio-inputs", class: "input", value: "{gen_inputs}",
-                                            oninput: move |e| gen_inputs.set(e.value()),
+                                }
+                            }
+                             section { class: "panel",
+                                 div { class: "panel-head",
+                                     h3 { "Generation" }
+                                     span { class: "form-help nowrap-unit", if request_count == 1 { "1 request" } else { "{request_count} requests" } }
+                                 }
+                                if let Some(error) = workflows.error.clone() {
+                                    ErrorCard { code: error.code, message: error.message }
+                                } else if workflows.loading {
+                                    Loading { text: "Loading workflows…".to_string() }
+                                }
+                                div { class: "form-stack",
+                                    div { class: "form-row",
+                                        div { class: "form-field",
+                                            label { class: "label-tech", r#for: "studio-workflow", "Workflow" }
+                                            select {
+                                                id: "studio-workflow", class: "input",
+                                                value: generation_workflow_id.map(|id| id.to_string()).unwrap_or_default(),
+                                                onchange: move |e| workflow_id.set(e.value().parse().ok()),
+                                                if generation_workflow_id.is_none() {
+                                                    option { value: "", "No workflows available" }
+                                                }
+                                                if let Some(items) = workflows.data.as_ref() {
+                                                    for workflow in items {
+                                                         option { key: "{workflow.id}", value: "{workflow.id}", "{workflow_label(&workflow.name)} · v{workflow.version}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        div { class: "form-field", style: "flex: 0 1 8rem;",
+                                            label { class: "label-tech", r#for: "studio-variants", "Variants" }
+                                            input {
+                                                id: "studio-variants", class: "input", r#type: "number",
+                                                min: "1", max: "8", value: "{variants}",
+                                                oninput: move |e| variants.set(e.value()),
+                                            }
                                         }
                                     }
-                                    div { class: "form-actions",
-                                        button { class: "btn btn-primary", onclick: generate, "Generate variants" }
+                                    if let Some(id) = generation_workflow_id {
+                                        GenerationInputs {
+                                            key: "{item.id}-{id}", inputs, has_prompt,
+                                            on_change: move |value| { gen_inputs.write().insert(id, value); },
+                                        }
+                                    }
+                                    div { class: "row",
+                                        button {
+                                            class: "btn primary",
+                                            disabled: generation_workflow_id.is_none() || initialized_for() != Some(item.id),
+                                            onclick: move |_| {
+                                                if let Some(id) = generation_workflow_id {
+                                                    generate(id, &default_inputs);
+                                                }
+                                            },
+                                            "Generate variants"
+                                        }
                                     }
                                 }
                                 if detail.generations.is_empty() {
@@ -441,11 +520,11 @@ pub fn StudioView() -> Element {
                                                 rsx! {
                                                     div { class: "glass-card generation", key: "{generation.id}",
                                                         div { class: "spread",
-                                                            span { class: "label-tech", "generation {format::short_hash(&generation.id.to_string())}" }
+                                                            span { class: "label-tech", "Started {format::fmt_dt(generation.created_at)}" }
                                                             Chip { label: gen_label.to_string(), tone: Some(gen_tone.to_string()) }
                                                         }
                                                         div { class: "row",
-                                                            span { class: "label-tech", "{generation.variants} variants · request v{generation.request_version} · {done}/{total} prompts done" }
+                                                            span { class: "label-tech", "{generation.variants} variants · {done}/{total} steps complete" }
                                                         }
                                                         div { class: "progress", div { class: "fill", style: "width: {pct}%;" } }
                                                         if !generation.attempts.is_empty() {
@@ -455,9 +534,11 @@ pub fn StudioView() -> Element {
                                                                         let (attempt_label, attempt_tone) = labels::attempt_state(attempt.state);
                                                                         rsx! {
                                                                             div { class: "attempt", key: "{attempt.id}",
-                                                                                span { class: "external", "{labels::attempt_kind(attempt.kind)} · {attempt.external_id}" }
+                                                                                span { "{labels::attempt_kind(attempt.kind)}" }
                                                                                 Chip { label: attempt_label.to_string(), tone: Some(attempt_tone.to_string()) }
-                                                                                span { "{format::preview(&serde_json::to_string(&attempt.progress).unwrap_or_default(), 60)}" }
+                                                                                if let Some(error) = attempt.progress.get("error").and_then(Value::as_str) {
+                                                                                    span { "{format::preview(error, 120)}" }
+                                                                                }
                                                                             }
                                                                         }
                                                                     }
@@ -499,21 +580,13 @@ pub fn StudioView() -> Element {
                                 }
                             }
                             Panel { title: "Assets".to_string(), caption: Some(format!("{} asset(s)", detail.assets.len())),
-                                div { class: "asset-toolbar",
-                                    button {
-                                        class: if four_up.cloned() { "btn btn-glass" } else { "btn btn-primary" },
-                                        onclick: move |_| four_up.set(false),
-                                        "2-up"
-                                    }
-                                    button {
-                                        class: if four_up.cloned() { "btn btn-primary" } else { "btn btn-glass" },
-                                        onclick: move |_| four_up.set(true),
-                                        "4-up"
-                                    }
-                                }
                                 if detail.assets.is_empty() {
-                                    EmptyState { title: "No assets yet.".to_string(), hint: Some("Generated images appear here when the engine reports receipts.".to_string()) }
+                                    EmptyState { title: "No assets yet.".to_string(), hint: Some("Images and videos appear here after generation.".to_string()) }
                                 } else {
+                                    div { class: "segmented", role: "group", aria_label: "Asset layout",
+                                        button { class: "seg-btn", aria_pressed: !four_up(), onclick: move |_| four_up.set(false), "2-up" }
+                                        button { class: "seg-btn", aria_pressed: four_up(), onclick: move |_| four_up.set(true), "4-up" }
+                                    }
                                     div { class: if four_up.cloned() { "asset-grid four" } else { "asset-grid two" },
                                         for asset in detail.assets.iter() {
                                             {
@@ -599,13 +672,13 @@ pub fn StudioView() -> Element {
                                     }
                                 }
                             }
-                            Panel { title: "Platform settings".to_string(), caption: Some("only the keys the selected channels read".to_string()),
+                            Panel { title: "Platform settings".to_string(), caption: None,
                                 div { class: "form-grid",
                                     if draft.drafts().is_empty() {
                                         if account_ids.cloned().is_empty() {
-                                            p { class: "label-tech", "Select an account: its channel decides which settings appear." }
+                                            p { class: "form-help", "Choose a publishing account below to see its settings." }
                                         } else {
-                                            p { class: "label-tech", "The selected accounts' channels have no known settings keys; no editor is shown rather than freezing keys nothing reads." }
+                                            p { class: "form-help", "The selected channels have no additional settings." }
                                         }
                                     }
                                     for channel in draft.drafts() {
@@ -704,14 +777,16 @@ pub fn StudioView() -> Element {
                                             }
                                         }
                                     }
-                                    div { class: "field-row",
-                                        span { class: "label-tech", "Frozen in the latest revision" }
-                                        pre { class: "raw-json", "{frozen_json}" }
+                                    if !draft.drafts().is_empty() {
+                                        p { class: "form-help", "If a channel has no disclosure field, include the disclosure in the post text." }
                                     }
-                                    p { class: "label-tech", "Only these keys are editable; other frozen keys are preserved. A channel with no disclosure field carries it in the post text, which the approval hash covers." }
                                 }
                             }
-                            Panel { title: "Release".to_string(), caption: Some(format!("{} revision(s)", detail.releases.len())),
+                            section { class: "panel", id: "studio-release-section", tabindex: "-1", aria_labelledby: "studio-release-title",
+                                div { class: "panel-head",
+                                    h3 { id: "studio-release-title", "Release" }
+                                    span { class: "label-tech", "{detail.releases.len()} revision(s)" }
+                                }
                                 if let Some(release) = latest_release.clone() {
                                     div { class: "glass-card",
                                         div { class: "spread",
@@ -721,14 +796,16 @@ pub fn StudioView() -> Element {
                                                 rsx! { Chip { label: release_label.to_string(), tone: Some(release_tone.to_string()) } }
                                             }
                                         }
-                                        div { class: "kv", span { class: "k", "payload hash" }, span { class: "v", "{release.payload_hash}" } }
-                                        if let Some(approval) = release.paperclip_approval_id.clone() {
-                                            div { class: "kv", span { class: "k", "paperclip approval" }, span { class: "v", "{approval}" } }
-                                        }
                                         if let Some(action) = release.actions.first() {
-                                            div { class: "kv", span { class: "k", "frozen text" }, span { class: "v", "{action.text}" } }
-                                            div { class: "field-row",
-                                                span { class: "label-tech", "frozen settings" }
+                                            p { class: "kv-value", "{action.text}" }
+                                        }
+                                        details {
+                                            summary { class: "muted", "Release details" }
+                                            div { class: "kv", span { class: "k", "Payload hash" }, span { class: "v", "{release.payload_hash}" } }
+                                            if let Some(approval) = release.paperclip_approval_id.as_ref() {
+                                                div { class: "kv", span { class: "k", "Paperclip approval" }, span { class: "v", "{approval}" } }
+                                            }
+                                            if let Some(action) = release.actions.first() {
                                                 pre { class: "raw-json", "{serde_json::to_string_pretty(&action.platform_settings).unwrap_or_default()}" }
                                             }
                                         }
@@ -768,16 +845,16 @@ pub fn StudioView() -> Element {
                                     div { class: "field-row",
                                         label { class: "label-tech", "Accounts" }
                                         div { class: "stack",
-                                            if let Some(error) = (store.accounts).cloned().error {
+                                            if let Some(error) = accounts.error.clone() {
                                                 ErrorCard { code: error.code, message: error.message }
-                                            } else if (store.accounts).cloned().data.is_none() {
+                                            } else if accounts.loading {
                                                 Loading { text: "Loading accounts…".to_string() }
                                             }
-                                            if let Some(accounts) = (store.accounts).cloned().data {
-                                                if accounts.is_empty() {
+                                            if let Some(items) = accounts.data.as_ref() {
+                                                if items.is_empty() {
                                                     p { class: "label-tech", "No accounts registered." }
                                                 }
-                                                for account in accounts {
+                                                for account in items {
                                                     {
                                                         let id = account.id.clone();
                                                         let checked = account_ids.cloned().contains(&id);
@@ -825,7 +902,7 @@ pub fn StudioView() -> Element {
                                         }
                                     }
                                     div { class: "form-actions",
-                                        button { class: "btn btn-primary", onclick: freeze, "Freeze release" }
+                                        button { class: "btn primary", onclick: freeze, "Save release draft" }
                                     }
                                 }
                                 if let Some(release) = approved.clone() {
@@ -852,13 +929,17 @@ pub fn StudioView() -> Element {
                                     }
                                 }
                                 if detail.intents.is_empty() {
-                                    EmptyState { title: "No publication intents yet.".to_string(), hint: Some("Approved releases become intents when scheduled.".to_string()) }
+                                    EmptyState { title: "Nothing scheduled yet.".to_string(), hint: Some("Schedule an approved release to publish it.".to_string()) }
                                 } else {
                                     div { class: "stack",
                                         for intent in detail.intents.iter() {
                                             {
                                                 let (intent_label, intent_tone) = labels::intent_state(intent.state);
                                                 let intent_id = intent.id;
+                                                let account = accounts.data.as_ref()
+                                                    .and_then(|items| items.iter().find(|account| account.id == intent.account_id))
+                                                    .map(|account| account.handle.as_str())
+                                                    .unwrap_or("Unknown account");
                                                 let cancellable = matches!(
                                                     intent.state,
                                                     contracts::IntentState::Scheduled
@@ -868,14 +949,11 @@ pub fn StudioView() -> Element {
                                                 rsx! {
                                                     div { class: "glass-card intent-row", key: "{intent.id}",
                                                         div { class: "spread",
-                                                            span { class: "label-tech", "{intent.account_id} · due {format::fmt_dt(intent.due_at)}" }
+                                                            span { class: "label-tech", "{account} · {format::fmt_dt(intent.due_at)}" }
                                                             Chip { label: intent_label.to_string(), tone: Some(intent_tone.to_string()) }
                                                         }
                                                         div { class: "row",
                                                             span { class: "label-tech", "schedule revision {intent.schedule_revision}" }
-                                                            if let Some(post) = intent.provider_post_id.clone() {
-                                                                span { class: "label-tech", "provider {post}" }
-                                                            }
                                                             if let Some(url) = intent.provider_url.clone() {
                                                                 button {
                                                                     class: "btn btn-glass btn-xs",
@@ -889,7 +967,7 @@ pub fn StudioView() -> Element {
                                                                 {
                                                                     let (attempt_label, attempt_tone) = labels::intent_state(attempt.state);
                                                                     rsx! {
-                                                                        span { class: "external", "attempt {attempt.attempt} · {attempt.idempotency_key}" }
+                                                                        span { "Attempt {attempt.attempt}" }
                                                                         Chip { label: attempt_label.to_string(), tone: Some(attempt_tone.to_string()) }
                                                                     }
                                                                 }
@@ -901,8 +979,8 @@ pub fn StudioView() -> Element {
                                                                 rsx! {
                                                                     DeltaRow {
                                                                         seq: format::short_hash(&intent.id.to_string()),
-                                                                        category: "intent".to_string(),
-                                                                        description: "cancel this publication intent".to_string(),
+                                                                        category: "schedule".to_string(),
+                                                                        description: "Cancel this scheduled post".to_string(),
                                                                         action: Some("Cancel".to_string()),
                                                                         on_confirm: move |_| {
                                                                             let client = client.clone();
@@ -955,6 +1033,45 @@ pub fn StudioView() -> Element {
     }
 }
 
+#[component]
+fn GenerationInputs(inputs: String, has_prompt: bool, on_change: EventHandler<String>) -> Element {
+    let prompt = has_prompt.then(|| generation_prompt(&inputs)).flatten();
+    let json_field = rsx! {
+        div { class: "form-field",
+            label { class: "label-tech", r#for: "studio-inputs", "Inputs (JSON)" }
+            textarea {
+                id: "studio-inputs", class: "input mono", value: "{inputs}", rows: "3",
+                spellcheck: false,
+                oninput: move |e| on_change.call(e.value()),
+            }
+        }
+    };
+    if !has_prompt {
+        return json_field;
+    }
+    rsx! {
+        if let Some(prompt) = prompt {
+            div { class: "form-field",
+                label { class: "label-tech", r#for: "studio-prompt", "Prompt" }
+                textarea {
+                    id: "studio-prompt", class: "input", value: "{prompt}", rows: "3",
+                    oninput: move |e| {
+                        if let Some(next) = set_generation_prompt(&inputs, e.value()) {
+                            on_change.call(next);
+                        }
+                    },
+                }
+            }
+        } else {
+            p { class: "form-help", "To use the prompt field, add a text prompt in the JSON below." }
+        }
+        details {
+            summary { class: "muted", "Advanced JSON inputs" }
+            {json_field}
+        }
+    }
+}
+
 fn transcript(messages: &[contracts::ChatMessage]) -> Vec<TranscriptLine> {
     messages
         .iter()
@@ -964,4 +1081,25 @@ fn transcript(messages: &[contracts::ChatMessage]) -> Vec<TranscriptLine> {
             proposal: message.proposal_id.map(|_| "Review canon proposal".to_string()),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generation_prompt, set_generation_prompt};
+    use serde_json::json;
+
+    #[test]
+    fn prompt_edits_preserve_advanced_inputs() {
+        let raw = r#"{"prompt":"original","seed":42,"options":{"enabled":true}}"#;
+        assert_eq!(generation_prompt(raw).as_deref(), Some("original"));
+        let updated = set_generation_prompt(raw, "new\nprompt".into()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&updated).unwrap(),
+            json!({"prompt": "new\nprompt", "seed": 42, "options": {"enabled": true}})
+        );
+        for raw in ["{", "[]", r#"{"prompt":42}"#, "{}"] {
+            assert_eq!(generation_prompt(raw), None);
+            assert_eq!(set_generation_prompt(raw, "new".into()), None);
+        }
+    }
 }
