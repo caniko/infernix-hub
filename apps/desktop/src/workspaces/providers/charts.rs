@@ -1,5 +1,9 @@
 //! SVGs use measured/estimated contract data and have equivalent text tables.
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write,
+    rc::Rc,
+};
 
 use chrono::{DateTime, TimeDelta, Utc};
 
@@ -30,7 +34,9 @@ fn fmt_compact_axis(metric: Metric, value: f64) -> String {
     match metric {
         Metric::CacheHitRate => format!("{value:.0}%"),
         Metric::Cost => {
-            if value >= 100.0 {
+            if value == 0.0 {
+                "$0".into()
+            } else if value >= 100.0 {
                 format!("${value:.0}")
             } else if value >= 1.0 {
                 format!("${value:.2}")
@@ -124,7 +130,7 @@ pub(super) fn ResetTime(at: Option<DateTime<Utc>>) -> Element {
 }
 
 #[component]
-pub(super) fn QuotaLimitBar(window: QuotaWindow) -> Element {
+pub(super) fn QuotaLimitBar(window: QuotaWindow, #[props(default)] forecast: Option<QuotaForecast>) -> Element {
     let (remaining, used) = quota_values(window.observation_state, window.remaining_percent, window.used_percent);
     let (label, tone) = freshness(&window);
     let status_label = quota_status_label(window.status);
@@ -141,8 +147,9 @@ pub(super) fn QuotaLimitBar(window: QuotaWindow) -> Element {
                 if let Some(status) = status_label { span { class: "muted", "{status}" } }
             }
             if let (Some(left), Some(used)) = (remaining, used) {
-                Meter { left, used }
-            } else if window.observation_state == QuotaObservationState::Measured {
+                Meter { left, used, resets_at: window.resets_at, window_seconds: window.window_duration_mins.map(|mins| u64::from(mins) * 60),
+                    forecast: forecast.filter(|_| !window.stale && window.observation_state == QuotaObservationState::Measured) }
+            } else if matches!(window.observation_state, QuotaObservationState::Measured | QuotaObservationState::StaleLastGood) {
                 p { class: "muted", "Percentage not observed" }
             }
             if matches!(window.observation_state, QuotaObservationState::Measured | QuotaObservationState::StaleLastGood)
@@ -159,8 +166,42 @@ pub(super) fn QuotaLimitBar(window: QuotaWindow) -> Element {
     }
 }
 
+fn pace_tick(now: DateTime<Utc>, reset: Option<DateTime<Utc>>, seconds: Option<u64>) -> Option<f64> {
+    let duration = seconds.filter(|s| *s > 0)? as f64;
+    Some((1.0 - (reset? - now).as_seconds_f64() / duration).clamp(0.0, 1.0) * 100.0)
+}
+
+fn window_end_estimate(forecast: &QuotaForecast, left: f64, reset: DateTime<Utc>, now: DateTime<Utc>) -> Option<(f64, bool)> {
+    let first = forecast.points.first()?;
+    let rate = forecast.drain_pct_per_hour;
+    // The pool's rate/anchor may describe a different cohort than the weighted reading.
+    if reset <= now
+        || first.at >= reset
+        || !first.remaining_percent.is_finite()
+        || (first.remaining_percent - left).abs() > 0.05
+        || !rate.is_finite()
+        || rate < 0.0
+    {
+        return None;
+    }
+    let end = (first.remaining_percent - rate * (reset - first.at).as_seconds_f64() / 3600.0).clamp(0.0, left.clamp(0.0, 100.0));
+    let runs_out = forecast.projected_exhaustion_at.is_some_and(|at| at < reset);
+    Some((end, runs_out))
+}
+
 #[component]
-pub(super) fn Meter(left: f64, used: f64) -> Element {
+pub(super) fn Meter(
+    left: f64,
+    used: f64,
+    resets_at: Option<DateTime<Utc>>,
+    window_seconds: Option<u64>,
+    forecast: Option<QuotaForecast>,
+) -> Element {
+    let hatch = use_hook(|| format!("quota-hatch-{}", Uuid::new_v4().simple()));
+    let now = Utc::now();
+    let pace = pace_tick(now, resets_at, window_seconds);
+    let pace_label = pace.map(|pct| format!("Window pace: {pct:.0}% elapsed"));
+    let estimate = forecast.as_ref().zip(resets_at).and_then(|(f, reset)| window_end_estimate(f, left, reset, now));
     let width = left.clamp(0.0, 100.0);
     let fill_class = if width < 10.0 {
         "quota-left bad"
@@ -175,485 +216,883 @@ pub(super) fn Meter(left: f64, used: f64) -> Element {
             strong { class: "mono nowrap-unit", "{left:.1}% left" }
             span { class: "form-help nowrap-unit", "{used_caption}" }
         }
-        svg { class: "quota-meter", view_box: "0 0 100 6", preserve_aspect_ratio: "none", "aria-hidden": "true",
-            rect { width: "100", height: "6", rx: "3", class: "quota-track" }
-            rect { width: "{width}", height: "6", rx: "3", class: "{fill_class}" }
-        }
-    }
-}
-
-type Point = (DateTime<Utc>, f64);
-
-const QUOTA_W: f64 = 620.0;
-const QUOTA_LEFT: f64 = 44.0;
-const QUOTA_RIGHT: f64 = 604.0;
-const QUOTA_TOP: f64 = 16.0;
-const QUOTA_BOTTOM: f64 = 148.0;
-
-fn line(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>) -> String {
-    let mut previous = None;
-    points
-        .iter()
-        .map(|&(at, value)| {
-            let move_to = previous.is_none_or(|prev| at - prev > TimeDelta::hours(4));
-            previous = Some(at);
-            format!("{}{:.2} {:.2}", if move_to { 'M' } else { 'L' }, x(at, start, end), y(value))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn area_segments(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<String> {
-    let mut runs: Vec<Vec<Point>> = Vec::new();
-    for &pt in points {
-        let break_run = runs.last().and_then(|r| r.last()).is_none_or(|prev| pt.0 - prev.0 > TimeDelta::hours(4));
-        if break_run {
-            runs.push(vec![pt]);
-        } else if let Some(last) = runs.last_mut() {
-            last.push(pt);
-        }
-    }
-    runs.into_iter()
-        .filter(|run| run.len() >= 2)
-        .map(|run| {
-            let first_x = x(run[0].0, start, end);
-            let last_x = x(run[run.len() - 1].0, start, end);
-            let mut d = format!("M{first_x:.2} {QUOTA_BOTTOM:.2}");
-            for (at, value) in &run {
-                d.push_str(&format!(" L{:.2} {:.2}", x(*at, start, end), y(*value)));
+        svg { class: "quota-meter", view_box: "0 0 100 10", preserve_aspect_ratio: "none", "aria-hidden": "true",
+            rect { y: "2", width: "100", height: "6", class: "quota-track" }
+            rect { y: "2", width: "{width}", height: "6", class: "{fill_class}" }
+            if let Some((end, risk)) = estimate {
+                defs {
+                    pattern { id: "{hatch}", width: "1.8", height: "6", pattern_units: "userSpaceOnUse",
+                        path { d: "M-1.8 6L0 0 M0 6L1.8 0 M1.8 6L3.6 0",
+                            class: if risk { "quota-hatch bad" } else { "quota-hatch" } }
+                    }
+                }
+                rect { x: "{end}", y: "2", width: "{width - end}", height: "6", fill: "url(#{hatch})", class: "quota-projected-end" }
             }
-            d.push_str(&format!(" L{last_x:.2} {QUOTA_BOTTOM:.2} Z"));
-            d
-        })
-        .collect()
+            if let (Some(pace), Some(label)) = (pace, &pace_label) {
+                {
+                    // The track runs from 0% left to 100% left, so pace is the remaining-time benchmark.
+                    let x = (100.0 - pace).clamp(0.3, 99.7);
+                    rsx! { line { x1: "{x}", x2: "{x}", y1: "0", y2: "10", class: "quota-pace", title { "{label}" } } }
+                }
+            }
+        }
+        if pace_label.is_some() || estimate.is_some() {
+            div { class: "row quota-meter-meta",
+                if let Some(label) = &pace_label { span { "{label}" } }
+                if let Some((end, risk)) = estimate {
+                    span { class: if risk { "quota-risk" } else { "" }, title: "Estimate at the reported reset, assuming the recent drain rate continues.",
+                        if risk { "Runs out before reset" } else { "Ends ~{end:.0}% left" }
+                    }
+                }
+            }
+        }
+    }
 }
 
-fn x(at: DateTime<Utc>, start: DateTime<Utc>, end: DateTime<Utc>) -> f64 {
-    QUOTA_LEFT + (QUOTA_RIGHT - QUOTA_LEFT) * (at - start).num_seconds() as f64 / (end - start).num_seconds().max(1) as f64
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TimeBounds {
+    pub(super) start: DateTime<Utc>,
+    pub(super) end: DateTime<Utc>,
 }
 
-fn y(value: f64) -> f64 {
-    QUOTA_BOTTOM - (QUOTA_BOTTOM - QUOTA_TOP) * value.clamp(0.0, 100.0) / 100.0
+impl TimeBounds {
+    pub(super) fn at(self, fraction: f64) -> DateTime<Utc> {
+        self.start + TimeDelta::microseconds(((self.end - self.start).as_seconds_f64() * fraction * 1e6).round() as i64)
+    }
+
+    pub(super) fn fraction(self, at: DateTime<Utc>) -> f64 {
+        (at - self.start).as_seconds_f64() / (self.end - self.start).as_seconds_f64().max(1e-6)
+    }
+
+    fn contains(self, at: DateTime<Utc>) -> bool {
+        (self.start..=self.end).contains(&at)
+    }
+
+    fn fit(self, start: DateTime<Utc>, span: TimeDelta) -> Self {
+        let start = start.clamp(self.start, self.end - span);
+        Self { start, end: start + span }
+    }
+
+    pub(super) fn zoom(self, full: Self, anchor: f64, factor: f64) -> Self {
+        let max = full.end - full.start;
+        let anchor = anchor.clamp(0.0, 1.0);
+        let span = TimeDelta::microseconds(((self.end - self.start).as_seconds_f64() * factor * 1e6).round() as i64)
+            .clamp(TimeDelta::minutes(5).min(max), max);
+        let offset = TimeDelta::microseconds((span.as_seconds_f64() * anchor * 1e6).round() as i64);
+        full.fit(self.at(anchor) - offset, span)
+    }
+
+    pub(super) fn pan(self, full: Self, fraction: f64) -> Self {
+        full.fit(self.at(fraction), (self.end - self.start).min(full.end - full.start))
+    }
+
+    fn timestamps(self, sorted: &[DateTime<Utc>]) -> &[DateTime<Utc>] {
+        &sorted[sorted.partition_point(|t| *t < self.start)..sorted.partition_point(|t| *t <= self.end)]
+    }
 }
+
+pub(super) fn nearest_timestamp(sorted: &[DateTime<Utc>], cursor: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let next = sorted.partition_point(|t| *t < cursor);
+    match (next.checked_sub(1).and_then(|i| sorted.get(i)), sorted.get(next)) {
+        (Some(&a), Some(&b)) => Some(if cursor - a <= b - cursor { a } else { b }),
+        (a, b) => a.or(b).copied(),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct TimeCursor {
+    at: DateTime<Utc>,
+    panel: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct TimeScrub {
+    view: Signal<Option<TimeBounds>>,
+    cursor: Signal<Option<TimeCursor>>,
+    drag: Signal<Option<(f64, TimeBounds)>>,
+}
+
+pub(super) fn use_time_scrub() -> TimeScrub {
+    TimeScrub { view: use_signal(|| None), cursor: use_signal(|| None), drag: use_signal(|| None) }
+}
+
+impl TimeScrub {
+    pub(super) fn bounds(self, full: TimeBounds) -> TimeBounds {
+        self.view.read().map_or(full, |v| v.pan(full, 0.0))
+    }
+
+    pub(super) fn active(self) -> Option<DateTime<Utc>> {
+        (*self.cursor.read()).map(|cursor| cursor.at)
+    }
+
+    pub(super) fn clear(mut self) {
+        self.cursor.set(None);
+        self.drag.set(None);
+    }
+
+    pub(super) fn reset(mut self) {
+        self.view.set(None);
+        self.clear();
+    }
+
+    pub(super) fn key(mut self, event: KeyboardEvent, full: TimeBounds, sorted: &[DateTime<Utc>]) {
+        let view = self.bounds(full);
+        match event.key() {
+            Key::Named(key @ (NamedKey::ArrowLeft | NamedKey::ArrowRight)) => {
+                let visible = view.timestamps(sorted);
+                let previous = *self.cursor.peek();
+                let idx = match (previous, key == NamedKey::ArrowRight) {
+                    (Some(cursor), true) => visible.partition_point(|t| *t <= cursor.at).min(visible.len().saturating_sub(1)),
+                    (Some(cursor), false) => visible.partition_point(|t| *t < cursor.at).saturating_sub(1),
+                    (None, true) => 0,
+                    (None, false) => visible.len().saturating_sub(1),
+                };
+                self.cursor.set(visible.get(idx).map(|&at| TimeCursor { at, panel: previous.map_or(0, |c| c.panel) }));
+            }
+            Key::Character(key) if matches!(key.as_str(), "+" | "=" | "-") => {
+                let anchor = self.active().map_or(0.5, |at| view.fraction(at));
+                self.view.set(Some(view.zoom(full, anchor, if key == "-" { 1.25 } else { 0.8 })));
+            }
+            Key::Character(key) if key == "0" => self.reset(),
+            Key::Named(NamedKey::Escape) => self.reset(),
+            _ => return,
+        }
+        event.prevent_default();
+    }
+
+    fn scrub(mut self, at: Option<DateTime<Utc>>, panel: usize) {
+        let next = at.map(|at| TimeCursor { at, panel });
+        let unchanged = *self.cursor.peek() == next;
+        if !unchanged {
+            self.cursor.set(next);
+        }
+    }
+}
+
+/// Pixel coordinates in a width-matched SVG viewBox (no letterboxing).
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct TimePlotBox {
+    pub(super) left: f64,
+    pub(super) right: f64,
+    pub(super) top: f64,
+    pub(super) bottom: f64,
+}
+
+impl TimePlotBox {
+    pub(super) fn x(self, view: TimeBounds, at: DateTime<Utc>) -> f64 {
+        self.left + (self.right - self.left) * view.fraction(at)
+    }
+}
+
+fn midnight(at: DateTime<Utc>) -> DateTime<Utc> {
+    at.date_naive().and_time(chrono::NaiveTime::MIN).and_utc()
+}
+
+fn time_ticks(view: TimeBounds, width: f64, compact: bool, dates: bool) -> Vec<(DateTime<Utc>, String)> {
+    let count = if compact || width < 200.0 {
+        3
+    } else if width < 360.0 && dates {
+        4
+    } else {
+        5
+    };
+    let crosses_midnight = view.start.date_naive() != view.end.date_naive();
+    let labels = |times: &[DateTime<Utc>]| {
+        times
+            .iter()
+            .enumerate()
+            .map(|(i, &at)| {
+                let rollover = i == 0 || at.date_naive() != times[i - 1].date_naive();
+                let format = if dates {
+                    "%b %d"
+                } else if crosses_midnight && rollover {
+                    "%b %d %H:%M"
+                } else {
+                    "%H:%M"
+                };
+                (at, at.format(format).to_string())
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut times = vec![view.start, view.end];
+    let boundaries: Vec<_> = (1..=2).map(|day| midnight(view.start) + TimeDelta::days(day)).filter(|&at| !dates && at < view.end).collect();
+    let mut regular: Vec<_> = (1..count - 1)
+        .map(|i| view.at(f64::from(i) / f64::from(count - 1)))
+        .map(|at| if dates { midnight(at + TimeDelta::hours(12)) } else { at })
+        .collect();
+    // Keep rollover ticks first, and fill gaps rather than clustering regular ticks around midnight.
+    regular.sort_by_key(|at| std::cmp::Reverse(times.iter().chain(&boundaries).map(|anchor| (*anchor - *at).abs()).min()));
+    for at in boundaries.into_iter().chain(regular) {
+        if times.len() == count as usize {
+            break;
+        }
+        let index = times.partition_point(|&t| t < at);
+        if index == 0 || index == times.len() || times[index] == at || (dates && times.iter().any(|t| t.date_naive() == at.date_naive())) {
+            continue;
+        }
+        times.insert(index, at);
+        let ticks = labels(&times);
+        let fits = ticks.windows(2).enumerate().all(|(i, pair)| {
+            let label_width = |label: &str| label.len() as f64 * 6.7;
+            let left = label_width(&pair[0].1) * if i == 0 { 1.0 } else { 0.5 };
+            let right = label_width(&pair[1].1) * if i + 2 == ticks.len() { 1.0 } else { 0.5 };
+            (view.fraction(pair[1].0) - view.fraction(pair[0].0)) * width >= left + right + 6.0
+        });
+        if !fits {
+            times.remove(index);
+        }
+    }
+    labels(&times)
+}
+
+#[component]
+pub(super) fn TimeAxis(
+    plot: TimePlotBox,
+    view: TimeBounds,
+    #[props(default)] date_only: bool,
+    #[props(default)] compact: bool,
+    #[props(default = 24.0)] label_offset: f64,
+    #[props(default)] grid: bool,
+) -> Element {
+    let width = plot.right - plot.left;
+    if date_only {
+        let first = midnight(view.start);
+        let first = if first < view.start { first + TimeDelta::days(1) } else { first };
+        let count = (view.end - first).num_days() + 1;
+        let limit = (width / 64.0).floor().max(1.0) as usize;
+        let stride = (count.max(1) as usize).div_ceil(limit);
+        return rsx! {
+            g { class: "time-axis", pointer_events: "none",
+                for day in (0..count).step_by(stride) {
+                    {
+                        let at = first + TimeDelta::days(day);
+                        let x = plot.x(view, at);
+                        let anchor = if x > plot.right - 26.0 { "end" } else { "middle" };
+                        rsx! {
+                            line { x1: "{x}", x2: "{x}", y1: "{plot.top}", y2: "{plot.bottom}", class: "chart-gridline subtle time-gridline" }
+                            text { x: "{x}", y: "{plot.bottom + 17.0}", text_anchor: anchor, "{at.format(\"%b %d\")}" }
+                        }
+                    }
+                }
+            }
+        };
+    }
+    let ticks = time_ticks(view, width, compact, view.end - view.start > TimeDelta::hours(48));
+    let (y1, y2) = if grid { (plot.top, plot.bottom) } else { (plot.bottom, plot.bottom + 4.0) };
+    rsx! {
+        g { class: "time-axis", pointer_events: "none",
+            for (i, (at, label)) in ticks.iter().enumerate() {
+                {
+                    let x = plot.x(view, *at);
+                    let anchor = if i == 0 { "start" } else if i == ticks.len() - 1 { "end" } else { "middle" };
+                    rsx! {
+                        line { x1: "{x}", x2: "{x}", y1: "{y1}", y2: "{y2}",
+                            class: if grid { "chart-gridline subtle time-gridline" } else { "chart-gridline" } }
+                        text { x: "{x}", y: "{plot.bottom + label_offset}", text_anchor: anchor, "{label}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+pub(super) fn TimeCrosshair(plot: TimePlotBox, x: f64) -> Element {
+    rsx! { line { x1: "{x}", x2: "{x}", y1: "{plot.top}", y2: "{plot.bottom + 8.0}", class: "chart-crosshair time-crosshair", pointer_events: "none" } }
+}
+
+#[component]
+pub(super) fn TimePlotHit(
+    plot: TimePlotBox,
+    origin: Signal<(f64, f64)>,
+    full: TimeBounds,
+    sorted: Rc<Vec<DateTime<Utc>>>,
+    mut scrub: TimeScrub,
+    #[props(default)] panel: usize,
+    #[props(default)] rail_times: Rc<Vec<DateTime<Utc>>>,
+) -> Element {
+    use dioxus::html::{
+        geometry::WheelDelta,
+        input_data::MouseButton,
+        point_interaction::{InteractionLocation, PointerInteraction},
+    };
+    let zoomed = scrub.bounds(full) != full;
+    let width = plot.right - plot.left;
+    let fraction = move |client_x| (client_x - origin().0 - plot.left) / width;
+    let hover_times = sorted.clone();
+    rsx! {
+        rect {
+            x: "{plot.left}", y: "{plot.top}", width: "{width}", height: "{plot.bottom - plot.top + 10.0}", fill: "transparent",
+            class: if scrub.drag.read().is_some() { "time-hit panning" } else if zoomed { "time-hit zoomed" } else { "time-hit" },
+            onmousemove: move |e: MouseEvent| {
+                let f = fraction(e.client_coordinates().x);
+                let drag = *scrub.drag.peek();
+                if let Some((start, initial)) = drag && e.held_buttons().contains(MouseButton::Primary) {
+                    scrub.view.set(Some(initial.pan(full, start - f)));
+                    return;
+                }
+                if drag.is_some() { scrub.drag.set(None); }
+                let view = scrub.bounds(full);
+                let at = view.at(f.clamp(0.0, 1.0));
+                let near_rail = e.client_coordinates().y - origin().1 >= plot.bottom + 2.0;
+                let event = near_rail.then(|| nearest_timestamp(view.timestamps(&rail_times), at))
+                    .flatten().filter(|time| (view.fraction(*time) - f).abs() * width <= 6.0);
+                scrub.scrub(event.or_else(|| nearest_timestamp(view.timestamps(&hover_times), at)), panel);
+            },
+            onmouseleave: move |_| scrub.clear(),
+            onmousedown: move |e: MouseEvent| {
+                let view = scrub.bounds(full);
+                if view != full && e.trigger_button() == Some(MouseButton::Primary) {
+                    let f = fraction(e.client_coordinates().x);
+                    scrub.clear();
+                    scrub.drag.set(Some((f, view)));
+                }
+            },
+            onmouseup: move |_| { if scrub.drag.peek().is_some() { scrub.drag.set(None); } },
+            onwheel: move |e: WheelEvent| {
+                let delta = match e.delta() {
+                    WheelDelta::Pixels(v) => v.y / 100.0,
+                    WheelDelta::Lines(v) => v.y / 3.0,
+                    WheelDelta::Pages(v) => v.y,
+                };
+                if delta == 0.0 { return; }
+                e.prevent_default();
+                let f = fraction(e.client_coordinates().x);
+                let view = scrub.bounds(full).zoom(full, f, 1.25_f64.powf(delta.clamp(-3.0, 3.0)));
+                scrub.drag.set(None);
+                scrub.view.set(Some(view));
+                scrub.scrub(nearest_timestamp(view.timestamps(&sorted), view.at(f.clamp(0.0, 1.0))), panel);
+            },
+            ondoubleclick: move |_| scrub.reset(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Reading {
+    at: DateTime<Utc>,
+    left: f64,
+    reset: Option<DateTime<Utc>>,
+}
+
+fn same_quota_run(previous: &Reading, next: &Reading) -> bool {
+    next.at - previous.at <= TimeDelta::hours(4)
+        && !previous.reset.zip(next.reset).is_some_and(|(a, b)| b > a)
+        && next.left - previous.left <= 20.0
+}
+
+fn measured_at(history: &[Reading], at: DateTime<Utc>) -> Option<Reading> {
+    let next = history.partition_point(|p| p.at <= at);
+    let point = *history.get(next.checked_sub(1)?)?;
+    (point.at == at || history.get(next).is_some_and(|later| same_quota_run(&point, later))).then_some(point)
+}
+
+pub(super) type QuotaSeriesKey = (String, Option<String>);
 
 #[derive(Clone, PartialEq)]
-enum QuotaHover {
-    Point {
-        series_idx: usize,
-        label: String,
-        at: DateTime<Utc>,
-        left: f64,
-        cx: f64,
-        cy: f64,
-        projected: bool,
-    },
-    Segment {
-        series_idx: usize,
-        seg_idx: usize,
-        label: String,
-        from_at: DateTime<Utc>,
-        from_left: f64,
-        to_at: DateTime<Utc>,
-        to_left: f64,
-        x1: f64,
-        y1: f64,
-        x2: f64,
-        y2: f64,
-        projected: bool,
-    },
-    Marker {
-        label: String,
-        at: DateTime<Utc>,
-        cx: f64,
-        exhaustion: bool,
-    },
+struct QuotaSeries {
+    key: QuotaSeriesKey,
+    label: String,
+    history: Vec<Reading>,
+    forecast: Vec<Reading>,
+    exhaustion: Option<DateTime<Utc>>,
+    next_reset: Option<DateTime<Utc>>,
+    latest: Option<Reading>,
+    resets: BTreeSet<DateTime<Utc>>,
 }
 
-impl QuotaHover {
-    fn readout(&self) -> String {
-        match self {
-            Self::Point { label, at, left, projected, .. } => {
-                let tag = if *projected { " (est.)" } else { "" };
-                format!("{label}{tag} · {} · {left:.1}% left ({:.1}% used)", fmt_dt(*at), 100.0 - left)
-            }
-            Self::Segment { label, from_at, from_left, to_at, to_left, projected, .. } => {
-                let delta = to_left - from_left;
-                let tag = if *projected { " (est.)" } else { "" };
-                format!("{label}{tag} · {from_left:.1}% → {to_left:.1}% ({delta:+.1} pp) · {} → {}", fmt_dt(*from_at), fmt_dt(*to_at))
-            }
-            Self::Marker { label, at, exhaustion, .. } => {
-                if *exhaustion {
-                    format!("{label} · Projected exhaustion {}", fmt_dt(*at))
-                } else {
-                    format!("Quota reset · {}", fmt_dt(*at))
-                }
-            }
-        }
+impl QuotaSeries {
+    fn color(index: usize, focused: bool) -> &'static str {
+        const PALETTE: [&str; 8] = ["#8cafb0", "#98b27a", "#b0a1cb", "#b7a183", "#81a5cc", "#c696ac", "#90b69d", "#c0bb87"];
+        if focused { "var(--honey)" } else { PALETTE[index % PALETTE.len()] }
     }
 
-    fn tooltip(&self) -> TooltipSpec {
-        match self {
-            Self::Point { label, at, left, cx, cy, projected, .. } => TooltipSpec {
-                x: *cx,
-                y: *cy,
-                crosshair_x: Some(*cx),
-                y_top: QUOTA_TOP,
-                y_bottom: QUOTA_BOTTOM,
-                view_w: QUOTA_W,
-                title: if *projected { format!("{label} (projected)") } else { label.clone() },
-                detail: format!("{left:.1}% left · {:.1}% used", 100.0 - left),
-                subdetail: Some(fmt_dt(*at)),
-            },
-            Self::Segment { label, from_at, from_left, to_at, to_left, x1, y1, x2, y2, projected, .. } => {
-                let mid_x = (x1 + x2) / 2.0;
-                let mid_y = (y1 + y2) / 2.0;
-                let delta = to_left - from_left;
-                TooltipSpec {
-                    x: mid_x,
-                    y: mid_y,
-                    crosshair_x: Some(mid_x),
-                    y_top: QUOTA_TOP,
-                    y_bottom: QUOTA_BOTTOM,
-                    view_w: QUOTA_W,
-                    title: if *projected { format!("{label} (projected segment)") } else { format!("{label} · segment") },
-                    detail: format!("{from_left:.1}% → {to_left:.1}% ({delta:+.1} pp)"),
-                    subdetail: Some(format!("{} → {}", fmt_dt(*from_at), fmt_dt(*to_at))),
-                }
-            }
-            Self::Marker { label, at, cx, exhaustion } => TooltipSpec {
-                x: *cx,
-                y: QUOTA_TOP + 24.0,
-                crosshair_x: Some(*cx),
-                y_top: QUOTA_TOP,
-                y_bottom: QUOTA_BOTTOM,
-                view_w: QUOTA_W,
-                title: if *exhaustion { format!("{label} · exhaustion") } else { "Quota reset".into() },
-                detail: fmt_dt(*at),
-                subdetail: None,
-            },
+    fn at(&self, at: DateTime<Utc>, future: bool) -> Option<Reading> {
+        if !future {
+            return measured_at(&self.history, at);
+        }
+        let next = self.forecast.partition_point(|p| p.at < at);
+        let to = *self.forecast.get(next)?;
+        if to.at == at {
+            return Some(to);
+        }
+        let from = self.forecast.get(next.checked_sub(1)?)?;
+        if !same_forecast_run(from, &to) {
+            return None;
+        }
+        let time = (at - from.at).as_seconds_f64() / (to.at - from.at).as_seconds_f64();
+        Some(Reading { at, left: from.left + (to.left - from.left) * time, reset: to.reset })
+    }
+}
+
+fn same_forecast_run(a: &Reading, b: &Reading) -> bool {
+    a.reset == b.reset && b.left - a.left <= 20.0
+}
+
+fn quota_series(
+    samples: &[QuotaSample],
+    forecasts: &[QuotaForecast],
+    names: &BTreeMap<String, String>,
+    history: TimeBounds,
+) -> Vec<QuotaSeries> {
+    let mut groups = BTreeMap::<QuotaSeriesKey, Vec<Reading>>::new();
+    for row in samples {
+        if history.contains(row.observed_at)
+            && !row.stale
+            && row.observation_state == QuotaObservationState::Measured
+            && let (Some(left), _) = quota_values(row.observation_state, row.remaining_percent, row.used_percent)
+        {
+            groups.entry((row.account_id.clone(), row.scope_model.clone())).or_default().push(Reading {
+                at: row.observed_at,
+                left,
+                reset: row.resets_at,
+            });
         }
     }
+    for forecast in forecasts {
+        if let Some(account) = &forecast.account_id {
+            groups.entry((account.clone(), forecast.scope_model.clone())).or_default();
+        }
+    }
+    let show_model = groups.keys().map(|(_, model)| model).collect::<BTreeSet<_>>().len() > 1;
+    let mut series: Vec<_> = groups
+        .into_iter()
+        .map(|(key, mut points)| {
+            points.sort_by_key(|p| p.at);
+            let (account, model) = &key;
+            let name = names.get(account).unwrap_or(account);
+            let label = if show_model { format!("{name} · {}", model.as_deref().unwrap_or("Unscoped")) } else { name.clone() };
+            let reset = points.last().and_then(|p| p.reset);
+            QuotaSeries {
+                key,
+                label,
+                next_reset: reset.filter(|at| *at > history.end),
+                latest: points.last().copied(),
+                resets: points.iter().filter_map(|p| p.reset).collect(),
+                history: points,
+                forecast: Vec::new(),
+                exhaustion: None,
+            }
+        })
+        .collect();
+    series.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.key.cmp(&b.key)));
+    series
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct QuotaChartScope {
+    pub(super) history: TimeBounds,
+    pub(super) forecast_until: Option<DateTime<Utc>>,
+    pub(super) history_truncated: bool,
+    pub(super) pool: bool,
 }
 
 #[component]
 pub(super) fn QuotaHistoryChart(
     samples: Vec<QuotaSample>,
     forecasts: Vec<QuotaForecast>,
-    resets: Vec<DateTime<Utc>>,
-    from: DateTime<Utc>,
-    until: DateTime<Utc>,
     names: BTreeMap<String, String>,
+    scope: QuotaChartScope,
+    #[props(default)] current: Vec<ModelAccount>,
+    #[props(default)] window_key: String,
 ) -> Element {
-    let mut hovered = use_signal(|| None::<QuotaHover>);
-    let grad_id = use_hook(|| format!("chart-quota-fill-{}", Uuid::new_v4().simple()));
-    let grad_url = format!("url(#{grad_id})");
-    let mut groups = BTreeMap::<String, Vec<Point>>::new();
-    for row in &samples {
-        if row.observed_at >= from
-            && row.observed_at <= until
-            && !row.stale
-            && row.observation_state == QuotaObservationState::Measured
-            && let (Some(left), _) = quota_values(row.observation_state, row.remaining_percent, row.used_percent)
+    let as_of = scope.history.end;
+    let full = TimeBounds { start: scope.history.start, end: scope.forecast_until.unwrap_or(as_of) };
+    let mut series = quota_series(&samples, &forecasts, &names, scope.history);
+    for series in &mut series {
+        if let Some(window) = current
+            .iter()
+            .find(|a| a.id == series.key.0)
+            .and_then(|a| a.windows.iter().find(|w| w.window_key == window_key && w.scope_model == series.key.1))
+            && let Some(at) = window.observed_at.filter(|at| *at <= as_of)
+            && let Some(left) = quota_values(window.observation_state, window.remaining_percent, window.used_percent).0
+            && series.latest.is_none_or(|r| r.at <= at)
         {
-            groups.entry(row.account_id.clone()).or_default().push((row.observed_at, left));
+            series.latest = Some(Reading { at, left, reset: window.resets_at });
+            series.next_reset = window.resets_at.filter(|at| *at > as_of);
+            series.resets.extend(window.resets_at);
+        }
+        if let Some(f) = forecasts.iter().find(|f| f.account_id.as_ref() == Some(&series.key.0) && f.scope_model == series.key.1) {
+            series.exhaustion = f.projected_exhaustion_at.filter(|at| series.next_reset.is_some_and(|reset| *at < reset));
+            series.forecast = f
+                .points
+                .iter()
+                .filter(|p| p.at >= as_of && p.remaining_percent.is_finite())
+                .map(|p| Reading { at: p.at, left: p.remaining_percent, reset: series.next_reset.filter(|reset| p.at >= *reset) })
+                .collect();
+            series.forecast.sort_by_key(|p| p.at);
         }
     }
-    for points in groups.values_mut() {
-        points.sort_by_key(|p| p.0);
-    }
-    let series_list: Vec<(String, String, Vec<Point>)> = groups
-        .into_iter()
-        .map(|(id, pts)| {
-            let label = names.get(&id).cloned().unwrap_or_else(|| id.clone());
-            (id, label, pts)
+    series.retain(|s| s.latest.is_some() || !s.history.is_empty() || (scope.forecast_until.is_some() && !s.forecast.is_empty()));
+    let times = series
+        .iter()
+        .flat_map(|s| {
+            s.history
+                .iter()
+                .map(|r| r.at)
+                .chain(s.forecast.iter().filter(|r| r.at > as_of).map(|r| r.at))
+                .chain(s.resets.iter().copied())
+                .chain(s.exhaustion)
         })
-        .collect();
-    let reset_times: BTreeSet<_> = resets.into_iter().filter(|t| *t >= from && *t <= until).collect();
-    let reset_labels = reset_times.iter().map(|at| fmt_dt(*at)).collect::<Vec<_>>().join(", ");
-    let mid_time = from + TimeDelta::seconds((until - from).num_seconds() / 2);
-    let name = |id: &str| names.get(id).map_or_else(|| id.to_string(), Clone::clone);
-    let active = hovered();
+        .filter(|at| full.contains(*at))
+        .collect::<BTreeSet<_>>();
+    let sorted = Rc::new(times.into_iter().collect());
+    let series = Rc::new(series);
     rsx! {
-        figure { class: "provider-chart chart-stage",
-            div { class: "chart-header",
-                figcaption {
-                    "Remaining quota (%) · " span { class: "nowrap-unit", "{fmt_dt(from)}" }
-                    " → " span { class: "nowrap-unit", "{fmt_dt(until)}" }
+        figure { class: "provider-chart chart-stage quota-history",
+            figcaption { "Remaining quota · UTC" }
+            if scope.history_truncated { Chip { label: "Showing newest 4,000 samples".to_string(), tone: Some("amber".to_string()) } }
+            if !series.iter().any(|s| !s.history.is_empty()) {
+                p { class: "form-help", "No measured percentage samples for this window and time range." }
+            }
+            QuotaExplorer { series: series.clone(), sorted, full, as_of, pool: scope.pool }
+            QuotaHistoryTables { series, show_forecast: scope.forecast_until.is_some() }
+        }
+    }
+}
+
+fn quota_defaults_to_multiples(pool: bool, series: usize) -> bool {
+    pool && series > 6
+}
+
+#[component]
+fn QuotaExplorer(
+    series: Rc<Vec<QuotaSeries>>,
+    sorted: Rc<Vec<DateTime<Utc>>>,
+    full: TimeBounds,
+    as_of: DateTime<Utc>,
+    pool: bool,
+) -> Element {
+    let scrub = use_time_scrub();
+    let mut focus = use_signal(|| None::<QuotaSeriesKey>);
+    let mut multiples = use_signal(|| None);
+    let future = full.end > as_of;
+    use_effect(use_reactive((&future,), move |_| scrub.reset()));
+    let focus_key = focus.read();
+    let selected = series.iter().position(|s| focus_key.as_ref() == Some(&s.key));
+    let view = scrub.bounds(full);
+    let has_layout_choice = pool && series.len() >= 4;
+    let small = has_layout_choice && multiples().unwrap_or_else(|| quota_defaults_to_multiples(pool, series.len()));
+    let summary = selected.or_else(|| (series.len() == 1).then_some(0));
+    let keyboard_times = sorted.clone();
+    if series.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        if let Some(s) = summary.and_then(|i| series.get(i)) {
+            div { class: "row quota-decision",
+                if let Some(r) = s.latest {
+                    strong { class: "mono", "{r.left:.1}% left" }
+                } else {
+                    strong { "Not observed" }
                 }
-                if let Some(active) = &active {
-                    span { class: "chart-readout active mono", "{active.readout()}" }
-                } else if !series_list.is_empty() || !forecasts.is_empty() || !reset_times.is_empty() {
-                    span { class: "form-help", "Hover a line, segment, or point to inspect" }
+                span { "Next reset: {date(s.next_reset)}" }
+                span { "Last observed: {date(s.latest.map(|r| r.at))}" }
+                if s.exhaustion.is_some() { span { class: "quota-risk", "May run out before reset" } }
+            }
+        } else {
+            div { class: "row quota-decision",
+                span { "{series.len()} separate quota traces · select a series for its latest reading and next reset" }
+                if series.iter().any(|s| s.exhaustion.is_some()) { span { class: "quota-risk", "May run out before reset" } }
+            }
+        }
+        div { class: "filter-row quota-series-chips", role: "group", aria_label: "Focus quota series",
+            if series.len() > 1 {
+                button { class: "filter-chip", aria_pressed: selected.is_none(), onclick: move |_| focus.set(None), "All" }
+            }
+            for (i, s) in series.iter().enumerate() {
+                {
+                    let key = s.key.clone();
+                    let active = selected == Some(i);
+                    let color = QuotaSeries::color(i, active);
+                    rsx! {
+                        button { key: "{i}", class: "filter-chip", aria_pressed: active,
+                            style: "--chart-accent: {color}", onclick: move |_| focus.set(if active { None } else { Some(key.clone()) }),
+                            span { class: "chart-swatch", aria_hidden: "true" } "{s.label}"
+                        }
+                    }
                 }
             }
-            if !series_list.is_empty() || !forecasts.is_empty() {
-                div { class: "chart-legend",
-                    for (i, (_, label, _)) in series_list.iter().enumerate() {
-                        span { key: "leg-{i}", class: "chart-legend-item chart-series-{i % 4}",
-                            span { class: "chart-swatch" }
-                            "{label}"
-                        }
-                    }
-                    if !forecasts.is_empty() {
-                        span { class: "chart-legend-item",
-                            span { class: "chart-swatch dashed" }
-                            "Estimated projection"
-                        }
-                    }
-                    if !reset_times.is_empty() {
-                        span { class: "chart-legend-item",
-                            span { class: "chart-swatch reset" }
-                            "Reset"
-                        }
-                    }
+        }
+        div { class: "row quota-plot-controls",
+            if has_layout_choice {
+                div { class: "segmented", role: "group", aria_label: "Quota chart layout",
+                    button { class: "seg-btn", aria_pressed: !small, onclick: move |_| { multiples.set(Some(false)); scrub.clear(); }, "Overlay" }
+                    button { class: "seg-btn", aria_pressed: small, onclick: move |_| { multiples.set(Some(true)); scrub.clear(); }, "Small multiples" }
                 }
             }
-            if series_list.is_empty() && forecasts.is_empty() {
-                p { class: "muted", "No measured percentage samples for this window and time range." }
+            if view != full {
+                button { class: "filter-chip", onclick: move |_| scrub.reset(), "Reset zoom" }
             }
-            svg {
-                view_box: "0 0 620 174",
-                role: "img",
-                "aria-label": "Measured remaining quota; dashed lines are estimated projections. Data table follows.",
-                onmouseleave: move |_| hovered.set(None),
-                defs {
-                    linearGradient { id: "{grad_id}", x1: "0", y1: "0", x2: "0", y2: "1",
-                        stop { offset: "0%", stop_color: "var(--honey)", stop_opacity: "0.22" }
-                        stop { offset: "100%", stop_color: "var(--honey)", stop_opacity: "0.0" }
+            if future {
+                span { class: "chart-legend-item", span { class: "chart-swatch dashed" } "Forecast (estimate)" }
+            }
+            if series.iter().any(|s| s.resets.iter().any(|&at| view.contains(at))) {
+                span { class: "chart-legend-item", "◆ Reset" }
+            }
+            span { class: "form-help", "Hover or focus chart and use ←/→ · wheel or +/− to zoom · drag to pan · 0 to reset" }
+        }
+        div { class: if small { "quota-plots multiples" } else { "quota-plots" },
+            tabindex: "0", role: "group", aria_label: "Quota timeline. Arrow keys scrub, plus or minus zooms, zero or Escape resets.",
+            onkeydown: move |e| scrub.key(e, full, &keyboard_times),
+            onblur: move |_| scrub.clear(),
+            if small {
+                for (i, s) in series.iter().enumerate() {
+                    QuotaPlot { key: "{i}", series: series.clone(), sorted: sorted.clone(), full, as_of, scrub, selected, single: Some(i), label: s.label.clone() }
+                }
+            } else {
+                QuotaPlot { series, sorted, full, as_of, scrub, selected, single: None, label: "Remaining quota".to_string() }
+            }
+        }
+    }
+}
+
+/// Measure the CSS box; resize updates keep the viewBox and hit target in CSS pixels.
+#[derive(Clone, Copy)]
+pub(super) struct TimePlotMeasure {
+    mounted: Signal<Option<Rc<MountedData>>>,
+    pub(super) width: Signal<f64>,
+    pub(super) origin: Signal<(f64, f64)>,
+}
+
+pub(super) fn use_time_plot_measure() -> TimePlotMeasure {
+    TimePlotMeasure { mounted: use_signal(|| None), width: use_signal(|| 620.0), origin: use_signal(|| (0.0, 0.0)) }
+}
+
+impl TimePlotMeasure {
+    pub(super) async fn mount(mut self, event: MountedEvent) {
+        self.mounted.set(Some(event.data()));
+        self.refresh().await;
+    }
+
+    pub(super) async fn refresh(mut self) {
+        let mounted = self.mounted.peek().clone();
+        if let Some(el) = mounted
+            && let Ok(rect) = el.get_client_rect().await
+        {
+            if rect.size.width > 0.0 && *self.width.peek() != rect.size.width {
+                self.width.set(rect.size.width);
+            }
+            let origin = (rect.origin.x, rect.origin.y);
+            if *self.origin.peek() != origin {
+                self.origin.set(origin);
+            }
+        }
+    }
+}
+
+fn quota_y(plot: TimePlotBox, pct: f64) -> f64 {
+    plot.bottom - (plot.bottom - plot.top) * pct.clamp(0.0, 100.0) / 100.0
+}
+
+#[component]
+fn QuotaTraces(
+    series: Rc<Vec<QuotaSeries>>,
+    plot: TimePlotBox,
+    view: TimeBounds,
+    as_of: DateTime<Utc>,
+    selected: Option<usize>,
+    single: Option<usize>,
+) -> Element {
+    let show_future = view.end > as_of;
+    let rail = plot.bottom + 7.0;
+    // Paint the highlighted trace last so a context line cannot cover it.
+    let indices = (0..series.len()).filter(|i| Some(*i) != selected).chain(selected);
+    rsx! {
+        for i in indices.filter(|i| single.is_none_or(|j| j == *i)) {
+            {
+                let s = &series[i];
+                let focused = selected == Some(i);
+                let color = QuotaSeries::color(i, focused);
+                let mut path = String::new();
+                let mut projected = String::new();
+                for run in s.history.chunk_by(same_quota_run).filter(|run| run.len() > 1) {
+                    let first = run[0];
+                    let _ = write!(path, "M{:.2} {:.2}", plot.x(view, first.at), quota_y(plot, first.left));
+                    for point in &run[1..] {
+                        let _ = write!(path, "H{:.2}V{:.2}", plot.x(view, point.at), quota_y(plot, point.left));
                     }
                 }
-                for pct in [0.0, 25.0, 50.0, 75.0, 100.0] {
-                    line {
-                        x1: "{QUOTA_LEFT}",
-                        x2: "{QUOTA_RIGHT}",
-                        y1: "{y(pct):.2}",
-                        y2: "{y(pct):.2}",
-                        class: if pct == 0.0 || pct == 100.0 { "chart-gridline" } else { "chart-gridline subtle" },
-                    }
-                    if pct == 0.0 || pct == 50.0 || pct == 100.0 {
-                        text { x: "{QUOTA_LEFT - 6.0}", y: "{y(pct) + 3.5:.2}", text_anchor: "end", "{pct:.0}%" }
-                    }
-                }
-                text { x: "{QUOTA_LEFT}", y: "166", "{fmt_dt(from)}" }
-                text { x: "{(QUOTA_LEFT + QUOTA_RIGHT) / 2.0:.1}", y: "166", text_anchor: "middle", "{fmt_dt(mid_time)}" }
-                text { x: "{QUOTA_RIGHT}", y: "166", text_anchor: "end", "{fmt_dt(until)}" }
-                for &at in &reset_times {
-                    {
-                        let rx = x(at, from, until);
-                        rsx! {
-                            line { x1: "{rx:.2}", x2: "{rx:.2}", y1: "{QUOTA_TOP}", y2: "{QUOTA_BOTTOM}", class: "chart-reset",
-                                title { "Reset: {fmt_dt(at)}" }
-                            }
-                            line {
-                                x1: "{rx:.2}", x2: "{rx:.2}", y1: "{QUOTA_TOP}", y2: "{QUOTA_BOTTOM}",
-                                class: "chart-hit",
-                                stroke: "transparent",
-                                stroke_width: "10",
-                                onmouseenter: move |_| hovered.set(Some(QuotaHover::Marker { label: "Reset".into(), at, cx: rx, exhaustion: false })),
-                            }
+                if show_future {
+                    for run in s.forecast.chunk_by(same_forecast_run).filter(|run| run.len() > 1) {
+                        for (i, point) in run.iter().enumerate() {
+                            let _ = write!(projected, "{}{:.2} {:.2}", if i == 0 { 'M' } else { 'L' }, plot.x(view, point.at), quota_y(plot, point.left));
                         }
                     }
                 }
-                for (i, (_, label, points)) in series_list.iter().enumerate() {
-                    g { key: "series-{i}", class: "chart-series chart-series-{i % 4}",
-                        if series_list.len() == 1 {
-                            for area_d in area_segments(points, from, until) {
-                                path { d: "{area_d}", fill: "{grad_url}", pointer_events: "none" }
+                rsx! {
+                    g { key: "{i}", class: if focused { "quota-trace focused" } else { "quota-trace" }, style: "color: {color}",
+                        opacity: if selected.is_some() && !focused { 0.22 } else { 1.0 },
+                        path { class: "chart-line", d: "{path}" }
+                        for run in s.history.chunk_by(same_quota_run).filter(|run| run.len() == 1 && view.contains(run[0].at)) {
+                            circle { cx: "{plot.x(view, run[0].at)}", cy: "{quota_y(plot, run[0].left)}", r: "2.4", class: "chart-point" }
+                        }
+                        if show_future {
+                            path { class: "chart-line chart-projection", d: "{projected}" }
+                            for run in s.forecast.chunk_by(same_forecast_run).filter(|run| run.len() == 1 && view.contains(run[0].at)) {
+                                circle { cx: "{plot.x(view, run[0].at)}", cy: "{quota_y(plot, run[0].left)}", r: "2.4", class: "chart-point quota-forecast-point" }
+                            }
+                            if let Some(at) = s.exhaustion.filter(|at| view.contains(*at)) {
+                                line { class: "chart-exhaustion", x1: "{plot.x(view, at)}", x2: "{plot.x(view, at)}", y1: "{plot.bottom - 9.0}", y2: "{rail}" }
                             }
                         }
-                        path { class: "chart-line", d: line(points, from, until), title { "{label}" } }
-                        for (seg_idx, pair) in points.windows(2).enumerate() {
-                            if pair[1].0 - pair[0].0 <= TimeDelta::hours(4) {
-                                {
-                                    let x1 = x(pair[0].0, from, until);
-                                    let y1 = y(pair[0].1);
-                                    let x2 = x(pair[1].0, from, until);
-                                    let y2 = y(pair[1].1);
-                                    let is_seg = matches!(active, Some(QuotaHover::Segment { series_idx, seg_idx: s, projected: false, .. }) if series_idx == i && s == seg_idx);
-                                    let seg_label = label.clone();
-                                    let p0 = pair[0];
-                                    let p1 = pair[1];
-                                    rsx! {
-                                        if is_seg {
-                                            line { x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}", class: "chart-line chart-segment-active", pointer_events: "none" }
-                                        }
-                                        line {
-                                            x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}",
-                                            class: "chart-hit",
-                                            stroke: "transparent",
-                                            stroke_width: "12",
-                                            onmouseenter: move |_| hovered.set(Some(QuotaHover::Segment {
-                                                series_idx: i,
-                                                seg_idx,
-                                                label: seg_label.clone(),
-                                                from_at: p0.0,
-                                                from_left: p0.1,
-                                                to_at: p1.0,
-                                                to_left: p1.1,
-                                                x1,
-                                                y1,
-                                                x2,
-                                                y2,
-                                                projected: false,
-                                            })),
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        for &(at, left) in points {
+                        for &at in s.resets.iter().filter(|&&at| view.contains(at)) {
                             {
-                                let cx = x(at, from, until);
-                                let cy = y(left);
-                                let is_pt = matches!(active, Some(QuotaHover::Point { series_idx, at: a, projected: false, .. }) if series_idx == i && a == at);
-                                let pt_label = label.clone();
-                                rsx! {
-                                    circle {
-                                        cx: "{cx:.2}",
-                                        cy: "{cy:.2}",
-                                        r: if is_pt { "4.2" } else { "2.4" },
-                                        class: if is_pt { "chart-point active" } else { "chart-point" },
-                                        title { "{label} · {fmt_dt(at)} · {left:.1}% remaining" }
-                                    }
-                                    circle {
-                                        cx: "{cx:.2}",
-                                        cy: "{cy:.2}",
-                                        r: "7.5",
-                                        fill: "transparent",
-                                        class: "chart-hit",
-                                        onmouseenter: move |_| hovered.set(Some(QuotaHover::Point {
-                                            series_idx: i,
-                                            label: pt_label.clone(),
-                                            at,
-                                            left,
-                                            cx,
-                                            cy,
-                                            projected: false,
-                                        })),
-                                    }
-                                }
+                                let x = plot.x(view, at);
+                                rsx! { path { class: "quota-reset-mark", d: "M{x} {rail - 3.0}l3 3-3 3-3-3z" } }
                             }
                         }
                     }
                 }
-                for (fi, forecast) in forecasts.iter().enumerate() {
+            }
+        }
+    }
+}
+
+#[component]
+fn QuotaPlot(
+    series: Rc<Vec<QuotaSeries>>,
+    sorted: Rc<Vec<DateTime<Utc>>>,
+    full: TimeBounds,
+    as_of: DateTime<Utc>,
+    scrub: TimeScrub,
+    selected: Option<usize>,
+    single: Option<usize>,
+    label: String,
+) -> Element {
+    let measure = use_time_plot_measure();
+    let clip_id = use_hook(|| format!("quota-clip-{}", Uuid::new_v4().simple()));
+    let width = (measure.width)().max(100.0);
+    let plot = TimePlotBox { left: 38.0, right: width - 8.0, top: 22.0, bottom: if single.is_some() { 94.0 } else { 158.0 } };
+    let view = scrub.bounds(full);
+    let height = plot.bottom + 33.0;
+    let active = scrub.active().filter(|at| view.contains(*at));
+    let active_x = active.map(|at| plot.x(view, at));
+    let panel = single.unwrap_or(0);
+    let tooltip = (*scrub.cursor.read()).filter(|c| c.panel == panel && view.contains(c.at));
+    let show_future = view.end > as_of;
+    let now_x = plot.x(view, as_of).max(plot.left);
+    let badge_x = now_x.clamp(plot.left + 16.0, plot.right - 16.0);
+    let rail = plot.bottom + 7.0;
+    let rail_times = Rc::new(
+        series
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| single.is_none_or(|j| *i == j))
+            .flat_map(|(_, s)| s.resets.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    );
+    rsx! {
+        div { class: "quota-plot",
+            if single.is_some() { strong { class: "quota-plot-label", "{label}" } }
+            div { class: "quota-plot-surface",
+                onmounted: move |e| measure.mount(e),
+                onresize: move |_| measure.refresh(),
+                onmouseenter: move |_| measure.refresh(),
+                svg { role: "img", "aria-label": "{label}. Remaining quota, 0 to 100 percent. Data tables follow.",
+                    width: "100%", height: "{height}", view_box: "0 0 {width} {height}", preserve_aspect_ratio: "none",
+                    defs { clipPath { id: "{clip_id}", rect { x: "{plot.left}", y: "{plot.top - 3.0}",
+                        width: "{plot.right - plot.left}", height: "{rail - plot.top + 6.0}" } } }
+                    if show_future {
+                        rect { x: "{now_x}", y: "{plot.top}", width: "{plot.right - now_x}", height: "{plot.bottom - plot.top}", class: "quota-future" }
+                    }
+                    TimeAxis { plot, view, compact: single.is_some(), grid: true }
+                    for pct in [0.0, 25.0, 50.0, 75.0, 100.0] {
+                        {
+                            let y = quota_y(plot, pct);
+                            rsx! {
+                                line { x1: "{plot.left}", x2: "{plot.right}", y1: "{y}", y2: "{y}",
+                                    class: if pct == 0.0 { "chart-gridline" } else { "chart-gridline subtle" } }
+                                if pct % 50.0 == 0.0 {
+                                    text { x: "{plot.left - 5.0}", y: "{y + 3.5}", text_anchor: "end", "{pct:.0}%" }
+                                }
+                            }
+                        }
+                    }
+                    line { x1: "{plot.left}", x2: "{plot.right}", y1: "{rail}", y2: "{rail}", class: "chart-gridline" }
+                    g { clip_path: "url(#{clip_id})", pointer_events: "none",
+                        QuotaTraces { series: series.clone(), plot, view, as_of, selected, single }
+                    }
+                    if show_future && view.contains(as_of) {
+                        line { x1: "{now_x}", x2: "{now_x}", y1: "18", y2: "{plot.bottom}", class: "quota-now-line" }
+                        rect { x: "{badge_x - 16.0}", y: "2", width: "32", height: "16", rx: "4", class: "quota-now-badge" }
+                        text { x: "{badge_x}", y: "14", text_anchor: "middle", "Now" }
+                    }
+                    if let (Some(at), Some(x)) = (active, active_x) {
+                        TimeCrosshair { plot, x }
+                        for (i, s) in series.iter().enumerate().filter(|(i, _)| single.is_none_or(|j| j == *i)) {
+                            if let Some(r) = s.at(at, at > as_of) {
+                                circle { key: "{i}", cx: "{x}", cy: "{quota_y(plot, r.left)}", r: "3.6", pointer_events: "none",
+                                    class: if at > as_of { "chart-point active quota-forecast-point" } else { "chart-point active" },
+                                    style: "color: {QuotaSeries::color(i, selected == Some(i))}" }
+                            }
+                        }
+                    }
+                    TimePlotHit { plot, origin: measure.origin, full, sorted, scrub, panel, rail_times }
+                }
+                div { role: "status",
+                    if let Some(cursor) = tooltip {
+                        QuotaReadout { series, at: cursor.at, as_of, selected, right: view.fraction(cursor.at) < 0.5 }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn QuotaReadout(series: Rc<Vec<QuotaSeries>>, at: DateTime<Utc>, as_of: DateTime<Utc>, selected: Option<usize>, right: bool) -> Element {
+    let future = at > as_of;
+    let timestamp = at.format("%Y-%m-%d %H:%M:%S UTC");
+    let side = if right { "right" } else { "" };
+    let density = if series.len() > 10 { "dense" } else { "" };
+    rsx! {
+        div { class: "quota-readout {side} {density}",
+            strong { class: "mono", "{timestamp}" if future { " · Estimated" } }
+            ul {
+                for (i, s) in series.iter().enumerate() {
                     {
-                        let points: Vec<_> = forecast.points.iter().filter(|p| p.at >= from && p.at <= until && p.remaining_percent.is_finite())
-                            .map(|p| (p.at, p.remaining_percent)).collect();
-                        let coords = points.iter().map(|(at, value)| format!("{:.2},{:.2}", x(*at, from, until), y(*value))).collect::<Vec<_>>().join(" ");
-                        let label = forecast.account_id.as_deref().map(name).unwrap_or_else(|| "Pool".into());
-                        let exh_label = label.clone();
+                        let r = s.at(at, future);
+                        let color = QuotaSeries::color(i, selected == Some(i));
                         rsx! {
-                            polyline { class: "chart-line chart-projection", points: coords, title { "{label} · Estimated projection" } }
-                            for (seg_idx, pair) in points.windows(2).enumerate() {
-                                {
-                                    let x1 = x(pair[0].0, from, until);
-                                    let y1 = y(pair[0].1);
-                                    let x2 = x(pair[1].0, from, until);
-                                    let y2 = y(pair[1].1);
-                                    let seg_label = label.clone();
-                                    let p0 = pair[0];
-                                    let p1 = pair[1];
-                                    rsx! {
-                                        line {
-                                            x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}",
-                                            class: "chart-hit",
-                                            stroke: "transparent",
-                                            stroke_width: "12",
-                                            onmouseenter: move |_| hovered.set(Some(QuotaHover::Segment {
-                                                series_idx: fi,
-                                                seg_idx,
-                                                label: seg_label.clone(),
-                                                from_at: p0.0,
-                                                from_left: p0.1,
-                                                to_at: p1.0,
-                                                to_left: p1.1,
-                                                x1,
-                                                y1,
-                                                x2,
-                                                y2,
-                                                projected: true,
-                                            })),
-                                        }
-                                    }
+                            li { key: "{i}", style: "--chart-accent: {color}",
+                                span { class: "chart-swatch", aria_hidden: "true" }
+                                span { "{s.label}" }
+                                span { class: "mono",
+                                    if let Some(r) = r { "{r.left:.1}% left" } else { "—" }
                                 }
-                            }
-                            for &(at, left) in &points {
-                                {
-                                    let cx = x(at, from, until);
-                                    let cy = y(left);
-                                    let pt_label = label.clone();
-                                    rsx! {
-                                        circle {
-                                            cx: "{cx:.2}", cy: "{cy:.2}", r: "6.5", fill: "transparent", class: "chart-hit",
-                                            onmouseenter: move |_| hovered.set(Some(QuotaHover::Point {
-                                                series_idx: fi,
-                                                label: pt_label.clone(),
-                                                at,
-                                                left,
-                                                cx,
-                                                cy,
-                                                projected: true,
-                                            })),
-                                        }
-                                    }
+                                if let Some(r) = r.filter(|r| r.at != at) {
+                                    small { {format!("Held from {}", r.at.format("%H:%M:%S UTC"))} }
                                 }
-                            }
-                            if let Some(at) = forecast.projected_exhaustion_at.filter(|at| *at >= from && *at <= until) {
-                                {
-                                    let ex = x(at, from, until);
-                                    rsx! {
-                                        line { x1: "{ex:.2}", x2: "{ex:.2}", y1: "{QUOTA_TOP}", y2: "{QUOTA_BOTTOM}", class: "chart-exhaustion",
-                                            title { "{exh_label} · Projected exhaustion {fmt_dt(at)}" }
-                                        }
-                                        line {
-                                            x1: "{ex:.2}", x2: "{ex:.2}", y1: "{QUOTA_TOP}", y2: "{QUOTA_BOTTOM}",
-                                            class: "chart-hit",
-                                            stroke: "transparent",
-                                            stroke_width: "10",
-                                            onmouseenter: move |_| hovered.set(Some(QuotaHover::Marker {
-                                                label: exh_label.clone(),
-                                                at,
-                                                cx: ex,
-                                                exhaustion: true,
-                                            })),
-                                        }
-                                    }
+                                if s.resets.contains(&at) {
+                                    small { if future { "Scheduled reset" } else { "Reported reset" } }
                                 }
+                                if s.exhaustion == Some(at) { small { class: "quota-risk", "Projected exhaustion" } }
                             }
                         }
                     }
                 }
-                if let Some(spec) = active.as_ref().map(QuotaHover::tooltip) {
-                    SvgTooltip { spec }
-                }
             }
-            if !forecasts.is_empty() {
-                p { class: "label-tech", "Estimated projection · dashed · not a provider guarantee" }
-                for forecast in &forecasts {
-                    p { {format!("{} · {:.2} percentage points/hour · projected exhaustion {}", forecast.account_id.as_deref().map(name).unwrap_or_else(|| "Pool".into()), forecast.drain_pct_per_hour, date(forecast.projected_exhaustion_at))}
-                        if forecast.resets_before_exhaustion { " · resets first" }
-                    }
-                }
-                details {
-                    summary { "Estimated projection data table" }
-                    Table { label: "Estimated projection", headers: &["Scope", "Projected time", "Remaining %", "Used %"],
-                        rows: forecasts.iter().flat_map(|forecast| {
-                            let scope = forecast.account_id.as_deref().map(name).unwrap_or_else(|| "Pool".into());
-                            forecast.points.iter().map(move |point| vec![
-                                scope.clone(), fmt_dt(point.at), number(Some(point.remaining_percent)), number(Some(point.used_percent))
-                            ])
-                        }).collect() }
-                }
-            }
-            if !reset_times.is_empty() {
-                p { class: "muted", "Reset markers: {reset_labels}" }
-            }
+        }
+    }
+}
+
+#[component]
+fn QuotaHistoryTables(series: Rc<Vec<QuotaSeries>>, show_forecast: bool) -> Element {
+    rsx! {
+        if show_forecast {
             details {
-                summary { "Measured history data table" }
-                Table { label: "Measured quota", headers: &["Account", "Observed", "Remaining %"],
-                    rows: series_list.iter().flat_map(|(_, label, points)| points.iter().map(move |(at, val)| vec![label.clone(), fmt_dt(*at), number(Some(*val))])).collect() }
+                summary { "Estimated projection data table" }
+                Table { label: "Estimated projection", headers: &["Series", "Projected time", "Remaining %"],
+                    rows: series.iter().flat_map(|s| s.forecast.iter().map(|r| vec![s.label.clone(), fmt_dt(r.at), number(Some(r.left))])).collect() }
             }
+        }
+        details {
+            summary { "Measured history data table" }
+            Table { label: "Measured quota", headers: &["Series", "Observed", "Remaining %", "Reported reset"],
+                rows: series.iter().flat_map(|s| s.history.iter().map(|r| vec![s.label.clone(), fmt_dt(r.at), number(Some(r.left)), date(r.reset)])).collect() }
         }
     }
 }
@@ -705,7 +1144,7 @@ impl Metric {
 
 #[derive(Clone, PartialEq)]
 struct BarItem {
-    label: String,
+    window: String,
     value: Option<f64>,
     requests: u64,
     failures: u64,
@@ -716,150 +1155,276 @@ struct BarItem {
 }
 
 pub(super) const NO_RANGE_DATA: &str = "No data for selected range";
+const INSPECT: &str = "Hover or ←/→ to inspect";
+
+pub(super) fn bucket_badge(seconds: Option<u64>) -> Option<&'static str> {
+    match seconds {
+        Some(3600) => Some("Hourly · 24h"),
+        Some(10800) => Some("3-hour · 7d"),
+        Some(86400) => Some("Daily"),
+        _ => None,
+    }
+}
+
+fn bucket_bounds(points: &[ActivityTrendPoint], seconds: u64) -> Option<TimeBounds> {
+    Some(TimeBounds { start: points.first()?.bucket_start, end: points.last()?.bucket_start + TimeDelta::seconds(seconds as i64) })
+}
+
+fn bucket_window(at: DateTime<Utc>, seconds: u64) -> String {
+    let format = if seconds == 86400 { "%Y-%m-%d" } else { "%b %d %H:%M" };
+    let start = at.format(format);
+    let end = at + TimeDelta::seconds(seconds as i64);
+    let end = end.format(if seconds != 86400 && end.date_naive() == at.date_naive() { "%H:%M" } else { format });
+    format!("{start} → {end} UTC")
+}
+
+fn trend_buckets(mut points: Vec<ActivityTrendPoint>, bucket_seconds: Option<u64>) -> (u64, Vec<ActivityTrendPoint>) {
+    let seconds = bucket_seconds.filter(|s| matches!(s, 3600 | 10800 | 86400)).unwrap_or(86400);
+    points.sort_by_key(|p| p.bucket_start);
+    if bucket_seconds.is_some() {
+        // Adaptive reports are already dense, including buckets with no requests.
+        return (seconds, points);
+    }
+    let mut dense = Vec::<ActivityTrendPoint>::with_capacity(points.len());
+    for mut p in points {
+        if let Some(previous) = dense.last() {
+            let days = (p.bucket_start - previous.bucket_start).num_days();
+            if (2..=400).contains(&days) {
+                let start = previous.bucket_start;
+                dense.extend((1..days).map(|offset| ActivityTrendPoint {
+                    bucket_start: start + TimeDelta::days(offset),
+                    label: String::new(),
+                    requests: 0,
+                    failures: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    cache_hit_rate: 0.0,
+                    cache_hit_rate_observed: None,
+                    thinking_tokens: 0,
+                    api_equivalent_cost_usd: 0.0,
+                }));
+            }
+        }
+        p.cache_hit_rate_observed =
+            p.cache_hit_rate_observed.or_else(|| effective_cache_hit_rate(p.input_tokens, p.cache_read_tokens, p.cache_hit_rate));
+        dense.push(p);
+    }
+    (seconds, dense)
+}
+
+fn activity_plot(width: f64) -> TimePlotBox {
+    TimePlotBox { left: 48.0, right: width - 12.0, top: 16.0, bottom: 146.0 }
+}
+
+fn chart_y(plot: TimePlotBox, fraction: f64) -> f64 {
+    plot.bottom - (plot.bottom - plot.top) * fraction.clamp(0.0, 1.0)
+}
 
 #[component]
-fn InteractiveBars(label: &'static str, metric: Metric, items: Vec<BarItem>) -> Element {
+fn ActivityGrid(plot: TimePlotBox, ticks: Vec<String>) -> Element {
+    rsx! {
+        for (i, tick) in ticks.iter().enumerate() {
+            {
+                let y = chart_y(plot, i as f64 / (ticks.len() - 1) as f64);
+                rsx! {
+                    line { x1: "{plot.left}", x2: "{plot.right}", y1: "{y}", y2: "{y}",
+                        class: if i == 0 { "chart-gridline" } else { "chart-gridline subtle" } }
+                    text { x: "{plot.left - 6.0}", y: "{y + 3.5}", text_anchor: "end", "{tick}" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn RhythmTicks(plot: TimePlotBox, labels: Vec<String>) -> Element {
+    let width = plot.right - plot.left;
+    let step = width / labels.len().max(1) as f64;
+    let stride = if step >= 10.0 {
+        4
+    } else if step >= 7.0 {
+        6
+    } else {
+        (52.0 / step).ceil() as usize
+    };
+    rsx! {
+        for (i, label) in labels.iter().enumerate() {
+            {
+                let x = plot.left + (i as f64 + 0.5) * step;
+                if x + 23.0 > plot.right + 12.0 || i % stride != 0 {
+                    rsx! {}
+                } else {
+                    rsx! {
+                        line { x1: "{x}", x2: "{x}", y1: "{plot.bottom}", y2: "{plot.bottom + 4.0}", class: "chart-gridline" }
+                        text { x: "{x}", y: "{plot.bottom + 17.0}", text_anchor: "middle", "{label}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn step_bucket(e: KeyboardEvent, mut active: Signal<Option<usize>>, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let i = match e.key() {
+        Key::Named(NamedKey::ArrowLeft) => active.peek().map_or(count - 1, |i| i.saturating_sub(1)),
+        Key::Named(NamedKey::ArrowRight) => active.peek().map_or(0, |i| (i + 1).min(count - 1)),
+        _ => return,
+    };
+    e.prevent_default();
+    active.set(Some(i));
+}
+
+#[component]
+fn BucketHit(plot: TimePlotBox, index: usize, count: usize, mut active: Signal<Option<usize>>) -> Element {
+    let step = (plot.right - plot.left) / count as f64;
+    rsx! { rect { class: "chart-hit", x: "{plot.left + index as f64 * step}", y: "{plot.top}",
+        width: "{step}", height: "{plot.bottom - plot.top + 20.0}", fill: "transparent",
+        onmouseenter: move |_| active.set(Some(index)),
+    } }
+}
+
+#[component]
+fn ActivityReadout(right: bool, heading: String, fields: Vec<(&'static str, String)>) -> Element {
+    rsx! {
+        div { class: if right { "activity-readout right" } else { "activity-readout" },
+            strong { "{heading}" }
+            dl { for (label, value) in fields { dt { "{label}" } dd { "{value}" } } }
+        }
+    }
+}
+
+#[component]
+pub(super) fn ShareBar(
+    label: String,
+    value: f64,
+    total: f64,
+    #[props(default = "of listed total")] scale_label: &'static str,
+    #[props(default)] show_share: bool,
+) -> Element {
+    let share = (total.is_finite() && total > 0.0 && value.is_finite()).then(|| (value / total).clamp(0.0, 1.0) * 100.0);
+    rsx! {
+        span { class: if show_share { "share-bar-cell share-bar-labeled" } else { "share-bar-cell" },
+            span { "{label}" }
+            if let Some(pct) = share {
+                span { class: "share-bar-track", aria_hidden: "true", title: "{pct:.1}% {scale_label}",
+                    span { class: if pct > 0.0 { "nonzero" } else { "" }, style: "width: {pct:.2}%" }
+                }
+                if show_share {
+                    span { class: "share-bar-percent", aria_label: "{pct:.1}% {scale_label}", "{pct:.1}%" }
+                } else {
+                    span { class: "sr-only", ", {pct:.1}% {scale_label}" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn InteractiveBars(
+    label: &'static str,
+    metric: Metric,
+    items: Vec<BarItem>,
+    #[props(default)] rhythm: bool,
+    #[props(default)] time: Option<TimeBounds>,
+) -> Element {
     let mut hovered = use_signal(|| None::<usize>);
-    let grad_prefix = use_hook(|| Uuid::new_v4().simple().to_string());
-    let accent_grad_id = format!("chart-bar-accent-{grad_prefix}");
-    let cache_grad_id = format!("chart-bar-cache-{grad_prefix}");
-    let view_w = 620.0_f64;
-    let plot_left = 48.0_f64;
-    let plot_right = 604.0_f64;
-    let plot_top = 18.0_f64;
-    let plot_bottom = 132.0_f64;
-    let plot_w = plot_right - plot_left;
-    let plot_h = plot_bottom - plot_top;
-    let scale =
-        if metric == Metric::CacheHitRate { 100.0 } else { items.iter().filter_map(|p| p.value).fold(0.0, f64::max).max(f64::EPSILON) };
-    let step = plot_w / items.len().max(1) as f64;
+    let measure = use_time_plot_measure();
+    let width = (measure.width)().max(100.0);
+    let plot = TimePlotBox { bottom: if rhythm { 118.0 } else { 146.0 }, ..activity_plot(width) };
+    let (plot_left, plot_bottom) = (plot.left, plot.bottom);
+    let count = items.len();
+    let step = (plot.right - plot_left) / count.max(1) as f64;
     let unit = metric.label();
-    let active_idx = hovered().filter(|&i| i < items.len());
-    let grad_url = if metric == Metric::CacheHitRate { format!("url(#{cache_grad_id})") } else { format!("url(#{accent_grad_id})") };
-    let readout = active_idx.map(|i| {
-        let p = &items[i];
-        format!(
-            "{} · {} · {} req · {} tok · {} cache",
-            p.label,
-            metric.format_value(p.value),
-            fmt_count(p.requests),
-            fmt_count(p.tokens),
-            fmt_hit_pct(p.cache_hit_rate)
-        )
-    });
+    let active_idx = hovered().filter(|&i| i < count);
+    let peak = items.iter().enumerate().filter_map(|(i, p)| Some((i, p.value?))).max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)));
+    let peak_idx = peak.filter(|&(_, v)| v > 0.0 || metric == Metric::CacheHitRate).map(|(i, _)| i);
+    let max = peak.map_or(0.0, |(_, v)| v);
+    let scale = match metric {
+        Metric::CacheHitRate => 100.0,
+        Metric::Cost => max.max(0.002),
+        _ => (max / 2.0).ceil().max(1.0) * 2.0,
+    };
+    let height = plot_bottom + 24.0;
     rsx! {
         if items.is_empty() {
             p { class: "form-help", "{NO_RANGE_DATA}" }
         } else {
             figure { class: "provider-chart chart-stage",
-                div { class: "chart-header",
-                    figcaption { "{label} · {unit}" }
-                    span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
-                        {readout.as_deref().unwrap_or("Hover a bar to inspect")}
-                    }
-                }
-                svg {
-                    view_box: "0 0 620 156",
-                    role: "img",
-                    "aria-label": "{label}, {unit}. Data table follows.",
-                    onmouseleave: move |_| hovered.set(None),
-                    defs {
-                        linearGradient { id: "{accent_grad_id}", x1: "0", y1: "0", x2: "0", y2: "1",
-                            stop { offset: "0%", stop_color: "var(--honey)", stop_opacity: "0.95" }
-                            stop { offset: "100%", stop_color: "var(--honey)", stop_opacity: "0.45" }
-                        }
-                        linearGradient { id: "{cache_grad_id}", x1: "0", y1: "0", x2: "0", y2: "1",
-                            stop { offset: "0%", stop_color: "var(--ok)", stop_opacity: "0.95" }
-                            stop { offset: "100%", stop_color: "var(--ok)", stop_opacity: "0.45" }
-                        }
-                    }
-                    for frac in [0.0, 0.5, 1.0] {
-                        {
-                            let gy = plot_bottom - plot_h * frac;
-                            let tick = fmt_compact_axis(metric, scale * frac);
-                            rsx! {
-                                line {
-                                    x1: "{plot_left}",
-                                    x2: "{plot_right}",
-                                    y1: "{gy:.2}",
-                                    y2: "{gy:.2}",
-                                    class: if frac == 0.0 { "chart-gridline" } else { "chart-gridline subtle" },
-                                }
-                                text { x: "{plot_left - 6.0}", y: "{gy + 3.5:.2}", text_anchor: "end", "{tick}" }
-                            }
-                        }
-                    }
-                    for (i, item) in items.iter().enumerate() {
-                        {
-                            let col_x = plot_left + i as f64 * step;
-                            let bar_w = (step * 0.78).max(2.0);
-                            let bar_x = col_x + (step - bar_w) / 2.0;
-                            let height = (plot_h * item.value.unwrap_or_default() / scale).clamp(0.0, plot_h);
-                            let bar_y = plot_bottom - height;
-                            let is_active = active_idx == Some(i);
-                            rsx! {
-                                if is_active {
-                                    rect { x: "{col_x:.2}", y: "{plot_top}", width: "{step:.2}", height: "{plot_h}", class: "chart-col-highlight", pointer_events: "none" }
-                                }
-                                if item.value.is_some() {
-                                    rect {
-                                        x: "{bar_x:.2}",
-                                        y: "{bar_y:.2}",
-                                        width: "{bar_w:.2}",
-                                        height: "{height:.2}",
-                                        rx: "2.5",
-                                        fill: "{grad_url}",
-                                        class: if is_active { "chart-bar chart-bar-active" } else { "chart-bar" },
-                                        pointer_events: "none",
-                                    }
-                                }
-                                rect {
-                                    x: "{col_x:.2}",
-                                    y: "{plot_top}",
-                                    width: "{step:.2}",
-                                    height: "{plot_h}",
-                                    fill: "transparent",
-                                    class: "chart-hit",
-                                    onmouseenter: move |_| hovered.set(Some(i)),
-                                    title { "{item.label} · {unit}: {metric.format_value(item.value)}" }
-                                }
-                            }
-                        }
-                    }
-                    text { x: "{plot_left}", y: "149", "{items.first().map(|p| p.label.as_str()).unwrap_or_default()}" }
-                    if items.len() > 2 {
-                        text { x: "{(plot_left + plot_right) / 2.0:.1}", y: "149", text_anchor: "middle", "{items[items.len() / 2].label}" }
-                    }
-                    text { x: "{plot_right}", y: "149", text_anchor: "end", "{items.last().map(|p| p.label.as_str()).unwrap_or_default()}" }
-                    if let Some(i) = active_idx {
+                figcaption { class: "chart-header",
+                    span { "{label} · {unit}" }
+                    if let Some(i) = peak_idx {
                         {
                             let item = &items[i];
-                            let cx = plot_left + (i as f64 + 0.5) * step;
-                            let height = (plot_h * item.value.unwrap_or_default() / scale).clamp(0.0, plot_h);
-                            let cy = plot_bottom - height;
-                            let fail_part = if item.failures > 0 { format!(" · {} fail", fmt_count(item.failures)) } else { String::new() };
-                            let spec = TooltipSpec {
-                                x: cx,
-                                y: cy,
-                                crosshair_x: Some(cx),
-                                y_top: plot_top,
-                                y_bottom: plot_bottom,
-                                view_w,
-                                title: format!("{} · {}", item.label, metric.format_value(item.value)),
-                                detail: format!("{} req{fail_part} · {} tok", fmt_count(item.requests), fmt_count(item.tokens)),
-                                subdetail: Some(format!("Cache {} ({} read) · ${:.4}", fmt_hit_pct(item.cache_hit_rate), fmt_count(item.cache_read), item.cost_usd)),
-                            };
-                            rsx! { SvgTooltip { spec } }
+                            let time = item.window.split_once(" → ").map_or(item.window.as_str(), |(start, _)| start);
+                            let suffix = match metric { Metric::Requests => " req", Metric::Tokens => " tok", _ => "" };
+                            rsx! { span { class: "activity-peak mono", "Peak: {time} · {metric.format_value(item.value)}{suffix}" } }
+                        }
+                    }
+                    if rhythm && items.iter().any(|item| item.failures > 0) {
+                        span { class: "chart-legend-item form-help", span { class: "chart-swatch outlier", aria_hidden: "true" } "Failed requests" }
+                    }
+                    span { class: "chart-inspect form-help", "{INSPECT}" }
+                }
+                div { class: "activity-plot", tabindex: "0", role: "group",
+                    aria_label: "{label}, {unit}. Use left and right arrows to inspect. Data table follows.",
+                    onkeydown: move |e| step_bucket(e, hovered, count),
+                    onblur: move |_| hovered.set(None),
+                    onmouseleave: move |_| hovered.set(None),
+                    onmounted: move |e| measure.mount(e),
+                    onresize: move |_| measure.refresh(),
+                    svg { width: "100%", height: "{height}", view_box: "0 0 {width} {height}", preserve_aspect_ratio: "none", "aria-hidden": "true",
+                        ActivityGrid { plot, ticks: [0.0, 0.5, 1.0].map(|f| fmt_compact_axis(metric, scale * f)).to_vec() }
+                        if let Some(view) = time {
+                            TimeAxis { plot, view, label_offset: 17.0 }
+                        } else if rhythm {
+                            RhythmTicks { plot, labels: items.iter().map(|p| p.window.clone()).collect() }
+                        }
+                        for (i, item) in items.iter().enumerate() {
+                            {
+                                let x = plot_left + (i as f64 + 0.5) * step;
+                                let bar_w = (step * 0.74).min(34.0);
+                                let y = chart_y(plot, item.value.unwrap_or_default() / scale);
+                                let peak_class = if peak_idx == Some(i) { "peak" } else { "" };
+                                rsx! {
+                                    if item.value.is_some() {
+                                        rect { x: "{x - bar_w / 2.0}", y: "{y}", width: "{bar_w}", height: "{plot_bottom - y}", rx: "2",
+                                            class: "activity-bar {peak_class}" }
+                                    }
+                                    if rhythm && item.failures > 0 {
+                                        circle { cx: "{x}", cy: "{(y - 5.0).max(4.0)}", r: "2.4", class: "chart-outlier" }
+                                    }
+                                    if active_idx == Some(i) { TimeCrosshair { plot, x } }
+                                    BucketHit { plot, index: i, count, active: hovered }
+                                }
+                            }
+                        }
+                    }
+                    div { role: "status",
+                        if let Some(i) = active_idx {
+                            {
+                                let item = &items[i];
+                                rsx! { ActivityReadout { right: i < count / 2, heading: item.window.clone(), fields: vec![
+                                    ("Requests", fmt_count(item.requests)), ("Tokens", fmt_count(item.tokens)),
+                                    ("API-equivalent USD", format!("${:.4}", item.cost_usd)), ("Failures", fmt_count(item.failures)),
+                                    ("Cache hit", fmt_hit_pct(item.cache_hit_rate)), ("Cache read", fmt_count(item.cache_read)),
+                                ] } }
+                            }
                         }
                     }
                 }
                 details { summary { "Data table" }
-                    Table { label, headers: &["Period", "Value", "Requests", "Tokens", "Cache hit %", "API-equivalent USD"],
+                    Table { label, headers: &["Period", "Value", "Requests", "Tokens", "Failures", "Cache hit %", "API-equivalent USD"],
                         rows: items.iter().map(|p| vec![
-                            p.label.clone(),
+                            p.window.clone(),
                             metric.format_value(p.value),
                             fmt_count(p.requests),
                             fmt_count(p.tokens),
+                            fmt_count(p.failures),
                             fmt_hit_pct(p.cache_hit_rate),
                             format!("${:.4}", p.cost_usd),
                         ]).collect()
@@ -871,47 +1436,34 @@ fn InteractiveBars(label: &'static str, metric: Metric, items: Vec<BarItem>) -> 
 }
 
 #[component]
-pub(super) fn ActivityTrendChart(points: Vec<ActivityTrendPoint>, metric: Metric) -> Element {
-    let mut points = points;
-    points.sort_by_key(|p| p.bucket_start);
-    // Hub daily buckets use UTC dates and %m-%d labels. Leave longer spans sparse.
-    let fill_gaps = points
-        .first()
-        .zip(points.last())
-        .is_some_and(|(first, last)| last.bucket_start.date_naive() - first.bucket_start.date_naive() <= TimeDelta::days(400));
-    let mut items = Vec::with_capacity(points.len());
-    let mut previous_day = None;
-    for p in points {
-        let day = p.bucket_start.date_naive();
-        if fill_gaps && let Some(previous) = previous_day {
-            for offset in 1..day.signed_duration_since(previous).num_days() {
-                items.push(BarItem {
-                    label: (previous + TimeDelta::days(offset)).format("%m-%d").to_string(),
-                    value: metric.value(0, 0, 0.0, None),
-                    requests: 0,
-                    failures: 0,
-                    tokens: 0,
-                    cache_read: 0,
-                    cache_hit_rate: None,
-                    cost_usd: 0.0,
-                });
+pub(super) fn ActivityTrendChart(
+    points: Vec<ActivityTrendPoint>,
+    metric: Metric,
+    #[props(default)] bucket_seconds: Option<u64>,
+) -> Element {
+    let (seconds, points) = trend_buckets(points, bucket_seconds);
+    let time = bucket_bounds(&points, seconds);
+    let items = points
+        .into_iter()
+        .map(|p| {
+            let tokens = p.input_tokens.saturating_add(p.output_tokens);
+            BarItem {
+                window: bucket_window(p.bucket_start, seconds),
+                value: metric.value(p.requests, tokens, p.api_equivalent_cost_usd, p.cache_hit_rate_observed),
+                requests: p.requests,
+                failures: p.failures,
+                tokens,
+                cache_read: p.cache_read_tokens,
+                cache_hit_rate: p.cache_hit_rate_observed,
+                cost_usd: p.api_equivalent_cost_usd,
             }
-        }
-        previous_day = Some(day);
-        let tokens = p.input_tokens.saturating_add(p.output_tokens);
-        let cache_hit_rate = effective_cache_hit_rate(p.input_tokens, p.cache_read_tokens, p.cache_hit_rate);
-        items.push(BarItem {
-            label: p.label,
-            value: metric.value(p.requests, tokens, p.api_equivalent_cost_usd, cache_hit_rate),
-            requests: p.requests,
-            failures: p.failures,
-            tokens,
-            cache_read: p.cache_read_tokens,
-            cache_hit_rate,
-            cost_usd: p.api_equivalent_cost_usd,
-        });
-    }
-    rsx! { InteractiveBars { label: "Daily activity", metric, items } }
+        })
+        .collect();
+    rsx! { InteractiveBars { label: "Activity over time (UTC)", metric, items, time } }
+}
+
+fn local_hour(hour: u8) -> String {
+    format!("{} {}", if hour.is_multiple_of(12) { 12 } else { hour % 12 }, if hour < 12 { "AM" } else { "PM" })
 }
 
 #[component]
@@ -924,10 +1476,10 @@ pub(super) fn ActivityRhythmChart(points: Vec<RhythmBucket>, metric: Metric) -> 
             Some(p) => {
                 let cache_hit_rate = effective_cache_hit_rate(p.input_tokens, p.cache_read_tokens, p.cache_hit_rate);
                 BarItem {
-                    label: format!("{h:02}:00"),
+                    window: local_hour(h),
                     value: metric.value(p.requests, p.tokens, p.api_equivalent_cost_usd, cache_hit_rate),
                     requests: p.requests,
-                    failures: 0,
+                    failures: p.failures,
                     tokens: p.tokens,
                     cache_read: p.cache_read_tokens,
                     cache_hit_rate,
@@ -935,7 +1487,7 @@ pub(super) fn ActivityRhythmChart(points: Vec<RhythmBucket>, metric: Metric) -> 
                 }
             }
             None => BarItem {
-                label: format!("{h:02}:00"),
+                window: local_hour(h),
                 value: metric.value(0, 0, 0.0, None),
                 requests: 0,
                 failures: 0,
@@ -946,296 +1498,180 @@ pub(super) fn ActivityRhythmChart(points: Vec<RhythmBucket>, metric: Metric) -> 
             },
         })
         .collect();
-    rsx! { InteractiveBars { label: "Local-hour rhythm", metric, items } }
-}
-
-#[derive(Clone, PartialEq)]
-enum CacheHover {
-    Point(usize),
-    Segment(usize),
+    rsx! { InteractiveBars { label: "By local hour", metric, items, rhythm: true } }
 }
 
 #[component]
-pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>) -> Element {
-    let mut hovered = use_signal(|| None::<CacheHover>);
-    let grad_id = use_hook(|| format!("chart-cache-area-{}", Uuid::new_v4().simple()));
-    let grad_url = format!("url(#{grad_id})");
-    let view_w = 620.0_f64;
-    let plot_left = 44.0_f64;
-    let plot_right = 604.0_f64;
-    let plot_top = 16.0_f64;
-    let plot_bottom = 134.0_f64;
-    let plot_h = plot_bottom - plot_top;
-    let mut points = points;
-    points.sort_by_key(|p| p.bucket_start);
-    let n = points.len();
-    let px = |i: usize| match (points.first(), points.last()) {
-        (Some(first), Some(last)) if first.bucket_start != last.bucket_start => {
-            let elapsed = (points[i].bucket_start - first.bucket_start).as_seconds_f64();
-            let span = (last.bucket_start - first.bucket_start).as_seconds_f64();
-            plot_left + (plot_right - plot_left) * elapsed / span
-        }
-        _ => (plot_left + plot_right) / 2.0,
+pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>, #[props(default)] bucket_seconds: Option<u64>) -> Element {
+    let mut active = use_signal(|| None::<usize>);
+    let measure = use_time_plot_measure();
+    let (seconds, points) = trend_buckets(points, bucket_seconds);
+    let Some(view) = bucket_bounds(&points, seconds) else {
+        return rsx! { p { class: "form-help", "{NO_RANGE_DATA}" } };
     };
-    let py = |rate: f64| plot_bottom - plot_h * rate.clamp(0.0, 1.0);
-    let rates: Vec<_> = points.iter().map(|p| effective_cache_hit_rate(p.input_tokens, p.cache_read_tokens, p.cache_hit_rate)).collect();
-    let plotted: Vec<_> = rates.iter().enumerate().filter_map(|(i, rate)| Some((i, (*rate)?))).collect();
-    let (weighted_rate, total_in) = plotted.iter().fold((0.0, 0.0), |(sum, total), &(i, rate)| {
-        let input = points[i].input_tokens as f64;
-        (sum + rate * input, total + input)
-    });
-    let avg_rate = (total_in > 0.0).then(|| weighted_rate / total_in);
-
-    // Use the same runs for visible paths and interactive segments.
-    let runs = plotted.chunk_by(|&(a, _), &(b, _)| b == a + 1 && points[b].bucket_start - points[a].bucket_start <= TimeDelta::hours(36));
-    let mut lines = Vec::new();
-    let mut areas = Vec::new();
-    let mut segments = Vec::new();
-    for run in runs {
-        let coords = run.iter().map(|&(i, rate)| format!("{:.2} {:.2}", px(i), py(rate))).collect::<Vec<_>>().join(" L");
-        lines.push(format!("M{coords}"));
-        if let [first, .., last] = run {
-            areas.push(format!("M{:.2} {plot_bottom:.2} L{coords} L{:.2} {plot_bottom:.2} Z", px(first.0), px(last.0)));
-        }
-        segments.extend(run.windows(2).map(|pair| (pair[0], pair[1])));
-    }
-    let line_d = lines.join(" ");
-    let active = hovered();
-    let (readout, tooltip_spec) = match active {
-        Some(CacheHover::Point(i)) => rates.get(i).copied().map(|rate| {
-            let p = &points[i];
-            let hit_pct = fmt_hit_pct(rate);
-            let readout = format!(
-                "{} · {} hit · {} read / {} in · {} write",
-                p.label,
-                hit_pct,
-                fmt_count(p.cache_read_tokens),
-                fmt_count(p.input_tokens),
-                fmt_count(p.cache_write_tokens),
-            );
-            let spec = TooltipSpec {
-                x: px(i),
-                y: rate.map_or(plot_bottom, py),
-                crosshair_x: Some(px(i)),
-                y_top: plot_top,
-                y_bottom: plot_bottom,
-                view_w,
-                title: format!("{} · {hit_pct} cache hit", p.label),
-                detail: format!("{} read / {} input tokens", fmt_count(p.cache_read_tokens), fmt_count(p.input_tokens)),
-                subdetail: Some(format!("{} write · {} req", fmt_count(p.cache_write_tokens), fmt_count(p.requests))),
-            };
-            (readout, spec)
-        }),
-        Some(CacheHover::Segment(i)) => segments.get(i).map(|&((a, from), (b, to))| {
-            let delta = (to - from) * 100.0;
-            let mx = (px(a) + px(b)) / 2.0;
-            let my = (py(from) + py(to)) / 2.0;
-            let title = format!("{} → {}", points[a].label, points[b].label);
-            let detail = format!("{} → {} ({delta:+.1} pp)", fmt_hit_pct(Some(from)), fmt_hit_pct(Some(to)));
-            let readout = format!("{title} · {detail}");
-            let spec = TooltipSpec {
-                x: mx,
-                y: my,
-                crosshair_x: Some(mx),
-                y_top: plot_top,
-                y_bottom: plot_bottom,
-                view_w,
-                title,
-                detail,
-                subdetail: Some(format!("Mean overall: {}", fmt_hit_pct(avg_rate))),
-            };
-            (readout, spec)
-        }),
-        None => None,
-    }
-    .unzip();
+    let count = points.len();
+    let width = (measure.width)().max(100.0);
+    let plot = TimePlotBox { bottom: 118.0, ..activity_plot(width) };
+    let volume = TimePlotBox { top: plot.bottom + 22.0, bottom: plot.bottom + 46.0, ..plot };
+    let inspection = TimePlotBox { bottom: volume.bottom, ..plot };
+    let height = volume.bottom + 24.0;
+    let step = (plot.right - plot.left) / count.max(1) as f64;
+    let px = |i: usize| plot.left + (i as f64 + 0.5) * step;
+    let max_input = points.iter().map(|p| p.input_tokens).max().unwrap_or_default() as f64;
+    let volume_peak = fmt_compact_axis(Metric::Tokens, max_input);
+    let observed = active().filter(|&i| i < count);
     rsx! {
-        if plotted.is_empty() {
-            p { class: "form-help", "{NO_RANGE_DATA}" }
-        } else {
             figure { class: "provider-chart chart-stage",
-                div { class: "chart-header",
-                    figcaption { "Daily cache hit rate (%) · avg {fmt_hit_pct(avg_rate)}" }
-                    span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
-                        {readout.as_deref().unwrap_or("Hover a line segment or point to inspect")}
-                    }
+                figcaption { class: "chart-header",
+                    span { "Cache hit rate (%) · UTC" }
+                    span { class: "chart-inspect form-help", "{INSPECT}" }
                 }
-                svg {
-                    view_box: "0 0 620 156",
-                    role: "img",
-                    "aria-label": "Daily cache hit rate percentage over time.",
-                    onmouseleave: move |_| hovered.set(None),
-                    defs {
-                        linearGradient { id: "{grad_id}", x1: "0", y1: "0", x2: "0", y2: "1",
-                            stop { offset: "0%", stop_color: "var(--ok)", stop_opacity: "0.28" }
-                            stop { offset: "100%", stop_color: "var(--ok)", stop_opacity: "0.02" }
+                if !points.iter().any(|p| p.cache_hit_rate_observed.is_some()) {
+                    p { class: "form-help", "No observed cache hit rate in this range." }
+                }
+                div { class: "activity-plot", tabindex: "0", role: "group",
+                    aria_label: "Cache hit rate and input volume. Use left and right arrows to inspect. Data table follows.",
+                    onkeydown: move |e| step_bucket(e, active, count),
+                    onblur: move |_| active.set(None),
+                    onmouseleave: move |_| active.set(None),
+                    onmounted: move |e| measure.mount(e),
+                    onresize: move |_| measure.refresh(),
+                    svg { width: "100%", height: "{height}", view_box: "0 0 {width} {height}", preserve_aspect_ratio: "none", "aria-hidden": "true",
+                        ActivityGrid { plot, ticks: vec!["0%".into(), "50%".into(), "100%".into()] }
+                        TimeAxis { plot: volume, view, label_offset: 17.0 }
+                        line { x1: "{volume.left}", x2: "{volume.right}", y1: "{volume.bottom}", y2: "{volume.bottom}", class: "chart-gridline" }
+                        for (i, p) in points.iter().enumerate().filter(|(_, p)| p.input_tokens > 0) {
+                            {
+                                let bar_w = (step * 0.74).min(34.0);
+                                let y = chart_y(volume, p.input_tokens as f64 / max_input);
+                                rsx! { rect { x: "{px(i) - bar_w / 2.0}", y: "{y}", width: "{bar_w}", height: "{volume.bottom - y}", rx: "2", class: "activity-volume-bar" } }
+                            }
+                        }
+                        for (i, pair) in points.windows(2).enumerate() {
+                            if let Some((a, b)) = pair[0].cache_hit_rate_observed.zip(pair[1].cache_hit_rate_observed)
+                                && pair[1].bucket_start - pair[0].bucket_start == TimeDelta::seconds(seconds as i64) {
+                                line { x1: "{px(i)}", x2: "{px(i + 1)}", y1: "{chart_y(plot, a)}", y2: "{chart_y(plot, b)}",
+                                    class: "chart-line chart-cache-line activity-cache-segment" }
+                            }
+                        }
+                        if let Some(i) = observed { TimeCrosshair { plot: inspection, x: px(i) } }
+                        text { x: "{volume.left}", y: "{volume.top - 5.0}", class: "activity-volume-label", "Input volume · peak {volume_peak} tok" }
+                        for (i, p) in points.iter().enumerate() {
+                            if let Some(rate) = p.cache_hit_rate_observed {
+                                circle { cx: "{px(i)}", cy: "{chart_y(plot, rate)}", r: if observed == Some(i) { "4.5" } else { "2.6" },
+                                    class: if observed == Some(i) { "chart-cache-dot active" } else { "chart-cache-dot" } }
+                            }
+                        }
+                        for i in 0..count {
+                            BucketHit { plot: inspection, index: i, count, active }
                         }
                     }
-                    for pct in [0.0, 25.0, 50.0, 75.0, 100.0] {
-                        {
-                            let gy = py(pct / 100.0);
-                            rsx! {
-                                line {
-                                    x1: "{plot_left}",
-                                    x2: "{plot_right}",
-                                    y1: "{gy:.2}",
-                                    y2: "{gy:.2}",
-                                    class: if pct == 0.0 || pct == 100.0 { "chart-gridline" } else { "chart-gridline subtle" },
-                                }
-                                if pct == 0.0 || pct == 50.0 || pct == 100.0 {
-                                    text { x: "{plot_left - 6.0}", y: "{gy + 3.5:.2}", text_anchor: "end", "{pct:.0}%" }
+                    div { role: "status",
+                        if let Some(i) = observed {
+                            {
+                                let p = &points[i];
+                                rsx! {
+                                    ActivityReadout { right: i < count / 2, heading: bucket_window(p.bucket_start, seconds), fields: vec![
+                                        ("Cache hit", p.cache_hit_rate_observed.map_or_else(|| "N/A · no input".into(), |r| fmt_hit_pct(Some(r)))),
+                                        ("Read / input tokens", format!("{} / {}", fmt_count(p.cache_read_tokens), fmt_count(p.input_tokens))),
+                                        ("Cache write tokens", fmt_count(p.cache_write_tokens)),
+                                    ] }
                                 }
                             }
                         }
-                    }
-                    if let Some(avg_rate) = avg_rate {
-                        line {
-                            x1: "{plot_left}",
-                            x2: "{plot_right}",
-                            y1: "{py(avg_rate):.2}",
-                            y2: "{py(avg_rate):.2}",
-                            class: "chart-cache-avg",
-                        }
-                    }
-                    for d in areas {
-                        path { d: "{d}", fill: "{grad_url}", pointer_events: "none" }
-                    }
-                    path { class: "chart-line chart-cache-line", d: "{line_d}", pointer_events: "none" }
-                    for (i, &((a, from), (b, to))) in segments.iter().enumerate() {
-                        {
-                            let x1 = px(a);
-                            let y1 = py(from);
-                            let x2 = px(b);
-                            let y2 = py(to);
-                            let is_seg = active == Some(CacheHover::Segment(i));
-                            rsx! {
-                                if is_seg {
-                                    line { x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}", class: "chart-line chart-cache-line chart-segment-active", pointer_events: "none" }
-                                }
-                                line {
-                                    x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}",
-                                    class: "chart-hit",
-                                    stroke: "transparent",
-                                    stroke_width: "12",
-                                    onmouseenter: move |_| hovered.set(Some(CacheHover::Segment(i))),
-                                    onmouseleave: move |_| hovered.set(None),
-                                }
-                            }
-                        }
-                    }
-                    for (i, &rate) in rates.iter().enumerate() {
-                        {
-                            let p = &points[i];
-                            let cx = px(i);
-                            let cy = rate.map_or(plot_bottom, py);
-                            let is_pt = active == Some(CacheHover::Point(i));
-                            rsx! {
-                                if rate.is_some() {
-                                    circle {
-                                        cx: "{cx:.2}",
-                                        cy: "{cy:.2}",
-                                        r: if is_pt { "4.4" } else { "2.8" },
-                                        class: if is_pt { "chart-cache-dot active" } else { "chart-cache-dot" },
-                                        pointer_events: "none",
-                                    }
-                                }
-                                circle {
-                                    cx: "{cx:.2}",
-                                    cy: "{cy:.2}",
-                                    r: "8",
-                                    fill: "transparent",
-                                    class: "chart-hit",
-                                    onmouseenter: move |_| hovered.set(Some(CacheHover::Point(i))),
-                                    onmouseleave: move |_| hovered.set(None),
-                                    title { "{p.label} · {fmt_hit_pct(rate)}" }
-                                }
-                            }
-                        }
-                    }
-                    text { x: "{plot_left}", y: "149", "{points.first().map(|p| p.label.as_str()).unwrap_or_default()}" }
-                    if n > 2 {
-                        text { x: "{px(n / 2):.1}", y: "149", text_anchor: "middle", "{points[n / 2].label}" }
-                    }
-                    text { x: "{plot_right}", y: "149", text_anchor: "end", "{points.last().map(|p| p.label.as_str()).unwrap_or_default()}" }
-                    if let Some(spec) = tooltip_spec {
-                        SvgTooltip { spec }
                     }
                 }
                 details { summary { "Data table" }
-                    Table { label: "Daily cache hit rate", headers: &["Day", "Cache hit %", "Cache read", "Input tokens"],
-                        rows: points.iter().zip(&rates).map(|(p, rate)| vec![
-                            p.label.clone(), fmt_hit_pct(*rate), fmt_count(p.cache_read_tokens), fmt_count(p.input_tokens),
+                    Table { label: "Cache hit rate by bucket", headers: &["Period", "Cache hit %", "Cache read", "Input tokens", "Cache write"],
+                        rows: points.iter().map(|p| vec![
+                            bucket_window(p.bucket_start, seconds), fmt_hit_pct(p.cache_hit_rate_observed),
+                            fmt_count(p.cache_read_tokens), fmt_count(p.input_tokens), fmt_count(p.cache_write_tokens),
                         ]).collect()
                     }
                 }
             }
+    }
+}
+
+#[component]
+fn HeatmapScale(metric: Metric, max: f64) -> Element {
+    let peak = fmt_compact_axis(metric, max);
+    let unit = match metric {
+        Metric::Requests => " req",
+        Metric::Tokens => " tok",
+        _ => "",
+    };
+    rsx! {
+        div { class: "activity-heat-scale", aria_label: "Heatmap color scale: zero to {peak}{unit}",
+            span { class: "mono", "0" }
+            span { "Less" }
+            for step in [0.12, 0.36, 0.65, 1.0] {
+                span { class: if metric == Metric::CacheHitRate { "chart-heat-swatch cache" } else { "chart-heat-swatch" },
+                    style: "opacity: {step}", aria_hidden: "true" }
+            }
+            span { "More" }
+            span { class: "mono", "{peak}{unit}" }
         }
     }
 }
 
 #[component]
-pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Element {
+pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric, #[props(default)] covered_weekdays: Vec<u8>) -> Element {
     let mut hovered = use_signal(|| None::<(usize, usize)>);
-    if cells.is_empty() {
+    let measure = use_time_plot_measure();
+    let hatch = use_hook(|| format!("activity-outside-{}", Uuid::new_v4().simple()));
+    let width = (measure.width)().max(100.0);
+    let step = (width - 38.0) / 24.0;
+    let in_scope = |day| covered_weekdays.is_empty() || covered_weekdays.contains(&(day as u8));
+    if cells.is_empty() && covered_weekdays.is_empty() {
         return rsx! { p { class: "form-help", "{NO_RANGE_DATA}" } };
     }
     let unit = metric.label();
     let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     let cell_map: BTreeMap<_, _> = cells
         .iter()
+        .filter(|c| in_scope(usize::from(c.day_of_week)))
         .map(|c| {
             let rate = effective_cache_hit_rate(c.input_tokens, c.cache_read_tokens, c.cache_hit_rate);
             let value = metric.value(c.requests, c.tokens, c.api_equivalent_cost_usd, rate);
             ((usize::from(c.day_of_week), usize::from(c.hour)), (c, rate, value))
         })
         .collect();
-    let max = if metric == Metric::CacheHitRate {
-        100.0
-    } else {
-        cell_map.values().filter_map(|&(_, _, v)| v).fold(0.0, f64::max).max(f64::EPSILON)
-    };
+    let max = cell_map.values().filter_map(|&(_, _, v)| v).fold(0.0, f64::max);
     let empty_value = metric.value(0, 0, 0.0, None);
     let value_at = |d, h| cell_map.get(&(d, h)).map_or(empty_value, |&(_, _, value)| value);
     let active = hovered();
     let cell_class = if metric == Metric::CacheHitRate { "chart-heat-cache" } else { "chart-bar chart-solid" };
-    let readout = active.map(|(d, h)| {
-        if let Some(&(c, rate, value)) = cell_map.get(&(d, h)) {
-            format!(
-                "{} {h:02}:00 · {} · {} req · {} tok · {} cache",
-                days[d],
-                metric.format_value(value),
-                fmt_count(c.requests),
-                fmt_count(c.tokens),
-                fmt_hit_pct(rate),
-            )
-        } else {
-            format!("{} {h:02}:00 · {} (no activity)", days[d], metric.format_value(empty_value))
-        }
-    });
     rsx! {
         figure { class: "provider-chart chart-stage",
-            div { class: "chart-header",
-                figcaption { "Activity by weekday and local hour · {unit}" }
-                span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
-                    {readout.as_deref().unwrap_or("Hover a cell to inspect")}
-                }
+            figcaption { class: "chart-header",
+                span { "By weekday and local hour · {unit}" }
+                HeatmapScale { metric, max }
             }
             div { class: "chart-legend",
-                span { class: "muted", "Low" }
-                for step in [0.14, 0.34, 0.56, 0.78, 1.0] {
-                    span { class: if metric == Metric::CacheHitRate { "chart-heat-swatch cache" } else { "chart-heat-swatch" }, style: "opacity: {step}" }
+                if !covered_weekdays.is_empty() && covered_weekdays.len() < days.len() {
+                    span { class: "chart-legend-item", span { class: "chart-heat-swatch outside" } "Outside selected window" }
                 }
-                span { class: "muted", "Peak ({fmt_compact_axis(metric, max)})" }
+                if metric == Metric::CacheHitRate {
+                    span { class: "chart-legend-item", span { class: "chart-heat-swatch na" } "N/A · no input" }
+                }
             }
-            svg {
-                view_box: "0 0 616 184",
+            div { class: "activity-plot",
+                onmounted: move |e| measure.mount(e),
+                onresize: move |_| measure.refresh(),
+                svg {
+                width: "100%", height: "154", view_box: "0 0 {width} 154", preserve_aspect_ratio: "none",
                 role: "img",
                 "aria-label": "Seven by twenty-four activity heatmap. Data table follows.",
                 onmouseleave: move |_| hovered.set(None),
-                for hour in [0, 3, 6, 9, 12, 15, 18, 21, 23] {
+                defs { pattern { id: "{hatch}", width: "5", height: "5", pattern_units: "userSpaceOnUse",
+                    path { d: "M-1 1L1 -1 M0 5L5 0 M4 6L6 4", class: "activity-heat-hatch" }
+                } }
+                for hour in (0..24).step_by(if step >= 18.0 { 3 } else { 6 }) {
                     text {
-                        x: "{36 + 24 * hour}",
+                        x: "{35.0 + step * (hour as f64 + 0.5)}",
                         y: "12",
+                        text_anchor: "middle",
                         class: if active.is_some_and(|(_, h)| h == hour) { "chart-axis-active" } else { "" },
                         "{hour:02}"
                     }
@@ -1243,7 +1679,7 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Elemen
                 for (d, day) in days.into_iter().enumerate() {
                     text {
                         x: "2",
-                        y: "{34 + 22 * d}",
+                        y: "{30 + 18 * d}",
                         class: if active.is_some_and(|(ad, _)| ad == d) { "chart-axis-active" } else { "" },
                         "{day}"
                     }
@@ -1252,19 +1688,27 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Elemen
                             let value = value_at(d, h);
                             let intensity = value.unwrap_or_default();
                             let is_active = active == Some((d, h));
-                            let cx = 36 + 24 * h;
-                            let cy = 20 + 22 * d;
+                            let cx = 35.0 + step * h as f64;
+                            let cy = 18 + 18 * d;
+                            let outside = !in_scope(d);
+                            let state = if outside { "activity-heat-outside" } else if value.is_none() { "activity-heat-na" } else { cell_class };
+                            let active_class = if is_active { "chart-cell-active" } else { "" };
+                            let description = if outside { "Outside selected window".into() } else if value.is_none() {
+                                "N/A · no input tokens".into()
+                            } else { format!("{unit}: {}", metric.format_value(value)) };
                             rsx! {
                                 rect {
                                     x: "{cx}",
                                     y: "{cy}",
-                                    width: "21",
-                                    height: "19",
-                                    rx: "3",
-                                    class: if is_active { "{cell_class} chart-cell-active chart-hit" } else { "{cell_class} chart-hit" },
-                                    opacity: if intensity <= 0.0 { 0.12 } else { 0.24 + 0.76 * (intensity / max).clamp(0.0, 1.0) },
+                                    width: "{(step - 2.0).max(1.0)}",
+                                    height: "16",
+                                    rx: "2",
+                                    class: "{state} {active_class} chart-hit",
+                                    fill: if outside { format!("url(#{hatch})") } else { String::new() },
+                                     opacity: if outside || value.is_none() { 1.0 } else if intensity == 0.0 { 0.04 }
+                                         else { 0.12 + 0.88 * (intensity / max).clamp(0.0, 1.0) },
                                     onmouseenter: move |_| hovered.set(Some((d, h))),
-                                    title { "{day} {h:02}:00 · {unit}: {metric.format_value(value)}" }
+                                    title { "{day} {h:02}:00 · {description}" }
                                 }
                             }
                         }
@@ -1272,7 +1716,11 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Elemen
                 }
                 if let Some((d, h)) = active {
                     {
-                        let (detail, subdetail) = if let Some(&(c, rate, _)) = cell_map.get(&(d, h)) {
+                        let (detail, subdetail) = if !in_scope(d) {
+                            ("Outside selected window".into(), None)
+                        } else if value_at(d, h).is_none() {
+                            ("N/A · no input tokens".into(), None)
+                        } else if let Some(&(c, rate, _)) = cell_map.get(&(d, h)) {
                             (
                                 format!("{} req · {} tok", fmt_count(c.requests), fmt_count(c.tokens)),
                                 Some(format!("Cache {} · ${:.4}", fmt_hit_pct(rate), c.api_equivalent_cost_usd)),
@@ -1281,18 +1729,21 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Elemen
                             ("No recorded requests".into(), None)
                         };
                         let spec = TooltipSpec {
-                            x: 36.0 + 24.0 * h as f64 + 10.5,
-                            y: 20.0 + 22.0 * d as f64 + 9.5,
+                            x: 35.0 + step * (h as f64 + 0.5),
+                            y: 26.0 + 18.0 * d as f64,
                             crosshair_x: None,
                             y_top: 20.0,
-                            y_bottom: 174.0,
-                            view_w: 616.0,
-                            title: format!("{} {h:02}:00 · {}", days[d], metric.format_value(value_at(d, h))),
+                            y_bottom: 144.0,
+                            view_w: width,
+                            title: if in_scope(d) && value_at(d, h).is_some() {
+                                format!("{} {h:02}:00 · {}", days[d], metric.format_value(value_at(d, h)))
+                            } else { format!("{} {h:02}:00", days[d]) },
                             detail,
                             subdetail,
                         };
                         rsx! { SvgTooltip { spec } }
                     }
+                }
                 }
             }
             if cells.is_empty() { p { class: "muted", "No activity observations in this scope." } }
@@ -1314,203 +1765,146 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric) -> Elemen
     }
 }
 
-#[derive(Clone, PartialEq)]
-enum DriftHover {
-    Day(usize),
-    Segment(usize),
+fn drift_date(date: &str) -> Option<DateTime<Utc>> {
+    Some(chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?.and_time(chrono::NaiveTime::MIN).and_utc())
+}
+
+fn drift_ticks(peak: f64) -> [f64; 3] {
+    let target = (peak / 2.0).max(1.0);
+    let decade = 10.0_f64.powf(target.log10().floor());
+    let step = decade * [1.0, 2.0, 2.5, 5.0, 10.0].into_iter().find(|n| *n >= target / decade).unwrap_or(10.0);
+    [0.0, step, 2.0 * step]
 }
 
 #[component]
-pub(super) fn DriftBandChart(days: Vec<DriftDayPoint>, markers: Vec<DriftMarker>) -> Element {
-    let mut hovered = use_signal(|| None::<DriftHover>);
-    let view_w = 620.0_f64;
-    let plot_left = 48.0_f64;
-    let plot_right = 604.0_f64;
-    let plot_top = 16.0_f64;
-    let plot_bottom = 140.0_f64;
-    let max = days.iter().flat_map(|d| [d.thinking_per_reply, d.baseline_high.unwrap_or(0.0)]).fold(1.0, f64::max);
-    let n = days.len();
-    let dx = |i: usize| {
-        if n <= 1 { (plot_left + plot_right) / 2.0 } else { plot_left + (plot_right - plot_left) * i as f64 / (n - 1) as f64 }
+pub(super) fn DriftBandChart(days: Vec<DriftDayPoint>, markers: Vec<DriftMarker>, #[props(default)] ttft: bool) -> Element {
+    let mut active = use_signal(|| None::<usize>);
+    let measure = use_time_plot_measure();
+    let mut dated: Vec<_> = days.iter().filter_map(|day| Some((drift_date(&day.date)?, day))).collect();
+    dated.sort_by_key(|(at, _)| *at);
+    let Some(((first, _), (last, _))) = dated.first().zip(dated.last()) else {
+        return rsx! { p { class: "form-help", "No dated observations in this scope." } };
     };
-    let dy = |v: f64| plot_bottom - (plot_bottom - plot_top) * (v / max).clamp(0.0, 1.0);
-    let band_path = |range: &[(usize, &DriftDayPoint)]| {
-        let high = range.iter().map(|(i, d)| format!("{:.2},{:.2}", dx(*i), dy(d.baseline_high.unwrap_or_default())));
-        let low = range.iter().rev().map(|(i, d)| format!("{:.2},{:.2}", dx(*i), dy(d.baseline_low.unwrap_or_default())));
-        high.chain(low).collect::<Vec<_>>().join(" ")
-    };
-    let trend_d = days
+    let view = TimeBounds { start: *first - TimeDelta::hours(12), end: *last + TimeDelta::hours(12) };
+    let width = (measure.width)().max(100.0);
+    let plot = activity_plot(width);
+    let height = plot.bottom + 24.0;
+    let x = |at| plot.x(view, at);
+    let value =
+        |d: &DriftDayPoint| (if ttft { d.median_ttft_ms } else { Some(d.thinking_per_reply) }).filter(|v| v.is_finite() && *v >= 0.0);
+    let peak = dated.iter().filter_map(|&(at, d)| Some((at, value(d)?))).max_by(|a, b| a.1.total_cmp(&b.1));
+    let high = dated.iter().filter_map(|(_, d)| d.baseline_high.filter(|v| v.is_finite())).fold(0.0, f64::max);
+    let ticks = drift_ticks(peak.map_or(0.0, |(_, v)| v).max(if ttft { 0.0 } else { high }));
+    let y = |v: f64| chart_y(plot, v / ticks[2]);
+    let half_day = (x(*first + TimeDelta::hours(12)) - x(*first) - 0.5).clamp(0.0, 15.0);
+    let show_median = !ttft && dated.iter().any(|(_, d)| d.baseline_median_thinking.is_some());
+    let show_band = !ttft && dated.iter().any(|(_, d)| d.baseline_low.zip(d.baseline_high).is_some());
+    let show_outlier = !ttft && dated.iter().any(|(_, d)| d.outlier);
+    let markers: Vec<_> = markers.iter().filter_map(|m| Some((drift_date(&m.date)?, m))).filter(|(at, _)| view.contains(*at)).collect();
+    let targets: Vec<_> = markers
         .iter()
-        .enumerate()
-        .map(|(i, d)| format!("{}{:.2} {:.2}", if i == 0 { 'M' } else { 'L' }, dx(i), dy(d.thinking_per_reply)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let indexed: Vec<_> = days.iter().enumerate().collect();
-    let groups = indexed.split(|(_, d)| d.baseline_low.is_none() || d.baseline_high.is_none());
-    let active = hovered();
-    let readout = match active {
-        Some(DriftHover::Day(i)) if i < n => {
-            let d = &days[i];
-            let band = match (d.baseline_low, d.baseline_median_thinking, d.baseline_high) {
-                (Some(lo), Some(med), Some(hi)) => format!("normal {lo:.0}–{med:.0}–{hi:.0}"),
-                _ => "baseline building".into(),
-            };
-            let tag = if d.outlier { " · OUTLIER" } else { "" };
-            Some(format!("{} · {:.1} tok/reply ({} replies) · {band}{tag}", d.date, d.thinking_per_reply, d.replies))
-        }
-        Some(DriftHover::Segment(i)) if i + 1 < n => {
-            let a = &days[i];
-            let b = &days[i + 1];
-            let delta = b.thinking_per_reply - a.thinking_per_reply;
-            Some(format!("{} → {} · {:.1} → {:.1} tok/reply ({delta:+.1})", a.date, b.date, a.thinking_per_reply, b.thinking_per_reply))
-        }
-        _ => None,
-    };
-    let tooltip_spec = match active {
-        Some(DriftHover::Day(i)) if i < n => {
-            let d = &days[i];
-            let marker = markers.iter().find(|m| m.date == d.date).map(|m| m.label.clone());
-            let band = match (d.baseline_low, d.baseline_median_thinking, d.baseline_high) {
-                (Some(lo), Some(med), Some(hi)) => format!("Normal: {lo:.0}–{med:.0}–{hi:.0}"),
-                _ => "Insufficient baseline coverage".into(),
-            };
-            let sub = match (d.outlier, marker) {
-                (true, Some(m)) => Some(format!("Outlier · {m}")),
-                (true, None) => Some("Outlier vs 14-day baseline".into()),
-                (false, Some(m)) => Some(format!("Change: {m}")),
-                (false, None) => Some(band.clone()),
-            };
-            Some(TooltipSpec {
-                x: dx(i),
-                y: dy(d.thinking_per_reply),
-                crosshair_x: Some(dx(i)),
-                y_top: plot_top,
-                y_bottom: plot_bottom,
-                view_w,
-                title: format!("{} · {:.1} tok/reply", d.date, d.thinking_per_reply),
-                detail: format!("{} replies · {band}", d.replies),
-                subdetail: sub.filter(|s| s != &band),
-            })
-        }
-        Some(DriftHover::Segment(i)) if i + 1 < n => {
-            let a = &days[i];
-            let b = &days[i + 1];
-            let delta = b.thinking_per_reply - a.thinking_per_reply;
-            let mx = (dx(i) + dx(i + 1)) / 2.0;
-            let my = (dy(a.thinking_per_reply) + dy(b.thinking_per_reply)) / 2.0;
-            Some(TooltipSpec {
-                x: mx,
-                y: my,
-                crosshair_x: Some(mx),
-                y_top: plot_top,
-                y_bottom: plot_bottom,
-                view_w,
-                title: format!("{} → {}", a.date, b.date),
-                detail: format!("{:.1} → {:.1} tok/reply ({delta:+.1})", a.thinking_per_reply, b.thinking_per_reply),
-                subdetail: Some(format!("{} → {} replies", a.replies, b.replies)),
-            })
-        }
-        _ => None,
-    };
+        .map(|&(at, _)| (at, None))
+        .chain(dated.iter().map(|&(at, day)| (at, Some(day))))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    let count = targets.len();
+    let selected = active().filter(|&i| i < count);
+    let label = if ttft { "Daily median TTFT (ms)" } else { "Daily thinking tokens per reply" };
     rsx! {
         figure { class: "provider-chart chart-stage",
-            div { class: "chart-header",
-                figcaption { "Thinking tokens per reply · preceding 14-day normal band and median" }
-                span { class: if readout.is_some() { "chart-readout active mono" } else { "chart-readout mono" },
-                    {readout.as_deref().unwrap_or("Hover a day or segment to inspect")}
-                }
+            figcaption { class: "chart-header",
+                span { "{label} · UTC" }
+                span { class: "chart-inspect form-help", "{INSPECT}" }
             }
             div { class: "chart-legend",
                 span { class: "chart-legend-item", span { class: "chart-swatch" } "Observed" }
-                span { class: "chart-legend-item", span { class: "chart-swatch band" } "14d normal band" }
-                span { class: "chart-legend-item", span { class: "chart-swatch reset" } "Median / change" }
-                span { class: "chart-legend-item", span { class: "chart-swatch outlier" } "Outlier" }
+                if show_median { span { class: "chart-legend-item", span { class: "chart-swatch drift-median" } "14d median" } }
+                if show_band { span { class: "chart-legend-item", span { class: "chart-swatch band" } "Normal band" } }
+                if !markers.is_empty() { span { class: "chart-legend-item", span { class: "chart-swatch reset" } "Client change" } }
+                if show_outlier { span { class: "chart-legend-item", span { class: "chart-swatch outlier" } "Outlier" } }
             }
-            svg {
-                view_box: "0 0 620 164",
-                role: "img",
-                "aria-label": "Daily thinking tokens, normal band, median, outliers and change markers. Daily data table follows.",
-                onmouseleave: move |_| hovered.set(None),
-                for frac in [0.0, 0.5, 1.0] {
-                    {
-                        let gy = plot_bottom - (plot_bottom - plot_top) * frac;
-                        rsx! {
-                            line {
-                                x1: "{plot_left}",
-                                x2: "{plot_right}",
-                                y1: "{gy:.2}",
-                                y2: "{gy:.2}",
-                                class: if frac == 0.0 { "chart-gridline" } else { "chart-gridline subtle" },
-                            }
-                            text { x: "{plot_left - 6.0}", y: "{gy + 3.5:.2}", text_anchor: "end", "{max * frac:.0}" }
-                        }
-                    }
-                }
-                for group in groups.filter(|group| !group.is_empty()) {
-                    polygon { class: "chart-band", points: band_path(group), pointer_events: "none" }
-                }
-                if n >= 2 {
-                    path { class: "chart-line chart-drift-line", d: "{trend_d}", pointer_events: "none" }
-                }
-                for i in 0..n.saturating_sub(1) {
-                    {
-                        let x1 = dx(i);
-                        let y1 = dy(days[i].thinking_per_reply);
-                        let x2 = dx(i + 1);
-                        let y2 = dy(days[i + 1].thinking_per_reply);
-                        let is_seg = active == Some(DriftHover::Segment(i));
-                        rsx! {
-                            if is_seg {
-                                line { x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}", class: "chart-line chart-drift-line chart-segment-active", pointer_events: "none" }
-                            }
-                            line {
-                                x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}",
-                                class: "chart-hit",
-                                stroke: "transparent",
-                                stroke_width: "12",
-                                onmouseenter: move |_| hovered.set(Some(DriftHover::Segment(i))),
-                            }
-                        }
-                    }
-                }
-                for (i, day) in days.iter().enumerate() {
-                    {
-                        let cx = dx(i);
-                        let cy = dy(day.thinking_per_reply);
-                        let is_day = active == Some(DriftHover::Day(i));
-                        rsx! {
-                            if let Some(marker) = markers.iter().find(|m| m.date == day.date) {
-                                line { x1: "{cx:.2}", x2: "{cx:.2}", y1: "{plot_top}", y2: "{plot_bottom}", class: "chart-reset", title { "{marker.label}" } }
+            if ttft && !dated.iter().any(|(_, d)| value(d).is_some()) {
+                p { class: "form-help", "No observed TTFT in this scope." }
+            }
+            div { class: "activity-plot", tabindex: "0", role: "group",
+                aria_label: "{label}. Use left and right arrows to inspect. Daily data table follows.",
+                onkeydown: move |e| step_bucket(e, active, count),
+                onblur: move |_| active.set(None),
+                onmouseleave: move |_| active.set(None),
+                onmounted: move |e| measure.mount(e),
+                onresize: move |_| measure.refresh(),
+                svg { width: "100%", height: "{height}", view_box: "0 0 {width} {height}", preserve_aspect_ratio: "none", "aria-hidden": "true",
+                    TimeAxis { plot, view, date_only: true }
+                    ActivityGrid { plot, ticks: ticks.map(|tick| if tick.fract() != 0.0 { format!("{tick:.1}") } else { fmt_compact_axis(Metric::Tokens, tick) }).to_vec() }
+                    if !ttft {
+                        for (at, day) in dated.iter().copied() {
+                            if let Some((low, high)) = day.baseline_low.zip(day.baseline_high) {
+                                rect { x: "{x(at) - half_day}", width: "{half_day * 2.0}", y: "{y(high)}", height: "{(y(low) - y(high)).max(1.0)}", class: "chart-band" }
                             }
                             if let Some(median) = day.baseline_median_thinking {
-                                line { x1: "{cx - 4.0:.2}", x2: "{cx + 4.0:.2}", y1: "{dy(median):.2}", y2: "{dy(median):.2}", class: "chart-median", pointer_events: "none" }
-                            }
-                            circle {
-                                cx: "{cx:.2}",
-                                cy: "{cy:.2}",
-                                r: if is_day { "5" } else if day.outlier { "4.2" } else { "2.8" },
-                                class: if day.outlier { "chart-outlier" } else { "chart-bar chart-solid" },
-                                pointer_events: "none",
-                            }
-                            circle {
-                                cx: "{cx:.2}",
-                                cy: "{cy:.2}",
-                                r: "8",
-                                fill: "transparent",
-                                class: "chart-hit",
-                                onmouseenter: move |_| hovered.set(Some(DriftHover::Day(i))),
-                                title { "{day.date} · {day.thinking_per_reply:.1} thinking tokens per reply" }
+                                line { x1: "{x(at) - half_day}", x2: "{x(at) + half_day}", y1: "{y(median)}", y2: "{y(median)}", class: "chart-median" }
                             }
                         }
                     }
+                    for (at, marker) in &markers {
+                        line { x1: "{x(*at)}", x2: "{x(*at)}", y1: "{plot.top - 6.0}", y2: "{plot.bottom}", class: "chart-reset", title { "{marker.label}" } }
+                        circle { cx: "{x(*at)}", cy: "{plot.top - 6.0}", r: "2.5", class: "chart-marker-dot" }
+                    }
+                    for pair in dated.windows(2) {
+                        if let Some((a, b)) = value(pair[0].1).zip(value(pair[1].1)) && pair[1].0 - pair[0].0 == TimeDelta::days(1) {
+                            line { x1: "{x(pair[0].0)}", x2: "{x(pair[1].0)}", y1: "{y(a)}", y2: "{y(b)}", class: "chart-line chart-drift-line" }
+                        }
+                    }
+                    for (i, (at, day)) in targets.iter().copied().enumerate() {
+                        {
+                            let cx = x(at);
+                            let left = x(at - TimeDelta::hours(12));
+                            let right = x(at + TimeDelta::hours(12));
+                            let outlier = !ttft && day.is_some_and(|d| d.outlier);
+                            rsx! {
+                                if selected == Some(i) { TimeCrosshair { plot, x: cx } }
+                                if let Some(v) = day.and_then(value) {
+                                    circle { cx: "{cx}", cy: "{y(v)}", r: if selected == Some(i) || outlier { "4.5" } else { "2.8" },
+                                        class: if outlier { "chart-outlier" } else { "chart-solid" } }
+                                }
+                                rect { x: "{left}", y: "{plot.top - 9.0}", width: "{right - left}", height: "{plot.bottom - plot.top + 29.0}",
+                                    fill: "transparent", class: "chart-hit", onmouseenter: move |_| active.set(Some(i)),
+                                    onmouseleave: move |_| active.set(None) }
+                            }
+                        }
+                    }
+                    if let Some((at, peak)) = peak {
+                        {
+                            let cx = x(at);
+                            let cy = y(peak);
+                            let align_right = cx > (plot.left + plot.right) / 2.0;
+                            let label_x = if align_right { cx - 6.0 } else { cx + 6.0 };
+                            let label_y = cy - 6.0;
+                            rsx! { text { class: "activity-peak-label", pointer_events: "none", x: "{label_x}", y: "{label_y}",
+                                text_anchor: if align_right { "end" } else { "start" }, "Peak {peak:.1}" } }
+                        }
+                    }
                 }
-                text { x: "{plot_left}", y: "156", "{days.first().map(|d| d.date.as_str()).unwrap_or_default()}" }
-                if n > 2 {
-                    text { x: "{(plot_left + plot_right) / 2.0:.1}", y: "156", text_anchor: "middle", "{days[n / 2].date}" }
-                }
-                text { x: "{plot_right}", y: "156", text_anchor: "end", "{days.last().map(|d| d.date.as_str()).unwrap_or_default()}" }
-                if let Some(spec) = tooltip_spec {
-                    SvgTooltip { spec }
+                div { role: "status",
+                    if let Some(i) = selected {
+                        {
+                            let (at, day) = targets[i];
+                            let mut fields = Vec::new();
+                            if let Some(d) = day {
+                                let observed = value(d).map_or_else(|| "Not observed".into(), |v| if ttft { format!("{v:.1} ms") } else { format!("{v:.1} tokens/reply") });
+                                fields.extend([("Observed", observed), ("Replies", fmt_count(d.replies))]);
+                                if !ttft {
+                                    if let Some(median) = d.baseline_median_thinking { fields.push(("14d median", format!("{median:.1}"))); }
+                                    if let Some((low, high)) = d.baseline_low.zip(d.baseline_high) { fields.push(("Normal band", format!("{low:.1}–{high:.1}"))); }
+                                    let judgment = if d.outlier { "Outlier" } else if d.judgeable { "Not an outlier" } else { "Insufficient coverage" };
+                                    fields.push(("Judgment", judgment.into()));
+                                }
+                            }
+                            for (_, marker) in markers.iter().filter(|(time, _)| *time == at) { fields.push(("Client change", marker.label.clone())); }
+                            rsx! { ActivityReadout { right: view.fraction(at) < 0.5, heading: at.format("%Y-%m-%d").to_string(), fields } }
+                        }
+                    }
                 }
             }
         }
@@ -1519,7 +1913,112 @@ pub(super) fn DriftBandChart(days: Vec<DriftDayPoint>, markers: Vec<DriftMarker>
 
 #[cfg(test)]
 mod tests {
+    use dioxus::dioxus_core::{AttributeValue, Mutation, Mutations};
+
     use super::*;
+
+    fn svg_attribute_values<'a>(rendered: &'a Mutations, attr: &str) -> Vec<&'a str> {
+        rendered
+            .edits
+            .iter()
+            .filter_map(|edit| match edit {
+                Mutation::SetAttribute { name, value: AttributeValue::Text(value), .. } if name == attr => Some(value.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn time_axes_label_midnight_and_keep_the_closing_date() {
+        let start = DateTime::UNIX_EPOCH + TimeDelta::hours(10);
+        let view = TimeBounds { start, end: start + TimeDelta::days(1) };
+        assert_eq!(bucket_badge(Some(3600)), Some("Hourly · 24h"));
+        assert_eq!(bucket_badge(Some(10800)), Some("3-hour · 7d"));
+        assert_eq!(bucket_badge(Some(86400)), Some("Daily"));
+        let ticks = time_ticks(view, 260.0, true, false);
+        assert_eq!(ticks.len(), 3);
+        assert_eq!(ticks[0], (view.start, "Jan 01 10:00".into()));
+        assert_eq!(ticks[1], (DateTime::UNIX_EPOCH + TimeDelta::days(1), "Jan 02 00:00".into()));
+        assert_eq!(ticks[2], (view.end, "10:00".into()));
+        assert_eq!(
+            time_ticks(view, 1000.0, false, false).into_iter().map(|(_, label)| label).collect::<Vec<_>>(),
+            ["Jan 01 10:00", "16:00", "Jan 02 00:00", "04:00", "10:00"]
+        );
+        let wide = TimeBounds { start, end: start + TimeDelta::days(7) };
+        let dates = time_ticks(wide, 300.0, false, true);
+        assert!((4..=5).contains(&dates.len()));
+        assert_eq!(dates.last(), Some(&(wide.end, "Jan 08".into())));
+    }
+
+    #[test]
+    fn quota_pool_defaults_to_multiples_only_above_six_series() {
+        assert!(!quota_defaults_to_multiples(true, 6));
+        assert!(quota_defaults_to_multiples(true, 7));
+        assert!(!quota_defaults_to_multiples(false, 12));
+    }
+
+    #[test]
+    fn drift_ticks_cover_the_data_with_round_intervals() {
+        assert_eq!(drift_ticks(1884.0), [0.0, 1000.0, 2000.0]);
+        assert_eq!(drift_ticks(42.0), [0.0, 25.0, 50.0]);
+        assert_eq!(drift_ticks(0.0), [0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn adaptive_cache_preserves_none_and_scales_volume_independently() {
+        fn app() -> Element {
+            let mut points = vec![daily_point(0, 100), daily_point(1, 0), daily_point(2, 200)];
+            points[0].cache_hit_rate_observed = Some(0.6);
+            points[1].cache_read_tokens = 0;
+            points[2].cache_hit_rate_observed = Some(0.0);
+            rsx! { CacheHitRateChart { points, bucket_seconds: Some(86400) } }
+        }
+        let mutations = VirtualDom::new(app).rebuild_to_vec();
+        let heights = svg_attribute_values(&mutations, "height");
+        assert!(heights.contains(&"12")); // Half the input of the highest-volume bucket.
+        assert!(heights.contains(&"24"));
+        assert!(!heights.contains(&"0")); // No empty volume rectangle for the unobserved bucket.
+        let rendered = format!("{mutations:?}");
+        assert!(rendered.contains("activity-volume-bar"));
+        assert_eq!(rendered.matches("chart-cache-dot").count(), 2);
+        assert!(rendered.contains("60.0%"));
+        assert!(rendered.contains("0.0%"));
+        assert!(rendered.contains("—"));
+        assert!(!rendered.contains("activity-cache-segment"));
+    }
+
+    #[test]
+    fn drift_does_not_connect_calendar_gaps_or_apply_thinking_baseline_to_ttft() {
+        fn app() -> Element {
+            let day = |date: &str, median_ttft_ms| DriftDayPoint {
+                date: date.into(),
+                replies: 30,
+                thinking_per_reply: 42.0,
+                output_per_reply: 80.0,
+                no_thinking_share: 0.0,
+                median_ttft_ms,
+                failure_rate: 0.0,
+                baseline_median_thinking: Some(40.0),
+                baseline_low: Some(30.0),
+                baseline_high: Some(50.0),
+                judgeable: true,
+                outlier: false,
+            };
+            let days = vec![day("2026-11-01", Some(200.0)), day("2026-11-02", None), day("2026-11-09", Some(260.0))];
+            let markers = vec![DriftMarker { date: "2026-11-06".into(), label: "Updated client".into(), kind: "client_version".into() }];
+            rsx! {
+                DriftBandChart { days: days.clone(), markers: markers.clone() }
+                DriftBandChart { days, markers, ttft: true }
+            }
+        }
+        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        assert_eq!(rendered.matches("chart-drift-line").count(), 1);
+        assert_eq!(rendered.matches("14d median").count(), 1);
+        assert_eq!(rendered.matches("Normal band").count(), 1);
+        assert_eq!(rendered.matches("Updated client").count(), 2);
+        assert!(rendered.contains("Peak 260.0"));
+        assert!(rendered.contains("Daily median TTFT (ms)"));
+    }
 
     #[test]
     fn unavailable_quota_is_not_zero_and_measured_zero_is_valid() {
@@ -1550,12 +2049,97 @@ mod tests {
     }
 
     #[test]
-    fn quota_lines_break_only_after_four_hours() {
+    fn measured_steps_break_at_gaps_resets_and_sharp_refills() {
         let start = DateTime::UNIX_EPOCH;
-        let end = start + TimeDelta::hours(12);
-        let points = [(start, 90.0), (start + TimeDelta::hours(4), 80.0), (start + TimeDelta::hours(9), 70.0)];
-        assert_eq!(line(&points, start, end).matches('M').count(), 2);
-        assert_eq!(line(&points, start, end).matches('L').count(), 1);
+        let at = |h| start + TimeDelta::hours(h);
+        let mk = |h, left, reset| Reading { at: at(h), left, reset: Some(at(reset)) };
+        let points = [mk(0, 90.0, 5), mk(4, 80.0, 5), mk(5, 89.0, 10), mk(6, 30.0, 10), mk(7, 95.0, 10), mk(12, 92.0, 10)];
+        assert_eq!(points.chunk_by(same_quota_run).map(<[_]>::len).collect::<Vec<_>>(), [2, 2, 1, 1]);
+        assert_eq!(measured_at(&points, at(2)), Some(points[0]));
+        assert_eq!(measured_at(&points, at(9)), None);
+    }
+
+    #[test]
+    fn scope_models_get_separate_series_even_with_the_same_account_and_window() {
+        let at = DateTime::UNIX_EPOCH;
+        let sample = |model: &str| -> QuotaSample {
+            serde_json::from_value(serde_json::json!({
+                "id": 1, "provider_id": "example", "account_id": "a", "window_key": "weekly",
+                "scope_model": model, "label": "Weekly", "kind": "weekly", "unit": "percent", "remaining_percent": 75.0,
+                "cadence": "unknown", "status": "unknown", "observation_state": "measured", "observed_at": at,
+                "recorded_at": at, "stale": false
+            }))
+            .unwrap()
+        };
+        let groups = quota_series(&[sample("opus"), sample("sonnet")], &[], &BTreeMap::new(), TimeBounds { start: at, end: at });
+        assert_eq!(groups.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), ["a · opus", "a · sonnet"]);
+        assert!(groups.iter().all(|s| s.history.len() == 1));
+    }
+
+    #[test]
+    fn zoom_preserves_cursor_time_and_pan_stays_inside_full_bounds() {
+        let start = DateTime::UNIX_EPOCH;
+        let at = |h| start + TimeDelta::hours(h);
+        let full = TimeBounds { start, end: at(24) };
+        let zoom = full.zoom(full, 0.25, 0.5);
+        assert_eq!(zoom.at(0.25), at(6));
+        assert_eq!(zoom.pan(full, -2.0), TimeBounds { start, end: at(12) });
+        assert_eq!(zoom.pan(full, 2.0), TimeBounds { start: at(12), end: at(24) });
+        assert_eq!(zoom.zoom(full, 0.25, 10.0), full);
+        assert_eq!(zoom.zoom(full, 0.25, 0.0).end - zoom.zoom(full, 0.25, 0.0).start, TimeDelta::minutes(5));
+    }
+
+    #[test]
+    fn pace_is_elapsed_window_fraction_and_rejects_unknown_duration() {
+        let now = DateTime::UNIX_EPOCH;
+        let reset = |hours| Some(now + TimeDelta::hours(hours));
+        assert_eq!(pace_tick(now, reset(2), Some(14_400)), Some(50.0));
+        assert_eq!(pace_tick(now, reset(8), Some(14_400)), Some(0.0));
+        assert_eq!(pace_tick(now, reset(-1), Some(14_400)), Some(100.0));
+        assert_eq!(pace_tick(now, reset(2), Some(0)), None);
+        assert_eq!(pace_tick(now, None, Some(14_400)), None);
+    }
+
+    fn forecast(at: DateTime<Utc>, left: f64) -> QuotaForecast {
+        let point = |at, left| ForecastPoint { at, remaining_percent: left, used_percent: 100.0 - left };
+        QuotaForecast {
+            window_key: "weekly".into(),
+            account_id: Some("a".into()),
+            scope_model: Some("opus".into()),
+            drain_pct_per_hour: 10.0,
+            projected_exhaustion_at: Some(at + TimeDelta::hours(5)),
+            resets_before_exhaustion: true,
+            lookback_hours: 6,
+            horizon_hours: 12,
+            points: vec![point(at, left), point(at + TimeDelta::hours(1), left - 10.0), point(at + TimeDelta::hours(12), 95.0)],
+            is_estimate: true,
+        }
+    }
+
+    #[test]
+    fn meter_estimates_the_pre_reset_balance_only_for_the_same_reading() {
+        let now = DateTime::UNIX_EPOCH;
+        let f = forecast(now, 50.0);
+        assert_eq!(window_end_estimate(&f, 50.0, now + TimeDelta::hours(4), now), Some((10.0, false)));
+        assert_eq!(window_end_estimate(&f, 50.0, now + TimeDelta::hours(5), now), Some((0.0, false)));
+        assert_eq!(window_end_estimate(&f, 50.0, now + TimeDelta::hours(6), now), Some((0.0, true)));
+        assert_eq!(window_end_estimate(&f, 60.0, now + TimeDelta::hours(4), now), None);
+    }
+
+    #[test]
+    fn projection_is_drawn_only_when_the_future_is_enabled() {
+        fn app() -> Element {
+            let now = DateTime::UNIX_EPOCH;
+            let history = TimeBounds { start: now - TimeDelta::hours(6), end: now };
+            rsx! {
+                for forecast_until in [None, Some(now + TimeDelta::hours(12))] {
+                    QuotaHistoryChart { samples: vec![], forecasts: vec![forecast(now, 50.0)], names: BTreeMap::new(),
+                        scope: QuotaChartScope { history, forecast_until, history_truncated: false, pool: true } }
+                }
+            }
+        }
+        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        assert_eq!(rendered.matches("M229.33").count(), 1); // Now is one-third of a 6h history + 12h forecast.
     }
 
     #[test]
@@ -1581,6 +2165,7 @@ mod tests {
             cache_read_tokens: 80,
             cache_write_tokens: 0,
             cache_hit_rate: 0.0,
+            cache_hit_rate_observed: None,
             thinking_tokens: 0,
             api_equivalent_cost_usd: 0.0,
         }
@@ -1592,7 +2177,7 @@ mod tests {
             rsx! { CacheHitRateChart { points: vec![daily_point(0, 100)] } }
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
-        assert!(rendered.contains("1970-01-01 · 80.0%"));
+        assert!(rendered.contains("80.0%"));
     }
 
     #[test]
@@ -1600,12 +2185,12 @@ mod tests {
         fn app() -> Element {
             rsx! {
                 ActivityTrendChart { points: vec![], metric: Metric::Requests }
-                CacheHitRateChart { points: vec![daily_point(0, 0)] }
+                CacheHitRateChart { points: vec![] }
             }
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
         assert_eq!(rendered.matches("No data for selected range").count(), 2);
-        assert!(!rendered.contains("Hover"));
+        assert!(!rendered.contains("left and right arrows"));
     }
 
     #[test]
@@ -1614,8 +2199,9 @@ mod tests {
             rsx! { CacheHitRateChart { points: vec![daily_point(0, 100), daily_point(1, 0), daily_point(2, 100)] } }
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
-        assert!(rendered.contains("M44.00 39.60 M604.00 39.60"));
-        assert!(rendered.contains("1970-01-02 · —"));
+        assert_eq!(rendered.matches("chart-cache-dot").count(), 2);
+        assert!(!rendered.contains("activity-cache-segment"));
+        assert!(rendered.contains("1970-01-02 → 1970-01-03 UTC"));
     }
 
     #[test]
@@ -1623,23 +2209,26 @@ mod tests {
         fn app() -> Element {
             rsx! { CacheHitRateChart { points: vec![daily_point(0, 100), daily_point(1, 100), daily_point(3, 100), daily_point(4, 100)] } }
         }
-        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
-        assert!(rendered.contains("M44.00 39.60 L184.00 39.60 M464.00 39.60 L604.00 39.60"));
+        let mutations = VirtualDom::new(app).rebuild_to_vec();
+        let ends = svg_attribute_values(&mutations, "x2");
+        let count = |x| ends.iter().filter(|&&v| v == x).count();
+        assert_eq!(count("216"), 1); // Line segment end at the bucket's center.
+        assert_eq!(count("328"), 0); // Missing bucket gets no line segment.
+        assert_eq!(count("552"), 1);
+        let rendered = format!("{mutations:?}");
+        assert!(rendered.contains("1970-01-03 → 1970-01-04 UTC"));
     }
 
     #[test]
     fn daily_activity_sorts_buckets_and_displays_missing_days() {
         fn app() -> Element {
-            let mut points = vec![daily_point(2, 200), daily_point(0, 100)];
-            for point in &mut points {
-                point.label = point.bucket_start.format("%m-%d").to_string();
-            }
+            let points = vec![daily_point(2, 200), daily_point(0, 100)];
             rsx! { ActivityTrendChart { points, metric: Metric::CacheHitRate } }
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
-        let first = rendered.find("01-01 · Cache hit rate (%): 80.0%").unwrap();
-        let missing = rendered.find("01-02 · Cache hit rate (%): —").expect("missing day should have a slot");
-        let last = rendered.find("01-03 · Cache hit rate (%): 40.0%").unwrap();
+        let first = rendered.find("1970-01-01 → 1970-01-02 UTC").unwrap();
+        let missing = rendered.find("1970-01-02 → 1970-01-03 UTC").expect("missing day should have a slot");
+        let last = rendered.find("1970-01-03 → 1970-01-04 UTC").unwrap();
         assert!(first < missing && missing < last);
     }
 
@@ -1664,6 +2253,7 @@ mod tests {
                     provider_id: "google".into(),
                     account_id: "ag-a".into(),
                     window_key: "5h".into(),
+                    scope_model: None,
                     label: "5h".into(),
                     kind: QuotaWindowKind::Session,
                     unit: QuotaUnit::Percent,
@@ -1686,6 +2276,7 @@ mod tests {
                     provider_id: "google".into(),
                     account_id: "ag-a".into(),
                     window_key: "5h".into(),
+                    scope_model: None,
                     label: "5h".into(),
                     kind: QuotaWindowKind::Session,
                     unit: QuotaUnit::Percent,
@@ -1715,6 +2306,7 @@ mod tests {
                     cache_read_tokens: 7_500,
                     cache_write_tokens: 500,
                     cache_hit_rate: 0.75,
+                    cache_hit_rate_observed: Some(0.75),
                     thinking_tokens: 300,
                     api_equivalent_cost_usd: 0.12,
                 },
@@ -1728,6 +2320,7 @@ mod tests {
                     cache_read_tokens: 16_000,
                     cache_write_tokens: 1_000,
                     cache_hit_rate: 0.80,
+                    cache_hit_rate_observed: Some(0.80),
                     thinking_tokens: 600,
                     api_equivalent_cost_usd: 0.24,
                 },
@@ -1773,18 +2366,28 @@ mod tests {
                 },
             ];
             rsx! {
-                QuotaHistoryChart { samples, forecasts: vec![], resets: vec![], from, until: now, names: BTreeMap::from([("ag-a".into(), "Alpha".into())]) }
+                QuotaHistoryChart { samples, forecasts: vec![], names: BTreeMap::from([("ag-a".into(), "Alpha".into())]),
+                    scope: QuotaChartScope {
+                        history: TimeBounds { start: from, end: now }, forecast_until: None, history_truncated: true, pool: false,
+                    } }
                 CacheHitRateChart { points: trend.clone() }
                 ActivityTrendChart { points: trend, metric: Metric::CacheHitRate }
-                ActivityHeatmap { cells, metric: Metric::CacheHitRate }
+                ActivityHeatmap { cells, metric: Metric::CacheHitRate, covered_weekdays: vec![0] }
                 DriftBandChart { days: drift_days, markers: vec![] }
             }
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
         assert!(rendered.contains("chart-stage"));
-        assert!(rendered.contains("chart-readout"));
+        assert!(rendered.contains("Showing newest 4,000 samples"));
+        assert!(rendered.contains("55.0% left"));
+        assert!(!rendered.contains("Estimated projection data table"));
+        assert!(rendered.contains("activity-peak"));
         assert!(rendered.contains("chart-hit"));
-        assert!(rendered.contains("Daily cache hit rate (%)"));
+        assert!(rendered.contains("Cache hit rate (%) · UTC"));
         assert!(rendered.contains("Cache hit rate (%)"));
+        assert!(rendered.contains("14d median"));
+        assert!(rendered.contains("Normal band"));
+        assert!(rendered.contains("Tue 00:00 · Outside selected window"));
+        assert!(rendered.contains("Mon 00:00 · N/A · no input tokens"));
     }
 }

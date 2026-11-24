@@ -623,7 +623,7 @@ pub async fn get_provider(hub: &Hub, actor: &Actor, provider_id: &str) -> DResul
 pub async fn list_accounts(hub: &Hub, actor: &Actor, provider_id: &str) -> DResult<Vec<ModelAccount>> {
     actor.require(ANY_READER)?;
     let _ = load_descriptor(hub, provider_id).await?;
-    load_accounts_with_latest_windows(&hub.db, provider_id).await
+    load_accounts_with_latest_windows(&hub.db, provider_id, None).await
 }
 
 pub async fn list_models(hub: &Hub, actor: &Actor, provider_id: &str) -> DResult<Vec<DiscoveredModel>> {
@@ -689,42 +689,55 @@ pub async fn get_logs(hub: &Hub, actor: &Actor, provider_id: &str) -> DResult<Ve
 }
 
 pub async fn quota_report(hub: &Hub, actor: &Actor, provider_id: &str, query: QuotaQuery) -> DResult<ProviderQuotaReport> {
+    const HISTORY_LIMIT: usize = 4000;
+
     actor.require(ANY_READER)?;
+    let as_of = Utc::now();
     let desc = load_descriptor(hub, provider_id).await?;
-    let accounts = load_accounts_with_latest_windows(&hub.db, provider_id).await?;
+    let accounts = load_accounts_with_latest_windows(&hub.db, provider_id, Some(as_of)).await?;
     let range_hours = query.range_hours.unwrap_or(48).clamp(1, 24 * 35);
     let lookback_hours = query.lookback_hours.unwrap_or(6).clamp(1, 168);
     let horizon_hours = query.horizon_hours.unwrap_or(12).clamp(1, 168);
-    let since = Utc::now() - Duration::hours(range_hours as i64);
+    let since = as_of - Duration::hours(range_hours as i64);
+    let fetch_since = as_of - Duration::hours(range_hours.max(lookback_hours) as i64);
 
     let rows: Vec<Value> = sqlx::query_scalar(
         "select to_jsonb(s) from (
-            select id, provider_id, account_id, window_key, label, kind, unit,
+            select distinct on (account_id, window_key, coalesce(scope_model, ''), observed_at)
+                   id, provider_id, account_id, window_key, nullif(scope_model, '') as scope_model, label, kind, unit,
                    used_percent, remaining_percent, used_amount, limit_amount,
                    resets_at, window_duration_mins, cadence, status, observation_state,
                    observed_at, recorded_at, stale, error_reason
             from model_quota_samples
             where provider_id = $1
-              and observed_at >= $2
-              and ($3::text is null or account_id = $3)
-              and ($4::text is null or window_key = $4)
-            order by observed_at asc, id asc
-            limit 4000
-         ) s",
+              and observed_at between $2 and $3
+              and ($4::text is null or account_id = $4)
+              and ($5::text is null or window_key = $5)
+            order by account_id, window_key, coalesce(model_quota_samples.scope_model, ''), observed_at, id desc
+         ) s
+         order by s.observed_at desc, s.id desc
+         limit $6",
     )
     .bind(provider_id)
-    .bind(since)
+    .bind(fetch_since)
+    .bind(as_of)
     .bind(&query.account_id)
     .bind(&query.window_key)
+    .bind((HISTORY_LIMIT + 1) as i64)
     .fetch_all(&hub.db)
     .await?;
-    let samples: Vec<QuotaSample> = crate::decode(rows)?;
+    let mut samples: Vec<QuotaSample> = crate::decode(rows)?;
+    let history_truncated = samples.get(HISTORY_LIMIT).is_some_and(|sample| sample.observed_at >= since);
+    samples.truncate(HISTORY_LIMIT);
+    samples.reverse();
 
+    let forecasts = compute_forecasts(&samples, &accounts, lookback_hours, horizon_hours, as_of);
+    // The forecast lookback can be wider than the history requested by the chart.
+    samples.drain(..samples.partition_point(|sample| sample.observed_at < since));
     let past_windows = compute_past_windows(&samples);
-    let forecasts = compute_forecasts(&samples, &accounts, lookback_hours, horizon_hours, Utc::now());
     let pools = compute_pools(provider_id, &accounts, &forecasts);
 
-    Ok(ProviderQuotaReport { provider: desc, accounts, pools, samples, past_windows, forecasts, as_of: Utc::now() })
+    Ok(ProviderQuotaReport { provider: desc, accounts, pools, samples, history_truncated, past_windows, forecasts, as_of })
 }
 
 async fn load_descriptors(hub: &Hub) -> DResult<Vec<ProviderDescriptor>> {
@@ -762,7 +775,7 @@ async fn load_descriptor(hub: &Hub, provider_id: &str) -> DResult<ProviderDescri
 }
 
 async fn build_provider_summary(hub: &Hub, descriptor: ProviderDescriptor) -> DResult<ProviderSummary> {
-    let accounts = load_accounts_with_latest_windows(&hub.db, &descriptor.id).await?;
+    let accounts = load_accounts_with_latest_windows(&hub.db, &descriptor.id, None).await?;
     let enabled_accounts = accounts.iter().filter(|a| a.enabled).count();
     let active_account_id = accounts.iter().find(|a| a.is_active).map(|a| a.id.clone());
     let preferred_account_id = accounts.iter().find(|a| a.is_preferred).map(|a| a.id.clone());
@@ -780,7 +793,11 @@ async fn build_provider_summary(hub: &Hub, descriptor: ProviderDescriptor) -> DR
     })
 }
 
-async fn load_accounts_with_latest_windows(db: &sqlx::PgPool, provider_id: &str) -> DResult<Vec<ModelAccount>> {
+async fn load_accounts_with_latest_windows(
+    db: &sqlx::PgPool,
+    provider_id: &str,
+    as_of: Option<DateTime<Utc>>,
+) -> DResult<Vec<ModelAccount>> {
     let acct_rows: Vec<Value> = sqlx::query_scalar(
         "select to_jsonb(a) from (
             select id, provider_id, source_account_id, display_name, email, masked_email, note, plan,
@@ -805,16 +822,17 @@ async fn load_accounts_with_latest_windows(db: &sqlx::PgPool, provider_id: &str)
 
     let win_rows: Vec<Value> = sqlx::query_scalar(
         "select to_jsonb(w) from (
-            select distinct on (account_id, window_key)
+            select distinct on (account_id, window_key, coalesce(scope_model, ''))
                 account_id, window_key, label, kind, unit, used_percent, remaining_percent,
                 used_amount, limit_amount, currency, resets_at, window_duration_mins,
-                cadence, scope_model, status, observation_state, observed_at, stale, error_reason
+                 cadence, nullif(scope_model, '') as scope_model, status, observation_state, observed_at, stale, error_reason
             from model_quota_samples
-            where provider_id = $1
-            order by account_id, window_key, observed_at desc, id desc
+            where provider_id = $1 and ($2::timestamptz is null or observed_at <= $2)
+            order by account_id, window_key, coalesce(model_quota_samples.scope_model, ''), observed_at desc, id desc
          ) w",
     )
     .bind(provider_id)
+    .bind(as_of)
     .fetch_all(db)
     .await?;
 
@@ -842,7 +860,7 @@ async fn load_accounts_with_latest_windows(db: &sqlx::PgPool, provider_id: &str)
         grants_by_acct.insert(acct_id, grant);
     }
 
-    let now = Utc::now();
+    let now = as_of.unwrap_or_else(Utc::now);
     let mut out = Vec::with_capacity(acct_rows.len());
     for row in acct_rows {
         let mut acct: ModelAccount = crate::decode_one(row)?;
@@ -889,18 +907,18 @@ pub fn compute_pools(provider_id: &str, accounts: &[ModelAccount], forecasts: &[
         distinct_eligible.push(acct);
     }
 
-    let mut by_window: BTreeMap<String, Vec<(&ModelAccount, &QuotaWindow)>> = BTreeMap::new();
+    let mut by_window = BTreeMap::<_, Vec<_>>::new();
     for acct in &distinct_eligible {
         for win in &acct.windows {
             if win.unit != QuotaUnit::Percent {
                 continue;
             }
-            by_window.entry(win.window_key.clone()).or_default().push((acct, win));
+            by_window.entry((win.window_key.as_str(), win.scope_model.as_deref())).or_default().push((acct, win));
         }
     }
 
     let mut pools = Vec::new();
-    for (window_key, entries) in by_window {
+    for ((window_key, scope_model), entries) in by_window {
         let Some((_, first)) = entries.first() else {
             continue;
         };
@@ -909,6 +927,7 @@ pub fn compute_pools(provider_id: &str, accounts: &[ModelAccount], forecasts: &[
         let mut included = 0usize;
         let mut any_tier_weight = false;
         let mut next_reset: Option<DateTime<Utc>> = None;
+        let mut window_seconds = None;
 
         for (acct, win) in &entries {
             let Some(used) = win.used_percent else {
@@ -923,6 +942,17 @@ pub fn compute_pools(provider_id: &str, accounts: &[ModelAccount], forecasts: &[
             }
             weighted_used += used * cap;
             total_capacity += cap;
+            let seconds = win.window_duration_mins.filter(|&mins| mins > 0).map(|mins| u64::from(mins) * 60).or(match win.kind {
+                QuotaWindowKind::Daily => Some(86_400),
+                QuotaWindowKind::Weekly => Some(604_800),
+                _ if win.window_key == "5h" => Some(18_000),
+                _ => None,
+            });
+            if included == 0 {
+                window_seconds = seconds;
+            } else if window_seconds != seconds {
+                window_seconds = None;
+            }
             included += 1;
             if let Some(r) = win.resets_at {
                 next_reset = Some(match next_reset {
@@ -939,10 +969,14 @@ pub fn compute_pools(provider_id: &str, accounts: &[ModelAccount], forecasts: &[
             (None, None)
         };
 
-        let forecast = forecasts.iter().find(|f| f.window_key == window_key && f.account_id.is_none()).cloned();
+        let forecast = forecasts
+            .iter()
+            .find(|f| f.window_key == window_key && f.scope_model.as_deref() == scope_model && f.account_id.is_none())
+            .cloned();
         pools.push(PoolWindowSummary {
             provider_id: provider_id.to_string(),
-            window_key,
+            window_key: window_key.to_owned(),
+            scope_model: scope_model.map(str::to_owned),
             label: first.label.clone(),
             kind: first.kind,
             eligible_accounts: distinct_eligible.len(),
@@ -951,6 +985,7 @@ pub fn compute_pools(provider_id: &str, accounts: &[ModelAccount], forecasts: &[
             weighted_remaining_percent: rem_pct,
             capacity_basis: if any_tier_weight { "plan_tier_multiplier".into() } else { "equal_entitlements".into() },
             next_reset_at: next_reset,
+            window_seconds,
             forecast,
             is_estimate: true,
         });
@@ -961,15 +996,15 @@ pub fn compute_pools(provider_id: &str, accounts: &[ModelAccount], forecasts: &[
 /// Partition ordered quota samples into past completed windows by detecting
 /// reset boundaries (either `resets_at` advancing or a sharp drop in `used_percent`).
 pub fn compute_past_windows(samples: &[QuotaSample]) -> Vec<PastWindowSummary> {
-    let mut grouped: BTreeMap<(String, String), Vec<&QuotaSample>> = BTreeMap::new();
+    let mut grouped = BTreeMap::<_, Vec<_>>::new();
     for s in samples {
         if s.used_percent.is_some() {
-            grouped.entry((s.account_id.clone(), s.window_key.clone())).or_default().push(s);
+            grouped.entry(quota_series_key(s)).or_default().push(s);
         }
     }
 
     let mut out = Vec::new();
-    for ((account_id, window_key), series) in grouped {
+    for series in grouped.into_values() {
         if series.len() < 2 {
             continue;
         }
@@ -986,7 +1021,7 @@ pub fn compute_past_windows(samples: &[QuotaSample]) -> Vec<PastWindowSummary> {
                 _ => false,
             };
             if reset_advanced || usage_dropped {
-                if let Some(summary) = summarize_segment(&account_id, &window_key, &segment, curr.observed_at) {
+                if let Some(summary) = summarize_segment(&segment, curr.observed_at) {
                     out.push(summary);
                 }
                 segment.clear();
@@ -998,15 +1033,20 @@ pub fn compute_past_windows(samples: &[QuotaSample]) -> Vec<PastWindowSummary> {
     out
 }
 
-fn summarize_segment(account_id: &str, window_key: &str, segment: &[&QuotaSample], next_seen: DateTime<Utc>) -> Option<PastWindowSummary> {
+fn quota_series_key(sample: &QuotaSample) -> (&str, &str, Option<&str>) {
+    (&sample.account_id, &sample.window_key, sample.scope_model.as_deref())
+}
+
+fn summarize_segment(segment: &[&QuotaSample], next_seen: DateTime<Utc>) -> Option<PastWindowSummary> {
     let first = *segment.first()?;
     let last = *segment.last()?;
     let peak = segment.iter().filter_map(|s| s.used_percent).fold(None::<f64>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
     let exhausted_at = segment.iter().find(|s| s.used_percent.is_some_and(|u| u >= 99.5)).map(|s| s.observed_at);
     let early_replaced = last.resets_at.is_some_and(|r| next_seen + Duration::minutes(10) < r);
     Some(PastWindowSummary {
-        account_id: account_id.to_string(),
-        window_key: window_key.to_string(),
+        account_id: first.account_id.clone(),
+        window_key: first.window_key.clone(),
+        scope_model: first.scope_model.clone(),
         label: first.label.clone(),
         started_at: first.observed_at,
         ended_at: last.resets_at.unwrap_or(last.observed_at),
@@ -1029,18 +1069,18 @@ pub fn compute_forecasts(
     now: DateTime<Utc>,
 ) -> Vec<QuotaForecast> {
     let cutoff = now - Duration::hours(lookback_hours as i64);
-    let mut by_acct_win: BTreeMap<(String, String), Vec<&QuotaSample>> = BTreeMap::new();
+    let mut by_acct_win = BTreeMap::<_, Vec<_>>::new();
     for s in samples {
-        if s.observed_at >= cutoff && s.used_percent.is_some() {
-            by_acct_win.entry((s.account_id.clone(), s.window_key.clone())).or_default().push(s);
+        if (cutoff..=now).contains(&s.observed_at) && s.used_percent.is_some() {
+            by_acct_win.entry(quota_series_key(s)).or_default().push(s);
         }
     }
 
     let mut forecasts = Vec::new();
     type PoolRateSample = (f64, f64, Option<DateTime<Utc>>);
-    let mut pool_rates: BTreeMap<String, Vec<PoolRateSample>> = BTreeMap::new();
+    let mut pool_rates = BTreeMap::<_, Vec<PoolRateSample>>::new();
 
-    for ((account_id, window_key), series) in by_acct_win {
+    for ((account_id, window_key, scope_model), series) in by_acct_win {
         let Some(last) = series.last().copied() else {
             continue;
         };
@@ -1064,14 +1104,15 @@ pub fn compute_forecasts(
         let resets_at = accounts
             .iter()
             .find(|a| a.id == account_id)
-            .and_then(|a| a.windows.iter().find(|w| w.window_key == window_key))
+            .and_then(|a| a.windows.iter().find(|w| w.window_key == window_key && w.scope_model.as_deref() == scope_model))
             .and_then(|w| w.resets_at)
             .or(last.resets_at);
 
-        pool_rates.entry(window_key.clone()).or_default().push((current_used, drain_per_hour, resets_at));
+        pool_rates.entry((window_key, scope_model)).or_default().push((current_used, drain_per_hour, resets_at));
         forecasts.push(build_forecast(
-            Some(account_id),
+            Some(account_id.to_owned()),
             window_key,
+            scope_model,
             current_used,
             drain_per_hour,
             resets_at,
@@ -1081,8 +1122,8 @@ pub fn compute_forecasts(
         ));
     }
 
-    // Aggregate pool forecast per window_key.
-    for (window_key, entries) in pool_rates {
+    // Aggregate pool forecasts across accounts, never across model scopes.
+    for ((window_key, scope_model), entries) in pool_rates {
         let n = entries.len() as f64;
         if n <= 0.0 {
             continue;
@@ -1090,7 +1131,7 @@ pub fn compute_forecasts(
         let avg_used = entries.iter().map(|(u, _, _)| *u).sum::<f64>() / n;
         let avg_drain = entries.iter().map(|(_, r, _)| *r).sum::<f64>() / n;
         let next_reset = entries.iter().filter_map(|(_, _, r)| *r).min();
-        forecasts.push(build_forecast(None, window_key, avg_used, avg_drain, next_reset, lookback_hours, horizon_hours, now));
+        forecasts.push(build_forecast(None, window_key, scope_model, avg_used, avg_drain, next_reset, lookback_hours, horizon_hours, now));
     }
 
     forecasts
@@ -1099,7 +1140,8 @@ pub fn compute_forecasts(
 #[allow(clippy::too_many_arguments)]
 fn build_forecast(
     account_id: Option<String>,
-    window_key: String,
+    window_key: &str,
+    scope_model: Option<&str>,
     current_used: f64,
     drain_per_hour: f64,
     resets_at: Option<DateTime<Utc>>,
@@ -1139,7 +1181,8 @@ fn build_forecast(
     }
 
     QuotaForecast {
-        window_key,
+        window_key: window_key.to_owned(),
+        scope_model: scope_model.map(str::to_owned),
         account_id,
         drain_pct_per_hour: drain_per_hour,
         projected_exhaustion_at,
@@ -1764,7 +1807,7 @@ pub async fn reconcile_quota_notifications(hub: &Hub) -> DResult<()> {
 
 pub async fn sync_quota_notifications(hub: &Hub, provider_id: &str) -> DResult<()> {
     let settings = get_settings(hub, &internal_operator("provider-notify")).await?;
-    let accounts = load_accounts_with_latest_windows(&hub.db, provider_id).await?;
+    let accounts = load_accounts_with_latest_windows(&hub.db, provider_id, None).await?;
     let source = format!("providers:{provider_id}");
     notifications::sync(hub, &source, quota_raises(provider_id, &settings, &accounts, Utc::now())).await?;
     Ok(())
@@ -1788,7 +1831,7 @@ pub async fn sync_provider_health_notifications(hub: &Hub, provider_id: &str) ->
 }
 
 async fn sync_provider_health(hub: &Hub, provider: &ProviderDescriptor, settings: &ProviderPanelSettings) -> DResult<()> {
-    let accounts = load_accounts_with_latest_windows(&hub.db, &provider.id).await?;
+    let accounts = load_accounts_with_latest_windows(&hub.db, &provider.id, None).await?;
     let publishers = sqlx::query_as(
         "select source_host, source_user, max(last_observed_at) from model_provider_publishers
          where provider_id = $1 group by source_host, source_user order by source_host, source_user",
@@ -2009,25 +2052,34 @@ fn quota_raises(provider_id: &str, settings: &ProviderPanelSettings, accounts: &
                     url: None,
                 });
             }
+            // Keep the existing alert key when model scopes share a window key.
+            let mut lowest = BTreeMap::new();
             for win in &acct.windows {
-                if win.observation_state == QuotaObservationState::Measured
+                if let Some(remaining) = win.remaining_percent
+                    && remaining <= 5.0
+                    && win.observation_state == QuotaObservationState::Measured
                     && win.resets_at.is_none_or(|reset| reset > now)
-                    && win.remaining_percent.is_some_and(|rem| rem <= 5.0)
                 {
-                    items.push(Raise {
-                        source: source.clone(),
-                        dedupe_key: provider_notification_key(provider_id, &format!("{}:{}:low", acct.id, win.window_key)),
-                        severity: if win.remaining_percent.unwrap_or(0.0) <= 0.5 { Severity::Critical } else { Severity::Warning },
-                        title: format!("{provider_id} · {label} {} low ({:.0}% left)", win.label, win.remaining_percent.unwrap_or(0.0)),
-                        body: match win.resets_at {
-                            Some(r) => format!("Resets at {}", r.format("%Y-%m-%d %H:%M UTC")),
-                            None => "Reset time unknown.".into(),
-                        },
-                        subject_type: Some("model_provider".into()),
-                        subject_id: None,
-                        url: None,
-                    });
+                    let entry = lowest.entry(&win.window_key).or_insert((win, remaining));
+                    if remaining < entry.1 {
+                        *entry = (win, remaining);
+                    }
                 }
+            }
+            for (win, remaining) in lowest.into_values() {
+                items.push(Raise {
+                    source: source.clone(),
+                    dedupe_key: provider_notification_key(provider_id, &format!("{}:{}:low", acct.id, win.window_key)),
+                    severity: if remaining <= 0.5 { Severity::Critical } else { Severity::Warning },
+                    title: format!("{provider_id} · {label} {} low ({remaining:.0}% left)", win.label),
+                    body: match win.resets_at {
+                        Some(r) => format!("Resets at {}", r.format("%Y-%m-%d %H:%M UTC")),
+                        None => "Reset time unknown.".into(),
+                    },
+                    subject_type: Some("model_provider".into()),
+                    subject_id: None,
+                    url: None,
+                });
             }
         }
     }
@@ -2269,15 +2321,20 @@ mod tests {
     fn quota_alerts_clear_at_reset_without_clearing_the_future_weekly_window() {
         let reset: DateTime<Utc> = "2026-11-10T03:10:00Z".parse().unwrap();
         let mut session = sample_window("five_hour", Some(100.0), QuotaObservationState::Measured);
+        session.scope_model = Some("pro".into());
         session.resets_at = Some(reset);
+        let flash = QuotaWindow { scope_model: Some("flash".into()), remaining_percent: Some(4.0), ..session.clone() };
         let mut weekly = sample_window("weekly", Some(98.0), QuotaObservationState::Measured);
         weekly.kind = QuotaWindowKind::Weekly;
         weekly.resets_at = Some(reset + Duration::days(5));
         let mut account = acct("google-primary", true, None, None, session);
+        account.windows.push(flash);
         account.windows.push(weekly);
         let settings = ProviderPanelSettings { notify_limit_hit: true, ..Default::default() };
         let raises = |now| quota_raises("antigravity", &settings, std::slice::from_ref(&account), now);
-        assert_eq!(raises(reset - Duration::seconds(1)).len(), 2);
+        let items = raises(reset - Duration::seconds(1));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items.iter().find(|item| item.dedupe_key.ends_with(":five_hour:low")).unwrap().severity, Severity::Critical);
         for now in [reset, reset + Duration::seconds(1)] {
             let items = raises(now);
             assert_eq!(items.len(), 1);
@@ -2296,6 +2353,7 @@ mod tests {
         let p = &pools[0];
         assert_eq!(p.eligible_accounts, 3, "duplicate fingerprint collapsed");
         assert_eq!(p.included_accounts, 2, "unobserved never coerced to 0");
+        assert_eq!(p.window_seconds, Some(18_000));
         // Weighted used = (20*5 + 80*1) / 6 = 180 / 6 = 30%
         assert!((p.weighted_used_percent.unwrap() - 30.0).abs() < 1e-6);
         assert!((p.weighted_remaining_percent.unwrap() - 70.0).abs() < 1e-6);

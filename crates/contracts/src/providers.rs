@@ -702,6 +702,8 @@ pub struct QuotaSample {
     pub provider_id: String,
     pub account_id: String,
     pub window_key: String,
+    #[serde(default)]
+    pub scope_model: Option<String>,
     pub label: String,
     pub kind: QuotaWindowKind,
     pub unit: QuotaUnit,
@@ -731,6 +733,8 @@ pub struct QuotaSampleIn {
 pub struct PastWindowSummary {
     pub account_id: String,
     pub window_key: String,
+    #[serde(default)]
+    pub scope_model: Option<String>,
     pub label: String,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
@@ -754,6 +758,8 @@ pub struct ForecastPoint {
 pub struct QuotaForecast {
     pub window_key: String,
     pub account_id: Option<String>,
+    #[serde(default)]
+    pub scope_model: Option<String>,
     /// Percentage points drained per hour (estimated over `lookback_hours`).
     pub drain_pct_per_hour: f64,
     pub projected_exhaustion_at: Option<DateTime<Utc>>,
@@ -769,6 +775,8 @@ pub struct QuotaForecast {
 pub struct PoolWindowSummary {
     pub provider_id: String,
     pub window_key: String,
+    #[serde(default)]
+    pub scope_model: Option<String>,
     pub label: String,
     pub kind: QuotaWindowKind,
     pub eligible_accounts: usize,
@@ -779,6 +787,9 @@ pub struct PoolWindowSummary {
     /// Explains what weights were used (e.g. "plan_multiplier", "equal_entitlements").
     pub capacity_basis: String,
     pub next_reset_at: Option<DateTime<Utc>>,
+    /// Duration shared by the included windows, when known.
+    #[serde(default)]
+    pub window_seconds: Option<u64>,
     pub forecast: Option<QuotaForecast>,
     pub is_estimate: bool,
 }
@@ -803,6 +814,9 @@ pub struct ProviderQuotaReport {
     pub accounts: Vec<ModelAccount>,
     pub pools: Vec<PoolWindowSummary>,
     pub samples: Vec<QuotaSample>,
+    /// Older samples in the requested range were omitted by the history cap.
+    #[serde(default)]
+    pub history_truncated: bool,
     pub past_windows: Vec<PastWindowSummary>,
     pub forecasts: Vec<QuotaForecast>,
     pub as_of: DateTime<Utc>,
@@ -1599,6 +1613,9 @@ pub struct ActivityTrendPoint {
     pub cache_write_tokens: u64,
     #[serde(default)]
     pub cache_hit_rate: f64,
+    /// `None` when the bucket has no input tokens. The numeric rate is retained for older clients.
+    #[serde(default)]
+    pub cache_hit_rate_observed: Option<f64>,
     pub thinking_tokens: u64,
     pub api_equivalent_cost_usd: f64,
 }
@@ -1624,6 +1641,8 @@ pub struct HeatmapCell {
 pub struct RhythmBucket {
     pub hour: u8,
     pub requests: u64,
+    #[serde(default)]
+    pub failures: u64,
     pub tokens: u64,
     #[serde(default)]
     pub input_tokens: u64,
@@ -1684,7 +1703,13 @@ pub struct ActivityOverview {
     pub matched_proxy_requests: u64,
     pub bypassed_local_requests: u64,
     pub trend: Vec<ActivityTrendPoint>,
+    /// Width of the UTC-aligned trend and cache buckets.
+    #[serde(default)]
+    pub bucket_seconds: Option<u64>,
     pub heatmap: Vec<HeatmapCell>,
+    /// Local weekdays intersecting the requested range, 0 (Mon) .. 6 (Sun).
+    #[serde(default)]
+    pub covered_weekdays: Vec<u8>,
     pub rhythm: Vec<RhythmBucket>,
     pub by_model: Vec<BreakdownRow>,
     pub by_account: Vec<BreakdownRow>,
