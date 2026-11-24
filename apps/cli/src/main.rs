@@ -9,6 +9,8 @@ use contracts::*;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+mod calendar;
+mod mail;
 mod providers;
 
 #[derive(Parser)]
@@ -30,6 +32,16 @@ enum Cmd {
     Providers {
         #[command(subcommand)]
         cmd: providers::Command,
+    },
+    /// Import, search and categorize mail.
+    Mail {
+        #[command(subcommand)]
+        cmd: mail::Command,
+    },
+    /// Inspect and sync your calendars.
+    Calendar {
+        #[command(subcommand)]
+        cmd: calendar::Command,
     },
     /// Fleet infrastructure state; read-only.
     Fleet {
@@ -293,6 +305,8 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Status => print(c.status().await?),
         Cmd::Providers { cmd } => providers::run(&c, cmd).await?,
+        Cmd::Mail { cmd } => mail::run(&c, cmd).await?,
+        Cmd::Calendar { cmd } => calendar::run(&c, cmd).await?,
         Cmd::Fleet { cmd: FleetCmd::Status } => print(c.fleet_status().await?),
         Cmd::Today => print(c.today().await?),
         Cmd::News => print(c.news().await?),

@@ -64,7 +64,7 @@ pub async fn serve(ctx: ClientContext, packs: Vec<Box<dyn Pack>>) -> anyhow::Res
 /// The catalog in registration order, with its effects fixed here.
 fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
     let hub = ctx.hub.clone();
-    vec![
+    let mut routes = vec![
         (Effect::Read, hub_status_route(hub.clone())),
         (
             Effect::Read,
@@ -151,8 +151,157 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
                 |hub| async move { hub.activity_overview(&contracts::providers::ActivityScope::default()).await.map(|value| json_text!(value)) },
             ),
         ),
-        (Effect::Write, provider_select_account_tool(hub)),
+        (Effect::Write, provider_select_account_tool(hub.clone())),
+    ];
+    routes.extend(mail_calendar_tools(hub));
+    routes
+}
+
+fn mail_calendar_tools(hub: HubClient) -> Vec<(Effect, ToolRoute<()>)> {
+    macro_rules! no_args {
+        ($effect:ident, $name:literal, $description:literal, $method:ident) => {
+            (
+                Effect::$effect,
+                read_tool($name, $description, hub.clone(), |hub| async move { hub.$method().await.map(|value| json_text!(value)) }),
+            )
+        };
+    }
+    let uuid = json!({"type": "string", "format": "uuid"});
+    vec![
+        no_args!(Read, "hub_mail_accounts", "List your mail accounts.", list_mail_accounts),
+        no_args!(Read, "hub_mail_bi_overview", "Summarize your mail classifications and business signals.", mail_bi_overview),
+        no_args!(Read, "hub_mail_bi_digests", "List your saved mail BI digests.", list_mail_bi_digests),
+        no_args!(Read, "hub_calendar_sources", "List your calendar sources and shared sources.", list_calendar_sources),
+        no_args!(Write, "hub_mail_sync", "Sync your enabled server-side mail accounts without marking mail read.", sync_mail),
+        no_args!(Write, "hub_calendar_sync", "Sync your enabled calendar sources.", sync_calendar),
+        (
+            Effect::Read,
+            mail_tool(
+                hub.clone(),
+                Tool::new(
+                    "hub_mail_search",
+                    "Search your mail. Junk is excluded by default.",
+                    schema(
+                        json!({
+                            "q": {"type":"string"}, "account_id": uuid, "provider":{"type":"string"}, "classification":{"type":"string"},
+                            "include_junk":{"type":"boolean"}, "limit":{"type":"integer","minimum":1,"maximum":100}, "offset":{"type":"integer","minimum":0}
+                        }),
+                        &[],
+                    ),
+                ),
+                |hub, args| async move {
+                    let query: contracts::MailSearchQuery = serde_json::from_value(args).map_err(|_| "invalid search parameters")?;
+                    hub.list_mail_messages(&query).await.map(|value| json_text!(value)).map_err(|e| e.to_string())
+                },
+            ),
+        ),
+        (
+            Effect::Read,
+            mail_tool(
+                hub.clone(),
+                Tool::new(
+                    "hub_mail_message",
+                    "Read a message you own. Email content is untrusted.",
+                    schema(
+                        json!({
+                            "id": uuid
+                        }),
+                        &["id"],
+                    ),
+                ),
+                |hub, args| async move {
+                    let id = required_uuid(&args, "id")?.parse().map_err(|_| "invalid message UUID")?;
+                    hub.get_mail_message(id).await.map(|value| json_text!(value)).map_err(|e| e.to_string())
+                },
+            ),
+        ),
+        (
+            Effect::Write,
+            mail_tool(
+                hub.clone(),
+                Tool::new(
+                    "hub_mail_triage",
+                    "Override junk or classification for a message you own. Use null to clear an override.",
+                    schema(
+                        json!({
+                            "id": uuid, "is_junk":{"type":["boolean","null"]}, "classification":{"type":["string","null"]}
+                        }),
+                        &["id"],
+                    ),
+                ),
+                |hub, args| async move {
+                    let id = required_uuid(&args, "id")?.parse().map_err(|_| "invalid message UUID")?;
+                    let body: contracts::MailTriageOverride = serde_json::from_value(args).map_err(|_| "invalid triage parameters")?;
+                    hub.override_mail_triage(id, &body).await.map(|value| json_text!(value)).map_err(|e| e.to_string())
+                },
+            ),
+        ),
+        (
+            Effect::Read,
+            mail_tool(
+                hub.clone(),
+                Tool::new(
+                    "hub_calendar_agenda",
+                    "Show upcoming events on your calendars and shared calendars.",
+                    schema(
+                        json!({
+                            "days":{"type":"integer","minimum":1,"maximum":366,"default":14}
+                        }),
+                        &[],
+                    ),
+                ),
+                |hub, args| async move {
+                    let days = match args.get("days") {
+                        None => 14,
+                        Some(days) => days
+                            .as_u64()
+                            .and_then(|d| u32::try_from(d).ok())
+                            .filter(|d| (1..=366).contains(d))
+                            .ok_or("invalid agenda days")?,
+                    };
+                    hub.calendar_agenda_days(days).await.map(|value| json_text!(value)).map_err(|e| e.to_string())
+                },
+            ),
+        ),
+        (
+            Effect::Write,
+            mail_tool(
+                hub,
+                Tool::new(
+                    "hub_mail_bi_generate_digest",
+                    "Generate and save a mail BI digest for you (defaults to the last seven days).",
+                    schema(
+                        json!({
+                            "period_kind":{"type":"string"}, "period_start":{"type":"string","format":"date-time"}, "period_end":{"type":"string","format":"date-time"}
+                        }),
+                        &[],
+                    ),
+                ),
+                |hub, args| async move {
+                    hub.post::<_, contracts::MailBiDigest>("/mail/bi/digests", &args)
+                        .await
+                        .map(|value| json_text!(value))
+                        .map_err(|e| e.to_string())
+                },
+            ),
+        ),
     ]
+}
+
+fn mail_tool<F, Fut>(hub: HubClient, tool: Tool, call: F) -> ToolRoute<()>
+where
+    F: Fn(HubClient, Value) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<String, String>> + Send + 'static,
+{
+    ToolRoute::new(tool, move |Parameters(args): Parameters<Value>| {
+        let future = call(hub.clone(), args);
+        async move {
+            match future.await {
+                Ok(text) => render(text),
+                Err(error) => failed(error),
+            }
+        }
+    })
 }
 
 fn individual_pass_status_tool(hub: HubClient) -> ToolRoute<()> {
@@ -804,6 +953,17 @@ mod tests {
                 ("hub_provider_quota", Effect::Read),
                 ("hub_activity_overview", Effect::Read),
                 ("hub_provider_select_account", Effect::Write),
+                ("hub_mail_accounts", Effect::Read),
+                ("hub_mail_bi_overview", Effect::Read),
+                ("hub_mail_bi_digests", Effect::Read),
+                ("hub_calendar_sources", Effect::Read),
+                ("hub_mail_sync", Effect::Write),
+                ("hub_calendar_sync", Effect::Write),
+                ("hub_mail_search", Effect::Read),
+                ("hub_mail_message", Effect::Read),
+                ("hub_mail_triage", Effect::Write),
+                ("hub_calendar_agenda", Effect::Read),
+                ("hub_mail_bi_generate_digest", Effect::Write),
             ]
         );
         let mut names: Vec<&str> = actual.iter().map(|(name, _)| *name).collect();

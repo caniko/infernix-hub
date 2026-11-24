@@ -24,13 +24,14 @@ pub enum Workspace {
     News,
     Studio,
     Calendar,
+    Mail,
     Relationships,
     Projects,
     Library,
 }
 
 impl Workspace {
-    pub const ALL: [Workspace; 13] = [
+    pub const ALL: [Workspace; 14] = [
         Workspace::Notifications,
         Workspace::Command,
         Workspace::Hosts,
@@ -41,6 +42,7 @@ impl Workspace {
         Workspace::News,
         Workspace::Studio,
         Workspace::Calendar,
+        Workspace::Mail,
         Workspace::Relationships,
         Workspace::Projects,
         Workspace::Library,
@@ -58,6 +60,7 @@ impl Workspace {
             Workspace::News => "News",
             Workspace::Studio => "Studio",
             Workspace::Calendar => "Calendar",
+            Workspace::Mail => "Mail",
             Workspace::Relationships => "Relationships",
             Workspace::Projects => "Projects",
             Workspace::Library => "Library",
@@ -78,6 +81,7 @@ impl Workspace {
             Workspace::News => "news",
             Workspace::Studio => "studio",
             Workspace::Calendar => "calendar",
+            Workspace::Mail => "mail",
             Workspace::Relationships => "relationships",
             Workspace::Projects => "projects",
             Workspace::Library => "library",
@@ -102,6 +106,7 @@ impl Workspace {
             Workspace::News => "6",
             Workspace::Studio => "7",
             Workspace::Calendar => "8",
+            Workspace::Mail => "m",
             Workspace::Relationships => "9",
             Workspace::Projects => "p",
             Workspace::Library => "0",
@@ -127,7 +132,8 @@ impl Workspace {
             Workspace::Today => "Reviews, production, due releases, failed work and overdue replies",
             Workspace::News => "Coverage, evidence and brief creation",
             Workspace::Studio => "Briefs, generation, assets, release freeze and scheduling",
-            Workspace::Calendar => "Scheduled posts by day",
+            Workspace::Calendar => "Personal agenda and scheduled posts",
+            Workspace::Mail => "Inbox, message triage and business insights",
             Workspace::Relationships => "Threads, ownership, drafts and handoff",
             Workspace::Projects => "Influencer projects and individuals",
             Workspace::Library => "Assets",
@@ -529,6 +535,8 @@ mod tests {
         assert_eq!(Workspace::Notifications.key(), "n", "Notifications keeps its letter");
         assert_eq!(Workspace::Command.key(), "1", "the ten original digits do not move");
         assert_eq!(Workspace::Library.key(), "0");
+        assert_eq!(start_workspace(&args(&["app", "--workspace", "mail"])).0.slug(), "mail");
+        assert_eq!(Workspace::from_key("m").map(Workspace::slug), Some("mail"));
     }
 
     #[test]

@@ -1,4 +1,6 @@
-//! Calendar: scheduled posts grouped by UTC day and account.
+//! Personal agenda and scheduled posts, grouped by UTC day.
+
+use std::{collections::BTreeMap, time::Duration};
 
 use chrono::NaiveDate;
 use contracts::client::HubClient;
@@ -14,6 +16,132 @@ use crate::{
 
 #[component]
 pub fn CalendarView() -> Element {
+    let personal_enabled = std::env::var("HUB_PERSONAL_CALENDAR").as_deref() != Ok("0");
+    let personal = use_signal(|| personal_enabled);
+    if personal() {
+        rsx! { PersonalSchedule { personal } }
+    } else {
+        rsx! { PublishingSchedule { personal, personal_enabled } }
+    }
+}
+
+#[component]
+fn ScheduleMode(mut personal: Signal<bool>) -> Element {
+    rsx! {
+        div { class: "segmented", role: "group", aria_label: "Calendar schedule",
+            button { class: "seg-btn", aria_pressed: personal(), onclick: move |_| personal.set(true), "Personal Schedule" }
+            button { class: "seg-btn", aria_pressed: !personal(), onclick: move |_| personal.set(false), "Publishing Schedule" }
+        }
+    }
+}
+
+#[component]
+fn PersonalSchedule(personal: Signal<bool>) -> Element {
+    let store = use_context::<Store>();
+    let client = use_context::<HubClient>();
+    let mut syncing = use_signal(|| false);
+    let source_client = client.clone();
+    let mut sources = use_resource(move || {
+        let client = source_client.clone();
+        async move { api::timed(client.list_calendar_sources()).await }
+    });
+    let agenda_client = client.clone();
+    let mut agenda = use_resource(move || {
+        let client = agenda_client.clone();
+        async move { api::timed(client.calendar_agenda_days(14)).await }
+    });
+    let source_result = sources.cloned();
+    let source_list = source_result.as_ref().and_then(|r| r.as_ref().ok()).map(Vec::as_slice).unwrap_or_default();
+
+    rsx! {
+        aside { class: "context", aria_label: "Calendar sources",
+            div { class: "context-head", h2 { "Calendar sources" } }
+            div { class: "context-list",
+                match source_result.as_ref() {
+                    None => rsx! { Loading { text: "Loading sources…".to_string() } },
+                    Some(Err(e)) => rsx! { ErrorCard { code: e.code.clone(), message: e.message.clone() } },
+                    Some(Ok(items)) if items.is_empty() => rsx! { p { class: "muted", "No calendar sources enrolled." } },
+                    Some(Ok(items)) => rsx! {
+                        for source in items {
+                            div { class: "glass-card", key: "{source.id}",
+                                strong { "{source.label}" }
+                                div { class: "row",
+                                    Chip { label: source.visibility.clone() }
+                                    Chip { label: source.status.clone(), tone: super::mail::status_tone(&source.status) }
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        }
+        main { class: "work",
+            div { class: "work-head content-bounded",
+                div {
+                    h1 { "Calendar" }
+                    ScheduleMode { personal }
+                    p { class: "form-help", "Next 14 days · UTC" }
+                }
+                div { class: "spacer" }
+                button {
+                    class: "btn secondary", disabled: syncing(),
+                    onclick: move |_| {
+                        syncing.set(true);
+                        let client = client.clone();
+                        spawn(async move {
+                            match api::timed_for(Duration::from_secs(600), client.sync_calendar()).await {
+                                Ok(_) => store.notify(true, "Calendar sync finished. See source statuses.".to_string()),
+                                Err(e) => store.notify(false, format!("{} — {}", e.code, e.message)),
+                            }
+                            sources.restart();
+                            agenda.restart();
+                            syncing.set(false);
+                        });
+                    },
+                    if syncing() { "Syncing…" } else { "Sync Now" }
+                }
+            }
+            match agenda.cloned() {
+                None => rsx! { Loading { text: "Loading agenda…".to_string() } },
+                Some(Err(e)) => rsx! { ErrorCard { code: e.code, message: e.message } },
+                Some(Ok(agenda)) if agenda.events.is_empty() => rsx! { EmptyState { title: "No upcoming events".to_string() } },
+                Some(Ok(agenda)) => {
+                    let mut days = BTreeMap::<_, Vec<_>>::new();
+                    for event in agenda.events {
+                        days.entry(event.event.starts_at.date_naive()).or_default().push(event);
+                    }
+                    rsx! {
+                        for (day, events) in days {
+                            section { class: "calendar-day content-bounded", key: "{day}",
+                                h2 { "{format::fmt_day(day)}" }
+                                div { class: "glass-card calendar-account",
+                                    for item in events {
+                                        {
+                                            let event = item.event;
+                                            let time = if event.all_day { "All Day".to_string() } else { event.starts_at.format("%H:%M").to_string() };
+                                            let label = source_list.iter().find(|s| s.id == item.source_id).map(|s| s.label.as_str()).unwrap_or("Calendar");
+                                            rsx! {
+                                                div { class: "intent-row", key: "{item.id}",
+                                                    span { class: "time", "{time}" }
+                                                    strong { "{event.title}" }
+                                                    if !event.location.is_empty() { span { class: "muted", "{event.location}" } }
+                                                    Chip { label: format!("{label} · {}", item.visibility) }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[component]
+fn PublishingSchedule(personal: Signal<bool>, personal_enabled: bool) -> Element {
     let store = use_context::<Store>();
     let client = use_context::<HubClient>();
     let intents = (store.intents).cloned();
@@ -116,6 +244,9 @@ pub fn CalendarView() -> Element {
             div { class: "work-head content-bounded",
                 div {
                     h1 { "Scheduled posts by day" }
+                    if personal_enabled {
+                        ScheduleMode { personal }
+                    }
                     p { class: "form-help", "{scope_account} · {scope_dates}" }
                 }
                 div { class: "spacer" }

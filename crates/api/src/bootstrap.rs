@@ -52,6 +52,9 @@ pub struct Settings {
     pub secret_inventory_file: Option<PathBuf>,
     /// Status feeds to poll (`feeds::load`); unset means none.
     pub feeds_config: Option<PathBuf>,
+    pub principal_owners_config: Option<PathBuf>,
+    pub mail_config: Option<PathBuf>,
+    pub calendar_config: Option<PathBuf>,
     /// Raise `hub:summary-stale` when no daily summary has been written for
     /// this many hours; unset disables the rule.
     pub summary_stale_hours: Option<u32>,
@@ -96,6 +99,9 @@ impl Settings {
             fleet_status_file: env("HUB_FLEET_STATUS_FILE").map(PathBuf::from),
             secret_inventory_file: env("HUB_SECRET_INVENTORY_FILE").map(PathBuf::from),
             feeds_config: env("HUB_FEEDS_CONFIG").map(PathBuf::from),
+            principal_owners_config: env("HUB_PRINCIPAL_OWNERS_CONFIG").map(PathBuf::from),
+            mail_config: env("HUB_MAIL_CONFIG").map(PathBuf::from),
+            calendar_config: env("HUB_CALENDAR_CONFIG").map(PathBuf::from),
             summary_stale_hours: match env("HUB_SUMMARY_STALE_HOURS") {
                 None => None,
                 Some(v) => Some(v.parse().with_context(|| format!("HUB_SUMMARY_STALE_HOURS must be a number of hours, got {v}"))?),
@@ -128,6 +134,9 @@ impl Settings {
             fleet_status_file: None,
             secret_inventory_file: None,
             feeds_config: None,
+            principal_owners_config: None,
+            mail_config: None,
+            calendar_config: None,
             summary_stale_hours: None,
             company_id: None,
             fleet_issues: None,
@@ -215,6 +224,11 @@ pub(crate) fn require_live_approvals(
 }
 
 pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
+    let principal_owners = load_runtime_json(s.principal_owners_config.as_deref(), "principal owners")?;
+    let mail_calendar = crate::mail_calendar::Runtime::new(
+        load_runtime_json(s.mail_config.as_deref(), "mail")?,
+        load_runtime_json(s.calendar_config.as_deref(), "calendar")?,
+    )?;
     // Only the publisher has a real disabled mode; the others would silently
     // fall back to a simulation that the status page reports as disabled.
     for (name, mode) in
@@ -369,6 +383,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         dispatch_window_secs: 15 * 60,
         fleet_issues: s.fleet_issues.clone(),
         summary_stale_hours: s.summary_stale_hours,
+        principal_owners,
     };
     // Publishing channels are addressed by `accounts.transport`. The built-in
     // adapter answers under its own real name only; a `fixture` deployment
@@ -466,15 +481,26 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
             }
         }
     }
+    mail_calendar.register(&hub).await.context("registering mail accounts and calendar sources")?;
     Ok((
         AppState {
             hub,
             fixture_paperclip: fx.paperclip.clone(),
             fleet_status_file: s.fleet_status_file.clone(),
             secret_inventory_file: s.secret_inventory_file.clone(),
+            mail_calendar: Arc::new(mail_calendar),
         },
         fx,
     ))
+}
+
+fn load_runtime_json<T: serde::de::DeserializeOwned + Default>(path: Option<&Path>, name: &str) -> anyhow::Result<T> {
+    let Some(path) = path else {
+        return Ok(T::default());
+    };
+    let bytes = std::fs::read(path).with_context(|| format!("reading {name} configuration"))?;
+    // Serde diagnostics can contain invalid values, including private URLs.
+    serde_json::from_slice(&bytes).map_err(|e| anyhow::anyhow!("invalid {name} configuration at line {}, column {}", e.line(), e.column()))
 }
 
 #[derive(Debug, Deserialize)]
