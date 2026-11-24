@@ -77,9 +77,10 @@ unless the service is started with a separate worker key.
 
 For CLI use, pass `--worker-unix-socket PATH` or
 `--worker-listen 127.0.0.1:PORT` to `fleetix-agent-proxy serve`, together
-with `--worker-allowed-models MODEL[,MODEL...]`. TCP requires a distinct
-`--worker-api-key-file PATH` (or `--worker-api-key`). The dedicated worker
-bearer is not a client, management, or provider credential.
+with `--worker-allowed-models MODEL[,MODEL...]`. TCP requires
+`--worker-api-key-file PATH`: a service-owned regular file with no group or
+world permissions. Generate a random bearer of at least 32 characters,
+distinct from every client, management, and provider credential.
 
 Only `POST /backend-api/codex/responses` with an exactly allowlisted model is
 accepted. Worker requests always go to the ChatGPT Codex backend with a

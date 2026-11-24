@@ -1,7 +1,7 @@
 //! A separate, deny-by-default HTTP surface for Codex subscription workers.
 use std::{
     collections::BTreeSet,
-    fs,
+    fmt, fs,
     io::ErrorKind,
     net::SocketAddr,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -15,20 +15,24 @@ use axum::{
     Router,
     body::to_bytes,
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{HeaderName, StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
 };
 use clap::Args;
 use reqwest::Url;
-use serde_json::Value;
+use serde::{
+    Deserializer,
+    de::{self, MapAccess, Visitor},
+};
+use serde_json::{Map, Value};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 
 use crate::{
     Proxy,
-    config::{Config, matches_secret, private_dir, secret_file, validate_secret},
+    config::{Config, matches_secret, private_dir, worker_secret_file},
     pool::{Lane, bounded_identifier},
-    router::{REQUEST_BODY_LIMIT, bearer, forward_authorized, scan_unique_fields},
+    router::{REQUEST_BODY_LIMIT, bearer, connection_headers, forward_authorized},
 };
 
 pub(crate) const CODEX_RESPONSES: &str = "/backend-api/codex/responses";
@@ -41,10 +45,7 @@ pub struct WorkerOptions {
     /// Bind the worker listener to a numeric loopback address.
     #[arg(long)]
     pub worker_listen: Option<SocketAddr>,
-    /// Dedicated worker bearer; prefer the file option to keep it out of process arguments.
-    #[arg(long, conflicts_with = "worker_api_key_file")]
-    pub worker_api_key: Option<String>,
-    /// File containing the dedicated worker bearer (required on TCP unless passed directly).
+    /// Private file containing the dedicated worker bearer (required on TCP).
     #[arg(long)]
     pub worker_api_key_file: Option<PathBuf>,
     /// Exact Codex model names; comma-separated or repeated.
@@ -73,7 +74,7 @@ impl WorkerOptions {
         let bind = match (self.worker_unix_socket, self.worker_listen) {
             (None, None) => {
                 ensure!(
-                    self.worker_api_key.is_none() && self.worker_api_key_file.is_none() && self.worker_allowed_models.is_empty(),
+                    self.worker_api_key_file.is_none() && self.worker_allowed_models.is_empty(),
                     "worker authentication and models require a worker listener"
                 );
                 return Ok(None);
@@ -93,12 +94,7 @@ impl WorkerOptions {
                 "worker model allowlist must contain only non-empty Codex model names"
             );
         }
-        let key = match (self.worker_api_key, self.worker_api_key_file) {
-            (Some(key), None) => Some(validate_secret(&key)?),
-            (None, Some(path)) => Some(secret_file(&path)?),
-            (None, None) => None,
-            (Some(_), Some(_)) => bail!("configure only one source for the worker API key"),
-        };
+        let key = self.worker_api_key_file.as_deref().map(worker_secret_file).transpose()?;
         ensure!(!matches!(bind, Bind::Tcp(_)) || key.is_some(), "worker TCP listener requires a dedicated bearer");
         if let Some(key) = &key {
             ensure!(
@@ -118,12 +114,17 @@ impl WorkerOptions {
 }
 
 impl WorkerConfig {
+    pub async fn validate_pool(&self, proxy: &Proxy) -> Result<()> {
+        if let Some(key) = &self.scope.key {
+            ensure!(!pool_has_secret(proxy, key).await, "worker bearer must differ from loaded provider credentials");
+        }
+        Ok(())
+    }
+
     pub async fn bind(self) -> Result<BoundWorker> {
         let listener = match self.bind {
             Bind::Tcp(addr) => Listener::Tcp(TcpListener::bind(addr).await.context("bind worker TCP listener")?),
-            Bind::Unix(path) => {
-                Listener::Unix(bind_unix(&path).await.with_context(|| format!("bind worker Unix socket {}", path.display()))?)
-            }
+            Bind::Unix(path) => bind_unix(&path).await.with_context(|| format!("bind worker Unix socket {}", path.display()))?,
         };
         Ok(BoundWorker { listener, scope: self.scope })
     }
@@ -148,7 +149,7 @@ pub struct BoundWorker {
 
 enum Listener {
     Tcp(TcpListener),
-    Unix(UnixListener),
+    Unix(UnixListener, UnixSocketGuard),
 }
 
 impl BoundWorker {
@@ -165,7 +166,7 @@ impl BoundWorker {
                 tracing::info!(addr = %listener.local_addr()?, "scoped worker proxy listening");
                 axum::serve(listener, app).with_graceful_shutdown(shutdown).await
             }
-            Listener::Unix(listener) => {
+            Listener::Unix(listener, _guard) => {
                 tracing::info!(addr = ?listener.local_addr()?, "scoped worker proxy listening");
                 axum::serve(listener, app).with_graceful_shutdown(shutdown).await
             }
@@ -173,7 +174,21 @@ impl BoundWorker {
     }
 }
 
-async fn bind_unix(path: &Path) -> Result<UnixListener> {
+struct UnixSocketGuard {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl Drop for UnixSocketGuard {
+    fn drop(&mut self) {
+        if fs::symlink_metadata(&self.path).is_ok_and(|m| m.file_type().is_socket() && m.dev() == self.dev && m.ino() == self.ino) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+async fn bind_unix(path: &Path) -> Result<Listener> {
     let path = std::path::absolute(path)?;
     ensure!(!path.components().any(|c| c == Component::ParentDir), "worker socket path cannot contain '..'");
     let parent = path.parent().context("worker socket requires a parent directory")?;
@@ -215,8 +230,11 @@ async fn bind_unix(path: &Path) -> Result<UnixListener> {
     }
     // The private parent prevents access before chmod and before we serve requests.
     let listener = UnixListener::bind(&path)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
+    let metadata = fs::symlink_metadata(&path)?;
+    ensure!(metadata.file_type().is_socket() && metadata.uid() == uid, "worker socket path changed after bind");
+    let guard = UnixSocketGuard { path, dev: metadata.dev(), ino: metadata.ino() };
+    fs::set_permissions(&guard.path, fs::Permissions::from_mode(0o600))?;
+    Ok(Listener::Unix(listener, guard))
 }
 
 impl Scope {
@@ -265,7 +283,6 @@ fn local_header(name: &str) -> bool {
         name,
         "accept-encoding"
             | "authorization"
-            | "connection"
             | "content-length"
             | "content-type"
             | "host"
@@ -305,11 +322,61 @@ fn inference_header(name: &str) -> bool {
     )
 }
 
+struct WorkerBody;
+
+impl<'de> Visitor<'de> for WorkerBody {
+    type Value = Map<String, Value>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object with unique keys")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+        let mut object = Map::new();
+        while let Some(key) = access.next_key::<String>()? {
+            if object.contains_key(&key) || !BODY_FIELDS.contains(&key.as_str()) {
+                return Err(de::Error::custom("unsupported or duplicate worker body field"));
+            }
+            // Deserialize the model as a string, not a generic Value that can interpret raw JSON.
+            let value = if key == "model" { Value::String(access.next_value::<String>()?) } else { access.next_value()? };
+            object.insert(key, value);
+        }
+        Ok(object)
+    }
+}
+
+async fn pool_has_secret(proxy: &Proxy, key: &str) -> bool {
+    proxy
+        .state
+        .read()
+        .await
+        .pool
+        .accounts
+        .values()
+        .any(|account| account.current_secrets().into_iter().any(|secret| !secret.is_empty() && matches_secret(key, secret)))
+}
+
 async fn forward(State((proxy, scope)): State<(Arc<Proxy>, Arc<Scope>)>, request: Request) -> Response {
     let (mut parts, body) = request.into_parts();
+    if parts.headers.get_all(header::CONNECTION).iter().any(|value| value.to_str().is_err()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Ok(nominated) = connection_headers(&parts.headers)
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .map(str::parse::<HeaderName>)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    for name in nominated {
+        parts.headers.remove(name);
+    }
+    parts.headers.remove(header::CONNECTION);
     if let Some(key) = &scope.key
         && (parts.headers.get_all(header::AUTHORIZATION).iter().count() != 1
-            || !bearer(&parts.headers).is_some_and(|token| matches_secret(token, key)))
+            || !bearer(&parts.headers).is_some_and(|token| matches_secret(token, key))
+            || pool_has_secret(&proxy, key).await)
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -322,18 +389,21 @@ async fn forward(State((proxy, scope)): State<(Arc<Proxy>, Arc<Scope>)>, request
     let Ok(body) = to_bytes(body, REQUEST_BODY_LIMIT).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
-    let Ok(raw) = serde_json::from_slice::<Value>(&body) else {
+    if !body.trim_ascii_start().starts_with(b"{") {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    let mut json = serde_json::Deserializer::from_slice(&body);
+    let object = match json.deserialize_map(WorkerBody).and_then(|object| json.end().map(|()| object)) {
+        Ok(object) => object,
+        Err(error) if error.is_data() => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let Some(object) = raw.as_object() else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    if !object.get("model").and_then(Value::as_str).is_some_and(|model| scope.models.contains(model))
-        || object.keys().any(|key| !BODY_FIELDS.contains(&key.as_str()))
-        || scan_unique_fields(&body, BODY_FIELDS, |_, _| Some(())).is_none()
-    {
+    if !object.get("model").and_then(Value::as_str).is_some_and(|model| scope.models.contains(model)) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let Ok(body) = serde_json::to_vec(&object) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     // Do not pass inbound credentials, transport headers, or client telemetry
     // to the shared forwarding path.
     parts.headers = parts
@@ -343,5 +413,5 @@ async fn forward(State((proxy, scope)): State<(Arc<Proxy>, Arc<Scope>)>, request
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
     parts.headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
-    forward_authorized(proxy, parts, body, raw, Lane::Codex, Some(&scope.upstream)).await
+    forward_authorized(proxy, parts, body.into(), Value::Object(object), Lane::Codex, Some(&scope.upstream)).await
 }

@@ -564,7 +564,7 @@ pub(crate) async fn forward_authorized(
             }
             drop(quota_reader.take());
         }
-        if limited {
+        if limited && worker_upstream.is_none() {
             proxy.schedule_usage_refresh(account.id.clone()).await;
         }
         if failover {
@@ -698,6 +698,7 @@ pub(crate) async fn forward_authorized(
             request_at: started,
             capture_buf: Vec::new(),
             response_size: 0,
+            allow_usage_refresh: worker_upstream.is_none(),
         };
         let mut response = Response::new(Body::from_stream(stream::try_unfold(state, Wire::next)));
         *response.status_mut() = status;
@@ -1096,7 +1097,7 @@ impl ProjectFields {
     }
 }
 
-pub(crate) fn scan_unique_fields<const N: usize>(
+fn scan_unique_fields<const N: usize>(
     body: &[u8],
     fields: [&str; N],
     mut visit: impl FnMut(&str, Range<usize>) -> Option<()>,
@@ -1161,7 +1162,7 @@ fn header_id<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|name| headers.get(*name)?.to_str().ok()).filter(|s| bounded_identifier(s))
 }
 
-fn connection_headers(headers: &HeaderMap) -> Vec<&str> {
+pub(crate) fn connection_headers(headers: &HeaderMap) -> Vec<&str> {
     headers.get_all(header::CONNECTION).iter().filter_map(|v| v.to_str().ok()).flat_map(|s| s.split(',').map(str::trim)).collect()
 }
 
@@ -2214,6 +2215,7 @@ struct Wire {
     request_at: DateTime<Utc>,
     capture_buf: Vec<u8>,
     response_size: usize,
+    allow_usage_refresh: bool,
 }
 
 impl Wire {
@@ -2313,7 +2315,7 @@ impl Wire {
         let model = self.guard.0.as_ref().map_or("", |exchange| exchange.model.as_str());
         result(&self.proxy, &self.account, model, limited, false, self.request_at, None).await;
         self.proxy.report_account_error(&self.account, &error).await;
-        if limited.is_some() {
+        if self.allow_usage_refresh && limited.is_some() {
             self.proxy.schedule_usage_refresh(self.account.id.clone()).await;
         }
     }

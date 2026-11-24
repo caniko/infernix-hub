@@ -126,10 +126,6 @@ async fn main() -> Result<()> {
                 .map(|(url, token)| Ok::<_, anyhow::Error>((config::origin(&url)?.to_string(), token)))
                 .transpose()?;
             let listener = TcpListener::bind(config.bind).await?;
-            let worker = match worker {
-                Some(worker) => Some(worker.bind().await?),
-                None => None,
-            };
             config.bind = listener.local_addr()?;
             config.url = if config.bind.ip().is_unspecified() {
                 format!("http://127.0.0.1:{}", config.bind.port())
@@ -142,6 +138,12 @@ async fn main() -> Result<()> {
             let addr = config.bind;
             let proxy = Arc::new(Proxy::new(config)?.with_hub_sync_configured(hub.is_some()));
             proxy.discover_local_commands().await;
+            let worker = if let Some(worker) = worker {
+                worker.validate_pool(&proxy).await?;
+                Some(worker.bind().await?)
+            } else {
+                None
+            };
             let quota = tokio::spawn(hub_sync::poll_quota(proxy.clone()));
             let sync = hub.map(|(url, token)| tokio::spawn(hub_sync::run(proxy.clone(), url, token)));
             tracing::info!(%addr, "agent proxy listening");
@@ -231,6 +233,7 @@ mod tests {
             Cli::try_parse_from(["proxy", "serve", "--worker-unix-socket", "/tmp/worker.sock", "--worker-listen", "127.0.0.1:9000",])
                 .is_err()
         );
+        assert!(Cli::try_parse_from(["proxy", "serve", "--worker-listen", "127.0.0.1:9000", "--worker-api-key", "fixture"]).is_err());
     }
 
     #[test]

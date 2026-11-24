@@ -1,9 +1,9 @@
 use std::{
     collections::BTreeSet,
     env, fs,
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     net::SocketAddr,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -120,6 +120,27 @@ pub fn read_text(path: &Path) -> Result<Option<String>> {
 
 pub fn secret_file(path: &Path) -> Result<String> {
     validate_secret(&read_text(path)?.context("secret file not found")?)
+}
+
+pub(crate) fn worker_secret_file(path: &Path) -> Result<String> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    // NONBLOCK also lets us reject a FIFO without waiting for a writer.
+    let file = fs::File::from(
+        open(path, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())
+            .context("open worker bearer file")?,
+    );
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.uid() == rustix::process::geteuid().as_raw() && metadata.mode() & 0o077 == 0,
+        "worker bearer file must be a regular file owned by the service user with no group or world permissions"
+    );
+    let mut raw = String::new();
+    file.take(32_769).read_to_string(&mut raw)?;
+    ensure!(raw.len() <= 32_768, "worker bearer file is too large");
+    let key = validate_secret(&raw)?;
+    ensure!(key.len() >= 32 && !key.starts_with("sk-"), "worker bearer must be at least 32 characters and not an API key");
+    Ok(key)
 }
 
 pub(crate) fn validate_secret(raw: &str) -> Result<String> {

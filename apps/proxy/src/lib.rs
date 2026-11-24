@@ -596,6 +596,7 @@ impl Proxy {
             }
             entry.replace_access(updated.access);
             entry.replace_refresh(updated.refresh);
+            entry.codex_oauth_explicit = updated.codex_oauth_explicit;
             entry.expires = updated.expires;
             entry.source_fingerprint = updated.source_fingerprint;
             return Ok(entry.clone());
