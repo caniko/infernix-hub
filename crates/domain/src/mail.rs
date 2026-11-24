@@ -8,6 +8,13 @@ use uuid::Uuid;
 use crate::mail_bi::{CLASSES, analyze_message, bounded_body, bounded_snippet, executive_digest, sender_domain};
 use crate::{Actor, DResult, DomainError, Hub, decode, decode_one, invalid};
 
+pub struct MailSyncState<'a> {
+    pub status: &'a str,
+    pub cursor: Option<&'a Value>,
+    /// A sanitized error, never a provider response or credential.
+    pub error: Option<&'a str>,
+}
+
 // `owner` is always resolved before constructing a user query. Composite
 // foreign keys also prevent mismatched ownership from being persisted.
 const MESSAGE_SUMMARY: &str = "
@@ -124,18 +131,16 @@ impl Hub {
         Ok(())
     }
 
-    /// Store only a sanitized error string, never a provider response or credential.
     pub async fn update_mail_account_sync_state(
         &self,
         actor: &Actor,
         owner: &str,
         id: Uuid,
         token: Uuid,
-        status: &str,
-        cursor: Option<&Value>,
-        error: Option<&str>,
+        state: MailSyncState<'_>,
     ) -> DResult<MailAccount> {
         let owner = Self::sync_owner(actor, owner)?;
+        let MailSyncState { status, cursor, error } = state;
         if !matches!(status, "idle" | "ok" | "awaiting_credentials" | "error" | "disabled") {
             return Err(invalid("mail_sync_status", "invalid account sync status"));
         }
@@ -236,10 +241,10 @@ impl Hub {
         if !enabled {
             return Err(crate::conflict("mail_account_disabled", "mail account is disabled"));
         }
-        if let Some(token) = token {
-            if !lease_valid || held.as_deref() != Some(token.to_string().as_str()) {
-                return Err(crate::conflict("mail_sync_lease", "mail sync lease is no longer held"));
-            }
+        if let Some(token) = token
+            && (!lease_valid || held.as_deref() != Some(token.to_string().as_str()))
+        {
+            return Err(crate::conflict("mail_sync_lease", "mail sync lease is no longer held"));
         }
         let mut inserted = 0;
         let mut junk = 0;

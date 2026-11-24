@@ -4,66 +4,6 @@ use chrono::{DateTime, Utc};
 use contracts::{MailAnalysisView, MailBiOverview, MailEntities, MailMessageIn, MonetaryAmount};
 use std::fmt::Write;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transactional_mail_is_signal_even_from_a_bulk_no_reply_sender() {
-        let mut message = MailMessageIn {
-            from_addr: "no-reply@billing.example.com".into(),
-            from_name: " Example Services ".into(),
-            subject: "Invoice INV-104".into(),
-            body_text: "Total €1.234,56. Please pay by 2026-12-03.\nPrevious credit $12.50.".into(),
-            ..Default::default()
-        };
-        message.raw_headers.insert("Precedence".into(), "bulk".into());
-        message.raw_headers.insert("List-Unsubscribe".into(), "<mailto:unsubscribe@example.com>".into());
-        let analysis = analyze_message(&message, DateTime::UNIX_EPOCH);
-        assert_eq!(analysis.classification, "invoice");
-        assert!(!analysis.is_junk);
-        assert_eq!(analysis.entities.vendor.as_deref(), Some("example services"));
-        assert_eq!(analysis.entities.invoice_ids, ["INV-104"]);
-        assert_eq!(analysis.entities.deadlines, ["2026-12-03"]);
-        assert_eq!(
-            analysis.entities.amounts.iter().map(|a| (a.amount.as_str(), a.currency.as_str())).collect::<Vec<_>>(),
-            [("1234.56", "EUR"), ("12.50", "USD")]
-        );
-        assert_eq!(analysis.action_items, ["Please pay by 2026-12-03."]);
-        message.subject = "Your receipt".into();
-        assert_eq!(analyze_message(&message, DateTime::UNIX_EPOCH).classification, "receipt");
-    }
-
-    #[test]
-    fn separates_newsletter_spam_and_action_requests() {
-        let mut message = MailMessageIn {
-            subject: "Weekly newsletter".into(),
-            from_addr: "newsletter@example.org".into(),
-            body_text: "Unsubscribe at any time.".into(),
-            ..Default::default()
-        };
-        message.raw_headers.insert("list-unsubscribe".into(), "present".into());
-        let analysis = analyze_message(&message, DateTime::UNIX_EPOCH);
-        assert!(analysis.is_junk && (0.65..=1.).contains(&analysis.junk_score));
-        assert_eq!(analysis.classification, "newsletter");
-        message.raw_headers.insert("X-Spam-Flag".into(), "YES".into());
-        assert_eq!(analyze_message(&message, DateTime::UNIX_EPOCH).classification, "junk");
-        let action = analyze_message(
-            &MailMessageIn { subject: "Approval needed".into(), body_text: "Please approve the proposal.".into(), ..Default::default() },
-            DateTime::UNIX_EPOCH,
-        );
-        assert_eq!(action.classification, "action_required");
-        assert!(!action.is_junk);
-    }
-
-    #[test]
-    fn truncation_respects_utf8_and_counts_snippet_characters() {
-        let text = "€".repeat(BODY_LIMIT / 3 + 10);
-        assert_eq!(bounded_body(&text).len(), BODY_LIMIT - BODY_LIMIT % 3);
-        assert_eq!(bounded_snippet("", &text).chars().count(), 300);
-    }
-}
-
 const BODY_LIMIT: usize = 256 * 1024;
 
 pub(crate) fn bounded_body(body: &str) -> &str {
@@ -364,4 +304,64 @@ pub fn executive_digest(overview: &MailBiOverview) -> String {
         let _ = writeln!(output, "- {}: {} messages", literal(&domain.key), domain.message_count);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transactional_mail_is_signal_even_from_a_bulk_no_reply_sender() {
+        let mut message = MailMessageIn {
+            from_addr: "no-reply@billing.example.com".into(),
+            from_name: " Example Services ".into(),
+            subject: "Invoice INV-104".into(),
+            body_text: "Total €1.234,56. Please pay by 2026-12-03.\nPrevious credit $12.50.".into(),
+            ..Default::default()
+        };
+        message.raw_headers.insert("Precedence".into(), "bulk".into());
+        message.raw_headers.insert("List-Unsubscribe".into(), "<mailto:unsubscribe@example.com>".into());
+        let analysis = analyze_message(&message, DateTime::UNIX_EPOCH);
+        assert_eq!(analysis.classification, "invoice");
+        assert!(!analysis.is_junk);
+        assert_eq!(analysis.entities.vendor.as_deref(), Some("example services"));
+        assert_eq!(analysis.entities.invoice_ids, ["INV-104"]);
+        assert_eq!(analysis.entities.deadlines, ["2026-12-03"]);
+        assert_eq!(
+            analysis.entities.amounts.iter().map(|a| (a.amount.as_str(), a.currency.as_str())).collect::<Vec<_>>(),
+            [("1234.56", "EUR"), ("12.50", "USD")]
+        );
+        assert_eq!(analysis.action_items, ["Please pay by 2026-12-03."]);
+        message.subject = "Your receipt".into();
+        assert_eq!(analyze_message(&message, DateTime::UNIX_EPOCH).classification, "receipt");
+    }
+
+    #[test]
+    fn separates_newsletter_spam_and_action_requests() {
+        let mut message = MailMessageIn {
+            subject: "Weekly newsletter".into(),
+            from_addr: "newsletter@example.org".into(),
+            body_text: "Unsubscribe at any time.".into(),
+            ..Default::default()
+        };
+        message.raw_headers.insert("list-unsubscribe".into(), "present".into());
+        let analysis = analyze_message(&message, DateTime::UNIX_EPOCH);
+        assert!(analysis.is_junk && (0.65..=1.).contains(&analysis.junk_score));
+        assert_eq!(analysis.classification, "newsletter");
+        message.raw_headers.insert("X-Spam-Flag".into(), "YES".into());
+        assert_eq!(analyze_message(&message, DateTime::UNIX_EPOCH).classification, "junk");
+        let action = analyze_message(
+            &MailMessageIn { subject: "Approval needed".into(), body_text: "Please approve the proposal.".into(), ..Default::default() },
+            DateTime::UNIX_EPOCH,
+        );
+        assert_eq!(action.classification, "action_required");
+        assert!(!action.is_junk);
+    }
+
+    #[test]
+    fn truncation_respects_utf8_and_counts_snippet_characters() {
+        let text = "€".repeat(BODY_LIMIT / 3 + 10);
+        assert_eq!(bounded_body(&text).len(), BODY_LIMIT - BODY_LIMIT % 3);
+        assert_eq!(bounded_snippet("", &text).chars().count(), 300);
+    }
 }

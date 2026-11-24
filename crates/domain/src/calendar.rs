@@ -7,58 +7,6 @@ use uuid::Uuid;
 
 use crate::{Actor, DResult, DomainError, Hub, conflict, decode, decode_one, invalid};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn time(iso: &str) -> DateTime<Utc> {
-        iso.parse().unwrap()
-    }
-
-    fn occurrences(start: &str, rule: &str, from: &str, to: &str) -> Vec<DateTime<Utc>> {
-        let start = time(start);
-        let rule = Rule::parse(rule).unwrap();
-        rule.starts(start, TimeDelta::hours(1), time(from), time(to)).unwrap()
-    }
-
-    #[test]
-    fn recurrence_respects_frequency_interval_window_and_count() {
-        let start = "2026-01-01T10:00:00Z";
-        let from = "2026-01-03T10:30:00Z"; // Overlaps the first occurrence in the window.
-        let to = "2026-02-01T10:00:00Z";
-        assert_eq!(
-            occurrences(start, "FREQ=DAILY;INTERVAL=2;COUNT=3", from, to),
-            [time("2026-01-03T10:00:00Z"), time("2026-01-05T10:00:00Z")]
-        );
-        assert_eq!(
-            occurrences(start, "RRULE:FREQ=WEEKLY;UNTIL=20260115T100000Z", from, to),
-            [time("2026-01-08T10:00:00Z"), time("2026-01-15T10:00:00Z")]
-        );
-    }
-
-    #[test]
-    fn recurrence_skips_invalid_month_days_and_leap_years_without_drift() {
-        assert_eq!(
-            occurrences("2026-01-31T10:00:00Z", "FREQ=MONTHLY;COUNT=3", "2026-02-01T00:00:00Z", "2026-06-01T00:00:00Z"),
-            [time("2026-03-31T10:00:00Z"), time("2026-05-31T10:00:00Z")]
-        );
-        assert_eq!(
-            occurrences("2024-02-29T10:00:00Z", "FREQ=YEARLY;COUNT=2", "2025-01-01T00:00:00Z", "2029-01-01T00:00:00Z"),
-            [time("2028-02-29T10:00:00Z")]
-        );
-    }
-
-    #[test]
-    fn recurrence_jumps_to_recent_window_and_ignores_unsupported_rules() {
-        assert_eq!(
-            occurrences("1900-01-01T10:00:00Z", "FREQ=DAILY", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
-            [time("2026-01-01T10:00:00Z")]
-        );
-        assert!(Rule::parse("FREQ=DAILY;INTERVAL=0").is_none());
-        assert!(Rule::parse("FREQ=MONTHLY;BYDAY=-1FR").is_none());
-    }
-}
-
 impl Hub {
     pub async fn upsert_calendar_source_system(&self, actor: &Actor, owner: &str, input: &CalendarSourceUpsert) -> DResult<CalendarSource> {
         let owner = Self::sync_owner(actor, owner)?;
@@ -165,7 +113,7 @@ impl Hub {
         .bind(owner)
         .bind(id)
         .bind(visibility)
-        .bind(&payload)
+        .bind(payload)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -175,7 +123,7 @@ impl Hub {
         )
         .bind(owner)
         .bind(id)
-        .bind(&payload)
+        .bind(payload)
         .execute(&mut *tx)
         .await?;
         let (event_count, last_sync_at) = sqlx::query_as(
@@ -439,5 +387,57 @@ impl<'a> Rule<'a> {
             }
         }
         Err(too_many_events())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn time(iso: &str) -> DateTime<Utc> {
+        iso.parse().unwrap()
+    }
+
+    fn occurrences(start: &str, rule: &str, from: &str, to: &str) -> Vec<DateTime<Utc>> {
+        let start = time(start);
+        let rule = Rule::parse(rule).unwrap();
+        rule.starts(start, TimeDelta::hours(1), time(from), time(to)).unwrap()
+    }
+
+    #[test]
+    fn recurrence_respects_frequency_interval_window_and_count() {
+        let start = "2026-01-01T10:00:00Z";
+        let from = "2026-01-03T10:30:00Z"; // Overlaps the first occurrence in the window.
+        let to = "2026-02-01T10:00:00Z";
+        assert_eq!(
+            occurrences(start, "FREQ=DAILY;INTERVAL=2;COUNT=3", from, to),
+            [time("2026-01-03T10:00:00Z"), time("2026-01-05T10:00:00Z")]
+        );
+        assert_eq!(
+            occurrences(start, "RRULE:FREQ=WEEKLY;UNTIL=20260115T100000Z", from, to),
+            [time("2026-01-08T10:00:00Z"), time("2026-01-15T10:00:00Z")]
+        );
+    }
+
+    #[test]
+    fn recurrence_skips_invalid_month_days_and_leap_years_without_drift() {
+        assert_eq!(
+            occurrences("2026-01-31T10:00:00Z", "FREQ=MONTHLY;COUNT=3", "2026-02-01T00:00:00Z", "2026-06-01T00:00:00Z"),
+            [time("2026-03-31T10:00:00Z"), time("2026-05-31T10:00:00Z")]
+        );
+        assert_eq!(
+            occurrences("2024-02-29T10:00:00Z", "FREQ=YEARLY;COUNT=2", "2025-01-01T00:00:00Z", "2029-01-01T00:00:00Z"),
+            [time("2028-02-29T10:00:00Z")]
+        );
+    }
+
+    #[test]
+    fn recurrence_jumps_to_recent_window_and_ignores_unsupported_rules() {
+        assert_eq!(
+            occurrences("1900-01-01T10:00:00Z", "FREQ=DAILY", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+            [time("2026-01-01T10:00:00Z")]
+        );
+        assert!(Rule::parse("FREQ=DAILY;INTERVAL=0").is_none());
+        assert!(Rule::parse("FREQ=MONTHLY;BYDAY=-1FR").is_none());
     }
 }

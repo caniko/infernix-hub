@@ -17,7 +17,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use contracts::*;
-use domain::{Actor, DResult, DomainError, Hub};
+use domain::{Actor, DResult, DomainError, Hub, mail::MailSyncState};
 use integrations::{
     calendar_sync::{self, Auth, Snapshot},
     imap_sync::{self, Connection, TlsMode},
@@ -293,7 +293,9 @@ impl Runtime {
             Ok(Err(error)) => ("error", None, Some(error)),
             Err(_) => ("error", None, Some("mail sync timed out")),
         };
-        let updated = hub.update_mail_account_sync_state(actor, owner, account.id, lease, status, cursor.as_ref(), error).await;
+        let updated = hub
+            .update_mail_account_sync_state(actor, owner, account.id, lease, MailSyncState { status, cursor: cursor.as_ref(), error })
+            .await;
         let released = hub.release_mail_sync_lease(actor, owner, account.id, lease).await;
         updated?;
         released
@@ -611,10 +613,10 @@ async fn generate_digest(State(state): State<AppState>, Caller(actor): Caller, b
     })?;
     let kind = body.period_kind.as_deref().unwrap_or("weekly");
     let digest = state.hub.create_mail_bi_digest(&actor, kind, from, to).await.map_err(err(&actor))?;
-    if let Some(llm) = state.mail_calendar.llm() {
-        if let Ok(summary) = local_llm_bi::digest(&state.mail_calendar.client, &llm.base_url, &llm.model, &digest.summary_markdown).await {
-            return call!(actor, state.hub.summarize_mail_bi_digest(&actor, digest.id, &llm.model, &summary));
-        }
+    if let Some(llm) = state.mail_calendar.llm()
+        && let Ok(summary) = local_llm_bi::digest(&state.mail_calendar.client, &llm.base_url, &llm.model, &digest.summary_markdown).await
+    {
+        return call!(actor, state.hub.summarize_mail_bi_digest(&actor, digest.id, &llm.model, &summary));
     }
     Ok(Json(digest))
 }

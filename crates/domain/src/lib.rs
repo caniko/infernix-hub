@@ -170,26 +170,6 @@ pub const OPERATOR_OR_PROCEDURE: &[Role] = &[Role::Operator, Role::Procedure];
 /// Collectors authenticate per `(host, unix_user)` for telemetry and operation receipts.
 pub const OPERATOR_OR_COLLECTOR: &[Role] = &[Role::Operator, Role::Collector];
 
-#[cfg(test)]
-mod owner_tests {
-    use super::*;
-
-    #[test]
-    fn owner_mapping_is_fail_closed_when_configured_even_for_procedures() {
-        let procedure = Actor::system();
-        let mut user = procedure.clone();
-        user.principal.name = "alice-login".into();
-        user.principal.role = Role::Operator;
-        let mut config = HubConfig::default();
-        assert_eq!(config.resolve_owner(&user).unwrap(), "alice-login");
-        config.principal_owners.insert("alice-login".into(), "alice".into());
-        assert_eq!(config.resolve_owner(&user).unwrap(), "alice");
-        assert!(matches!(config.resolve_owner(&procedure), Err(DomainError::Forbidden(_))));
-        assert!(matches!(Hub::sync_owner(&user, "alice"), Err(DomainError::Forbidden(_))));
-        assert_eq!(Hub::sync_owner(&procedure, "alice").unwrap(), "alice");
-    }
-}
-
 impl HubConfig {
     fn resolve_owner(&self, actor: &Actor) -> DResult<String> {
         let name = &actor.principal.name;
@@ -296,4 +276,24 @@ pub async fn applied_migrations(db: &PgPool) -> DResult<Vec<i64>> {
         vec![]
     };
     Ok(applied)
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    #[test]
+    fn owner_mapping_is_fail_closed_when_configured_even_for_procedures() {
+        let procedure = Actor::system();
+        let mut user = procedure.clone();
+        user.principal.name = "alice-login".into();
+        user.principal.role = Role::Operator;
+        let mut config = HubConfig::default();
+        assert_eq!(config.resolve_owner(&user).unwrap(), "alice-login");
+        config.principal_owners.insert("alice-login".into(), "alice".into());
+        assert_eq!(config.resolve_owner(&user).unwrap(), "alice");
+        assert!(matches!(config.resolve_owner(&procedure), Err(DomainError::Forbidden(_))));
+        assert!(matches!(Hub::sync_owner(&user, "alice"), Err(DomainError::Forbidden(_))));
+        assert_eq!(Hub::sync_owner(&procedure, "alice").unwrap(), "alice");
+    }
 }

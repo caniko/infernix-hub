@@ -7,6 +7,7 @@ use sqlx::postgres::PgConnectOptions;
 use uuid::Uuid;
 
 use super::*;
+use crate::mail::MailSyncState;
 use crate::ports::*;
 
 struct Unused;
@@ -126,7 +127,9 @@ async fn mail_calendar_postgres() {
     assert!(hub.acquire_mail_sync_lease(&system, "alice", account.id, 60).await.unwrap().is_none());
     assert_eq!(hub.ingest_mail_messages_system(&system, "alice", mail_lease, &request).await.unwrap().inserted, 2);
     assert_eq!(hub.ingest_mail_messages(&alice, &request).await.unwrap().duplicates, 2);
-    hub.update_mail_account_sync_state(&system, "alice", account.id, mail_lease, "ok", None, None).await.unwrap();
+    hub.update_mail_account_sync_state(&system, "alice", account.id, mail_lease, MailSyncState { status: "ok", cursor: None, error: None })
+        .await
+        .unwrap();
     hub.release_mail_sync_lease(&system, "alice", account.id, mail_lease).await.unwrap();
     let search = MailSearchQuery { q: Some("INV-104".into()), ..Default::default() };
     let messages = hub.list_mail_messages(&alice, &search).await.unwrap();
