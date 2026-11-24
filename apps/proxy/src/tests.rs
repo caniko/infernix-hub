@@ -5823,6 +5823,34 @@ fn provenance_discovery_keeps_distinct_refresh_tokens_with_shared_access() {
 }
 
 #[test]
+fn provenance_discovery_adopts_refresh_on_access_only_survivor() {
+    let mut pool = Pool::default();
+    let now = Utc::now().timestamp();
+    let enrollment = |refresh, client, secret, expires| {
+        json!({
+            "access_token":"shared-access","refresh_token":refresh,"client_id":client,
+            "client_secret":secret,"expires_at":expires
+        })
+    };
+    pool::add_provenance_google(&mut pool, "a", enrollment(None, "old-client", "old-secret", now + 1800));
+    pool::add_provenance_google(&mut pool, "b", enrollment(Some("refresh-b"), "client-b", "secret-b", now + 3600));
+    pool::add_provenance_google(&mut pool, "c", enrollment(Some("refresh-c"), "client-c", "secret-c", now + 7200));
+
+    assert_eq!(pool.accounts.len(), 2);
+    let a = pool.accounts.values().find(|a| a.label == "a").unwrap();
+    let c = pool.accounts.values().find(|a| a.label == "c").unwrap();
+    assert_eq!(a.access, "shared-access");
+    assert_eq!(a.refresh.as_deref(), Some("refresh-b"));
+    assert_eq!(a.google_client.as_deref(), Some("client-b"));
+    assert_eq!(a.google_secret.as_deref(), Some("secret-b"));
+    assert_eq!(a.expires.unwrap().timestamp(), now + 3600);
+    assert!(c.access.is_empty());
+    assert_eq!(c.refresh.as_deref(), Some("refresh-c"));
+    assert_eq!(c.google_client.as_deref(), Some("client-c"));
+    assert_eq!(c.google_secret.as_deref(), Some("secret-c"));
+}
+
+#[test]
 fn provenance_reload_keeps_distinct_refresh_tokens_without_reusing_quarantined_access() {
     for prior_refresh in ["refresh-a", "old-refresh-a"] {
         let mut pool = Pool::default();

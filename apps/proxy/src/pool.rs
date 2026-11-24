@@ -1202,22 +1202,32 @@ fn add(pool: &mut Pool, lane: Lane, label: &str, mut raw: Value) {
     fields.remove("provider");
     fields.remove("family");
     let name = local_credential_name(lane, label);
-    if let Ok(mut found) = parse_credentials(&name, &raw, true) {
+    if let Ok(found) = parse_credentials(&name, &raw, true) {
         let cutoff = Utc::now() + chrono::TimeDelta::seconds(30);
-        found.retain_mut(|a| {
-            if !a.api_key && matches!(a.lane, Lane::Claude | Lane::Codex) && a.expires.is_some_and(|e| e <= cutoff) {
-                return false;
-            }
-            let mut duplicates = pool.accounts.values().filter(|old| old.id != a.id && old.shares_discovery_token(a)).peekable();
-            if duplicates.peek().is_none() {
-                return true;
-            }
-            if a.lane != Lane::Google || a.api_key || duplicates.any(|old| old.compatible_refresh(a)) {
-                return false;
-            }
-            a.discard_discovered_access();
-            true
-        });
+        let found = found
+            .into_iter()
+            .filter_map(|mut a| {
+                if !a.api_key && matches!(a.lane, Lane::Claude | Lane::Codex) && a.expires.is_some_and(|e| e <= cutoff) {
+                    return None;
+                }
+                let mut duplicates = pool.accounts.values_mut().filter(|old| old.id != a.id && old.shares_discovery_token(&a)).peekable();
+                if duplicates.peek().is_none() {
+                    return Some(a);
+                }
+                if a.lane != Lane::Google || a.api_key {
+                    return None;
+                }
+                if let Some(survivor) = duplicates.find(|old| old.compatible_refresh(&a)) {
+                    if !survivor.api_key && survivor.refresh.is_none() && a.refresh.is_some() {
+                        merge_google_duplicate(survivor, a, false, false);
+                        pool.revision += 1;
+                    }
+                    return None;
+                }
+                a.discard_discovered_access();
+                Some(a)
+            })
+            .collect();
         pool.insert(found);
     }
 }

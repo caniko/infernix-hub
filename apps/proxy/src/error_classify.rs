@@ -83,12 +83,7 @@ pub(crate) fn classify_upstream_http_error(
     let body = String::from_utf8_lossy(body);
     let html = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/html"))
         || body.trim_start().starts_with('<');
-    let status = Some(status.as_u16());
-    let error = classify(lane, status, &raw, &body, html, source, secrets);
-    if error.is_none() && lane == Lane::Google && raw.is_array() {
-        return classify(lane, status, &Value::Null, "", html, source, secrets);
-    }
-    error
+    classify(lane, Some(status.as_u16()), &raw, &body, html, source, secrets)
 }
 
 pub(crate) fn classify_oauth_error(lane: Lane, status: StatusCode, body: &[u8], secrets: &[&str]) -> AccountError {
@@ -118,6 +113,33 @@ fn numeric_code(error: &Value) -> Option<u16> {
     error.get("code").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok())
 }
 
+// The outer Option records whether the array contained a structured error at all.
+fn google_array_error(
+    items: &[Value],
+    status: Option<u16>,
+    html: bool,
+    source: AccountErrorSource,
+    secrets: &[&str],
+) -> Option<Option<AccountError>> {
+    items
+        .iter()
+        .filter_map(|item| {
+            if let Some(items) = item.as_array() {
+                return google_array_error(items, status, html, source, secrets);
+            }
+            let wrapped = item.get("error").or_else(|| item.pointer("/response/error"));
+            let code = numeric_code(wrapped.unwrap_or(item));
+            (wrapped.is_some_and(Value::is_object) || (wrapped.is_none() && code.is_some()))
+                .then(|| classify(Lane::Google, code.or(status), item, "", html, source, secrets))
+        })
+        // A quota entry must not hide an account-level rejection in the same response.
+        .min_by_key(|error| match error {
+            Some(error) if error.kind.is_blocking() => 0,
+            Some(_) => 1,
+            None => 2,
+        })
+}
+
 fn classify(
     lane: Lane,
     status: Option<u16>,
@@ -130,12 +152,8 @@ fn classify(
     if lane == Lane::Google
         && let Some(items) = raw.as_array()
     {
-        // A quota entry must not hide an account-level rejection in the same response.
-        return items
-            .iter()
-            .filter(|item| item.is_object() || item.is_array())
-            .filter_map(|item| classify(lane, numeric_code(error_payload(item)).or(status), item, "", html, source, secrets))
-            .min_by_key(|error| !error.kind.is_blocking());
+        return google_array_error(items, status, html, source, secrets)
+            .unwrap_or_else(|| status.and_then(|_| classify(lane, status, &Value::Null, "", html, source, secrets)));
     }
     let error = error_payload(raw);
     let rpc_status = (lane == Lane::Google).then(|| text(error, &["status"])).flatten();
@@ -435,6 +453,17 @@ pub(crate) mod tests {
         for body in ["[]", "[null, [], 42]"] {
             let error = http(Lane::Google, 403, body, Inference).unwrap();
             assert_eq!((error.kind, error.http_status), (PermissionDenied, Some(403)));
+        }
+    }
+
+    #[test]
+    fn google_array_client_error_overrides_forbidden_http_status() {
+        let error = http(Lane::Google, 403, "[]", Inference).unwrap();
+        assert_eq!(error.kind, PermissionDenied);
+        for body in
+            [r#"[{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]"#, r#"[{},[{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]]"#]
+        {
+            assert!(http(Lane::Google, 403, body, Inference).is_none(), "{body}");
         }
     }
 
