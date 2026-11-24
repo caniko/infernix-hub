@@ -220,6 +220,53 @@ fn OverviewBoard(
     let unpriced = report.unpriced_models.join(", ");
     let hit_rate = effective_cache_hit_rate(report.input_tokens, report.cache_read_tokens, report.cache_hit_rate);
     let hit_pct = fmt_hit_pct(hit_rate);
+    let visible = rows.iter().filter(|tile| tile.visible);
+    let featured = default_layout && visible.clone().take(4).map(|tile| tile.kind.as_str()).eq(["trend", "cache", "heatmap", "rhythm"]);
+    let mut tiles = visible.map(|tile| {
+        let metric = Metric::parse(&tile.metric);
+        rsx! {
+            article { key: "{tile.id}", class: "glass-card stack activity-span-{tile.span.clamp(1, 3)}", "data-tile": "{tile.kind}",
+                div { class: "row activity-tile-header",
+                    h2 { "{tile_name(&tile.kind)}" }
+                    if matches!(tile.kind.as_str(), "trend" | "cache")
+                        && let Some(label) = bucket_badge(report.bucket_seconds) {
+                        Chip { label: label.to_string(), tone: Some("amber".to_string()) }
+                    }
+                }
+                {match tile.kind.as_str() {
+                    "trend" => rsx! { ActivityTrendChart { points: report.trend.clone(), metric, bucket_seconds: report.bucket_seconds } },
+                    "heatmap" => rsx! { ActivityHeatmap { cells: report.heatmap.clone(), metric, covered_weekdays: report.covered_weekdays.clone() } },
+                    "rhythm" => rsx! { ActivityRhythmChart { points: report.rhythm.clone(), metric } },
+                    "cache" => rsx! {
+                        CacheHitRateChart { points: report.trend.clone(), bucket_seconds: report.bucket_seconds }
+                        div { class: "cache-summary stack",
+                            div { class: "row cache-summary-head",
+                                strong { class: "mono", "{hit_pct} cache hit rate" }
+                                span { class: "muted", "{usd(report.cache_savings_usd)} estimated savings" }
+                            }
+                            svg { class: "quota-meter cache-meter", view_box: "0 0 100 6", preserve_aspect_ratio: "none", "aria-hidden": "true",
+                                rect { width: "100", height: "6", rx: "3", class: "quota-track" }
+                                if let Some(rate) = hit_rate {
+                                    rect { width: "{rate * 100.0:.2}", height: "6", rx: "3", class: "cache-meter-fill" }
+                                }
+                            }
+                            p { class: "muted",
+                                "{fmt_count(report.cache_read_tokens)} read · {fmt_count(report.cache_write_tokens)} write · "
+                                span { class: "nowrap-unit", "{fmt_count(report.input_tokens.saturating_sub(report.cache_read_tokens))} uncached input" }
+                            }
+                        }
+                    },
+                    "models" => breakdown("Models", &report.by_model),
+                    "accounts" => breakdown("Accounts", &report.by_account),
+                    "clients" => breakdown("Clients", &report.by_client),
+                    "model_effort" => breakdown("Model / Effort", &report.by_model_effort),
+                    "compare" => rsx! { button { class: "btn btn-glass", onclick: move |_| on_compare.call(()), "Open model / effort comparison" } },
+                    _ => rsx! { p { class: "muted", "This tile is not supported by this desktop build." } },
+                }}
+            }
+        }
+    });
+    let featured_tiles: Vec<_> = tiles.by_ref().take(if featured { 4 } else { 0 }).collect();
     rsx! {
         div { class: "row",
             h2 { "Activity overview" }
@@ -272,50 +319,10 @@ fn OverviewBoard(
             }
         }
         div { class: "activity-board", "data-default-layout": if default_layout { "true" } else { "false" },
-            for tile in rows.iter().filter(|tile| tile.visible) {
-                article { key: "{tile.id}", class: "glass-card stack activity-span-{tile.span.clamp(1, 3)}", "data-tile": "{tile.kind}",
-                    div { class: "row activity-tile-header",
-                        h2 { "{tile_name(&tile.kind)}" }
-                        if matches!(tile.kind.as_str(), "trend" | "cache")
-                            && let Some(label) = bucket_badge(report.bucket_seconds) {
-                            Chip { label: label.to_string(), tone: Some("amber".to_string()) }
-                        }
-                    }
-                    {
-                        let metric = Metric::parse(&tile.metric);
-                        match tile.kind.as_str() {
-                            "trend" => rsx! { ActivityTrendChart { points: report.trend.clone(), metric, bucket_seconds: report.bucket_seconds } },
-                            "heatmap" => rsx! { ActivityHeatmap { cells: report.heatmap.clone(), metric, covered_weekdays: report.covered_weekdays.clone() } },
-                             "rhythm" => rsx! { ActivityRhythmChart { points: report.rhythm.clone(), metric } },
-                             "cache" => rsx! {
-                                 CacheHitRateChart { points: report.trend.clone(), bucket_seconds: report.bucket_seconds }
-                                 div { class: "cache-summary stack",
-                                    div { class: "row cache-summary-head",
-                                        strong { class: "mono", "{hit_pct} cache hit rate" }
-                                        span { class: "muted", "{usd(report.cache_savings_usd)} estimated savings" }
-                                    }
-                                    svg { class: "quota-meter cache-meter", view_box: "0 0 100 6", preserve_aspect_ratio: "none", "aria-hidden": "true",
-                                        rect { width: "100", height: "6", rx: "3", class: "quota-track" }
-                                        if let Some(rate) = hit_rate {
-                                            rect { width: "{rate * 100.0:.2}", height: "6", rx: "3", class: "cache-meter-fill" }
-                                        }
-                                    }
-                                    p { class: "muted",
-                                         "{fmt_count(report.cache_read_tokens)} read · {fmt_count(report.cache_write_tokens)} write · "
-                                         span { class: "nowrap-unit", "{fmt_count(report.input_tokens.saturating_sub(report.cache_read_tokens))} uncached input" }
-                                    }
-                                }
-                            },
-                            "models" => breakdown("Models", &report.by_model),
-                            "accounts" => breakdown("Accounts", &report.by_account),
-                            "clients" => breakdown("Clients", &report.by_client),
-                            "model_effort" => breakdown("Model / Effort", &report.by_model_effort),
-                            "compare" => rsx! { button { class: "btn btn-glass", onclick: move |_| on_compare.call(()), "Open model / effort comparison" } },
-                            _ => rsx! { p { class: "muted", "This tile is not supported by this desktop build." } },
-                        }
-                    }
-                }
+            if featured {
+                div { class: "activity-featured", for tile in featured_tiles { {tile} } }
             }
+            for tile in tiles { {tile} }
         }
         details { summary { "Traffic coverage, pricing and retention" }
             p { class: "form-help", "{fmt_count(report.matched_proxy_requests)} matched proxy · {fmt_count(report.bypassed_local_requests)} bypassed local" }

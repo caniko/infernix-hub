@@ -1335,7 +1335,7 @@ fn InteractiveBars(
     let mut hovered = use_signal(|| None::<usize>);
     let measure = use_time_plot_measure();
     let width = (measure.width)().max(100.0);
-    let plot = activity_plot(width);
+    let plot = TimePlotBox { bottom: if rhythm { 118.0 } else { 146.0 }, ..activity_plot(width) };
     let (plot_left, plot_bottom) = (plot.left, plot.bottom);
     let count = items.len();
     let step = (plot.right - plot_left) / count.max(1) as f64;
@@ -1880,7 +1880,7 @@ pub(super) fn DriftBandChart(days: Vec<DriftDayPoint>, markers: Vec<DriftMarker>
                             let cy = y(peak);
                             let align_right = cx > (plot.left + plot.right) / 2.0;
                             let label_x = if align_right { cx - 6.0 } else { cx + 6.0 };
-                            let label_y = if cy < plot.top + 14.0 { cy + 13.0 } else { cy - 6.0 };
+                            let label_y = cy - 6.0;
                             rsx! { text { class: "activity-peak-label", pointer_events: "none", x: "{label_x}", y: "{label_y}",
                                 text_anchor: if align_right { "end" } else { "start" }, "Peak {peak:.1}" } }
                         }

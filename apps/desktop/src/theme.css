@@ -1053,7 +1053,8 @@ select.input option { background: var(--card); color: var(--text); }
 .quota-readout li small { grid-column: 2 / -1; color: var(--text-muted); }
 .quota-readout li small.quota-risk { color: var(--bad); }
 .activity-board { display: grid; align-items: start; gap: 12px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.activity-board > * { min-width: 0; }
+.activity-board > *, .activity-featured > * { min-width: 0; }
+.activity-featured { display: contents; }
 .activity-span-2 { grid-column: span 2; }
 .activity-span-3 { grid-column: span 3; }
 .activity-tile-header { justify-content: space-between; }
@@ -1065,7 +1066,7 @@ select.input option { background: var(--card); color: var(--text); }
 .provider-chart .activity-plot text { font-size: 11px; }
 .activity-peak { color: var(--focus); font-size: 11px; }
 .provider-chart .activity-peak-label { fill: var(--focus); paint-order: stroke; stroke: var(--panel); stroke-width: 3px; }
-.chart-inspect { margin-inline-start: auto; white-space: nowrap; }
+.chart-inspect { margin-inline-start: auto; font-size: 11px; white-space: nowrap; }
 .activity-bar { fill: color-mix(in srgb, var(--honey) 62%, var(--elevated)); }
 .activity-bar.peak { fill: var(--focus); }
 .activity-volume-bar { fill: var(--honey); opacity: .48; }
@@ -1119,12 +1120,23 @@ select.input option { background: var(--card); color: var(--text); }
 .provider-logs p { font-size: 12px; }
 .provider-trace { list-style: none; margin: 0; padding: 0; }
 .provider-trace li { padding: 8px; border-left: 2px solid var(--border); margin-block: 6px; background: var(--panel); }
+@media (min-width: 1101px) {
+  /* Stack the default chart pairs independently without changing their narrow or keyboard order. */
+  .activity-featured { display: flow-root; grid-column: 1 / -1; }
+  .activity-featured > :is([data-tile="trend"], [data-tile="heatmap"]) {
+    float: left; clear: left; width: calc((200% - 12px) / 3);
+  }
+  .activity-featured > :is([data-tile="cache"], [data-tile="rhythm"]) {
+    float: right; clear: right; width: calc((100% - 24px) / 3);
+  }
+  .activity-featured > :is([data-tile="trend"], [data-tile="cache"]) { margin-block-end: 12px; }
+}
 @media (max-width: 1100px) {
   .activity-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .activity-span-3 { grid-column: span 2; }
 }
 @media (min-width: 961px) and (max-width: 1100px) {
-  .activity-board[data-default-layout="true"] > [data-tile="trend"] { grid-column: span 1; }
+  .activity-board[data-default-layout="true"] [data-tile="trend"] { grid-column: span 1; }
 }
 @media (max-width: 960px) {
   .activity-board { grid-template-columns: 1fr; }
