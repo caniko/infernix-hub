@@ -1322,6 +1322,16 @@ mod tests {
     }
 
     #[test]
+    fn routing_policy_defaults_to_switching_on_server_error() {
+        let omitted = serde_json::from_str::<providers::RoutingPolicy>("{}").unwrap();
+        assert_eq!(omitted, providers::RoutingPolicy::default());
+        assert!(omitted.switch_on_server_error);
+
+        let explicit = serde_json::from_str::<providers::RoutingPolicy>(r#"{"switch_on_server_error": false}"#).unwrap();
+        assert!(!explicit.switch_on_server_error);
+    }
+
+    #[test]
     fn individual_profile_defaults_and_preserves_bio() {
         let empty: IndividualProfile = serde_json::from_value(json!({})).unwrap();
         assert_eq!(empty, IndividualProfile::default());
