@@ -13,7 +13,7 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use contracts::providers::{
     AccountError, AccountErrorKind, AccountErrorSource, ActivityAttemptIn, ActivityExchangeIn, ActivityPurpose, ActivitySource,
     CaptureState, TraceEdgeKind,
@@ -28,8 +28,10 @@ use crate::{
     config::matches_secret,
     error_classify::{ERROR_BODY_LIMIT, account_secrets, classify_sse_error, classify_upstream_http_error, local_error, safe_label},
     openai_account,
-    pool::{Account, Lane, Pool, model_cooldown_scope, text},
+    pool::{Account, Cooldown, Lane, MAX_COOLDOWN_SECS, Pool, QuotaReader, bounded_identifier, model_cooldown_scope, text},
 };
+
+pub(crate) const POOL_QUOTA_HEADER: &str = "x-fleetix-pool-quota";
 
 pub(crate) fn routes() -> Router<Arc<Proxy>> {
     Router::new()
@@ -77,8 +79,25 @@ fn lane_error(lane: Lane, status: StatusCode, message: &'static str) -> Response
 
 struct RetainedQuota {
     account: Account,
-    until: DateTime<Utc>,
-    reader: Option<tokio::task::JoinHandle<DateTime<Utc>>>,
+    until: Option<DateTime<Utc>>,
+    reader: Option<tokio::task::JoinHandle<Option<DateTime<Utc>>>>,
+}
+
+struct PoolQuota {
+    reset: DateTime<Utc>,
+    verified_reset: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+}
+
+impl PoolQuota {
+    fn unverified(reset: DateTime<Utc>) -> Self {
+        Self { reset, verified_reset: None, now: Utc::now() }
+    }
+}
+
+enum QuotaSnapshot {
+    Ready(PoolQuota),
+    ReadBody(usize, tokio::task::JoinHandle<Option<DateTime<Utc>>>),
 }
 
 #[cfg(test)]
@@ -86,7 +105,7 @@ tokio::task_local! {
     pub(super) static AFTER_FAILOVER_PREVIEW: fn(&mut crate::pool::Pool);
 }
 
-async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response {
+pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let path = parts.uri.path();
     let native = path.starts_with("/backend-api/codex/");
@@ -160,15 +179,15 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
     let model = path_model()
         .or_else(|| text(&raw, &["model", "/request/model"]))
         .map(|m| if lane == Lane::Google { m.strip_prefix("models/").unwrap_or(m) } else { m })
-        .filter(|s| identifier(s))
+        .filter(|s| bounded_identifier(s))
         .unwrap_or_default();
     let effort = text(&raw, &["/reasoning/effort", "reasoning_effort", "/output_config/effort", "effort"])
-        .filter(|s| identifier(s))
+        .filter(|s| bounded_identifier(s))
         .map(str::to_owned);
     let metadata_user: Value = text(&raw, &["/metadata/user_id"]).and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
     let session_id = |s: &str| {
         let digits = s.strip_prefix('-').unwrap_or(s);
-        identifier(s) && (lane != Lane::Google || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()))
+        bounded_identifier(s) && (lane != Lane::Google || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()))
     };
     let session = if lane == Lane::Google {
         extract_google_session(&parts.headers, &raw)
@@ -234,65 +253,74 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
     let previous_session_account = moved_from.as_deref().filter(|_| exchange.session.is_some());
     let mut retained_quota = Vec::new();
     let mut last_decoded_quota_reset = None;
-    let exhausted_reset = async |retained: &mut [RetainedQuota]| {
+    let quota_snapshot = |pool: &Pool, now, retained: &mut [RetainedQuota]| {
+        if lane != Lane::Google {
+            let reset = pool
+                .next_reset(lane, model, required_project, now)
+                .filter(|_| pool.all_quota_limited(lane, model, required_project, now))?;
+            return Some(QuotaSnapshot::Ready(PoolQuota { reset, verified_reset: None, now }));
+        }
+        let live_deadline = |account: &Account| account.quota_limited_until(now, model);
+        let supported = |account: &Account| pool.supports(account, lane, model, required_project) && !account.quarantined(now);
+        let reset = pool
+            .accounts
+            .values()
+            .filter(|account| supported(account))
+            .filter_map(|account| {
+                live_deadline(account).or_else(|| {
+                    retained
+                        .iter()
+                        .find(|quota| quota.account.id == account.id && account.same_credential(&quota.account))
+                        .and_then(|quota| quota.until)
+                })
+            })
+            .min()?;
+        let verified_reset = pool.verified_google_reset_at(model, required_project, now);
+        let pending = retained.iter_mut().enumerate().find_map(|(index, quota)| {
+            let current = pool.accounts.get(&quota.account.id).filter(|a| a.same_credential(&quota.account) && supported(a))?;
+            if live_deadline(current).or(quota.until)? > reset.max(verified_reset.unwrap_or(reset)) {
+                return None;
+            }
+            Some(QuotaSnapshot::ReadBody(index, quota.reader.take()?))
+        });
+        pending.or(Some(QuotaSnapshot::Ready(PoolQuota { reset, verified_reset, now })))
+    };
+    let pick = |pool: &mut Pool, exchange: &Exchange, tried: &[String], now| {
+        pool.pick(lane, (exchange.affinity_key.as_deref(), exchange.parent.as_deref()), model, required_project, tried, now)
+    };
+    let pick_or_quota = async |exchange: &Exchange, tried: &[String], retained: &mut [RetainedQuota]| {
         loop {
-            let (quota, reader) = {
-                let state = proxy.state.read().await;
-                let pool = &state.pool;
-                if lane != Lane::Google {
-                    return pool
-                        .next_reset(lane, model, required_project)
-                        .filter(|_| pool.all_quota_limited(lane, model, required_project));
-                }
+            let snapshot = {
+                let mut state = proxy.state.write().await;
                 let now = Utc::now();
-                let live_deadline = |account: &Account| account.quota_limited_until(now, model);
-                let attempted = |quota: &RetainedQuota| {
-                    pool.accounts
-                        .get(&quota.account.id)
-                        .filter(|current| current.same_credential(&quota.account) && pool.supports(current, lane, model, required_project))
-                };
-                let reset = pool
-                    .accounts
-                    .values()
-                    .filter(|account| pool.supports(account, lane, model, required_project))
-                    .filter_map(|account| {
-                        live_deadline(account).or_else(|| {
-                            retained
-                                .iter()
-                                .find(|quota| quota.account.id == account.id && account.same_credential(&quota.account))
-                                .map(|quota| quota.until)
-                        })
-                    })
-                    .min()?;
-                // Readers can only extend their account's backoff. Recheck after each join.
-                let Some(next) = retained.iter_mut().find_map(|quota| {
-                    let current = attempted(quota)?;
-                    if live_deadline(current).unwrap_or(quota.until) != reset {
-                        return None;
-                    }
-                    let reader = quota.reader.take()?;
-                    Some((quota, reader))
-                }) else {
-                    return Some(reset);
-                };
-                next
+                if let Some(account) = pick(&mut state.pool, exchange, tried, now) {
+                    return (Some(account), None, None);
+                }
+                match quota_snapshot(&state.pool, now, retained) {
+                    Some(snapshot) => snapshot,
+                    None => return (None, None, unavailable_pool(&state.pool, lane, model, required_project, now)),
+                }
             };
-            if let Ok(until) = reader.await {
-                quota.until = until;
+            match snapshot {
+                QuotaSnapshot::ReadBody(index, reader) => {
+                    if let Ok(until) = reader.await {
+                        retained[index].until = until;
+                    }
+                    // Recheck both eligibility and quota after the body settles.
+                }
+                QuotaSnapshot::Ready(quota) => return (None, Some(quota), None),
             }
         }
     };
+    let mut next_account = None;
     loop {
-        let (account, unavailable) = {
-            let mut state = proxy.state.write().await;
-            let account =
-                state.pool.pick(lane, exchange.affinity_key.as_deref(), exchange.parent.as_deref(), model, required_project, &tried);
-            let unavailable = account.is_none().then(|| unavailable_pool(&state.pool, lane, model, required_project)).flatten();
-            (account, unavailable)
+        let (account, quota, unavailable) = match next_account.take() {
+            Some(account) => (Some(account), None, None),
+            None => pick_or_quota(&exchange, &tried, &mut retained_quota).await,
         };
         let Some(mut account) = account else {
-            if let Some(reset) = exhausted_reset(&mut retained_quota).await.or(last_decoded_quota_reset) {
-                return exchange.rate_limited(reset, Usage::default(), None).await;
+            if let Some(quota) = quota.or_else(|| last_decoded_quota_reset.map(PoolQuota::unverified)) {
+                return exchange.rate_limited(quota, Usage::default(), None).await;
             }
             if let Some(response) = unavailable {
                 exchange.finish(Some(StatusCode::SERVICE_UNAVAILABLE), "unavailable", Usage::default(), None, None).await;
@@ -402,7 +430,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                     if timed_out { "first_byte_timeout" } else { "upstream_error" },
                 );
                 exchange.attempt_error(&classified);
-                result(&proxy, &account, model, None, false, started).await;
+                result(&proxy, &account, model, None, false, started, None).await;
                 proxy.report_account_error(&account, &classified).await;
                 exchange.complete_attempt(Usage::default(), None);
                 // Credential preparation failed before any inference request was sent.
@@ -425,6 +453,8 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         let received_at = Utc::now();
         let oauth_unavailable = refresh_error.as_ref().is_some_and(|e| e.kind == AccountErrorKind::UpstreamUnavailable);
         let mut pending_quota_body = None;
+        let mut quota_reader = None;
+        let mut quota_body_verified = None;
         let mut header_reset = None;
         let mut body_reset = None;
         let mut classified = refresh_error;
@@ -440,6 +470,11 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         } else if !status.is_success() {
             let google_quota = lane == Lane::Google && status == StatusCode::TOO_MANY_REQUESTS;
             header_reset = header_cooldown(lane, &headers, received_at);
+            if google_quota {
+                let unverified_until =
+                    header_reset.is_none().then(|| quota_deadline(None, policy.failover_cooldown_secs, received_at).until);
+                quota_reader = begin_google_quota_read(&proxy, &account, model, header_reset, unverified_until, received_at).await;
+            }
             let diagnostic_deadline =
                 if google_quota && header_reset.is_none() { deadline } else { error_prefix_deadline(lane, status, &headers, deadline) };
             let mut prefix = ErrorPrefix::default();
@@ -456,7 +491,9 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                 );
             }
             if google_quota {
-                body_reset = body_reset_hint(diagnostic);
+                let (reset, verified) = prefix.quota_evidence(Utc::now());
+                body_reset = reset;
+                quota_body_verified = Some(verified);
                 if !prefix.finished() && classified.as_ref().is_some_and(|e| e.kind == AccountErrorKind::QuotaExhausted) {
                     pending_quota_body = header_reset.map(|until| (until, std::mem::take(&mut prefix)));
                 }
@@ -464,20 +501,23 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             prelude.first = prefix.chunks;
             prelude.stream_error = prefix.error;
         }
-        let limited = classified.as_ref().is_some_and(|e| e.kind == AccountErrorKind::QuotaExhausted);
+        let mut limited = classified.as_ref().is_some_and(|e| e.kind == AccountErrorKind::QuotaExhausted);
         let decoded_quota_reset = prelude
             .error
             .as_ref()
             .filter(|_| limited)
-            .map(|(error, _)| header_cooldown(lane, &headers, received_at).max(error.reset).unwrap_or(received_at));
+            .map(|(error, _)| quota_hint(lane, &headers, error.reset, received_at).map_or(received_at, |hint| hint.until));
         let cooldown = limited.then(|| {
             if let Some((error, _)) = &prelude.error {
                 header_reset = header_cooldown(lane, &headers, received_at);
                 body_reset = error.reset;
             }
-            quota_deadline(header_reset, body_reset, policy.failover_cooldown_secs, Utc::now())
+            let hint = merge_quota_hints(lane, &headers, header_reset, body_reset);
+            let mut cooldown = quota_deadline(hint, policy.failover_cooldown_secs, Utc::now());
+            cooldown.verified_reset &= quota_body_verified.unwrap_or(true);
+            cooldown
         });
-        let mut quota_until = cooldown.filter(|_| lane == Lane::Google);
+        let mut quota_until = cooldown.filter(|_| lane == Lane::Google).map(|cooldown| cooldown.until);
         let failover = classified.as_ref().is_some_and(|e| {
             e.kind.is_blocking()
                 || limited
@@ -499,8 +539,16 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         );
         if let Some(error) = classified.as_ref() {
             exchange.attempt_error(error);
-            result(&proxy, &account, model, cooldown, false, started).await;
+            let settled = cooldown.filter(|_| pending_quota_body.is_none());
+            let body_read = quota_reader.as_ref().zip(quota_body_verified);
+            result(&proxy, &account, model, settled, false, started, body_read).await;
             proxy.report_account_error(&account, error).await;
+        }
+        if pending_quota_body.is_none() {
+            if !limited && let Some(reader) = quota_reader.as_ref() {
+                discard_google_quota_read(&proxy, &account, reader).await;
+            }
+            drop(quota_reader.take());
         }
         if limited {
             proxy.schedule_usage_refresh(account.id.clone()).await;
@@ -508,11 +556,9 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         if failover {
             let has_next = {
                 let mut state = proxy.state.write().await;
+                let now = Utc::now();
                 // Preview on the real scheduler; retries do not increment the round-robin cursor.
-                let has_next = state
-                    .pool
-                    .pick(lane, exchange.affinity_key.as_deref(), exchange.parent.as_deref(), model, required_project, &tried)
-                    .is_some();
+                let has_next = pick(&mut state.pool, &exchange, &tried, now).is_some();
                 #[cfg(test)]
                 if has_next {
                     let _ = AFTER_FAILOVER_PREVIEW.try_with(|hook| hook(&mut state.pool));
@@ -527,13 +573,14 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
                     let account = account.clone();
                     tokio::spawn(async move {
                         body.read(&mut response, deadline, true).await;
-                        let reset = body_reset_hint(body.diagnostic()).filter(|until| *until > header_until);
-                        extend_quota(&proxy, &account, &model, reset).await;
-                        header_until.max(reset.unwrap_or(header_until))
+                        body.settle_google_quota(&proxy, &account, &model, &headers, header_until, quota_reader)
+                            .await
+                            .ok()
+                            .map(|cooldown| cooldown.until)
                     })
                 });
                 if let Some(until) = quota_until {
-                    retained_quota.push(RetainedQuota { account, until, reader });
+                    retained_quota.push(RetainedQuota { account, until: Some(until), reader });
                 }
                 exchange.complete_attempt(prelude.usage, Some(millis(began.elapsed())));
                 proxy.log("warn", "upstream request failed over").await;
@@ -541,22 +588,35 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
             }
             if let Some((header_until, mut body)) = pending_quota_body {
                 body.read(&mut response, deadline, true).await;
-                let reset = body_reset_hint(body.diagnostic()).filter(|until| *until > header_until);
-                extend_quota(&proxy, &account, model, reset).await;
-                quota_until = Some(header_until.max(reset.unwrap_or(header_until)));
+                match body.settle_google_quota(&proxy, &account, model, &headers, header_until, quota_reader).await {
+                    Ok(cooldown) => quota_until = Some(cooldown.until),
+                    Err(error) => {
+                        limited = false;
+                        quota_until = None;
+                        exchange.attempt_error(&error);
+                        classified = Some(*error);
+                    }
+                }
                 prelude.first = body.chunks;
                 prelude.stream_error = body.error;
             }
             if let Some(until) = quota_until {
-                retained_quota.push(RetainedQuota { account: account.clone(), until, reader: None });
+                retained_quota.push(RetainedQuota { account: account.clone(), until: Some(until), reader: None });
+            }
+            let (alternate, quota, unavailable) = pick_or_quota(&exchange, &tried, &mut retained_quota).await;
+            if alternate.is_some() {
+                next_account = alternate;
+                last_decoded_quota_reset = decoded_quota_reset.or(last_decoded_quota_reset);
+                exchange.complete_attempt(prelude.usage, Some(millis(began.elapsed())));
+                proxy.log("warn", "upstream request failed over").await;
+                continue;
             }
             if prelude.stream_error.is_none()
-                && let Some(reset) = exhausted_reset(&mut retained_quota).await
+                && let Some(reset) = quota
             {
                 return exchange.rate_limited(reset, prelude.usage, Some(millis(began.elapsed()))).await;
             }
             if !limited {
-                let unavailable = unavailable_pool(&proxy.state.read().await.pool, lane, model, required_project);
                 if let Some(response) = unavailable {
                     exchange.complete_attempt(prelude.usage, Some(millis(began.elapsed())));
                     exchange.finish(Some(StatusCode::SERVICE_UNAVAILABLE), "unavailable", Usage::default(), None, None).await;
@@ -571,7 +631,7 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         }
         if let Some((error, raw)) = prelude.error {
             if let Some(reset) = decoded_quota_reset {
-                return exchange.rate_limited(reset, prelude.usage, Some(millis(began.elapsed()))).await;
+                return exchange.rate_limited(PoolQuota::unverified(reset), prelude.usage, Some(millis(began.elapsed()))).await;
             }
             let bytes = raw.to_string();
             if let Some(capture) = &mut exchange.capture {
@@ -628,6 +688,9 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
         let connection = connection_headers(&headers);
         for (key, value) in &headers {
             let name = key.as_str();
+            if name == POOL_QUOTA_HEADER {
+                continue; // Only a locally synthesized pool response can attest a reset.
+            }
             if (matches!(
                 name,
                 "content-type" | "content-encoding" | "cache-control" | "retry-after" | "request-id" | "x-request-id" | "x-should-retry"
@@ -643,11 +706,11 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
     }
 }
 
-fn unavailable_pool(pool: &Pool, lane: Lane, model: &str, required_project: Option<&str>) -> Option<Response> {
-    if pool.has_eligible_account(lane, model, required_project) {
+fn unavailable_pool(pool: &Pool, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> Option<Response> {
+    if pool.has_eligible_account(lane, model, required_project, now) {
         return None;
     }
-    let kind = pool.uniform_quarantine_kind(lane, model, required_project).map_or("accounts_unavailable", |kind| kind.as_str());
+    let kind = pool.uniform_quarantine_kind(lane, model, required_project, now).map_or("accounts_unavailable", |kind| kind.as_str());
     Some((StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({
         "error": {
             "type": kind,
@@ -662,58 +725,33 @@ fn google_quota_message(model: &str) -> String {
 
 const GOOGLE_QUOTA_DELAY_MARGIN_SECS: i64 = 5;
 
-pub(crate) fn google_quota_error_body(model: &str, reset: DateTime<Utc>, now: DateTime<Utc>) -> Value {
-    let message = format!("{} All eligible accounts are rate limited.", google_quota_message(model));
-    let mut metadata = serde_json::Map::new();
+fn google_quota_detail(model: &str) -> Value {
+    let mut detail = json!({
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "reason": "QUOTA_EXHAUSTED",
+        "domain": "cloudcode-pa.googleapis.com",
+    });
     if !model.is_empty() {
-        metadata.insert("model".into(), Value::String(model.to_owned()));
+        detail["metadata"] = json!({"model":model});
     }
-    let mut details = Vec::new();
-    if reset != DateTime::<Utc>::MAX_UTC {
-        let ceiled = if reset.timestamp_subsec_nanos() > 0 {
-            DateTime::from_timestamp(reset.timestamp().saturating_add(1), 0).unwrap_or(reset)
-        } else {
-            reset
-        };
-        let near_expiry = reset - now <= TimeDelta::seconds(GOOGLE_QUOTA_DELAY_MARGIN_SECS);
-        let delay = ceiled - now;
-        let secs = if near_expiry { GOOGLE_QUOTA_DELAY_MARGIN_SECS } else { delay.num_seconds() + i64::from(delay.subsec_nanos() > 0) };
-        metadata.insert("quotaResetDelay".into(), Value::String(format!("{secs}s")));
-        if !near_expiry {
-            metadata.insert("quotaResetTimeStamp".into(), Value::String(ceiled.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)));
-        }
-        details.push(json!({
-            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-            "reason": "QUOTA_EXHAUSTED",
-            "domain": "cloudcode-pa.googleapis.com",
-            "metadata": metadata,
-        }));
-        details.push(json!({
-            "@type": "type.googleapis.com/google.rpc.RetryInfo",
-            "retryDelay": format!("{secs}s"),
-        }));
-    } else {
-        details.push(json!({
-            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-            "reason": "QUOTA_EXHAUSTED",
-            "domain": "cloudcode-pa.googleapis.com",
-            "metadata": metadata,
-        }));
-    }
+    detail
+}
+
+fn google_quota_error_body(model: &str) -> Value {
     json!({
         "error": {
             "code": 429,
-            "message": message,
+            "message": "all eligible accounts are rate limited",
             "status": "RESOURCE_EXHAUSTED",
-            "details": details,
+            "details": [google_quota_detail(model)],
         }
     })
 }
 
-pub(crate) fn normalize_google_quota(raw: &mut Value, model: &str, reset: DateTime<Utc>, now: DateTime<Utc>) {
+pub(crate) fn normalize_google_quota(raw: &mut Value, model: &str, now: DateTime<Utc>) {
     if let Value::Array(items) = raw {
         if let Some(item) = items.iter_mut().find(|item| GoogleError::from_frame(item).is_some()) {
-            normalize_google_quota(item, model, reset, now);
+            normalize_google_quota(item, model, now);
         }
         return;
     }
@@ -732,49 +770,36 @@ pub(crate) fn normalize_google_quota(raw: &mut Value, model: &str, reset: DateTi
     let Some(details) = details.as_array_mut() else {
         return;
     };
-    let template = google_quota_error_body(model, reset, now);
-    let target = &template["error"]["details"];
-    let copy_field = |actual: &mut serde_json::Map<String, Value>, expected: &Value, name: &str| {
-        if let Some(value) = expected.get(name) {
-            actual.insert(name.into(), value.clone());
-        } else {
-            actual.remove(name);
-        }
-    };
-    let mut found = [false; 2];
+    // Keep usable upstream timing on committed frames; never replace it with local backoff.
     for detail in details.iter_mut() {
         match google_detail_kind(detail) {
             Some("google.rpc.ErrorInfo" | "ErrorInfo") => {
-                found[0] = true;
-                if !detail["metadata"].is_object() {
-                    detail["metadata"] = json!({});
-                }
-                if let Some(metadata) = detail["metadata"].as_object_mut() {
-                    for name in ["quotaResetTimeStamp", "quotaResetDelay"] {
-                        copy_field(metadata, &target[0]["metadata"], name);
-                    }
+                if let Some(metadata) = detail.get_mut("metadata").and_then(Value::as_object_mut) {
+                    metadata.retain(|name, value| match name.as_str() {
+                        "quotaResetTimeStamp" => google_reset_timestamp(value, now).is_some_and(|hint| hint.verified_reset),
+                        "quotaResetDelay" => google_reset_delay(value, now).is_some_and(|hint| hint.verified_reset),
+                        _ => true,
+                    });
                 }
             }
             Some("google.rpc.RetryInfo" | "RetryInfo") => {
-                found[1] = true;
-                if let Some(retry) = detail.as_object_mut() {
-                    copy_field(retry, &target[1], "retryDelay");
+                if !google_reset_delay(&detail["retryDelay"], now).is_some_and(|hint| hint.verified_reset)
+                    && let Some(detail) = detail.as_object_mut()
+                {
+                    detail.remove("retryDelay");
                 }
             }
             _ => {}
         }
     }
-    for (index, found) in found.into_iter().enumerate() {
-        if !found && let Some(detail) = target.get(index) {
-            details.push(detail.clone());
-        }
+    if !details.iter().any(|detail| matches!(google_detail_kind(detail), Some("google.rpc.ErrorInfo" | "ErrorInfo"))) {
+        details.push(google_quota_detail(model));
     }
 }
 
-fn pool_limit(lane: Lane, model: &str, reset: DateTime<Utc>) -> Response {
-    let now = Utc::now();
+fn pool_limit(lane: Lane, model: &str, PoolQuota { reset, verified_reset, now }: PoolQuota) -> Response {
     let payload = if lane == Lane::Google {
-        google_quota_error_body(model, reset, now)
+        google_quota_error_body(model)
     } else {
         json!({
             "type":"error","error":{"type":"usage_limit_reached","message":"all eligible accounts are rate limited"}
@@ -783,6 +808,17 @@ fn pool_limit(lane: Lane, model: &str, reset: DateTime<Utc>) -> Response {
     let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(payload)).into_response();
     let headers = response.headers_mut();
     headers.insert("x-should-retry", header::HeaderValue::from_static("false"));
+    if lane == Lane::Google
+        && bounded_identifier(model)
+        && let Some(at) = verified_reset
+        && let Some(at) = DateTime::from_timestamp(at.timestamp() + i64::from(at.timestamp_subsec_nanos() > 0), 0)
+        && at > now
+        && at - now <= TimeDelta::seconds(MAX_COOLDOWN_SECS)
+        && let Ok(value) =
+            header::HeaderValue::from_str(&format!("v1;retry_at={};wire_model={model}", at.to_rfc3339_opts(SecondsFormat::Secs, true)))
+    {
+        headers.insert(POOL_QUOTA_HEADER, value);
+    }
     let set = |headers: &mut HeaderMap, name: &'static str, n: i64| {
         if let Ok(value) = header::HeaderValue::from_str(&n.to_string()) {
             headers.insert(name, value);
@@ -803,6 +839,31 @@ fn pool_limit(lane: Lane, model: &str, reset: DateTime<Utc>) -> Response {
     response
 }
 
+#[test]
+fn pool_witness_rounds_up_without_exceeding_the_horizon() {
+    let now = "2026-11-23T12:00:00.900Z".parse::<DateTime<Utc>>().unwrap();
+    let blocker = now + TimeDelta::seconds(10);
+    let model = "gemini-neon";
+    let response = pool_limit(Lane::Google, model, PoolQuota { reset: blocker, verified_reset: Some(blocker), now });
+    let expected = "2026-11-23T12:00:11Z";
+    assert_eq!(response.headers()[POOL_QUOTA_HEADER].to_str().unwrap(), format!("v1;retry_at={expected};wire_model={model}"));
+    assert!(expected.parse::<DateTime<Utc>>().unwrap() >= blocker);
+    assert_eq!(response.headers()["retry-after"], "10");
+
+    let horizon = now + TimeDelta::days(7);
+    let response = pool_limit(Lane::Google, model, PoolQuota { reset: horizon, verified_reset: Some(horizon), now });
+    assert!(!response.headers().contains_key(POOL_QUOTA_HEADER));
+}
+
+#[test]
+fn google_near_expiry_reset_keeps_transport_backoff_without_a_body_delay() {
+    let now = DateTime::from_timestamp_millis(1_800_000_000_999).unwrap();
+    let reset = now + TimeDelta::milliseconds(2);
+    let response = pool_limit(Lane::Google, "gemini", PoolQuota { reset, verified_reset: None, now });
+    assert_eq!(response.headers()["retry-after"], "5");
+    assert!(!response.headers().contains_key(POOL_QUOTA_HEADER));
+}
+
 pub(crate) async fn run_window_start(
     proxy: Arc<Proxy>,
     account: &Account,
@@ -814,6 +875,8 @@ pub(crate) async fn run_window_start(
     let started = Utc::now();
     let response = request.timeout(Duration::from_secs(45)).send().await;
     let mut usage = Usage::default();
+    let mut quota_reader = None;
+    let mut quota_body_verified = None;
     let fallback = proxy.state.read().await.pool.policy.failover_cooldown_secs;
     let (status, outcome, limited, error) = if let Ok(mut response) = response {
         let status = response.status();
@@ -821,6 +884,12 @@ pub(crate) async fn run_window_start(
             let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
             let headers = response.headers().clone();
             let google_quota = account.lane == Lane::Google && status == StatusCode::TOO_MANY_REQUESTS;
+            let now = Utc::now();
+            let header_reset = header_cooldown(account.lane, &headers, now);
+            if google_quota {
+                let unverified_until = header_reset.is_none().then(|| quota_deadline(None, fallback, now).until);
+                quota_reader = begin_google_quota_read(&proxy, account, model, None, unverified_until, now).await;
+            }
             let wait = if google_quota { deadline } else { error_prefix_deadline(account.lane, status, &headers, deadline) };
             let mut prefix = ErrorPrefix::default();
             prefix.read(&mut response, wait, google_quota).await;
@@ -833,10 +902,14 @@ pub(crate) async fn run_window_start(
                 AccountErrorSource::Inference,
                 &account_secrets(account),
             );
-            let limited = error
-                .as_ref()
-                .filter(|e| e.kind == AccountErrorKind::QuotaExhausted)
-                .map(|_| cooldown(account.lane, &headers, body, fallback));
+            let limited = error.as_ref().filter(|e| e.kind == AccountErrorKind::QuotaExhausted).map(|_| {
+                let (body_reset, verified) = if google_quota { prefix.quota_evidence(Utc::now()) } else { (None, true) };
+                quota_body_verified = Some(verified);
+                let mut cooldown =
+                    quota_deadline(merge_quota_hints(account.lane, &headers, header_reset, body_reset), fallback, Utc::now());
+                cooldown.verified_reset &= verified;
+                cooldown
+            });
             (Some(status), "http_error", limited, error)
         } else {
             let sse = is_sse(response.headers());
@@ -861,15 +934,21 @@ pub(crate) async fn run_window_start(
         error
             .as_ref()
             .filter(|e| e.kind == AccountErrorKind::QuotaExhausted && e.source == AccountErrorSource::Stream)
-            .map(|_| cooldown_after(Utc::now(), fallback as i64))
+            .map(|_| quota_deadline(None, fallback, Utc::now()))
     });
     if success || error.is_some() {
-        result(&proxy, account, model, limited, success, started).await;
+        result(&proxy, account, model, limited, success, started, quota_reader.as_ref().zip(quota_body_verified)).await;
     }
     if let Some(error) = error {
         exchange.attempt_error(&error);
         proxy.report_account_error(account, &error).await;
     }
+    if limited.is_none()
+        && let Some(reader) = quota_reader.as_ref()
+    {
+        discard_google_quota_read(&proxy, account, reader).await;
+    }
+    drop(quota_reader);
     if limited.is_some() {
         proxy.schedule_usage_refresh(account.id.clone()).await;
     }
@@ -880,7 +959,7 @@ pub(crate) async fn run_window_start(
 fn extract_google_session(headers: &HeaderMap, raw: &Value) -> Option<String> {
     let valid = |s: &str| {
         let digits = s.strip_prefix('-').unwrap_or(s);
-        identifier(s) && (digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()))
+        bounded_identifier(s) && (digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()))
     };
     // ACP's numeric request.session_id is a shared user hash, not a conversation ID.
     ["x-session-id", "session_id", "conversation_id"]
@@ -1062,12 +1141,8 @@ fn capture_path(path: &str) -> &str {
     }
 }
 
-fn identifier(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 192 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-:/".contains(&b))
-}
-
 fn header_id<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
-    names.iter().find_map(|name| headers.get(*name)?.to_str().ok()).filter(|s| identifier(s))
+    names.iter().find_map(|name| headers.get(*name)?.to_str().ok()).filter(|s| bounded_identifier(s))
 }
 
 fn connection_headers(headers: &HeaderMap) -> Vec<&str> {
@@ -1163,6 +1238,60 @@ struct ErrorPrefix {
 }
 
 impl ErrorPrefix {
+    fn quota_evidence(&self, now: DateTime<Utc>) -> (Option<Cooldown>, bool) {
+        let prefix = self.chunks[0].as_deref().unwrap_or_default();
+        if let Some(end) = self.json_end {
+            let (mut reset, verified) = serde_json::from_slice(&prefix[..end]).map_or((None, false), |raw| google_reset_hint(&raw, now));
+            let verified = verified && self.chunks[1].is_none();
+            if let Some(hint) = reset.as_mut() {
+                hint.verified_reset &= verified;
+            }
+            (reset, verified)
+        } else {
+            (None, self.complete && !matches!(prefix.trim_ascii_start().first(), Some(b'{' | b'[')))
+        }
+    }
+
+    async fn settle_google_quota(
+        &self,
+        proxy: &Proxy,
+        account: &Account,
+        model: &str,
+        headers: &HeaderMap,
+        header: Cooldown,
+        reader: Option<QuotaReader>,
+    ) -> Result<Cooldown, Box<AccountError>> {
+        if let Some(error) = classify_upstream_http_error(
+            Lane::Google,
+            StatusCode::TOO_MANY_REQUESTS,
+            headers,
+            self.diagnostic(),
+            AccountErrorSource::Inference,
+            &account_secrets(account),
+        )
+        .filter(|error| error.kind != AccountErrorKind::QuotaExhausted)
+        {
+            proxy.report_account_error(account, &error).await;
+            if let Some(reader) = reader.as_ref() {
+                discard_google_quota_read(proxy, account, reader).await;
+            }
+            return Err(Box::new(error));
+        }
+        let now = Utc::now();
+        let (reset, verified) = self.quota_evidence(now);
+        let mut merged = merge_quota_hints(Lane::Google, headers, Some(header), reset).unwrap_or(header);
+        merged.verified_reset &= verified;
+        if let Some(reader) = reader {
+            let mut state = proxy.state.write().await;
+            if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account))
+                && current.finish_google_quota_read(&reader, (!verified).then_some(merged.until))
+            {
+                apply_quota(current, model, merged, now);
+            }
+        }
+        Ok(merged)
+    }
+
     fn finished(&self) -> bool {
         self.complete
             || self.json_end.is_some()
@@ -1231,11 +1360,12 @@ impl ErrorPrefix {
     }
 }
 
-fn duration_seconds(mut raw: &str) -> Option<i64> {
+fn duration_seconds(mut raw: &str) -> Option<(f64, bool)> {
     if raw.is_empty() {
         return None;
     }
     let mut seconds = 0.0;
+    let mut strict = true;
     while !raw.is_empty() {
         let split = raw.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
         let (number, unit) = raw.split_at(split);
@@ -1256,52 +1386,110 @@ fn duration_seconds(mut raw: &str) -> Option<i64> {
             (factor, &unit[1..])
         };
         seconds += number.parse::<f64>().ok()? * factor;
+        strict &= !number.starts_with('.') && !number.ends_with('.');
         raw = rest;
     }
-    Some(seconds.ceil() as i64)
+    Some((seconds, strict))
 }
-
-const MAX_COOLDOWN_SECS: i64 = 604_800;
 
 fn cooldown_after(now: DateTime<Utc>, seconds: i64) -> DateTime<Utc> {
     now + TimeDelta::seconds(seconds.clamp(1, MAX_COOLDOWN_SECS))
 }
 
-fn clamp_cooldown(now: DateTime<Utc>, at: DateTime<Utc>) -> DateTime<Utc> {
-    at.clamp(cooldown_after(now, 1), cooldown_after(now, MAX_COOLDOWN_SECS))
+fn clamp_cooldown(now: DateTime<Utc>, at: DateTime<Utc>) -> Cooldown {
+    let until = at.clamp(cooldown_after(now, 1), cooldown_after(now, MAX_COOLDOWN_SECS));
+    Cooldown { until, verified_reset: until == at }
 }
 
-pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+fn upstream_delay(now: DateTime<Utc>, seconds: f64) -> Cooldown {
+    Cooldown { until: cooldown_after(now, seconds.ceil() as i64), verified_reset: (1.0..=MAX_COOLDOWN_SECS as f64).contains(&seconds) }
+}
+
+fn is_rate_limit_reset(name: &str) -> bool {
+    (name.starts_with("anthropic-ratelimit-") || name.starts_with("x-ratelimit-")) && (name.ends_with("-reset") || name.contains("-reset-"))
+}
+
+pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc>) -> Option<Cooldown> {
+    let digits = |raw: &str| !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+    let verify = |mut cooldown: Cooldown, strict| {
+        cooldown.verified_reset &= strict;
+        cooldown
+    };
     let clamp = |at| clamp_cooldown(now, at);
     let epoch =
         |n| clamp(DateTime::from_timestamp(n, 0).unwrap_or(if n < 0 { DateTime::<Utc>::MIN_UTC } else { DateTime::<Utc>::MAX_UTC }));
     let get = |name: &str| headers.get(name)?.to_str().ok();
-    let parse_reset = |raw: &str| {
+    let single = |name: &str| headers.get_all(name).iter().count() == 1;
+    // An unusable Retry-After may fall back for scheduling, but not for proof.
+    let fallback_can_verify = !headers.contains_key("retry-after");
+    // Preserve the legacy interpretation, but only attest known header/format pairs.
+    let parse_reset = |name: &str, raw: &str| {
+        let strict_source = (lane == Lane::Google || fallback_can_verify) && single(name);
         if let Ok(at) = raw.parse::<DateTime<Utc>>() {
-            return Some(clamp(at));
+            let known = matches!(
+                name,
+                "x-ratelimit-reset"
+                    | "anthropic-ratelimit-requests-reset"
+                    | "anthropic-ratelimit-tokens-reset"
+                    | "anthropic-ratelimit-input-tokens-reset"
+                    | "anthropic-ratelimit-output-tokens-reset"
+            );
+            let strict = matches!(raw.as_bytes().get(10), Some(&b'T' | &b't')) && DateTime::parse_from_rfc3339(raw).is_ok();
+            return Some(verify(clamp(at), strict_source && known && strict));
         }
         if let Ok(n) = raw.parse::<i64>() {
-            return Some(if n > 1_000_000_000 { epoch(n) } else { cooldown_after(now, n) });
+            let is_epoch = n > 1_000_000_000;
+            let known = name == "x-ratelimit-reset"
+                || (is_epoch
+                    && matches!(
+                        name,
+                        "anthropic-ratelimit-unified-reset"
+                            | "anthropic-ratelimit-unified-5h-reset"
+                            | "anthropic-ratelimit-unified-7d-reset"
+                    ));
+            let cooldown = if is_epoch { epoch(n) } else { upstream_delay(now, n as f64) };
+            return Some(verify(cooldown, strict_source && known && digits(raw)));
         }
-        duration_seconds(raw).map(|n| cooldown_after(now, n))
+        let known = matches!(name, "x-ratelimit-reset" | "x-ratelimit-reset-requests" | "x-ratelimit-reset-tokens");
+        duration_seconds(raw).map(|(n, strict)| verify(upstream_delay(now, n), strict_source && known && strict))
     };
-    if let Some(at) = get("retry-after").and_then(|raw| {
-        raw.parse::<i64>()
-            .ok()
-            .filter(|n| *n >= 0)
-            .map(|n| cooldown_after(now, n))
-            .or_else(|| DateTime::parse_from_rfc2822(raw).ok().map(|at| clamp(at.with_timezone(&Utc))))
-    }) {
-        return Some(at);
+    let retry_after = get("retry-after")
+        .and_then(|raw| {
+            raw.parse::<i64>().ok().filter(|n| *n >= 0).map(|n| verify(upstream_delay(now, n as f64), digits(raw))).or_else(|| {
+                let at = DateTime::parse_from_rfc2822(raw).ok()?.with_timezone(&Utc);
+                let strict = raw == at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                Some(verify(clamp(at), strict))
+            })
+        })
+        .map(|at| verify(at, single("retry-after")));
+    let resets = headers
+        .iter()
+        .filter(|(name, _)| is_rate_limit_reset(name.as_str()))
+        .map(|(name, value)| value.to_str().ok().and_then(|raw| parse_reset(name.as_str(), raw)));
+    if lane == Lane::Google {
+        // A bad reset header invalidates proof even if another header wins for scheduling.
+        let mut verified = fallback_can_verify || retry_after.is_some_and(|hint| hint.verified_reset);
+        let reset = resets.inspect(|hint| verified &= hint.is_some_and(|hint| hint.verified_reset)).flatten().reduce(Cooldown::merge);
+        return retry_after.or(reset).map(|at| verify(at, verified));
+    }
+    if retry_after.is_some() {
+        return retry_after;
     }
     if lane == Lane::Codex {
         let windows = ["x-codex-primary", "x-codex-secondary"].map(|prefix| {
-            let exhausted = get(&format!("{prefix}-used-percent")).and_then(|s| s.parse::<f64>().ok()).is_some_and(|n| n >= 100.0);
-            let reset = get(&format!("{prefix}-reset-at")).and_then(|s| s.parse::<i64>().ok()).map(epoch);
+            let percent = format!("{prefix}-used-percent");
+            let name = format!("{prefix}-reset-at");
+            let exhausted = get(&percent).and_then(|s| s.parse::<f64>().ok()).is_some_and(|n| n >= 100.0);
+            let reset = get(&name).and_then(|s| {
+                Some(verify(
+                    epoch(s.parse::<i64>().ok()?),
+                    fallback_can_verify && single(&name) && (!exhausted || single(&percent)) && digits(s),
+                ))
+            });
             (exhausted, reset)
         });
         if windows.iter().any(|(exhausted, _)| *exhausted) {
-            return windows.iter().filter_map(|(exhausted, at)| exhausted.then_some(*at).flatten()).max();
+            return windows.iter().filter_map(|(exhausted, at)| exhausted.then_some(*at).flatten()).reduce(Cooldown::merge);
         }
         if let Some(at) = windows.into_iter().find_map(|(_, at)| at) {
             return Some(at);
@@ -1315,115 +1503,188 @@ pub(crate) fn header_cooldown(lane: Lane, headers: &HeaderMap, now: DateTime<Utc
                 if !name.starts_with("anthropic-ratelimit-") {
                     return None;
                 }
-                match value.to_str().ok()? {
+                let window = match value.to_str().ok()? {
                     "rejected" => name.strip_suffix("-status"),
                     "0" => name.strip_suffix("-remaining"),
                     _ => None,
-                }
+                }?;
+                Some((window, single(name)))
             })
             .peekable();
         if exhausted.peek().is_some() {
-            return exhausted.filter_map(|window| get(&format!("{window}-reset")).and_then(parse_reset)).max();
+            return exhausted
+                .filter_map(|(window, unique)| {
+                    let name = format!("{window}-reset");
+                    parse_reset(&name, get(&name)?).map(|at| verify(at, unique))
+                })
+                .reduce(Cooldown::merge);
         }
     }
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let name = name.as_str();
-            ((name.starts_with("anthropic-ratelimit-") || name.starts_with("x-ratelimit-"))
-                && (name.ends_with("-reset") || name.contains("-reset-")))
-            .then(|| parse_reset(value.to_str().ok()?))
-            .flatten()
-        })
-        .max()
+    resets.flatten().reduce(Cooldown::merge)
 }
 
-fn body_reset_hint(body: &[u8]) -> Option<DateTime<Utc>> {
-    let now = Utc::now();
+#[cfg(test)]
+fn body_reset_hint(body: &[u8], now: DateTime<Utc>) -> Option<Cooldown> {
     let raw: Value = serde_json::from_slice(body).ok()?;
-    google_reset_hint(&raw, now)
+    google_reset_hint(&raw, now).0
 }
 
 fn google_detail_kind(detail: &Value) -> Option<&str> {
     detail["@type"].as_str()?.rsplit('/').next()
 }
 
-fn google_reset_hint(raw: &Value, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    if let Value::Array(items) = raw {
-        return items.iter().filter_map(|item| google_reset_hint(item, now)).max();
+fn google_reset_delay(value: &Value, now: DateTime<Utc>) -> Option<Cooldown> {
+    let (secs, strict) = duration_seconds(value.as_str()?)?;
+    let mut hint = upstream_delay(now, secs);
+    hint.verified_reset &= strict;
+    Some(hint)
+}
+
+fn google_reset_timestamp(value: &Value, now: DateTime<Utc>) -> Option<Cooldown> {
+    value.as_str()?.parse::<DateTime<Utc>>().ok().map(|at| clamp_cooldown(now, at))
+}
+
+fn google_reset_hint(raw: &Value, now: DateTime<Utc>) -> (Option<Cooldown>, bool) {
+    fn collect(raw: &Value, now: DateTime<Utc>, verified: &mut bool) -> Option<Cooldown> {
+        if let Value::Array(items) = raw {
+            return items.iter().filter_map(|item| collect(item, now, verified)).reduce(Cooldown::merge);
+        }
+        let error = raw.get("error")?;
+        // An item may omit its status in a 429 body, but an explicit non-quota error cannot attest a quota reset.
+        if !error.get("code").is_none_or(|code| matches!(code.as_u64(), Some(8 | 429)))
+            || !error.get("status").is_none_or(|status| matches!(status.as_str(), Some("RESOURCE_EXHAUSTED" | "QUOTA_EXHAUSTED")))
+        {
+            return None;
+        }
+        let mut parse = |value: Option<&Value>, parse: fn(&Value, DateTime<Utc>) -> Option<Cooldown>| {
+            let hint = parse(value?, now);
+            *verified &= hint.is_some_and(|hint| hint.verified_reset);
+            hint
+        };
+        error
+            .get("details")?
+            .as_array()?
+            .iter()
+            .flat_map(|detail| match google_detail_kind(detail) {
+                Some("google.rpc.RetryInfo" | "RetryInfo") => [parse(detail.get("retryDelay"), google_reset_delay), None],
+                Some("google.rpc.ErrorInfo" | "ErrorInfo") => [
+                    parse(detail.pointer("/metadata/quotaResetDelay"), google_reset_delay),
+                    parse(detail.pointer("/metadata/quotaResetTimeStamp"), google_reset_timestamp),
+                ],
+                _ => [None, None],
+            })
+            .flatten()
+            .reduce(Cooldown::merge)
     }
-    let delay = |v: &Value| v.as_str().and_then(duration_seconds).map(|secs| cooldown_after(now, secs));
-    raw.pointer("/error/details")
-        .and_then(Value::as_array)?
-        .iter()
-        .flat_map(|detail| match google_detail_kind(detail) {
-            Some("google.rpc.RetryInfo" | "RetryInfo") => [delay(&detail["retryDelay"]), None],
-            Some("google.rpc.ErrorInfo" | "ErrorInfo") => [
-                delay(&detail["metadata"]["quotaResetDelay"]),
-                detail["metadata"]["quotaResetTimeStamp"]
-                    .as_str()
-                    .and_then(|t| t.parse::<DateTime<Utc>>().ok())
-                    .map(|at| clamp_cooldown(now, at)),
-            ],
-            _ => [None, None],
-        })
-        .flatten()
-        .max()
+    let mut verified = true;
+    let mut reset = collect(raw, now, &mut verified);
+    if let Some(hint) = reset.as_mut() {
+        hint.verified_reset &= verified;
+    }
+    (reset, verified)
 }
 
-fn quota_deadline(header: Option<DateTime<Utc>>, body: Option<DateTime<Utc>>, fallback: u64, now: DateTime<Utc>) -> DateTime<Utc> {
-    header.max(body).unwrap_or_else(|| cooldown_after(now, fallback.min(MAX_COOLDOWN_SECS as u64) as i64))
+fn merge_quota_hints(lane: Lane, headers: &HeaderMap, header: Option<Cooldown>, body: Option<Cooldown>) -> Option<Cooldown> {
+    let mut cooldown = header.into_iter().chain(body).reduce(Cooldown::merge)?;
+    // A later body hint can extend the cooldown, but cannot rehabilitate an unusable header.
+    let reset_header = headers.contains_key(header::RETRY_AFTER)
+        || (lane == Lane::Google && headers.keys().any(|name| is_rate_limit_reset(name.as_str())));
+    cooldown.verified_reset &= !reset_header || header.is_some_and(|hint| hint.verified_reset);
+    Some(cooldown)
 }
 
+fn quota_hint(lane: Lane, headers: &HeaderMap, body: Option<Cooldown>, now: DateTime<Utc>) -> Option<Cooldown> {
+    merge_quota_hints(lane, headers, header_cooldown(lane, headers, now), body)
+}
+
+fn quota_deadline(hint: Option<Cooldown>, fallback: u64, now: DateTime<Utc>) -> Cooldown {
+    hint.unwrap_or_else(|| Cooldown { until: cooldown_after(now, fallback.min(MAX_COOLDOWN_SECS as u64) as i64), verified_reset: false })
+}
+
+#[cfg(test)]
+pub(crate) fn body_cooldown(lane: Lane, body: &[u8], fallback: u64, now: DateTime<Utc>) -> Cooldown {
+    quota_deadline((lane == Lane::Google).then(|| body_reset_hint(body, now)).flatten(), fallback, now)
+}
+
+#[cfg(test)]
 pub(crate) fn cooldown(lane: Lane, headers: &HeaderMap, body: &[u8], fallback: u64) -> DateTime<Utc> {
     let now = Utc::now();
-    quota_deadline(header_cooldown(lane, headers, now), if lane == Lane::Google { body_reset_hint(body) } else { None }, fallback, now)
+    let body = (lane == Lane::Google).then(|| body_reset_hint(body, now)).flatten();
+    quota_deadline(quota_hint(lane, headers, body, now), fallback, now).until
 }
 
 async fn result(
     proxy: &Proxy,
     account: &Account,
     model: &str,
-    cooldown: Option<DateTime<Utc>>,
+    cooldown: Option<Cooldown>,
     success: bool,
     request_at: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    body_read: Option<(&QuotaReader, bool)>,
+) {
     let mut state = proxy.state.write().await;
-    let current = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_secret(account))?;
+    let Some(current) = state.pool.accounts.get_mut(&account.id) else { return };
     let now = Utc::now();
-    current.last_used = Some(now);
-    if success {
-        current.success = current.success.saturating_add(1);
-        if current.last_error.as_ref().is_none_or(|e| e.occurred_at <= request_at) && current.clear_account_error() {
-            current.probe_failed = false;
-            proxy.notify_hub_sync();
+    let same_secret = current.same_secret(account);
+    if same_secret {
+        current.last_used = Some(now);
+        if success {
+            current.success = current.success.saturating_add(1);
+            if current.last_error.as_ref().is_none_or(|e| e.occurred_at <= request_at) && current.clear_account_error() {
+                current.probe_failed = false;
+                proxy.notify_hub_sync();
+            }
+        } else {
+            current.failure = current.failure.saturating_add(1);
         }
-    } else {
-        current.failure = current.failure.saturating_add(1);
     }
-    if let Some(until) = cooldown {
+    if let Some(until) = cooldown
+        && (same_secret || (account.lane == Lane::Google && current.same_credential(account)))
+        && body_read.is_none_or(|(reader, verified)| current.finish_google_quota_read(reader, (!verified).then_some(until.until)))
+    {
         apply_quota(current, model, until, now);
-        return current.quota_limited_until(now, model);
     }
-    None
 }
 
-async fn extend_quota(proxy: &Proxy, account: &Account, model: &str, until: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
-    let until = until?;
+async fn begin_google_quota_read(
+    proxy: &Proxy,
+    account: &Account,
+    model: &str,
+    provisional: Option<Cooldown>,
+    unverified_until: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<QuotaReader> {
+    proxy
+        .state
+        .write()
+        .await
+        .pool
+        .accounts
+        .get_mut(&account.id)
+        .filter(|a| a.same_credential(account))
+        .map(|current| current.begin_google_quota_read(model, provisional, unverified_until, now))
+}
+
+async fn extend_quota(proxy: &Proxy, account: &Account, model: &str, until: Cooldown) {
     let mut state = proxy.state.write().await;
-    let current = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account))?;
-    let now = Utc::now();
-    apply_quota(current, model, until, now);
-    current.quota_limited_until(now, model)
+    if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account)) {
+        apply_quota(current, model, until, Utc::now());
+    }
 }
 
-fn apply_quota(account: &mut Account, model: &str, until: DateTime<Utc>, now: DateTime<Utc>) {
+async fn discard_google_quota_read(proxy: &Proxy, account: &Account, reader: &QuotaReader) {
+    let mut state = proxy.state.write().await;
+    if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account)) {
+        current.finish_google_quota_read(reader, None);
+    }
+}
+
+fn apply_quota(account: &mut Account, model: &str, until: Cooldown, now: DateTime<Utc>) {
     if let Some(scope) = model_cooldown_scope(account.lane, model) {
-        account.scoped_cooldowns.retain(|_, at| *at > now);
-        let entry = account.scoped_cooldowns.entry(scope).or_insert(until);
-        *entry = (*entry).max(until);
+        account.scoped_cooldowns.retain(|_, c| c.until > now);
+        account.scoped_cooldowns.entry(scope).and_modify(|old| *old = old.merge(until)).or_insert(until);
     } else {
-        account.cooldown = account.cooldown.max(Some(until));
+        account.cooldown = Some(account.cooldown.map_or(until, |old| old.merge(until)));
     }
 }
 
@@ -1554,7 +1815,7 @@ fn inspect_google(headers: &HeaderMap) -> bool {
 #[derive(Clone, Copy)]
 struct GoogleError {
     status: StatusCode,
-    reset: Option<DateTime<Utc>>,
+    reset: Option<Cooldown>,
 }
 
 impl GoogleError {
@@ -1596,7 +1857,7 @@ impl GoogleError {
             .and_then(|n| StatusCode::from_u16(n).ok())
             .filter(|status| status.is_client_error() || status.is_server_error())
             .unwrap_or(StatusCode::BAD_GATEWAY);
-        Some((Self { status, reset: google_reset_hint(raw, Utc::now()) }, raw))
+        Some((Self { status, reset: google_reset_hint(raw, Utc::now()).0 }, raw))
     }
 
     fn classify(self, raw: &Value, account: &Account, source: AccountErrorSource) -> Option<AccountError> {
@@ -1990,10 +2251,10 @@ impl Wire {
                 let cooldown = classified
                     .as_ref()
                     .filter(|e| e.kind == AccountErrorKind::QuotaExhausted)
-                    .map(|_| quota_deadline(header_cooldown(Lane::Google, self.upstream.headers(), now), error.reset, self.fallback, now));
+                    .map(|_| quota_deadline(quota_hint(Lane::Google, self.upstream.headers(), error.reset, now), self.fallback, now));
                 let first_error = self.guard.1.is_none();
-                let effective = if first_error {
-                    let effective = result(&self.proxy, &self.account, &exchange.model, cooldown, false, self.request_at).await;
+                if first_error {
+                    result(&self.proxy, &self.account, &exchange.model, cooldown, false, self.request_at, None).await;
                     if let Some(classified) = &classified {
                         exchange.attempt_error(classified);
                         self.proxy.report_account_error(&self.account, classified).await;
@@ -2003,17 +2264,14 @@ impl Wire {
                         last.outcome = error.outcome().into();
                     }
                     self.guard.1 = Some((error, self.usage, millis(self.started.elapsed())));
-                    effective
                 } else if let Some(until) = cooldown {
-                    extend_quota(&self.proxy, &self.account, &exchange.model, Some(until)).await
-                } else {
-                    None
-                };
-                if let Some(until) = cooldown {
+                    extend_quota(&self.proxy, &self.account, &exchange.model, until).await;
+                }
+                if cooldown.is_some() {
                     if first_error {
                         self.proxy.schedule_usage_refresh(self.account.id.clone()).await;
                     }
-                    normalize_google_quota(&mut raw, &exchange.model, effective.map_or(until, |at| at.max(until)), Utc::now());
+                    normalize_google_quota(&mut raw, &exchange.model, now);
                 } else if let Some(error) = classified.filter(|e| e.kind.is_blocking()) {
                     raw = stream_error_body(error.kind);
                 } else {
@@ -2029,8 +2287,7 @@ impl Wire {
 
     async fn record_stream_error(&mut self, error: AccountError) {
         self.sse_failed = true;
-        let limited =
-            if error.kind == AccountErrorKind::QuotaExhausted { Some(cooldown_after(Utc::now(), self.fallback as i64)) } else { None };
+        let limited = (error.kind == AccountErrorKind::QuotaExhausted).then(|| quota_deadline(None, self.fallback, Utc::now()));
         if let Some(exchange) = &mut self.guard.0 {
             exchange.attempt_error(&error);
             if let Some(last) = exchange.attempts.last_mut() {
@@ -2038,7 +2295,7 @@ impl Wire {
             }
         }
         let model = self.guard.0.as_ref().map_or("", |exchange| exchange.model.as_str());
-        result(&self.proxy, &self.account, model, limited, false, self.request_at).await;
+        result(&self.proxy, &self.account, model, limited, false, self.request_at, None).await;
         self.proxy.report_account_error(&self.account, &error).await;
         if limited.is_some() {
             self.proxy.schedule_usage_refresh(self.account.id.clone()).await;
@@ -2153,7 +2410,7 @@ impl Wire {
                         .await;
                     }
                     if !self.sse_failed {
-                        result(&self.proxy, &self.account, "", None, true, self.request_at).await;
+                        result(&self.proxy, &self.account, "", None, true, self.request_at, None).await;
                     }
                 }
                 if let Some(mut exchange) = self.guard.0.take() {
@@ -2481,11 +2738,10 @@ impl Exchange {
         }
     }
 
-    async fn rate_limited(self, reset: DateTime<Utc>, usage: Usage, latency: Option<i64>) -> Response {
-        let lane = self.lane;
-        let model = self.model.clone();
+    async fn rate_limited(self, quota: PoolQuota, usage: Usage, latency: Option<i64>) -> Response {
+        let response = pool_limit(self.lane, &self.model, quota);
         self.finish(Some(StatusCode::TOO_MANY_REQUESTS), "rate_limited", usage, latency, None).await;
-        pool_limit(lane, &model, reset)
+        response
     }
 
     async fn finish(

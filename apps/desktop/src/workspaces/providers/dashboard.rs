@@ -6,6 +6,7 @@ use super::{charts::*, *};
 
 pub(super) const LOOKBACK: &[(&str, &str)] = &[("3", "3h"), ("6", "6h"), ("12", "12h"), ("24", "24h")];
 pub(super) const HORIZON: &[(&str, &str)] = &[("6", "6h"), ("12", "12h"), ("24", "24h"), ("48", "48h")];
+pub(super) const NEXT_PICK_HINT: &str = "Next pick for routing (cached; not model-scoped)";
 
 #[component]
 pub(super) fn Dashboard(providers: Vec<ProviderSummary>, stale: bool, all_providers: bool) -> Element {
@@ -163,6 +164,7 @@ fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
                 if let Some(message) = &provider.descriptor.status_message { p { "{message}" } }
             }
             div { class: "stack", style: "gap: 6px;",
+                if has_quota { p { class: "muted", "Cached quota and pool readings · not evaluated for a specific model." } }
                 if has_quota || account.is_some() {
                     div { class: "row",
                         h3 { if let Some(a) = account { "{account_name(a, prefs.mask_emails)} · History & Forecast" } else { "Pool · History & Forecast" } }
@@ -263,7 +265,7 @@ pub(super) fn AccountIdentity(
     rsx! {
         div { class: "row",
             strong { "{name}" }
-            span { title: is_next_pick(&provider, &account).then_some("Next pick for routing"),
+            span { title: is_next_pick(&provider, &account).then_some(NEXT_PICK_HINT),
                 Chip { label: label.to_string(), tone: Some(tone.to_string()) }
             }
             if let Some(credential) = credential {

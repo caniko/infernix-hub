@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::Mutex};
 use uuid::Uuid;
 
-use crate::{Proxy, clients::register_t3code, config::Config, error_classify::local_error, management, router};
+use crate::{Proxy, clients::register_t3code, config::Config, error_classify::local_error, management, pool::Cooldown, router};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckOutcome {
@@ -233,7 +233,7 @@ fn google_message_less_429_with_non_quota_reason_is_a_t3_usage_limit() {
         if let Some(message) = message {
             body["error"]["message"] = json!(message);
         }
-        router::normalize_google_quota(&mut body, "gemini", now + TimeDelta::seconds(30), now);
+        router::normalize_google_quota(&mut body, "gemini", now);
         assert_eq!(body["error"]["code"], 429);
         assert_eq!(body["error"]["status"], "RESOURCE_EXHAUSTED");
         assert_eq!(body["error"]["message"], "Quota exhausted for model gemini.");
@@ -243,7 +243,7 @@ fn google_message_less_429_with_non_quota_reason_is_a_t3_usage_limit() {
         assert_eq!(outcome.class, "usage_limit");
         assert_eq!(outcome.code, "RESOURCE_EXHAUSTED");
         assert!(outcome.retryable);
-        assert!(outcome.reset_at.unwrap() >= now + TimeDelta::seconds(30));
+        assert!(outcome.reset_at.is_none());
     }
 }
 
@@ -268,6 +268,7 @@ fn render_go_value(value: &Value) -> String {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct ParsedT3Outcome {
     class: &'static str,
@@ -278,6 +279,7 @@ struct ParsedT3Outcome {
 
 /// Mirrors T3 Code's `apps/server/src/provider/acp/AntigravityTurnOutcome.ts` (`turnFailure` + `resetAtFrom`)
 /// to algorithmically verify that rendered proxy errors trigger `UsageLimitRecoveryWorker` auto-resumption.
+#[cfg(test)]
 fn parse_t3code_antigravity_outcome(text: &str, now: DateTime<Utc>) -> ParsedT3Outcome {
     let api_error = parse_go_api_error_header(text);
     let quota_exhausted = contains_word(text, "reason:QUOTA_EXHAUSTED");
@@ -302,6 +304,7 @@ fn parse_t3code_antigravity_outcome(text: &str, now: DateTime<Utc>) -> ParsedT3O
     }
 }
 
+#[cfg(test)]
 fn parse_go_api_error_header(text: &str) -> Option<(u16, String, String)> {
     let rest = text.strip_prefix("Error ").or_else(|| text.split_once("Error ").map(|(_, tail)| tail))?;
     let (code_str, after_code) = rest.split_once(", Message: ")?;
@@ -321,6 +324,7 @@ fn parse_go_api_error_header(text: &str) -> Option<(u16, String, String)> {
     Some((code, message.to_owned(), status))
 }
 
+#[cfg(test)]
 fn contains_word(haystack: &str, needle: &str) -> bool {
     let mut start = 0;
     while let Some(pos) = haystack[start..].find(needle) {
@@ -336,10 +340,12 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+#[cfg(test)]
 fn extract_token_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let mut start = 0;
     while let Some(pos) = text[start..].find(key) {
@@ -357,6 +363,7 @@ fn extract_token_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+#[cfg(test)]
 fn extract_t3_reset_at(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     if let Some(ts) = extract_token_value(text, "quotaResetTimeStamp:")
         && let Ok(parsed) = ts.parse::<DateTime<Utc>>()
@@ -368,6 +375,7 @@ fn extract_t3_reset_at(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> 
     (ms > 0).then(|| now + TimeDelta::milliseconds(ms))
 }
 
+#[cfg(test)]
 fn parse_go_duration_ms(mut raw: &str) -> Option<i64> {
     if raw.is_empty() {
         return None;
@@ -496,7 +504,12 @@ async fn check_t3code_management_api_contract() -> Result<String> {
                 post(|headers: HeaderMap, body: String| async move {
                     let auth = router::bearer(&headers).unwrap_or_default().to_owned();
                     Json(json!({
-                        "groups": [],
+                        "buckets": [{
+                            "bucketId": "gemini-5h",
+                            "window": "5h",
+                            "remainingFraction": 0.8,
+                            "resetTime": Utc::now() + TimeDelta::hours(2)
+                        }],
                         "seen_token": auth,
                         "seen_body": body,
                     }))
@@ -593,11 +606,23 @@ async fn check_t3code_management_api_contract() -> Result<String> {
     proxy.refresh_usage(&accounts["ag-a.json"]).await.map_err(|err| anyhow!("{}", err.summary()))?;
     ensure!(proxy.state.read().await.pool.accounts["ag-a.json"].windows.iter().any(|w| w.used_percent.is_some()));
 
-    let codex_cooldown = Utc::now() + TimeDelta::minutes(3);
+    let codex_cooldown = Cooldown { until: Utc::now() + TimeDelta::minutes(3), verified_reset: false };
     proxy.state.write().await.pool.accounts.get_mut("codex-a.json").unwrap().cooldown = Some(codex_cooldown);
     let real_t3 = if let Some(root) = std::env::var_os("T3CODE_VERIFY_ROOT") {
-        check_real_t3code(PathBuf::from(root), &dir, &server, &mock).await?;
-        "real T3 source verified Claude/Codex filtering, Codex credit redemption, and near-expiry arm/dispatch"
+        let now = Utc::now();
+        let model = "gemini-4-neon-high";
+        proxy.state.write().await.pool.accounts.get_mut("ag-a.json").unwrap().cooldown =
+            Some(Cooldown { until: now + TimeDelta::seconds(30), verified_reset: true });
+        let res = http
+            .post(server.url("/v1internal:generateContent"))
+            .bearer_auth("verify-client-key")
+            .json(&json!({"model":model}))
+            .send()
+            .await?;
+        let witness = res.headers().get(router::POOL_QUOTA_HEADER).context("missing real T3 fixture witness")?.to_str()?.to_owned();
+        let body = res.json::<Value>().await?;
+        check_real_t3code(PathBuf::from(root), &dir, &server, &mock, now, &witness, &body).await?;
+        "real T3 source verified Claude/Codex/Antigravity reads, Codex credit redemption, and verified pool quota arm/dispatch"
     } else {
         let call = |method, path, data| {
             http.post(server.url("/v0/management/api-call")).bearer_auth("verify-mgmt-key").json(&json!({
@@ -706,14 +731,18 @@ fn check_management_allowlist(accounts: &BTreeMap<String, crate::pool::Account>)
     Ok(())
 }
 
-async fn check_real_t3code(root: PathBuf, dir: &TempDir, server: &EphemeralServer, mock: &EphemeralServer) -> Result<()> {
-    // The response is stamped just before the second rolls over, but the native
-    // turn finishes just after. A rounded absolute timestamp would already be stale.
-    let now = DateTime::from_timestamp_millis(1_800_000_000_999).unwrap();
-    let reset = now + TimeDelta::milliseconds(1);
-    let body = router::google_quota_error_body("gemini-4-neon-high", reset, now);
+async fn check_real_t3code(
+    root: PathBuf,
+    dir: &TempDir,
+    server: &EphemeralServer,
+    mock: &EphemeralServer,
+    now: DateTime<Utc>,
+    witness: &str,
+    body: &Value,
+) -> Result<()> {
     let mut native = message_less_rate_limit();
-    router::normalize_google_quota(&mut native, "gemini-4-neon-high", reset, now);
+    native["error"]["details"].as_array_mut().unwrap().push(json!({"@type":"google.rpc.RetryInfo","retryDelay":"30s"}));
+    router::normalize_google_quota(&mut native, "gemini-4-neon-high", now);
     let mut node = tokio::process::Command::new("node");
     node.current_dir(root.join("apps/server"))
         .kill_on_drop(true)
@@ -728,8 +757,9 @@ async fn check_real_t3code(root: PathBuf, dir: &TempDir, server: &EphemeralServe
         .arg(dir.path())
         .arg(server.url(""))
         .arg(mock.url(""))
-        .arg((now.timestamp_millis() + 2).to_string())
-        .arg(render_go_genai_api_error(&body)?)
+        .arg(now.timestamp_millis().to_string())
+        .arg(witness)
+        .arg(body.to_string())
         .arg(render_go_genai_api_error(&native)?);
     let output = tokio::time::timeout(Duration::from_secs(25), node.output())
         .await
@@ -1068,13 +1098,41 @@ async fn check_antigravity_cache_hit_preservation() -> Result<String> {
             .send()
             .await?;
         ensure!(res.status() == StatusCode::TOO_MANY_REQUESTS, "cache owner quota failure returned {}", res.status());
-        let body: Value = res.json().await?;
-        let reset = parse_t3code_antigravity_outcome(&render_go_genai_api_error(&body)?, Utc::now()).reset_at;
+        let reset = check_google_pool_error(res, "gemini-4-neon-high").await?;
         ensure!(reset.is_some_and(|at| (55..=65).contains(&(at - Utc::now()).num_seconds())), "expected the cache owner's reset");
     }
     let log = route_log.lock().await;
     ensure!(log.len() == 3 && log.iter().all(|(token, project)| token == "ag-access-a" && project == "proj-alpha"));
     Ok("all four strategies preserve cache affinity; cachedContent stays on its owning project on first pick and on 429".into())
+}
+
+async fn check_google_pool_error(response: reqwest::Response, model: &str) -> Result<Option<DateTime<Utc>>> {
+    ensure!(response.status() == StatusCode::TOO_MANY_REQUESTS);
+    ensure!(response.headers().get("x-should-retry").and_then(|v| v.to_str().ok()) == Some("false"));
+    let mut witnesses = response.headers().get_all(router::POOL_QUOTA_HEADER).iter();
+    let reset = if let Some(witness) = witnesses.next() {
+        ensure!(witnesses.next().is_none(), "duplicated pool quota witness");
+        let (stamp, wire_model) =
+            witness.to_str()?.strip_prefix("v1;retry_at=").and_then(|s| s.split_once(";wire_model=")).context("bad pool quota witness")?;
+        ensure!(wire_model == model && stamp.ends_with('Z') && !stamp.contains('.'), "bad pool quota witness: {witness:?}");
+        Some(stamp.parse()?)
+    } else {
+        None
+    };
+    let body: Value = response.json().await?;
+    let error = &body["error"];
+    ensure!(error["code"] == 429 && error["status"] == "RESOURCE_EXHAUSTED");
+    ensure!(error["message"] == "all eligible accounts are rate limited");
+    ensure!(
+        error["details"]
+            == json!([{
+                "@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED",
+                "domain":"cloudcode-pa.googleapis.com","metadata":{"model":model}
+            }]),
+        "unexpected pool quota details: {}",
+        error["details"]
+    );
+    Ok(reset)
 }
 
 async fn check_antigravity_quota_exhaustion_and_thread_auto_resume() -> Result<String> {
@@ -1177,22 +1235,8 @@ async fn check_antigravity_quota_exhaustion_and_thread_auto_resume() -> Result<S
     });
     let res_a =
         http.post(server.url("/v1internal:streamGenerateContent?alt=sse")).bearer_auth("verify-client-key").json(&payload).send().await?;
-    ensure!(res_a.status() == StatusCode::TOO_MANY_REQUESTS, "Path A expected 429, got {}", res_a.status());
-    ensure!(res_a.headers().get("x-should-retry").and_then(|v| v.to_str().ok()) == Some("false"), "x-should-retry must be false");
     ensure!(upstream_calls.load(Ordering::SeqCst) == 0, "pre-exhausted pool should not hit upstream");
-    let body_a: Value = res_a.json().await?;
-    let rendered_a = render_go_genai_api_error(&body_a).context("Path A body failed Go genai.APIError contract")?;
-    let parsed_a = parse_t3code_antigravity_outcome(&rendered_a, Utc::now());
-    ensure!(
-        parsed_a.class == "usage_limit" && parsed_a.code == "RESOURCE_EXHAUSTED" && parsed_a.retryable,
-        "Path A T3 Code classification failed: {parsed_a:?} from {rendered_a}"
-    );
-    let parsed_reset_a = parsed_a.reset_at.ok_or_else(|| anyhow!("Path A missing parsed usageLimitResetAt from {rendered_a}"))?;
-    ensure!(parsed_reset_a > now_a, "Path A resetAt must be > completedAt for UsageLimitRecoveryWorker");
-    ensure!(
-        (parsed_reset_a - reset_a).num_seconds().abs() <= 2,
-        "Path A resetAt ({parsed_reset_a}) did not match earliest pool reset ({reset_a})"
-    );
+    ensure!(check_google_pool_error(res_a, "claude-sonnet-4-6").await? == Some(reset_a), "Path A did not witness the earliest reset");
 
     // Path B: Dynamic upstream 429 exhaustion across all accounts
     {
@@ -1206,15 +1250,7 @@ async fn check_antigravity_quota_exhaustion_and_thread_auto_resume() -> Result<S
     let now_b = Utc::now();
     let res_b =
         http.post(server.url("/v1internal:streamGenerateContent?alt=sse")).bearer_auth("verify-client-key").json(&payload).send().await?;
-    ensure!(res_b.status() == StatusCode::TOO_MANY_REQUESTS, "Path B expected 429, got {}", res_b.status());
-    let body_b: Value = res_b.json().await?;
-    let rendered_b = render_go_genai_api_error(&body_b).context("Path B body failed Go genai.APIError contract")?;
-    let parsed_b = parse_t3code_antigravity_outcome(&rendered_b, Utc::now());
-    ensure!(
-        parsed_b.class == "usage_limit" && parsed_b.code == "RESOURCE_EXHAUSTED" && parsed_b.retryable,
-        "Path B T3 Code classification failed: {parsed_b:?}"
-    );
-    let parsed_reset_b = parsed_b.reset_at.ok_or_else(|| anyhow!("Path B missing parsed usageLimitResetAt from {rendered_b}"))?;
+    let parsed_reset_b = check_google_pool_error(res_b, "claude-sonnet-4-6").await?.context("Path B missing pool quota witness")?;
     let delta_b = (parsed_reset_b - now_b).num_seconds();
     ensure!((40..=50).contains(&delta_b), "Path B reset delay should match earliest ~45s reset, got {delta_b}s");
 
@@ -1235,11 +1271,11 @@ async fn check_antigravity_quota_exhaustion_and_thread_auto_resume() -> Result<S
             .json(&payload)
             .send()
             .await?;
-        ensure!(mixed.status() == StatusCode::TOO_MANY_REQUESTS, "mixed pool request {attempt}: {}", mixed.status());
-        ensure!(mixed.headers().get("x-should-retry").and_then(|v| v.to_str().ok()) == Some("false"));
-        let mixed_body: Value = mixed.json().await?;
-        let mixed_reset = parse_t3code_antigravity_outcome(&render_go_genai_api_error(&mixed_body)?, Utc::now()).reset_at;
-        ensure!(mixed_reset.is_some_and(|at| (40..=50).contains(&(at - Utc::now()).num_seconds())));
+        let mixed_reset = check_google_pool_error(mixed, "claude-sonnet-4-6").await?;
+        ensure!(
+            mixed_reset.is_some_and(|at| (40..=50).contains(&(at - Utc::now()).num_seconds())),
+            "mixed pool request {attempt}: missing verified reset"
+        );
         ensure!(upstream_calls.load(Ordering::SeqCst) == calls_before_mixed + 1);
     }
 
@@ -1358,6 +1394,7 @@ async fn check_antigravity_in_band_errors() -> Result<String> {
         let early = case.starts_with("early");
         let mid = case.starts_with("mid");
         ensure!(response.status() == if early || mid { StatusCode::OK } else { StatusCode::TOO_MANY_REQUESTS }, "{case}: status");
+        ensure!(!response.headers().contains_key(router::POOL_QUOTA_HEADER), "{case}: unexpected witness");
         let body = response.text().await?;
         if early {
             ensure!(body == CALL, "{case}: data from the failed account escaped");
@@ -1374,7 +1411,9 @@ async fn check_antigravity_in_band_errors() -> Result<String> {
                 }
                 _ => serde_json::from_str(&body)?,
             };
-            ensure!(error["error"]["details"][0]["metadata"]["quotaResetDelay"].is_string(), "{case}: reset details");
+            ensure!(error["error"]["status"] == "RESOURCE_EXHAUSTED");
+            ensure!(error["error"]["details"][0]["reason"] == "QUOTA_EXHAUSTED");
+            ensure!(!error.to_string().contains("quotaReset") && !error.to_string().contains("retryDelay"), "{case}: fabricated reset");
         } else {
             ensure!(body == format!("data: {CALL}\r\n\r\ndata: {UNAVAILABLE}\r\n\r\n"));
         }

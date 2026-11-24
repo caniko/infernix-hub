@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::{
-    dashboard::{AccountIdentity, account_name, is_next_pick, sorted_accounts},
+    dashboard::{AccountIdentity, NEXT_PICK_HINT, account_name, is_next_pick, sorted_accounts},
     *,
 };
 
@@ -127,7 +127,7 @@ fn AccountEditor(provider: ProviderSummary, account: ModelAccount, mask: bool) -
             details {
                 summary { aria_label: "Manage {name}", "Manage" }
                 p { class: "form-help", "Routing priority: {account.priority} · Routing weight: {account.weight}" }
-                if is_next_pick(&provider, &account) { p { class: "form-help", "Next pick for routing" } }
+                if is_next_pick(&provider, &account) { p { class: "form-help", "{NEXT_PICK_HINT}" } }
                 div { class: "row",
                     OperationButton { provider: provider.clone(), account: account.clone(), label: toggle, confirm: account.enabled,
                         command: ProviderCommand::Account(AccountCommand::SetEnabled { account_id: id.clone(), enabled: !account.enabled }) }
