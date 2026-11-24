@@ -11,12 +11,15 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sqlx::PgPool;
 
+pub mod calendar;
 pub mod canon;
 pub mod content;
 pub mod engagement;
 pub mod feeds;
 pub mod hash;
 pub mod look;
+pub mod mail;
+pub mod mail_bi;
 pub mod news;
 pub mod notifications;
 pub mod opportunities;
@@ -28,6 +31,9 @@ pub mod providers;
 pub mod release;
 pub mod renewals;
 pub mod system;
+
+#[cfg(test)]
+mod mail_calendar_tests;
 
 pub use sqlx;
 
@@ -73,8 +79,10 @@ pub fn invalid(code: &'static str, message: impl Into<String>) -> DomainError {
 pub type DResult<T> = Result<T, DomainError>;
 
 /// Static configuration the domain needs at runtime.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HubConfig {
+    /// Authenticated principal name → owner of mail and calendar data.
+    pub principal_owners: BTreeMap<String, String>,
     /// URL external procedures use to reach this hub (receipts, dispatch).
     pub public_url: String,
     pub company_id: String,
@@ -161,6 +169,55 @@ pub const OPERATOR_OR_AGENT: &[Role] = &[Role::Operator, Role::Agent];
 pub const OPERATOR_OR_PROCEDURE: &[Role] = &[Role::Operator, Role::Procedure];
 /// Collectors authenticate per `(host, unix_user)` for telemetry and operation receipts.
 pub const OPERATOR_OR_COLLECTOR: &[Role] = &[Role::Operator, Role::Collector];
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    #[test]
+    fn owner_mapping_is_fail_closed_when_configured_even_for_procedures() {
+        let procedure = Actor::system();
+        let mut user = procedure.clone();
+        user.principal.name = "alice-login".into();
+        user.principal.role = Role::Operator;
+        let mut config = HubConfig::default();
+        assert_eq!(config.resolve_owner(&user).unwrap(), "alice-login");
+        config.principal_owners.insert("alice-login".into(), "alice".into());
+        assert_eq!(config.resolve_owner(&user).unwrap(), "alice");
+        assert!(matches!(config.resolve_owner(&procedure), Err(DomainError::Forbidden(_))));
+        assert!(matches!(Hub::sync_owner(&user, "alice"), Err(DomainError::Forbidden(_))));
+        assert_eq!(Hub::sync_owner(&procedure, "alice").unwrap(), "alice");
+    }
+}
+
+impl HubConfig {
+    fn resolve_owner(&self, actor: &Actor) -> DResult<String> {
+        let name = &actor.principal.name;
+        if self.principal_owners.is_empty() {
+            return Ok(name.clone());
+        }
+        self.principal_owners
+            .get(name)
+            .filter(|owner| !owner.trim().is_empty())
+            .cloned()
+            .ok_or_else(|| DomainError::Forbidden("principal is not mapped to a mail/calendar owner".into()))
+    }
+}
+
+impl Hub {
+    pub fn resolve_owner(&self, actor: &Actor) -> DResult<String> {
+        self.config.resolve_owner(actor)
+    }
+
+    /// Only internal/procedure entry points accept an explicit owner.
+    fn sync_owner<'a>(actor: &Actor, owner: &'a str) -> DResult<&'a str> {
+        actor.require(&[Role::Procedure])?;
+        if owner.trim().is_empty() {
+            return Err(invalid("invalid_owner", "owner must not be empty"));
+        }
+        Ok(owner)
+    }
+}
 
 /// Decode rows produced by `select to_jsonb(t) from (...) t` into contract
 /// types. Column names are the contract field names.

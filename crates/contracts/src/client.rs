@@ -265,6 +265,48 @@ impl HubClient {
     pub async fn search(&self, q: &str) -> Result<Vec<SearchHit>, ClientError> {
         self.send(self.http.get(self.url("/search")).query(&[("q", q)])).await
     }
+    pub async fn list_mail_accounts(&self) -> Result<Vec<MailAccount>, ClientError> {
+        self.get("/mail/accounts").await
+    }
+    pub async fn ingest_mail_messages(&self, body: &MailIngestRequest) -> Result<MailIngestResult, ClientError> {
+        self.post("/mail/ingest", body).await
+    }
+    pub async fn list_mail_messages(&self, query: &MailSearchQuery) -> Result<Vec<MailMessageSummary>, ClientError> {
+        self.send(self.http.get(self.url("/mail/messages")).query(query)).await
+    }
+    pub async fn get_mail_message(&self, id: Uuid) -> Result<MailMessageDetail, ClientError> {
+        self.get(&format!("/mail/messages/{id}")).await
+    }
+    pub async fn override_mail_triage(&self, id: Uuid, body: &MailTriageOverride) -> Result<MailMessageDetail, ClientError> {
+        self.put(&format!("/mail/messages/{id}/triage"), body).await
+    }
+    pub async fn mail_bi_overview(&self) -> Result<MailBiOverview, ClientError> {
+        self.get("/mail/bi/overview").await
+    }
+    pub async fn create_mail_bi_digest(
+        &self,
+        period_kind: &str,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+    ) -> Result<MailBiDigest, ClientError> {
+        self.post(
+            "/mail/bi/digests",
+            &serde_json::json!({ "period_kind": period_kind, "period_start": period_start, "period_end": period_end }),
+        )
+        .await
+    }
+    pub async fn list_mail_bi_digests(&self) -> Result<Vec<MailBiDigest>, ClientError> {
+        self.get("/mail/bi/digests").await
+    }
+    pub async fn list_calendar_sources(&self) -> Result<Vec<CalendarSource>, ClientError> {
+        self.get("/calendar/sources").await
+    }
+    pub async fn list_calendar_events(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<CalendarEvent>, ClientError> {
+        self.send(self.http.get(self.url("/calendar/events")).query(&[("from", from), ("to", to)])).await
+    }
+    pub async fn calendar_agenda(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<CalendarAgendaResponse, ClientError> {
+        self.send(self.http.get(self.url("/calendar/agenda")).query(&[("from", from), ("to", to)])).await
+    }
     pub async fn assets(&self) -> Result<Vec<Asset>, ClientError> {
         self.get("/assets").await
     }

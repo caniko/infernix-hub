@@ -14,6 +14,9 @@ use uuid::Uuid;
 #[cfg(feature = "client")]
 pub mod client;
 
+pub mod mail_calendar;
+pub use mail_calendar::*;
+
 /// Generic AI model provider, multi-account, quota, activity, routing and export contracts.
 pub mod providers;
 
