@@ -368,6 +368,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         dispatch_early_secs: 30,
         dispatch_window_secs: 15 * 60,
         fleet_issues: s.fleet_issues.clone(),
+        summary_stale_hours: s.summary_stale_hours,
     };
     // Publishing channels are addressed by `accounts.transport`. The built-in
     // adapter answers under its own real name only; a `fixture` deployment

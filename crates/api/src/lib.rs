@@ -312,12 +312,7 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
         tokio::spawn(feeds::run(state.hub.clone(), feeds));
         tokio::spawn(providers::run_loop(state.hub.clone()));
         tokio::spawn(worker::run(state.hub.clone(), Duration::from_secs(2)));
-        tokio::spawn(notify_loop(
-            state.hub.clone(),
-            state.fleet_status_file.clone(),
-            state.secret_inventory_file.clone(),
-            settings.summary_stale_hours,
-        ));
+        tokio::spawn(notify_loop(state.hub.clone(), state.fleet_status_file.clone(), state.secret_inventory_file.clone()));
     }
     let listener = tokio::net::TcpListener::bind(&settings.bind).await.with_context(|| format!("binding {}", settings.bind))?;
     tracing::info!(bind = %settings.bind, "listening");
@@ -331,16 +326,11 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
 
 /// Producers ride one in-process loop next to the worker: no scheduler, no
 /// second process. `--no-worker` starts neither.
-pub async fn notify_loop(
-    hub: Hub,
-    fleet_status_file: Option<std::path::PathBuf>,
-    secret_inventory_file: Option<std::path::PathBuf>,
-    summary_stale_hours: Option<u32>,
-) {
+pub async fn notify_loop(hub: Hub, fleet_status_file: Option<std::path::PathBuf>, secret_inventory_file: Option<std::path::PathBuf>) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     loop {
         tick.tick().await;
-        notify_pass(&hub, fleet_status_file.as_deref(), secret_inventory_file.as_deref(), summary_stale_hours).await;
+        notify_pass(&hub, fleet_status_file.as_deref(), secret_inventory_file.as_deref(), hub.config.summary_stale_hours).await;
     }
 }
 
@@ -425,8 +415,9 @@ pub async fn notify_pass(
             }
         }
     }
-    match domain::notifications::summary_raises(hub, summary_stale_hours).await {
-        Ok(raises) => notify_sync(hub, "hub", raises).await,
+    match domain::notifications::sync_summary_staleness(hub, summary_stale_hours).await {
+        Ok(0) => {}
+        Ok(changed) => tracing::debug!(source = "hub", changed, "notifications: producer pass"),
         Err(error) => tracing::warn!(%error, "notifications: hub source skipped"),
     }
     if let Err(error) = domain::notifications::expire_snoozes(hub).await {

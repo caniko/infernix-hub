@@ -86,6 +86,8 @@ pub struct HubConfig {
     pub dispatch_window_secs: i64,
     /// Where fleet degradations are filed as Paperclip issues; unset files none.
     pub fleet_issues: Option<FleetIssues>,
+    /// How long a daily summary stays fresh; unset disables the stale alert.
+    pub summary_stale_hours: Option<u32>,
 }
 
 /// Paperclip routing for fleet notifications (the operations company, its
