@@ -509,6 +509,45 @@ async fn scoped_worker_requires_oauth_even_with_preferred_and_bound_api_key() {
 }
 
 #[tokio::test]
+async fn scoped_worker_rejects_single_entry_api_key_wrappers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = Scratch::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock = serve(Router::new().fallback({
+        let calls = calls.clone();
+        move || async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        }
+    }))
+    .await;
+    let config = fixture_config(&dir, &mock);
+    let worker = WorkerOptions {
+        worker_unix_socket: Some(dir.join("worker.sock")),
+        worker_allowed_models: vec!["gpt-test".into()],
+        ..Default::default()
+    }
+    .validate(&config)
+    .unwrap()
+    .unwrap()
+    .with_test_upstream(mock.0.join(CODEX_RESPONSES).unwrap());
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    let server = serve(worker.app(proxy.clone())).await;
+    let http = Http::new(&server);
+    for entry in [
+        json!({"access_token":"opaque-fixture","refresh_token":"fixture-refresh"}),
+        json!({"access_token":"opaque-fixture","auth_type":"oauth","account_id":"fixture-account"}),
+    ] {
+        let raw = json!({"type":"codex","api_key":entry});
+        proxy.state.write().await.pool.insert(pool::parse_credentials("wrapped.json", &raw, false).unwrap());
+        let result = http.request("POST", CODEX_RESPONSES).json(&json!({"model":"gpt-test"})).send().await.unwrap();
+        assert_eq!((result.status(), calls.load(Ordering::SeqCst)), (StatusCode::SERVICE_UNAVAILABLE, 0));
+        assert!(proxy.state.read().await.pool.accounts["wrapped.json"].api_key);
+    }
+}
+
+#[tokio::test]
 async fn scoped_worker_rechecks_oauth_after_renewal() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -570,7 +609,7 @@ async fn scoped_worker_denies_all_other_routes_models_and_overrides_before_forwa
     let config = fixture_config(&dir, &mock);
     let worker = WorkerOptions {
         worker_unix_socket: Some(dir.join("worker.sock")),
-        worker_allowed_models: vec!["gpt-test".into()],
+        worker_allowed_models: vec!["gpt-test".into(), "gpt-6.2-sol".into()],
         ..Default::default()
     }
     .validate(&config)
@@ -613,6 +652,13 @@ async fn scoped_worker_denies_all_other_routes_models_and_overrides_before_forwa
         ("{}", 403),
         (r#"{"model":4}"#, 403),
         (r#"{"model":{"value":"gpt-test"}}"#, 403),
+        (r#"{"model":{"$serde_json::private::RawValue":"\"gpt-6.2-sol\""}}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","$serde_json::private::Number":"1"}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","metadata":{"$serde_json::private::RawValue":"1"}}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","metadata":{"a":1,"\u0061":2}}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","meta":{"a":1,"a":2}}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","input":[{"a":1,"a":2}]}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","input":[{"a":1,"$serde_json::private::Number":"1"}]}"#, 403),
         (r#"{"model":["gpt-test"]}"#, 403),
         (r#"{"model":null}"#, 403),
         (r#"{"model":""}"#, 403),
@@ -646,8 +692,9 @@ async fn scoped_worker_tcp_accepts_only_the_dedicated_bearer() {
         Router::new()
             .route(
                 CODEX_RESPONSES,
-                post(|headers: HeaderMap| async move {
+                post(|headers: HeaderMap, axum::Json(body): axum::Json<Value>| async move {
                     assert_eq!(headers["authorization"], "Bearer upstream-oauth");
+                    assert_eq!(body["input"], json!([{"values":[true,null,"fixture",-1,2,0.5]}]));
                     StatusCode::OK
                 }),
             )
@@ -672,12 +719,10 @@ async fn scoped_worker_tcp_accepts_only_the_dedicated_bearer() {
     .validate(&config)
     .unwrap()
     .unwrap()
-    .with_test_upstream(mock.0.join(CODEX_RESPONSES).unwrap())
-    .bind()
-    .await
-    .unwrap();
+    .with_test_upstream(mock.0.join(CODEX_RESPONSES).unwrap());
+    let proxy = Arc::new(Proxy::new(config).unwrap().with_worker_config(Some(&worker)));
+    let worker = worker.bind().await.unwrap();
     let addr = worker.test_tcp_addr();
-    let proxy = Arc::new(Proxy::new(config).unwrap());
     for (name, raw) in [
         ("oauth.json", json!({"type":"codex","auth_type":"oauth","access_token":"upstream-oauth"})),
         ("google.json", json!({"type":"google","access_token":PROVIDER_FIXTURE})),
@@ -685,14 +730,16 @@ async fn scoped_worker_tcp_accepts_only_the_dedicated_bearer() {
         proxy.state.write().await.pool.insert(pool::parse_credentials(name, &raw, false).unwrap());
     }
     let shared = serve(proxy.clone().app()).await;
-    let shared_response =
-        Http::new(&shared).request("POST", google_path).bearer_auth(PROVIDER_FIXTURE).json(&json!({"contents":[]})).send().await.unwrap();
+    let shared_http = Http::new(&shared);
+    let shared_post = || shared_http.request("POST", google_path).json(&json!({"contents":[]}));
+    let shared_response = shared_post().bearer_auth(PROVIDER_FIXTURE).send().await.unwrap();
     assert_eq!(shared_response.status(), StatusCode::OK);
     let worker_proxy = proxy.clone();
     let task = tokio::spawn(async move { worker.serve(worker_proxy, std::future::pending()).await.unwrap() });
     let server = Server(format!("http://{addr}").parse().unwrap(), task);
     let http = Http::new(&server);
-    let post = || http.request("POST", CODEX_RESPONSES).json(&json!({"model":"gpt-test"}));
+    let post =
+        || http.request("POST", CODEX_RESPONSES).json(&json!({"model":"gpt-test","input":[{"values":[true,null,"fixture",-1,2,0.5]}]}));
     for token in [None, Some("inference-fixture"), Some("management-fixture"), Some(PROVIDER_FIXTURE), Some("wrong")] {
         let req = post();
         let req = if let Some(token) = token { req.bearer_auth(token) } else { req };
@@ -711,6 +758,25 @@ async fn scoped_worker_tcp_accepts_only_the_dedicated_bearer() {
         .pool
         .insert(pool::parse_credentials("later.json", &json!({"type":"google","access_token":WORKER_FIXTURE}), false).unwrap());
     assert_eq!(post().bearer_auth(WORKER_FIXTURE).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(shared_post().bearer_auth(WORKER_FIXTURE).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        shared_post().bearer_auth(WORKER_FIXTURE).header("x-api-key", "inference-fixture").send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(
+        shared_post()
+            .bearer_auth(PROVIDER_FIXTURE)
+            .header("authorization", format!("Bearer {WORKER_FIXTURE}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(
+        shared_post().bearer_auth(PROVIDER_FIXTURE).header("x-api-key", WORKER_FIXTURE).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+    );
 }
 
 #[tokio::test]
@@ -796,6 +862,28 @@ async fn scoped_worker_socket_guard_preserves_a_replacement() {
     assert_ne!(original, replacement);
     drop(bound);
     assert_eq!(path.symlink_metadata().unwrap().ino(), replacement);
+}
+
+#[tokio::test]
+async fn scoped_worker_socket_guard_does_not_unlink_while_startup_has_the_lock() {
+    let dir = Scratch::new();
+    let mock = serve(Router::new()).await;
+    let config = fixture_config(&dir, &mock);
+    let path = dir.join("worker.sock");
+    let unix = || {
+        WorkerOptions { worker_unix_socket: Some(path.clone()), worker_allowed_models: vec!["gpt-test".into()], ..Default::default() }
+            .validate(&config)
+            .unwrap()
+            .unwrap()
+    };
+    let bound = unix().bind().await.unwrap();
+    let directory = fs::File::open(path.parent().unwrap()).unwrap();
+    directory.try_lock().unwrap();
+    drop(bound);
+    assert!(path.exists(), "cleanup must not unlink without the directory lock");
+    drop(directory);
+    drop(unix().bind().await.unwrap());
+    assert!(!path.exists(), "a successor can recover and clean up the socket");
 }
 
 #[tokio::test]

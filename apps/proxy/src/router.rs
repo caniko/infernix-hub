@@ -8,7 +8,7 @@ use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
     extract::{Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
@@ -49,7 +49,11 @@ pub(crate) fn routes() -> Router<Arc<Proxy>> {
 }
 
 pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
-    let (scheme, secret) = headers.get(header::AUTHORIZATION)?.to_str().ok()?.split_once(' ')?;
+    parse_bearer(headers.get(header::AUTHORIZATION)?)
+}
+
+fn parse_bearer(value: &HeaderValue) -> Option<&str> {
+    let (scheme, secret) = value.to_str().ok()?.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then_some(secret).filter(|s| !s.is_empty())
 }
 
@@ -117,6 +121,17 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
         _ if path.starts_with("/v1internal/") || path.starts_with("/v1internal:") || path.starts_with("/v1beta/") => Lane::Google,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    if let Some(worker_bearer) = proxy.worker_bearer.as_deref()
+        && parts
+            .headers
+            .get_all(header::AUTHORIZATION)
+            .iter()
+            .filter_map(parse_bearer)
+            .chain(parts.headers.get_all("x-api-key").iter().filter_map(|value| value.to_str().ok()))
+            .any(|token| matches_secret(token, worker_bearer))
+    {
+        return lane_error(lane, StatusCode::UNAUTHORIZED, "invalid inference credentials");
+    }
     let provided = bearer(&parts.headers);
     let authorized = [parts.headers.get("x-api-key").and_then(|v| v.to_str().ok()), provided]
         .into_iter()

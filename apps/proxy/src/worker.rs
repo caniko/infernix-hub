@@ -22,10 +22,10 @@ use axum::{
 use clap::Args;
 use reqwest::Url;
 use serde::{
-    Deserializer,
-    de::{self, MapAccess, Visitor},
+    Deserialize, Deserializer,
+    de::{self, MapAccess, SeqAccess, Visitor},
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 
 use crate::{
@@ -114,6 +114,10 @@ impl WorkerOptions {
 }
 
 impl WorkerConfig {
+    pub(crate) fn bearer(&self) -> Option<&str> {
+        self.scope.key.as_deref()
+    }
+
     pub async fn validate_pool(&self, proxy: &Proxy) -> Result<()> {
         if let Some(key) = &self.scope.key {
             ensure!(!pool_has_secret(proxy, key).await, "worker bearer must differ from loaded provider credentials");
@@ -182,6 +186,12 @@ struct UnixSocketGuard {
 
 impl Drop for UnixSocketGuard {
     fn drop(&mut self) {
+        let Some(directory) = self.path.parent().and_then(|parent| fs::File::open(parent).ok()) else { return };
+        // Never block the runtime while a start holds the lock across its probe.
+        // If contended, leave the socket for a successor's stale-socket check.
+        if directory.try_lock().is_err() {
+            return;
+        }
         if fs::symlink_metadata(&self.path).is_ok_and(|m| m.file_type().is_socket() && m.dev() == self.dev && m.ino() == self.ino) {
             let _ = fs::remove_file(&self.path);
         }
@@ -213,7 +223,7 @@ async fn bind_unix(path: &Path) -> Result<Listener> {
             ensure!(metadata.uid() == uid && mode & 0o777 == 0o700, "worker socket parent must be owned by the service user and mode 0700");
         }
     }
-    // Serialize stale-socket checks with other starts in this private directory.
+    // Serialize stale-socket checks and bind with other starts and socket cleanup.
     let directory = fs::File::open(parent)?;
     directory.try_lock().context("lock worker socket directory")?;
     match fs::symlink_metadata(&path) {
@@ -233,7 +243,9 @@ async fn bind_unix(path: &Path) -> Result<Listener> {
     let metadata = fs::symlink_metadata(&path)?;
     ensure!(metadata.file_type().is_socket() && metadata.uid() == uid, "worker socket path changed after bind");
     let guard = UnixSocketGuard { path, dev: metadata.dev(), ino: metadata.ino() };
-    fs::set_permissions(&guard.path, fs::Permissions::from_mode(0o600))?;
+    let permissions = fs::set_permissions(&guard.path, fs::Permissions::from_mode(0o600));
+    drop(directory);
+    permissions?;
     Ok(Listener::Unix(listener, guard))
 }
 
@@ -322,26 +334,66 @@ fn inference_header(name: &str) -> bool {
     )
 }
 
-struct WorkerBody;
+struct StrictValue(Value);
 
-impl<'de> Visitor<'de> for WorkerBody {
-    type Value = Map<String, Value>;
+impl<'de> Deserialize<'de> for StrictValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(StrictJson).map(Self)
+    }
+}
+
+struct StrictJson;
+
+impl<'de> Visitor<'de> for StrictJson {
+    type Value = Value;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON object with unique keys")
+        formatter.write_str("JSON without duplicate or reserved object keys")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
+        Number::from_f64(value).map(Value::Number).ok_or_else(|| E::custom("invalid JSON number"))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(StrictValue(value)) = access.next_element()? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Value, A::Error> {
         let mut object = Map::new();
         while let Some(key) = access.next_key::<String>()? {
-            if object.contains_key(&key) || !BODY_FIELDS.contains(&key.as_str()) {
-                return Err(de::Error::custom("unsupported or duplicate worker body field"));
+            // Do not let serde_json reinterpret a field as raw JSON or a number.
+            if matches!(key.as_str(), "$serde_json::private::RawValue" | "$serde_json::private::Number") || object.contains_key(&key) {
+                return Err(de::Error::custom("duplicate or reserved JSON object key"));
             }
-            // Deserialize the model as a string, not a generic Value that can interpret raw JSON.
-            let value = if key == "model" { Value::String(access.next_value::<String>()?) } else { access.next_value()? };
+            let StrictValue(value) = access.next_value()?;
             object.insert(key, value);
         }
-        Ok(object)
+        Ok(Value::Object(object))
     }
 }
 
@@ -393,12 +445,14 @@ async fn forward(State((proxy, scope)): State<(Arc<Proxy>, Arc<Scope>)>, request
         return StatusCode::BAD_REQUEST.into_response();
     }
     let mut json = serde_json::Deserializer::from_slice(&body);
-    let object = match json.deserialize_map(WorkerBody).and_then(|object| json.end().map(|()| object)) {
-        Ok(object) => object,
+    let object = match StrictValue::deserialize(&mut json).and_then(|value| json.end().map(|()| value)) {
+        Ok(StrictValue(Value::Object(object))) => object,
         Err(error) if error.is_data() => return StatusCode::FORBIDDEN.into_response(),
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        _ => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if !object.get("model").and_then(Value::as_str).is_some_and(|model| scope.models.contains(model)) {
+    if object.keys().any(|key| !BODY_FIELDS.contains(&key.as_str()))
+        || !object.get("model").and_then(Value::as_str).is_some_and(|model| scope.models.contains(model))
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Ok(body) = serde_json::to_vec(&object) else {

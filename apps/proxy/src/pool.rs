@@ -596,7 +596,9 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
 fn parse_credentials_for_lane(name: &str, raw: &Value, local: bool, known_lane: Option<Lane>) -> Result<Vec<Account>> {
     ensure!(filename(name) && raw.is_object(), "invalid credential name or JSON object");
     let kind = text(raw, &["type", "provider"]).unwrap_or_default();
-    let group = raw.get("api_key").filter(|v| v.is_object()).unwrap_or(raw);
+    let api_key_wrapper = raw.get("api_key").filter(|v| v.is_object());
+    let forced_api_key = api_key_wrapper.is_some();
+    let group = api_key_wrapper.unwrap_or(raw);
     let lane = known_lane
         .or_else(|| text(raw, &["family", "provider", "type"]).and_then(Lane::parse))
         .or_else(|| text(group, &["family", "provider"]).and_then(Lane::parse))
@@ -628,13 +630,14 @@ fn parse_credentials_for_lane(name: &str, raw: &Value, local: bool, known_lane: 
         let auth_types = [raw, entry].into_iter().flat_map(|value| {
             ["type", "auth_type", "auth_mode"].into_iter().filter_map(|field| text(value, &[field]).map(str::to_ascii_lowercase))
         });
-        let api_key = lane != Lane::Go
-            && (key.is_some()
-                || is_group
-                || matches!(kind, "api_key" | "api-key")
-                || (lane == Lane::Codex
-                    && (access.starts_with("sk-")
-                        || auth_types.clone().any(|kind| matches!(kind.as_str(), "api" | "apikey" | "api_key" | "api-key")))));
+        let api_key = forced_api_key
+            || (lane != Lane::Go
+                && (key.is_some()
+                    || is_group
+                    || matches!(kind, "api_key" | "api-key")
+                    || (lane == Lane::Codex
+                        && (access.starts_with("sk-")
+                            || auth_types.clone().any(|kind| matches!(kind.as_str(), "api" | "apikey" | "api_key" | "api-key"))))));
         let codex_oauth_explicit = lane == Lane::Codex
             && !api_key
             && auth_types.into_iter().any(|kind| matches!(kind.as_str(), "oauth" | "oauth2" | "chatgpt" | "chatgptauthtokens"));
