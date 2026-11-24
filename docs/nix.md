@@ -58,6 +58,35 @@ Formatting is treefmt only (`rustfmt` with edition 2024 and the repo's
 `rustfmt.toml` max width, `alejandra` for Nix). Enter a shell and run
 `treefmt <paths>`; the flake's `formatter` output is the same wrapper.
 
+## Scoped Codex workers
+
+The worker listener is off by default. To enable the private Unix socket for
+the local Home Manager proxy:
+
+```nix
+programs.fleetixHub.agentProxy.workerListener = {
+  enable = true;
+  allowedModels = ["gpt-6.2-sol"];
+};
+```
+
+The default socket is `$XDG_RUNTIME_DIR/fleetix-agent-proxy/worker.sock`.
+The proxy creates the socket with mode `0600` and requires a service-owned
+`0700` parent directory. Clients on the Unix socket do not need a bearer
+unless the service is started with a separate worker key.
+
+For CLI use, pass `--worker-unix-socket PATH` or
+`--worker-listen 127.0.0.1:PORT` to `fleetix-agent-proxy serve`, together
+with `--worker-allowed-models MODEL[,MODEL...]`. TCP requires
+`--worker-api-key-file PATH`: a service-owned regular file with no group or
+world permissions. Generate a random bearer of at least 32 characters,
+distinct from every client, management, and provider credential.
+
+Only `POST /backend-api/codex/responses` with an exactly allowlisted model is
+accepted. Worker requests always go to the ChatGPT Codex backend with a
+subscription credential; they never fall back to a metered OpenAI API key.
+The worker listener does not expose proxy management or model discovery.
+
 ## Checks
 
 | Check | What it proves |

@@ -182,6 +182,7 @@ pub struct Account {
     provenance_project: Option<String>,
     pub project: Option<String>,
     pub api_key: bool,
+    pub(crate) codex_oauth_explicit: bool,
     pub base: Option<reqwest::Url>,
     pub local: bool,
     pub models: Vec<String>,
@@ -205,6 +206,21 @@ pub struct Account {
 }
 
 impl Account {
+    fn is_codex_oauth(&self) -> bool {
+        self.lane == Lane::Codex
+            && !self.api_key
+            && !self.access.is_empty()
+            && !self.access.starts_with("sk-")
+            && (self.codex_oauth_explicit
+                || self.refresh.as_deref().is_some_and(|token| {
+                    !token.is_empty()
+                        && token.len() <= 32_768
+                        && token != "spillway-pool"
+                        && !token.starts_with("sk-")
+                        && token.bytes().all(|b| b.is_ascii_graphic())
+                }))
+    }
+
     pub(crate) fn current_secrets(&self) -> [&str; 3] {
         [&self.access, self.refresh.as_deref().unwrap_or_default(), self.google_secret.as_deref().unwrap_or_default()]
     }
@@ -574,11 +590,17 @@ pub fn filename(name: &str) -> bool {
 }
 
 pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Account>> {
+    parse_credentials_for_lane(name, raw, local, None)
+}
+
+fn parse_credentials_for_lane(name: &str, raw: &Value, local: bool, known_lane: Option<Lane>) -> Result<Vec<Account>> {
     ensure!(filename(name) && raw.is_object(), "invalid credential name or JSON object");
     let kind = text(raw, &["type", "provider"]).unwrap_or_default();
-    let group = raw.get("api_key").filter(|v| v.is_object()).unwrap_or(raw);
-    let lane = text(raw, &["family", "provider", "type"])
-        .and_then(Lane::parse)
+    let api_key_wrapper = raw.get("api_key").filter(|v| v.is_object());
+    let forced_api_key = api_key_wrapper.is_some();
+    let group = api_key_wrapper.unwrap_or(raw);
+    let lane = known_lane
+        .or_else(|| text(raw, &["family", "provider", "type"]).and_then(Lane::parse))
         .or_else(|| text(group, &["family", "provider"]).and_then(Lane::parse))
         .or_else(|| text(raw, &["type"]).and_then(Lane::parse))
         .ok_or_else(|| anyhow!("unsupported credential provider"))?;
@@ -605,11 +627,20 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             "credential has no usable access or refresh token"
         );
         ensure!(access.len() <= 32_768 && access.bytes().all(|b| b.is_ascii_graphic()), "invalid credential token");
+        let auth_types = [raw, entry].into_iter().flat_map(|value| {
+            ["type", "auth_type", "auth_mode"].into_iter().filter_map(|field| text(value, &[field]).map(str::to_ascii_lowercase))
+        });
         let api_key = lane != Lane::Go
-            && (key.is_some()
+            && (forced_api_key
+                || key.is_some()
                 || is_group
                 || matches!(kind, "api_key" | "api-key")
-                || (kind == "openai" && access.starts_with("sk-") && refresh.is_none()));
+                || (lane == Lane::Codex
+                    && (access.starts_with("sk-")
+                        || auth_types.clone().any(|kind| matches!(kind.as_str(), "api" | "apikey" | "api_key" | "api-key")))));
+        let codex_oauth_explicit = lane == Lane::Codex
+            && !api_key
+            && auth_types.into_iter().any(|kind| matches!(kind.as_str(), "oauth" | "oauth2" | "chatgpt" | "chatgptauthtokens"));
         let access_claims = jwt_claims(access);
         let id_token = text(entry, &["id_token", "/tokens/id_token"]);
         let claims = id_token.map(jwt_claims).unwrap_or_else(|| access_claims.clone());
@@ -684,6 +715,7 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
             provenance_project: None,
             project: text(entry, &["project_id", "projectId", "project"]).map(str::to_owned),
             api_key,
+            codex_oauth_explicit,
             base: (api_key || lane == Lane::Go).then(|| base.clone()).flatten(),
             local,
             models: models.clone(),
@@ -709,6 +741,7 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
         let material = json!([
             account.access,
             account.refresh,
+            account.codex_oauth_explicit,
             account.expires,
             id_token,
             account.google_client,
@@ -746,6 +779,27 @@ pub(crate) struct ModelEligibility<'a> {
 struct AccountEligibility<'a> {
     auth_index: &'a str,
     exclusion_reasons: Vec<&'static str>,
+}
+
+pub(crate) struct AccountFilter<'a> {
+    pub lane: Lane,
+    pub model: &'a str,
+    pub required_project: Option<&'a str>,
+    pub subscriptions_only: bool,
+}
+
+impl<'a> AccountFilter<'a> {
+    pub(crate) fn shared(lane: Lane, model: &'a str, required_project: Option<&'a str>) -> Self {
+        Self { lane, model, required_project, subscriptions_only: false }
+    }
+
+    pub(crate) fn allows(&self, account: &Account) -> bool {
+        account.lane == self.lane && (!self.subscriptions_only || account.is_codex_oauth())
+    }
+
+    pub(crate) fn supports(&self, pool: &Pool, account: &Account) -> bool {
+        self.allows(account) && pool.supports(account, self.lane, self.model, self.required_project)
+    }
 }
 
 #[derive(Default)]
@@ -892,8 +946,8 @@ impl Pool {
         a.lane == lane && self.support_exclusion(a, model, required_project).is_none()
     }
 
-    fn supported<'a>(&'a self, lane: Lane, model: &'a str, required_project: Option<&'a str>) -> impl Iterator<Item = &'a Account> {
-        self.accounts.values().filter(move |a| self.supports(a, lane, model, required_project))
+    fn supported<'a>(&'a self, filter: &'a AccountFilter<'a>) -> impl Iterator<Item = &'a Account> {
+        self.accounts.values().filter(move |a| filter.supports(self, a))
     }
 
     pub(crate) fn evaluate_model_eligibility<'a>(
@@ -978,30 +1032,21 @@ impl Pool {
         self.evaluate_model_eligibility(Lane::Google, model, required_project, now)?.verified_next_reset_at
     }
 
-    pub fn next_reset(&self, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.supported(lane, model, required_project)
-            .filter(|a| !a.quarantined(now))
-            .filter_map(|a| a.quota_limited_until(now, model))
-            .min()
+    pub fn next_reset(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.supported(filter).filter(|a| !a.quarantined(now)).filter_map(|a| a.quota_limited_until(now, filter.model)).min()
     }
 
-    pub fn all_quota_limited(&self, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> bool {
-        let mut accounts = self.supported(lane, model, required_project).peekable();
-        accounts.peek().is_some() && accounts.all(|a| !a.quarantined(now) && a.quota_limited_until(now, model).is_some())
+    pub fn all_quota_limited(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> bool {
+        let mut accounts = self.supported(filter).peekable();
+        accounts.peek().is_some() && accounts.all(|a| !a.quarantined(now) && a.quota_limited_until(now, filter.model).is_some())
     }
 
-    pub(crate) fn has_eligible_account(&self, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> bool {
-        self.supported(lane, model, required_project).any(|a| a.eligible(now, model))
+    pub(crate) fn has_eligible_account(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> bool {
+        self.supported(filter).any(|a| a.eligible(now, filter.model))
     }
 
-    pub(crate) fn uniform_quarantine_kind(
-        &self,
-        lane: Lane,
-        model: &str,
-        required_project: Option<&str>,
-        now: DateTime<Utc>,
-    ) -> Option<AccountErrorKind> {
-        let mut kinds = self.supported(lane, model, required_project).map(|a| a.active_quarantine(now).map(|err| err.kind));
+    pub(crate) fn uniform_quarantine_kind(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> Option<AccountErrorKind> {
+        let mut kinds = self.supported(filter).map(|a| a.active_quarantine(now).map(|err| err.kind));
         let kind = kinds.next()??;
         kinds.all(|other| other == Some(kind)).then_some(kind)
     }
@@ -1019,13 +1064,24 @@ impl Pool {
     pub fn pick(
         &mut self,
         lane: Lane,
-        (session, parent): (Option<&str>, Option<&str>),
+        affinity: (Option<&str>, Option<&str>),
         model: &str,
         required_project: Option<&str>,
         tried: &[String],
         now: DateTime<Utc>,
     ) -> Option<Account> {
-        let eligible = |a: &&Account| self.supports(a, lane, model, required_project) && a.eligible(now, model) && !tried.contains(&a.id);
+        self.pick_for(&AccountFilter::shared(lane, model, required_project), affinity, tried, now)
+    }
+
+    pub(crate) fn pick_for(
+        &mut self,
+        filter: &AccountFilter<'_>,
+        (session, parent): (Option<&str>, Option<&str>),
+        tried: &[String],
+        now: DateTime<Utc>,
+    ) -> Option<Account> {
+        let AccountFilter { lane, model, .. } = *filter;
+        let eligible = |a: &&Account| filter.supports(self, a) && a.eligible(now, model) && !tried.contains(&a.id);
         if let Some(a) = self.preferred(lane).and_then(|id| self.accounts.get(id)).filter(eligible) {
             return Some(a.clone());
         }
@@ -1034,7 +1090,10 @@ impl Pool {
         if options.iter().any(|a| a.api_key == keys_first) {
             options.retain(|a| a.api_key == keys_first);
         }
-        let sticky = session.and_then(|id| self.bound(lane, id)).or_else(|| parent.and_then(|id| self.bound(lane, id)));
+        let bound = |session| {
+            self.bound(lane, session).filter(|id| !filter.subscriptions_only || self.accounts.get(*id).is_some_and(|a| filter.allows(a)))
+        };
+        let sticky = session.and_then(bound).or_else(|| parent.and_then(bound));
         if let Some(a) = sticky.and_then(|id| options.iter().find(|a| a.id == id)) {
             return Some((*a).clone());
         }
@@ -1196,13 +1255,9 @@ fn local_credential_name(lane: Lane, label: &str) -> String {
     format!("local-{}-{}.json", lane.name(), hex::encode(&Sha256::digest(label)[..8]))
 }
 
-fn add(pool: &mut Pool, lane: Lane, label: &str, mut raw: Value) {
-    let Some(fields) = raw.as_object_mut() else { return };
-    fields.insert("type".into(), json!(lane.name()));
-    fields.remove("provider");
-    fields.remove("family");
+fn add(pool: &mut Pool, lane: Lane, label: &str, raw: Value) {
     let name = local_credential_name(lane, label);
-    if let Ok(found) = parse_credentials(&name, &raw, true) {
+    if let Ok(found) = parse_credentials_for_lane(&name, &raw, true, Some(lane)) {
         let cutoff = Utc::now() + chrono::TimeDelta::seconds(30);
         let found = found
             .into_iter()

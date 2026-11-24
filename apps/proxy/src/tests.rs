@@ -1,4 +1,8 @@
 use super::*;
+use crate::{
+    pool::AccountFilter,
+    worker::{CODEX_RESPONSES, WorkerOptions},
+};
 use axum::{
     body::{Body, Bytes},
     http::{HeaderMap, StatusCode},
@@ -350,6 +354,593 @@ fn fixture_config(dir: &Scratch, mock: &Server) -> Config {
         antigravity: mock.0.clone(),
         url: config::DEFAULT_URL.into(),
     }
+}
+
+#[tokio::test]
+async fn scoped_worker_requires_oauth_even_with_preferred_and_bound_api_key() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const CLIENT_METADATA: [&str; 7] = [
+        "b3",
+        "traceparent",
+        "x-opencode-client",
+        "x-opencode-project",
+        "x-opencode-session",
+        "x-opencode-session-id",
+        "x-session-affinity",
+    ];
+    let dir = Scratch::new();
+    let shared_calls = Arc::new(AtomicUsize::new(0));
+    let shared = serve(Router::new().fallback({
+        let shared_calls = shared_calls.clone();
+        move || async move {
+            shared_calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        }
+    }))
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock = serve(Router::new().fallback({
+        let calls = calls.clone();
+        move |request: axum::extract::Request| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.uri().path(), CODEX_RESPONSES);
+            assert_eq!(request.headers()["authorization"], "Bearer upstream-oauth");
+            assert!(!request.headers().contains_key("x-api-key"));
+            for name in ["x-test-nominated", "x-client-version", "openai-beta"] {
+                assert!(!request.headers().contains_key(name), "{name} was nominated by Connection");
+            }
+            for name in CLIENT_METADATA {
+                assert!(!request.headers().contains_key(name), "{name} is local metadata");
+            }
+            let body = axum::body::to_bytes(request.into_body(), 1024).await.unwrap();
+            let raw: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(raw["model"], "gpt-test");
+            assert_eq!(&body[..], serde_json::to_vec(&raw).unwrap());
+            match raw["input"].as_str() {
+                Some("fail") => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                Some("quota") => (StatusCode::TOO_MANY_REQUESTS, r#"{"error":{"type":"usage_limit_reached"}}"#).into_response(),
+                Some("quota-stream") => (
+                    [("content-type", "text/event-stream")],
+                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"usage_limit_reached\"}}\n\n",
+                )
+                    .into_response(),
+                _ => StatusCode::OK.into_response(),
+            }
+        }
+    }))
+    .await;
+    let config = fixture_config(&dir, &shared);
+    let worker = WorkerOptions {
+        worker_unix_socket: Some(dir.join("worker.sock")),
+        worker_allowed_models: vec!["gpt-test".into()],
+        ..Default::default()
+    }
+    .validate(&config)
+    .unwrap()
+    .unwrap()
+    .with_test_upstream(mock.0.join(CODEX_RESPONSES).unwrap());
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    {
+        let mut state = proxy.state.write().await;
+        state.pool.insert(
+            pool::parse_credentials("key.json", &json!({"type":"api_key","family":"openai","api_key":"upstream-key"}), false).unwrap(),
+        );
+        state.pool.policy.api_key_order = contracts::providers::ApiKeyOrder::KeysFirst;
+        state.pool.policy.preferred_account_id = Some("key.json".into());
+        state.pool.bind(Lane::Codex, "same-session", "key.json");
+        assert_eq!(state.pool.preview(Lane::Codex).as_deref(), Some("key.json"));
+        pool::add_opencode(
+            &mut state.pool,
+            &json!({"openai":{"type":"codex","access_token":"sk-local-test-placeholder"}}),
+            &Default::default(),
+        );
+        assert!(state.pool.accounts.values().any(|account| account.local));
+        state
+            .pool
+            .insert(pool::parse_credentials("ambiguous.json", &json!({"type":"codex","access_token":"opaque-fixture"}), false).unwrap());
+    }
+    let server = serve(worker.app(proxy.clone())).await;
+    let http = Http::new(&server);
+    let post = |input| {
+        let request = http
+            .request("POST", CODEX_RESPONSES)
+            .bearer_auth("placeholder")
+            .header("x-api-key", "placeholder")
+            .header("content-type", "application/json")
+            .body(format!(r#"{{ "model" : "gpt-\u0074est", "prompt_cache_key": "same-session", "input": {} }}"#, json!(input)));
+        CLIENT_METADATA.into_iter().fold(request, |req, header| req.header(header, "fixture"))
+    };
+    assert_eq!(post("empty").send().await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials(
+            "oauth.json",
+            &json!({"type":"codex","auth_mode":"chatgpt","access_token":"upstream-oauth","base_url":shared.0.as_str()}),
+            false,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        post("allow")
+            .header("connection", "x-test-nominated, X-Client-Version")
+            .header("connection", "openai-beta")
+            .header("x-test-nominated", "fixture")
+            .header("x-client-version", "fixture")
+            .header("openai-beta", "fixture")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(shared_calls.load(Ordering::SeqCst), 0);
+    {
+        let mut state = proxy.state.write().await;
+        assert_eq!(state.pool.preview(Lane::Codex).as_deref(), Some("key.json"));
+        assert_eq!(state.pool.bound(Lane::Codex, "same-session"), Some("key.json"));
+        state.pool.policy.preferred_account_id = None;
+        state.pool.policy.switch_on_server_error = true;
+    }
+    assert_eq!(post("fail").send().await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "the worker must not fail over to the API key");
+    assert_eq!(post("quota").send().await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(shared_calls.load(Ordering::SeqCst), 0);
+    assert!(proxy.state.read().await.usage_refreshes.is_empty(), "no ad-hoc probe may be scheduled");
+
+    {
+        let mut state = proxy.state.write().await;
+        let account = state.pool.accounts.get_mut("oauth.json").unwrap();
+        account.cooldown = None;
+        account.scoped_cooldowns.clear();
+        account.clear_account_error();
+    }
+    let stream = post("quota-stream").send().await.unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert!(!stream.bytes().await.unwrap().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(shared_calls.load(Ordering::SeqCst), 0);
+    let state = proxy.state.read().await;
+    assert_eq!(state.pool.accounts["oauth.json"].last_error.as_ref().unwrap().kind, AccountErrorKind::QuotaExhausted);
+    assert!(state.usage_refreshes.is_empty(), "no ad-hoc probe may be scheduled from a stream either");
+}
+
+#[tokio::test]
+async fn scoped_worker_rejects_single_entry_api_key_wrappers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = Scratch::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock = serve(Router::new().fallback({
+        let calls = calls.clone();
+        move || async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        }
+    }))
+    .await;
+    let config = fixture_config(&dir, &mock);
+    let worker = WorkerOptions {
+        worker_unix_socket: Some(dir.join("worker.sock")),
+        worker_allowed_models: vec!["gpt-test".into()],
+        ..Default::default()
+    }
+    .validate(&config)
+    .unwrap()
+    .unwrap()
+    .with_test_upstream(mock.0.join(CODEX_RESPONSES).unwrap());
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    let server = serve(worker.app(proxy.clone())).await;
+    let http = Http::new(&server);
+    for entry in [
+        json!({"access_token":"opaque-fixture","refresh_token":"fixture-refresh"}),
+        json!({"access_token":"opaque-fixture","auth_type":"oauth","account_id":"fixture-account"}),
+    ] {
+        let raw = json!({"type":"codex","api_key":entry});
+        proxy.state.write().await.pool.insert(pool::parse_credentials("wrapped.json", &raw, false).unwrap());
+        let result = http.request("POST", CODEX_RESPONSES).json(&json!({"model":"gpt-test"})).send().await.unwrap();
+        assert_eq!((result.status(), calls.load(Ordering::SeqCst)), (StatusCode::SERVICE_UNAVAILABLE, 0));
+        assert!(proxy.state.read().await.pool.accounts["wrapped.json"].api_key);
+    }
+    let wrapped_go =
+        pool::parse_credentials("wrapped-go.json", &json!({"type":"opencode-go","api_key":{"access_token":"go-fixture"}}), false).unwrap();
+    assert_eq!(wrapped_go.len(), 1);
+    assert!(!wrapped_go[0].api_key);
+}
+
+#[tokio::test]
+async fn scoped_worker_rechecks_oauth_after_renewal() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = Scratch::new();
+    let path = dir.join("auth/oauth.json");
+    config::write_private(&path, br#"{"type":"codex","auth_mode":"chatgpt","access_token":"oauth-original-fixture"}"#, true).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock = serve(Router::new().route(
+        CODEX_RESPONSES,
+        post({
+            let calls = calls.clone();
+            move |headers: HeaderMap| {
+                let (calls, path) = (calls.clone(), path.clone());
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        assert_eq!(headers["authorization"], "Bearer oauth-original-fixture");
+                        config::write_private(&path, br#"{"type":"codex","access_token":"ambiguous-renewal-fixture"}"#, true).unwrap();
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }
+        }),
+    ))
+    .await;
+    let config = fixture_config(&dir, &mock);
+    let worker = WorkerOptions {
+        worker_unix_socket: Some(dir.join("worker.sock")),
+        worker_allowed_models: vec!["gpt-test".into()],
+        ..Default::default()
+    }
+    .validate(&config)
+    .unwrap()
+    .unwrap()
+    .with_test_upstream(mock.0.join(CODEX_RESPONSES).unwrap());
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    let server = serve(worker.app(proxy.clone())).await;
+    let result = Http::new(&server).request("POST", CODEX_RESPONSES).json(&json!({"model":"gpt-test"})).send().await.unwrap();
+    assert!(!result.status().is_success());
+    assert_eq!(proxy.state.read().await.pool.accounts["oauth.json"].access, "ambiguous-renewal-fixture");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "an ambiguous renewal must not go upstream");
+}
+
+#[tokio::test]
+async fn scoped_worker_denies_all_other_routes_models_and_overrides_before_forwarding() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = Scratch::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock = serve(Router::new().fallback({
+        let calls = calls.clone();
+        move || async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        }
+    }))
+    .await;
+    let config = fixture_config(&dir, &mock);
+    let worker = WorkerOptions {
+        worker_unix_socket: Some(dir.join("worker.sock")),
+        worker_allowed_models: vec!["gpt-test".into(), "gpt-6.2-sol".into()],
+        ..Default::default()
+    }
+    .validate(&config)
+    .unwrap()
+    .unwrap()
+    .with_test_upstream(mock.0.join(CODEX_RESPONSES).unwrap());
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials("oauth.json", &json!({"type":"codex","auth_type":"oauth","access_token":"upstream-oauth"}), false).unwrap(),
+    );
+    let server = serve(worker.app(proxy.clone())).await;
+    let http = Http::new(&server);
+    let body = r#"{"model":"gpt-test"}"#;
+    for (method, path) in [
+        ("POST", "/v1/messages"),
+        ("POST", "/v1/messages/count_tokens"),
+        ("GET", "/v0/management/status"),
+        ("GET", "/v8/management/status"),
+        ("POST", "/v1/responses"),
+        ("POST", "/v1/chat/completions"),
+        ("GET", "/v1/models"),
+        ("GET", "/api/hello"),
+        ("POST", "/v1internal:loadCodeAssist"),
+        ("POST", "/v1beta/models/test:generateContent"),
+        ("POST", "/arbitrary"),
+        ("GET", CODEX_RESPONSES),
+        ("HEAD", CODEX_RESPONSES),
+        ("OPTIONS", CODEX_RESPONSES),
+        ("POST", "/backend-api/codex/responses/"),
+        ("POST", "/backend-api/codex/%72esponses"),
+        ("POST", "/backend-api/codex/responses?base_url=https://example.test"),
+    ] {
+        assert_eq!(http.request(method, path).body(body).send().await.unwrap().status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+    let post = || http.request("POST", CODEX_RESPONSES);
+    for (body, status) in [
+        (r#"{"model":"gpt-4o"}"#, 403),
+        (r#"{"model":"claude-opus-5-5"}"#, 403),
+        (r#"{"model":"GPT-TEST"}"#, 403),
+        ("{}", 403),
+        (r#"{"model":4}"#, 403),
+        (r#"{"model":{"value":"gpt-test"}}"#, 403),
+        (r#"{"model":{"$serde_json::private::RawValue":"\"gpt-6.2-sol\""}}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","$serde_json::private::Number":"1"}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","metadata":{"$serde_json::private::RawValue":"1"}}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","metadata":{"$serde_json::private::Other":"1"}}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","metadata":{"a":1,"\u0061":2}}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","meta":{"a":1,"a":2}}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","input":[{"a":1,"a":2}]}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","input":[{"a":1,"$serde_json::private::Number":"1"}]}"#, 403),
+        (r#"{"model":["gpt-test"]}"#, 403),
+        (r#"{"model":null}"#, 403),
+        (r#"{"model":""}"#, 403),
+        (r#"{"model":"other","\u006dodel":"gpt-test"}"#, 403),
+        (r#"{"model":"gpt-test","input":"test","\u0069nput":"test"}"#, 403),
+        (r#"{"model":"gpt-test","base_url":"https://example.test"}"#, 403),
+        (r#"{"model":"gpt-test","request":{"model":"other"}}"#, 403),
+        ("[]", 400),
+        (r#"{"model":"gpt-test"} false"#, 400),
+        ("{", 400),
+    ] {
+        assert_eq!(post().body(body).send().await.unwrap().status(), status, "{body}");
+    }
+    for name in ["chatgpt-account-id", "openai-organization", "x-forwarded-host", "x-original-url", "content-encoding", "x-cpa-purpose"] {
+        assert_eq!(post().header(name, "override").body(body).send().await.unwrap().status(), StatusCode::FORBIDDEN, "{name}");
+    }
+    let oversized = vec![b' '; crate::router::REQUEST_BODY_LIMIT + 1];
+    assert_eq!(post().body(oversized).send().await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(proxy.state.read().await.activity.is_empty());
+}
+
+const WORKER_FIXTURE: &str = "fixture-worker-4287c94182de8ab38f";
+const PROVIDER_FIXTURE: &str = "fixture-provider-5c89d93c9948274b";
+
+#[tokio::test]
+async fn scoped_worker_tcp_accepts_only_the_dedicated_bearer() {
+    let dir = Scratch::new();
+    let google_path = "/v1beta/models/gemini-test:generateContent";
+    let mock = serve(
+        Router::new()
+            .route(
+                CODEX_RESPONSES,
+                post(|headers: HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(headers["authorization"], "Bearer upstream-oauth");
+                    assert_eq!(body["input"], json!([{"values":[true,null,"fixture",-1,2,0.5]}]));
+                    StatusCode::OK
+                }),
+            )
+            .route(
+                google_path,
+                post(|headers: HeaderMap| async move {
+                    assert_eq!(headers["authorization"], format!("Bearer {PROVIDER_FIXTURE}"));
+                    StatusCode::OK
+                }),
+            ),
+    )
+    .await;
+    let config = fixture_config(&dir, &mock);
+    let key_file = dir.join("worker-key");
+    config::write_private(&key_file, WORKER_FIXTURE.as_bytes(), true).unwrap();
+    let worker = WorkerOptions {
+        worker_listen: Some("127.0.0.1:0".parse().unwrap()),
+        worker_api_key_file: Some(key_file),
+        worker_allowed_models: vec!["gpt-test".into()],
+        ..Default::default()
+    }
+    .validate(&config)
+    .unwrap()
+    .unwrap()
+    .with_test_upstream(mock.0.join(CODEX_RESPONSES).unwrap());
+    let proxy = Arc::new(Proxy::new(config).unwrap().with_worker_config(Some(&worker)));
+    let worker = worker.bind().await.unwrap();
+    let addr = worker.test_tcp_addr();
+    for (name, raw) in [
+        ("oauth.json", json!({"type":"codex","auth_type":"oauth","access_token":"upstream-oauth"})),
+        ("google.json", json!({"type":"google","access_token":PROVIDER_FIXTURE})),
+    ] {
+        proxy.state.write().await.pool.insert(pool::parse_credentials(name, &raw, false).unwrap());
+    }
+    let shared = serve(proxy.clone().app()).await;
+    let shared_http = Http::new(&shared);
+    let shared_post = || shared_http.request("POST", google_path).json(&json!({"contents":[]}));
+    let shared_response = shared_post().bearer_auth(PROVIDER_FIXTURE).send().await.unwrap();
+    assert_eq!(shared_response.status(), StatusCode::OK);
+    let worker_proxy = proxy.clone();
+    let task = tokio::spawn(async move { worker.serve(worker_proxy, std::future::pending()).await.unwrap() });
+    let server = Server(format!("http://{addr}").parse().unwrap(), task);
+    let http = Http::new(&server);
+    let post =
+        || http.request("POST", CODEX_RESPONSES).json(&json!({"model":"gpt-test","input":[{"values":[true,null,"fixture",-1,2,0.5]}]}));
+    for token in [None, Some("inference-fixture"), Some("management-fixture"), Some(PROVIDER_FIXTURE), Some("wrong")] {
+        let req = post();
+        let req = if let Some(token) = token { req.bearer_auth(token) } else { req };
+        assert_eq!(req.send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(post().header("x-api-key", WORKER_FIXTURE).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        post().bearer_auth(WORKER_FIXTURE).header("authorization", format!("Bearer {WORKER_FIXTURE}")).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(post().bearer_auth(WORKER_FIXTURE).send().await.unwrap().status(), StatusCode::OK);
+    proxy
+        .state
+        .write()
+        .await
+        .pool
+        .insert(pool::parse_credentials("later.json", &json!({"type":"google","access_token":WORKER_FIXTURE}), false).unwrap());
+    assert_eq!(post().bearer_auth(WORKER_FIXTURE).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(shared_post().bearer_auth(WORKER_FIXTURE).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        shared_post().bearer_auth(WORKER_FIXTURE).header("x-api-key", "inference-fixture").send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(
+        shared_post()
+            .bearer_auth(PROVIDER_FIXTURE)
+            .header("authorization", format!("Bearer {WORKER_FIXTURE}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(
+        shared_post().bearer_auth(PROVIDER_FIXTURE).header("x-api-key", WORKER_FIXTURE).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+    );
+}
+
+#[tokio::test]
+async fn scoped_worker_unix_permissions_and_stale_socket_handling() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let dir = Scratch::new();
+    let mock = serve(Router::new().route(
+        CODEX_RESPONSES,
+        post(|headers: HeaderMap| async move {
+            assert_eq!(headers["authorization"], "Bearer upstream-oauth");
+            StatusCode::OK
+        }),
+    ))
+    .await;
+    let config = fixture_config(&dir, &mock);
+    let unix = |path| {
+        WorkerOptions { worker_unix_socket: Some(path), worker_allowed_models: vec!["gpt-test".into()], ..Default::default() }
+            .validate(&config)
+            .unwrap()
+            .unwrap()
+            .with_test_upstream(mock.0.join(CODEX_RESPONSES).unwrap())
+    };
+    let path = dir.join("private/w.sock");
+    let bound = unix(path.clone()).bind().await.unwrap();
+    assert_eq!(path.parent().unwrap().metadata().unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(path.symlink_metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(unix(path.clone()).bind().await.is_err(), "must not remove a live socket");
+    let stale = dir.join("stale.sock");
+    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    let stale_inode = stale.symlink_metadata().unwrap().ino();
+    let ordinary = dir.join("ordinary");
+    fs::write(&ordinary, "preserve").unwrap();
+    assert!(unix(ordinary.clone()).bind().await.is_err());
+    assert_eq!(fs::read_to_string(ordinary).unwrap(), "preserve");
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&stale, &link).unwrap();
+    assert!(unix(link.clone()).bind().await.is_err());
+    assert_eq!(fs::read_link(link).unwrap(), stale);
+    let metadata = stale.symlink_metadata().unwrap();
+    assert!(metadata.file_type().is_socket());
+    assert_eq!(metadata.ino(), stale_inode);
+    drop(unix(stale.clone()).bind().await.unwrap());
+    assert!(!stale.exists(), "the startup guard removes its socket on drop");
+    let linked_parent = dir.join("linked-parent");
+    std::os::unix::fs::symlink(path.parent().unwrap(), &linked_parent).unwrap();
+    assert!(unix(linked_parent.join("other.sock")).bind().await.is_err());
+
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials("oauth.json", &json!({"type":"codex","auth_type":"oauth","access_token":"upstream-oauth"}), false).unwrap(),
+    );
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(bound.serve(proxy, async { stopped.await.unwrap() }));
+    let client = reqwest::Client::builder().unix_socket(path.clone()).build().unwrap();
+    let response = client.post(format!("http://localhost{CODEX_RESPONSES}")).json(&json!({"model":"gpt-test"})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(!path.exists(), "graceful shutdown must remove its socket");
+}
+
+#[tokio::test]
+async fn scoped_worker_socket_guard_preserves_a_replacement() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = Scratch::new();
+    let mock = serve(Router::new()).await;
+    let config = fixture_config(&dir, &mock);
+    let path = dir.join("worker.sock");
+    let bound =
+        WorkerOptions { worker_unix_socket: Some(path.clone()), worker_allowed_models: vec!["gpt-test".into()], ..Default::default() }
+            .validate(&config)
+            .unwrap()
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+    let original = path.symlink_metadata().unwrap().ino();
+    fs::rename(&path, dir.join("original.sock")).unwrap();
+    let _replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let replacement = path.symlink_metadata().unwrap().ino();
+    assert_ne!(original, replacement);
+    drop(bound);
+    assert_eq!(path.symlink_metadata().unwrap().ino(), replacement);
+}
+
+#[tokio::test]
+async fn scoped_worker_socket_guard_does_not_unlink_while_startup_has_the_lock() {
+    let dir = Scratch::new();
+    let mock = serve(Router::new()).await;
+    let config = fixture_config(&dir, &mock);
+    let path = dir.join("worker.sock");
+    let unix = || {
+        WorkerOptions { worker_unix_socket: Some(path.clone()), worker_allowed_models: vec!["gpt-test".into()], ..Default::default() }
+            .validate(&config)
+            .unwrap()
+            .unwrap()
+    };
+    let bound = unix().bind().await.unwrap();
+    let directory = fs::File::open(path.parent().unwrap()).unwrap();
+    directory.try_lock().unwrap();
+    drop(bound);
+    assert!(path.exists(), "cleanup must not unlink without the directory lock");
+    drop(directory);
+    drop(unix().bind().await.unwrap());
+    assert!(!path.exists(), "a successor can recover and clean up the socket");
+}
+
+#[tokio::test]
+async fn scoped_worker_startup_rejects_invalid_configuration() {
+    let dir = Scratch::new();
+    let mock = serve(Router::new()).await;
+    let mut config = fixture_config(&dir, &mock);
+    config.client_key = "fixture-client-53c86ac4edf5931b65".into();
+    config.management_key = "fixture-management-2d32793fc12cd".into();
+    let tcp = |addr: &str, key: Option<PathBuf>, models: &[&str]| {
+        WorkerOptions {
+            worker_listen: Some(addr.parse().unwrap()),
+            worker_api_key_file: key,
+            worker_allowed_models: models.iter().map(|name| name.to_string()).collect(),
+            ..Default::default()
+        }
+        .validate(&config)
+    };
+    let file = dir.join("worker-key");
+    assert!(tcp("127.0.0.1:0", None, &["gpt-test"]).is_err());
+    for key in [&*config.client_key, &config.management_key, " ", "short", "sk-placeholder-key-fixture-12345678"] {
+        config::write_private(&file, key.as_bytes(), true).unwrap();
+        assert!(tcp("127.0.0.1:0", Some(file.clone()), &["gpt-test"]).is_err());
+    }
+    config::write_private(&file, WORKER_FIXTURE.as_bytes(), true).unwrap();
+    let link = dir.join("worker-key-link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert!(tcp("127.0.0.1:0", Some(link), &["gpt-test"]).is_err());
+    assert!(tcp("127.0.0.1:0", Some(dir.0.clone()), &["gpt-test"]).is_err());
+    for mode in [0o640, 0o604] {
+        fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(tcp("127.0.0.1:0", Some(file.clone()), &["gpt-test"]).is_err());
+    }
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(tcp("0.0.0.0:0", Some(file.clone()), &["gpt-test"]).is_err());
+    assert!(tcp("[::]:0", Some(file.clone()), &["gpt-test"]).is_err());
+    for models in [&[][..], &[""], &["gpt-test", "Gpt-ClAuDe"], &["prefix-ANTHROPIC-model"]] {
+        assert!(tcp("127.0.0.1:0", Some(file.clone()), models).is_err());
+    }
+    let worker = tcp("[::1]:0", Some(file), &["gpt-test"]).unwrap().unwrap();
+    assert!(WorkerOptions::default().validate(&config).unwrap().is_none());
+    let proxy = Proxy::new(config).unwrap();
+    worker.validate_pool(&proxy).await.unwrap();
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials(
+            "oauth.json",
+            &json!({"type":"codex","access_token":"fixture-access","refresh_token":WORKER_FIXTURE}),
+            false,
+        )
+        .unwrap(),
+    );
+    assert!(worker.validate_pool(&proxy).await.is_err());
 }
 
 struct Http<'a>(&'a Server, reqwest::Client);
@@ -2702,7 +3293,7 @@ async fn google_in_band_quota_normalizes_after_pending_reader_outlasts_its_deadl
     assert_google_pool_body(&response.json().await.unwrap(), "gemini-4-neon-high");
     let state = proxy.state.read().await;
     assert_eq!(state.activity.back().unwrap().attempts.len(), 2);
-    assert!(state.pool.next_reset(Lane::Google, "gemini-4-neon-high", None, Utc::now()).is_none());
+    assert!(state.pool.next_reset(&AccountFilter::shared(Lane::Google, "gemini-4-neon-high", None), Utc::now()).is_none());
 }
 
 #[tokio::test]
@@ -3409,7 +4000,7 @@ fn cached_quota_reset_cannot_be_verified_before_it_was_observed() {
     accounts[0].windows =
         parse_antigravity_summary(&json!({"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.0,"resetTime":reset}]}), observed);
     pool.insert(accounts);
-    assert_eq!(pool.next_reset(Lane::Google, "gemini-neon", None, now), Some(reset));
+    assert_eq!(pool.next_reset(&AccountFilter::shared(Lane::Google, "gemini-neon", None), now), Some(reset));
     assert_eq!(pool.verified_google_reset_at("gemini-neon", None, now), None);
     assert_eq!(pool.verified_google_reset_at("gemini-neon", None, observed), Some(reset));
 }
@@ -3470,8 +4061,9 @@ fn quota_decisions_agree_at_the_expiration_boundary() {
     let model = "gemini-neon";
     for (now, reset) in [(until - TimeDelta::nanoseconds(1), Some(until)), (until, None)] {
         assert_eq!(pool.pick(Lane::Google, (None, None), model, None, &[], now).is_none(), reset.is_some());
-        assert_eq!(pool.next_reset(Lane::Google, model, None, now), reset);
-        assert_eq!(pool.all_quota_limited(Lane::Google, model, None, now), reset.is_some());
+        let accounts = AccountFilter::shared(Lane::Google, model, None);
+        assert_eq!(pool.next_reset(&accounts, now), reset);
+        assert_eq!(pool.all_quota_limited(&accounts, now), reset.is_some());
         assert_eq!(pool.verified_google_reset_at(model, None, now), reset);
     }
 }
@@ -3512,7 +4104,7 @@ fn failed_google_quota_read_blocks_witness_until_its_own_deadline() {
     let reader = account.begin_google_quota_read(model, None, None, now);
     assert!(account.finish_google_quota_read(&reader, Some(failed_until)));
 
-    assert_eq!(pool.next_reset(Lane::Google, model, None, now), Some(reset));
+    assert_eq!(pool.next_reset(&AccountFilter::shared(Lane::Google, model, None), now), Some(reset));
     assert_eq!(pool.verified_google_reset_at(model, None, now), None);
     // The reader is still in scope, but it must no longer count as running.
     assert_eq!(pool.verified_google_reset_at(model, None, failed_until), Some(reset));
@@ -4028,7 +4620,7 @@ async fn oauth_file_reload_on_401_retries_once_and_fails_over_to_an_expired_toke
         assert!(until > at + TimeDelta::minutes(14) && until <= Utc::now() + TimeDelta::minutes(15));
         assert_eq!(a.last_error.as_ref().unwrap().kind, AccountErrorKind::AuthExpired);
         assert!(a.cooldown.is_none());
-        assert!(state.pool.next_reset(lane, "fixture", None, Utc::now()).is_none());
+        assert!(state.pool.next_reset(&AccountFilter::shared(lane, "fixture", None), Utc::now()).is_none());
         assert_eq!(a.priority, 10);
         assert_eq!(a.access, "a-refreshed");
         assert_eq!(state.pool.accounts["b.json"].access, "b-fresh");
@@ -4159,8 +4751,8 @@ async fn google_exhausted_failover_uses_quota_but_nonretryable_errors_keep_upstr
     let state = proxy.state.read().await;
     assert!(state.pool.accounts["a.json"].last_error.as_ref().unwrap().backoff_until.is_some());
     let now = Utc::now();
-    assert!(state.pool.next_reset(Lane::Claude, "claude-fixture", None, now).is_none());
-    assert!(!state.pool.all_quota_limited(Lane::Google, "", None, now));
+    assert!(state.pool.next_reset(&AccountFilter::shared(Lane::Claude, "claude-fixture", None), now).is_none());
+    assert!(!state.pool.all_quota_limited(&AccountFilter::shared(Lane::Google, "", None), now));
 }
 
 #[tokio::test]

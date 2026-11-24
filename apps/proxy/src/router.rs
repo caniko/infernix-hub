@@ -8,7 +8,7 @@ use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
     extract::{Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
@@ -28,9 +28,10 @@ use crate::{
     config::matches_secret,
     error_classify::{ERROR_BODY_LIMIT, account_secrets, classify_sse_error, classify_upstream_http_error, local_error, safe_label},
     openai_account,
-    pool::{Account, Cooldown, Lane, MAX_COOLDOWN_SECS, Pool, QuotaReader, bounded_identifier, model_cooldown_scope, text},
+    pool::{Account, AccountFilter, Cooldown, Lane, MAX_COOLDOWN_SECS, Pool, QuotaReader, bounded_identifier, model_cooldown_scope, text},
 };
 
+pub(crate) const REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024;
 pub(crate) const POOL_QUOTA_HEADER: &str = "x-fleetix-pool-quota";
 
 pub(crate) fn routes() -> Router<Arc<Proxy>> {
@@ -48,7 +49,11 @@ pub(crate) fn routes() -> Router<Arc<Proxy>> {
 }
 
 pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
-    let (scheme, secret) = headers.get(header::AUTHORIZATION)?.to_str().ok()?.split_once(' ')?;
+    parse_bearer(headers.get(header::AUTHORIZATION)?)
+}
+
+fn parse_bearer(value: &HeaderValue) -> Option<&str> {
+    let (scheme, secret) = value.to_str().ok()?.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then_some(secret).filter(|s| !s.is_empty())
 }
 
@@ -116,6 +121,17 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
         _ if path.starts_with("/v1internal/") || path.starts_with("/v1internal:") || path.starts_with("/v1beta/") => Lane::Google,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    if let Some(worker_bearer) = proxy.worker_bearer.as_deref()
+        && parts
+            .headers
+            .get_all(header::AUTHORIZATION)
+            .iter()
+            .filter_map(parse_bearer)
+            .chain(parts.headers.get_all("x-api-key").iter().filter_map(|value| value.to_str().ok()))
+            .any(|token| matches_secret(token, worker_bearer))
+    {
+        return lane_error(lane, StatusCode::UNAUTHORIZED, "invalid inference credentials");
+    }
     let provided = bearer(&parts.headers);
     let authorized = [parts.headers.get("x-api-key").and_then(|v| v.to_str().ok()), provided]
         .into_iter()
@@ -141,7 +157,7 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
     if lane == Lane::Google && !inspect_google(&parts.headers) {
         return lane_error(lane, StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported Google request content encoding");
     }
-    let Ok(body) = to_bytes(body, 32 * 1024 * 1024).await else {
+    let Ok(body) = to_bytes(body, REQUEST_BODY_LIMIT).await else {
         return lane_error(lane, StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds limit");
     };
     let raw: Value = match serde_json::from_slice(&body) {
@@ -151,6 +167,18 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
         }
         Err(_) => Value::Null,
     };
+    forward_authorized(proxy, parts, body, raw, lane, None).await
+}
+
+pub(crate) async fn forward_authorized(
+    proxy: Arc<Proxy>,
+    parts: axum::http::request::Parts,
+    body: Bytes,
+    raw: Value,
+    lane: Lane,
+    worker_upstream: Option<&reqwest::Url>,
+) -> Response {
+    let path = parts.uri.path();
     let mut projects = ProjectFields::default();
     let cache = if lane == Lane::Google {
         if raw.is_object() {
@@ -181,6 +209,7 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
         .map(|m| if lane == Lane::Google { m.strip_prefix("models/").unwrap_or(m) } else { m })
         .filter(|s| bounded_identifier(s))
         .unwrap_or_default();
+    let accounts = AccountFilter { lane, model, required_project, subscriptions_only: worker_upstream.is_some() };
     let effort = text(&raw, &["/reasoning/effort", "reasoning_effort", "/output_config/effort", "effort"])
         .filter(|s| bounded_identifier(s))
         .map(str::to_owned);
@@ -255,9 +284,7 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
     let mut last_decoded_quota_reset = None;
     let quota_snapshot = |pool: &Pool, now, retained: &mut [RetainedQuota]| {
         if lane != Lane::Google {
-            let reset = pool
-                .next_reset(lane, model, required_project, now)
-                .filter(|_| pool.all_quota_limited(lane, model, required_project, now))?;
+            let reset = pool.next_reset(&accounts, now).filter(|_| pool.all_quota_limited(&accounts, now))?;
             return Some(QuotaSnapshot::Ready(PoolQuota { reset, verified_reset: None, now }));
         }
         let live_deadline = |account: &Account| account.quota_limited_until(now, model);
@@ -286,7 +313,7 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
         pending.or(Some(QuotaSnapshot::Ready(PoolQuota { reset, verified_reset, now })))
     };
     let pick = |pool: &mut Pool, exchange: &Exchange, tried: &[String], now| {
-        pool.pick(lane, (exchange.affinity_key.as_deref(), exchange.parent.as_deref()), model, required_project, tried, now)
+        pool.pick_for(&accounts, (exchange.affinity_key.as_deref(), exchange.parent.as_deref()), tried, now)
     };
     let pick_or_quota = async |exchange: &Exchange, tried: &[String], retained: &mut [RetainedQuota]| {
         loop {
@@ -298,7 +325,7 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
                 }
                 match quota_snapshot(&state.pool, now, retained) {
                     Some(snapshot) => snapshot,
-                    None => return (None, None, unavailable_pool(&state.pool, lane, model, required_project, now)),
+                    None => return (None, None, unavailable_pool(&state.pool, &accounts, now)),
                 }
             };
             match snapshot {
@@ -341,11 +368,15 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
         let incoming = async {
             let upstream_error = || inference_error("upstream request failed");
             let resolved = proxy.token_account(&account, false).await.map_err(|error| *error)?;
-            if required_project.is_some_and(|project| resolved.project.as_deref() != Some(project)) {
+            let usable = |account: &Account| {
+                accounts.allows(account) && required_project.is_none_or(|project| account.project.as_deref() == Some(project))
+            };
+            if !usable(&resolved) {
                 return Err(upstream_error());
             }
             account = resolved;
-            let url = upstream(&proxy, &account, &parts.uri).ok_or_else(upstream_error)?;
+            // A worker credential must never go to an account base override or the shared API origin.
+            let url = worker_upstream.cloned().or_else(|| upstream(&proxy, &account, &parts.uri)).ok_or_else(upstream_error)?;
             let build = |account: &Account| {
                 let payload = request_body(&body, &projects, account);
                 let mut req = proxy.http.request(parts.method.clone(), url.clone()).body(payload);
@@ -386,9 +417,7 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
                 && (reload_on_401 || (lane == Lane::Google && !account.api_key && account.refresh.is_some()))
             {
                 match proxy.token_account(&account, true).await {
-                    Ok(fresh) if required_project.is_some_and(|project| fresh.project.as_deref() != Some(project)) => {
-                        return Err(upstream_error());
-                    }
+                    Ok(fresh) if !usable(&fresh) => return Err(upstream_error()),
                     Ok(fresh) if fresh.access != account.access => {
                         account = fresh;
                         res = build(&account).send().await.map_err(|_| upstream_error())?;
@@ -550,7 +579,7 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
             }
             drop(quota_reader.take());
         }
-        if limited {
+        if limited && worker_upstream.is_none() {
             proxy.schedule_usage_refresh(account.id.clone()).await;
         }
         if failover {
@@ -647,7 +676,9 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
             if let Some(key) = &exchange.affinity_key {
                 let current = state.pool.bound(lane, key);
                 // Do not overwrite a conversation moved while this request was in flight.
-                if current.is_none() || current == moved_from.as_deref() || current == Some(&account.id) {
+                let shared_key_binding =
+                    accounts.subscriptions_only && current.and_then(|id| state.pool.accounts.get(id)).is_some_and(|a| !accounts.allows(a));
+                if !shared_key_binding && (current.is_none() || current == moved_from.as_deref() || current == Some(&account.id)) {
                     state.pool.bind(lane, key, &account.id);
                     if let (Some(session), Some(parent)) = (&exchange.session, &exchange.parent) {
                         state.pool.link(lane, session, parent);
@@ -682,6 +713,7 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
             request_at: started,
             capture_buf: Vec::new(),
             response_size: 0,
+            allow_usage_refresh: worker_upstream.is_none(),
         };
         let mut response = Response::new(Body::from_stream(stream::try_unfold(state, Wire::next)));
         *response.status_mut() = status;
@@ -706,11 +738,11 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
     }
 }
 
-fn unavailable_pool(pool: &Pool, lane: Lane, model: &str, required_project: Option<&str>, now: DateTime<Utc>) -> Option<Response> {
-    if pool.has_eligible_account(lane, model, required_project, now) {
+fn unavailable_pool(pool: &Pool, accounts: &AccountFilter<'_>, now: DateTime<Utc>) -> Option<Response> {
+    if pool.has_eligible_account(accounts, now) {
         return None;
     }
-    let kind = pool.uniform_quarantine_kind(lane, model, required_project, now).map_or("accounts_unavailable", |kind| kind.as_str());
+    let kind = pool.uniform_quarantine_kind(accounts, now).map_or("accounts_unavailable", |kind| kind.as_str());
     Some((StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({
         "error": {
             "type": kind,
@@ -1145,7 +1177,7 @@ fn header_id<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|name| headers.get(*name)?.to_str().ok()).filter(|s| bounded_identifier(s))
 }
 
-fn connection_headers(headers: &HeaderMap) -> Vec<&str> {
+pub(crate) fn connection_headers(headers: &HeaderMap) -> Vec<&str> {
     headers.get_all(header::CONNECTION).iter().filter_map(|v| v.to_str().ok()).flat_map(|s| s.split(',').map(str::trim)).collect()
 }
 
@@ -2198,6 +2230,7 @@ struct Wire {
     request_at: DateTime<Utc>,
     capture_buf: Vec<u8>,
     response_size: usize,
+    allow_usage_refresh: bool,
 }
 
 impl Wire {
@@ -2297,7 +2330,7 @@ impl Wire {
         let model = self.guard.0.as_ref().map_or("", |exchange| exchange.model.as_str());
         result(&self.proxy, &self.account, model, limited, false, self.request_at, None).await;
         self.proxy.report_account_error(&self.account, &error).await;
-        if limited.is_some() {
+        if self.allow_usage_refresh && limited.is_some() {
             self.proxy.schedule_usage_refresh(self.account.id.clone()).await;
         }
     }

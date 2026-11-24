@@ -6,6 +6,7 @@ mod management;
 mod pool;
 mod router;
 pub mod verify;
+pub mod worker;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -35,6 +36,7 @@ use uuid::Uuid;
 
 pub struct Proxy {
     config: Config,
+    worker_bearer: Option<String>,
     hub_sync_configured: bool,
     pub(crate) source_host: String,
     pub(crate) source_user: String,
@@ -128,6 +130,7 @@ impl Proxy {
             .build()?;
         Ok(Self {
             config,
+            worker_bearer: None,
             hub_sync_configured: false,
             source_host,
             source_user,
@@ -154,6 +157,11 @@ impl Proxy {
 
     pub fn with_hub_sync_configured(mut self, configured: bool) -> Self {
         self.hub_sync_configured = configured;
+        self
+    }
+
+    pub fn with_worker_config(mut self, worker: Option<&worker::WorkerConfig>) -> Self {
+        self.worker_bearer = worker.and_then(worker::WorkerConfig::bearer).map(str::to_owned);
         self
     }
 
@@ -595,6 +603,7 @@ impl Proxy {
             }
             entry.replace_access(updated.access);
             entry.replace_refresh(updated.refresh);
+            entry.codex_oauth_explicit = updated.codex_oauth_explicit;
             entry.expires = updated.expires;
             entry.source_fingerprint = updated.source_fingerprint;
             return Ok(entry.clone());

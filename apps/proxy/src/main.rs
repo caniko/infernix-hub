@@ -7,7 +7,9 @@ use fleetix_agent_proxy::{
     clients::{Client, register_t3code},
     config::{self, Config, DEFAULT_BIND, DEFAULT_URL},
     hub_sync, verify,
+    worker::WorkerOptions,
 };
+use futures_util::FutureExt;
 use tokio::net::TcpListener;
 
 const SOURCE_ID: &str = "fleetix-proxy";
@@ -46,6 +48,8 @@ enum Command {
         /// Skip this provider during local credential discovery (does not affect --auth-dir).
         #[arg(long = "exclude-local-provider", value_name = "PROVIDER", env = "PROXY_EXCLUDE_LOCAL_PROVIDERS", value_delimiter = ',', value_parser = parse_local_provider)]
         exclude_local_providers: Vec<Lane>,
+        #[command(flatten)]
+        worker: Box<WorkerOptions>,
     },
     RegisterT3code {
         #[arg(long, default_value = DEFAULT_URL)]
@@ -104,8 +108,10 @@ async fn main() -> Result<()> {
             t3code_home,
             discover_local,
             exclude_local_providers,
+            worker,
         } => {
             let mut config = Config::new(bind, &state_dir(state)?, auth_dir, discover_local, client_key_file, management_key_file)?;
+            let worker = worker.validate(&config)?;
             config.exclude_local_lanes = exclude_local_providers.into_iter().collect();
             if let Some(home) = t3code_home {
                 config.t3code_home = home;
@@ -130,13 +136,20 @@ async fn main() -> Result<()> {
                 register_t3code(&config.t3code_home, SOURCE_ID, SOURCE_LABEL, &config.url, &config.management_key)?;
             }
             let addr = config.bind;
-            let proxy = Arc::new(Proxy::new(config)?.with_hub_sync_configured(hub.is_some()));
+            let proxy = Arc::new(Proxy::new(config)?.with_hub_sync_configured(hub.is_some()).with_worker_config(worker.as_ref()));
             proxy.discover_local_commands().await;
+            let worker = if let Some(worker) = worker {
+                worker.validate_pool(&proxy).await?;
+                Some(worker.bind().await?)
+            } else {
+                None
+            };
             let quota = tokio::spawn(hub_sync::poll_quota(proxy.clone()));
             let sync = hub.map(|(url, token)| tokio::spawn(hub_sync::run(proxy.clone(), url, token)));
             tracing::info!(%addr, "agent proxy listening");
-            let result = axum::serve(listener, proxy.clone().app().into_make_service_with_connect_info::<SocketAddr>())
-                .with_graceful_shutdown(async move {
+            let shutdown = {
+                let proxy = proxy.clone();
+                async move {
                     use tokio::signal::unix::{SignalKind, signal};
                     let term = async {
                         if let Ok(mut signal) = signal(SignalKind::terminate()) {
@@ -150,8 +163,16 @@ async fn main() -> Result<()> {
                         _ = tokio::signal::ctrl_c() => {},
                         _ = term => {},
                     }
-                })
-                .await;
+                }
+                .shared()
+            };
+            let shared = axum::serve(listener, proxy.clone().app().into_make_service_with_connect_info::<SocketAddr>())
+                .with_graceful_shutdown(shutdown.clone());
+            let result = if let Some(worker) = worker {
+                tokio::try_join!(std::future::IntoFuture::into_future(shared), worker.serve(proxy, shutdown)).map(|_| ())
+            } else {
+                shared.await
+            };
             quota.abort();
             if let Some(sync) = sync {
                 sync.abort();
@@ -191,6 +212,29 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_parses_worker_flags_and_rejects_conflicting_transports() {
+        let cli = Cli::try_parse_from([
+            "proxy",
+            "serve",
+            "--worker-unix-socket",
+            "/tmp/worker.sock",
+            "--worker-allowed-models",
+            "gpt-a,gpt-b",
+            "--worker-allowed-models",
+            "gpt-c",
+        ])
+        .unwrap();
+        let Command::Serve { worker, .. } = cli.command else { panic!("expected serve command") };
+        assert_eq!(worker.worker_allowed_models, ["gpt-a", "gpt-b", "gpt-c"]);
+        assert_eq!(worker.worker_unix_socket, Some(PathBuf::from("/tmp/worker.sock")));
+        assert!(
+            Cli::try_parse_from(["proxy", "serve", "--worker-unix-socket", "/tmp/worker.sock", "--worker-listen", "127.0.0.1:9000",])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["proxy", "serve", "--worker-listen", "127.0.0.1:9000", "--worker-api-key", "fixture"]).is_err());
+    }
 
     #[test]
     fn serve_excludes_multiple_local_provider_aliases_and_rejects_unknowns() {

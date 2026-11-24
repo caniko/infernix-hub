@@ -62,6 +62,14 @@
     );
   };
   proxyCfg = cfg.agentProxy;
+  workerCfg = proxyCfg.workerListener;
+  # The socket's leading %t is the only intentional systemd specifier.
+  workerSocketArg = let
+    escaped = escapeSystemdExecArgs [workerCfg.unixSocket];
+  in
+    if lib.hasPrefix ''"%%t/'' escaped
+    then ''"%t/${lib.removePrefix ''"%%t/'' escaped}''
+    else escaped;
   localProxy = cfg.enable && proxyCfg.enable && hasProxy;
   collectorCfg = cfg.collector;
   hasDeclarativeT3UsageSources =
@@ -240,6 +248,22 @@ in {
         default = "127.0.0.1:8317";
         description = "Loopback bind address for fleetix-agent-proxy.";
       };
+      workerListener = {
+        enable = lib.mkEnableOption "the OAuth-only Codex worker socket";
+        unixSocket = lib.mkOption {
+          type = types.strMatching "(%t|/run)/[A-Za-z0-9._/-]+";
+          default = "%t/fleetix-agent-proxy/worker.sock";
+          description = "Private Unix socket for scoped workers under %t or /run, with no parent traversal.";
+        };
+        allowedModels = lib.mkOption {
+          type = types.listOf (types.addCheck (types.strMatching "[A-Za-z0-9._:/-]+") (model: let
+            lower = lib.toLower model;
+          in
+            !(lib.hasInfix "claude" lower || lib.hasInfix "anthropic" lower)));
+          default = [];
+          description = "Exact Codex model names permitted on the worker socket; required when enabled.";
+        };
+      };
       discoverLocal = lib.mkOption {
         type = lib.types.bool;
         default = true;
@@ -298,6 +322,14 @@ in {
           assertion = !(proxyCfg.enable && proxyCfg.externalUrl != null);
           message = "Fleetix Agent Proxy local and external modes are mutually exclusive.";
         }
+        {
+          assertion = !(lib.elem ".." (lib.splitString "/" workerCfg.unixSocket));
+          message = "Fleetix Agent Proxy worker socket must not contain '..' path components.";
+        }
+        {
+          assertion = !workerCfg.enable || workerCfg.allowedModels != [];
+          message = "Fleetix Agent Proxy worker listener requires a non-empty model allowlist.";
+        }
       ];
     }
     (lib.mkIf cfg.enable {
@@ -330,31 +362,36 @@ in {
               Before = ["t3code.service"];
             };
             Service = {
-              ExecStart = lib.concatStringsSep " " (
-                [
-                  "${proxy.wrapped}/bin/fleetix-agent-proxy"
-                  "serve"
-                  "--bind"
-                  (lib.escapeShellArg proxyCfg.bind)
-                  "--state-dir"
-                  (lib.escapeShellArg proxyCfg.stateDir)
-                  "--hub-url"
-                  (lib.escapeShellArg cfg.url)
-                  "--hub-token-file"
-                  (lib.escapeShellArg (
-                    if collectorCfg.tokenFile != null
-                    then collectorCfg.tokenFile
-                    else cfg.tokenFile
-                  ))
-                ]
-                ++ lib.optionals (proxyCfg.authDir != null) ["--auth-dir" (lib.escapeShellArg proxyCfg.authDir)]
-                ++ lib.optional proxyCfg.discoverLocal "--discover-local"
-                ++ lib.optionals (proxyCfg.registerT3Code && !useDeclarativeT3Registration) [
-                  "--register-t3code"
-                  "--t3code-home"
-                  (lib.escapeShellArg t3codeHome)
-                ]
-              );
+              ExecStart =
+                escapeSystemdExecArgs (
+                  [
+                    "${proxy.wrapped}/bin/fleetix-agent-proxy"
+                    "serve"
+                    "--bind"
+                    proxyCfg.bind
+                    "--state-dir"
+                    proxyCfg.stateDir
+                    "--hub-url"
+                    cfg.url
+                    "--hub-token-file"
+                    (
+                      if collectorCfg.tokenFile != null
+                      then collectorCfg.tokenFile
+                      else cfg.tokenFile
+                    )
+                  ]
+                  ++ lib.optionals (proxyCfg.authDir != null) ["--auth-dir" proxyCfg.authDir]
+                  ++ lib.optional proxyCfg.discoverLocal "--discover-local"
+                  ++ lib.optionals (proxyCfg.registerT3Code && !useDeclarativeT3Registration) [
+                    "--register-t3code"
+                    "--t3code-home"
+                    t3codeHome
+                  ]
+                )
+                + lib.optionalString workerCfg.enable (
+                  " \"--worker-unix-socket\" ${workerSocketArg} "
+                  + escapeSystemdExecArgs (map (model: "--worker-allowed-models=${model}") workerCfg.allowedModels)
+                );
               Restart = "on-failure";
               RestartSec = 5;
               UMask = "0077";
