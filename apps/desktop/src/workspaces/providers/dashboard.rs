@@ -502,6 +502,7 @@ mod tests {
         let session = PoolWindowSummary {
             provider_id: "test".into(),
             window_key: "session".into(),
+            scope_model: None,
             label: "Session".into(),
             kind: QuotaWindowKind::Session,
             eligible_accounts: 1,
@@ -510,6 +511,7 @@ mod tests {
             weighted_remaining_percent: None,
             capacity_basis: "equal_entitlements".into(),
             next_reset_at: None,
+            window_seconds: None,
             forecast: None,
             is_estimate: true,
         };

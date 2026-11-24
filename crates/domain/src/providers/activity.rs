@@ -319,6 +319,7 @@ fn truncate_hour(dt: DateTime<Utc>) -> DateTime<Utc> {
 }
 
 #[derive(sqlx::FromRow)]
+#[cfg_attr(test, derive(Default))]
 struct ExchangeRow {
     id: Uuid,
     source_exchange_id: String,
@@ -461,12 +462,78 @@ async fn query_exchanges(db: &sqlx::PgPool, scope: &ActivityScope, ordinary_only
 
 // ── 1. Overview ─────────────────────────────────────────────────────────────
 
-pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult<ActivityOverview> {
+pub async fn overview(hub: &Hub, actor: &Actor, mut scope: ActivityScope) -> DResult<ActivityOverview> {
     actor.require(ANY_READER)?;
+    let to = scope.to.unwrap_or_else(Utc::now);
+    let from = scope.from.unwrap_or_else(|| to.checked_sub_signed(Duration::days(30)).unwrap_or(DateTime::<Utc>::MIN_UTC));
+    // Bound the number of zero buckets even for untrusted query ranges.
+    if from > to || to - from > Duration::days(3660) {
+        return Err(invalid("invalid_activity_range", "activity overview requires from <= to and a span at most 3660 days"));
+    }
+    scope.from = Some(from);
+    scope.to = Some(to);
     let rows = query_exchanges(&hub.db, &scope, true, None).await?;
-    let catalog = pricing::default_catalog();
     let policy = capture::get_capture_policy(hub, actor).await.unwrap_or_default();
     let tz_offset = Duration::minutes(scope.tz_offset_mins.unwrap_or(0) as i64);
+    summarize_overview(&rows, from, to, tz_offset, policy.detail_retention_days)
+}
+
+fn summarize_overview(
+    rows: &[ExchangeRow],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    tz_offset: Duration,
+    detail_retention_days: u32,
+) -> DResult<ActivityOverview> {
+    let catalog = pricing::default_catalog();
+    let span = to - from;
+    let bucket_seconds = if span <= Duration::hours(48) {
+        3600
+    } else if span <= Duration::days(14) {
+        10800
+    } else {
+        86400
+    };
+    let bucket_index = |at: DateTime<Utc>| at.timestamp().div_euclid(bucket_seconds);
+    let mut trend_map = (bucket_index(from)..=bucket_index(to))
+        .map(|index| {
+            let bucket_start = DateTime::from_timestamp(index * bucket_seconds, 0)
+                .ok_or_else(|| invalid("invalid_activity_range", "trend bucket start is out of range"))?;
+            let label = if bucket_seconds == 86400 {
+                bucket_start.date_naive().to_string()
+            } else {
+                bucket_start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            };
+            Ok((
+                index,
+                ActivityTrendPoint {
+                    bucket_start,
+                    label,
+                    requests: 0,
+                    failures: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    cache_hit_rate: 0.0,
+                    cache_hit_rate_observed: None,
+                    thinking_tokens: 0,
+                    api_equivalent_cost_usd: 0.0,
+                },
+            ))
+        })
+        .collect::<DResult<BTreeMap<_, _>>>()?;
+    let local_date = |at: DateTime<Utc>| {
+        at.checked_add_signed(tz_offset)
+            .map(|local| local.date_naive())
+            .ok_or_else(|| invalid("invalid_activity_range", "local activity date is out of range"))
+    };
+    let start_date = local_date(from)?;
+    let last_date = local_date(to)?;
+    let first_weekday = start_date.weekday().num_days_from_monday() as u8;
+    let day_span = last_date.signed_duration_since(start_date).num_days().min(6) as u8;
+    let mut covered_weekdays: Vec<_> = (0..=day_span).map(|n| (first_weekday + n) % 7).collect();
+    covered_weekdays.sort_unstable();
 
     let mut cost_usd = 0.0;
     let mut unpriced_requests = 0u64;
@@ -481,7 +548,6 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
     let mut matched_proxy = 0u64;
     let mut bypassed_local = 0u64;
 
-    let mut trend_map: BTreeMap<DateTime<Utc>, ActivityTrendPoint> = BTreeMap::new();
     let mut heatmap_map: BTreeMap<(u8, u8), HeatmapCell> = BTreeMap::new();
     let mut rhythm_map: BTreeMap<u8, RhythmBucket> = (0..24)
         .map(|h| {
@@ -490,6 +556,7 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
                 RhythmBucket {
                     hour: h,
                     requests: 0,
+                    failures: 0,
                     tokens: 0,
                     input_tokens: 0,
                     cache_read_tokens: 0,
@@ -504,7 +571,7 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
     let mut by_client: BTreeMap<String, BreakdownRow> = BTreeMap::new();
     let mut by_model_effort: BTreeMap<String, BreakdownRow> = BTreeMap::new();
 
-    for r in &rows {
+    for r in rows {
         let is_fail = u64::from(!is_success_outcome(&r.outcome));
         failures += is_fail;
         let inp = r.input_tokens.max(0) as u64;
@@ -549,29 +616,16 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
             }
         };
 
-        let day = r.occurred_at.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
-        let tp = trend_map.entry(day).or_insert_with(|| ActivityTrendPoint {
-            bucket_start: day,
-            label: day.format("%m-%d").to_string(),
-            requests: 0,
-            failures: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            cache_hit_rate: 0.0,
-            thinking_tokens: 0,
-            api_equivalent_cost_usd: 0.0,
-        });
-        tp.requests += 1;
-        tp.failures += is_fail;
-        tp.input_tokens += inp;
-        tp.output_tokens += out;
-        tp.cache_read_tokens += cr;
-        tp.cache_write_tokens += cw;
-        tp.cache_hit_rate = cache_hit_rate(tp.cache_read_tokens, tp.input_tokens);
-        tp.thinking_tokens += th;
-        tp.api_equivalent_cost_usd += row_cost;
+        if let Some(tp) = trend_map.get_mut(&bucket_index(r.occurred_at)) {
+            tp.requests += 1;
+            tp.failures += is_fail;
+            tp.input_tokens += inp;
+            tp.output_tokens += out;
+            tp.cache_read_tokens += cr;
+            tp.cache_write_tokens += cw;
+            tp.thinking_tokens += th;
+            tp.api_equivalent_cost_usd += row_cost;
+        }
 
         let local = r.occurred_at + tz_offset;
         let dow = local.weekday().num_days_from_monday() as u8;
@@ -595,6 +649,7 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
 
         if let Some(rb) = rhythm_map.get_mut(&hour) {
             rb.requests += 1;
+            rb.failures += is_fail;
             rb.tokens += inp + out;
             rb.input_tokens += inp;
             rb.cache_read_tokens += cr;
@@ -614,6 +669,10 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
         add_breakdown(&mut by_model_effort, &me_key, &me_key, is_fail, inp, out, cr, cw, th, row_cost, unpriced_inc);
     }
 
+    for tp in trend_map.values_mut() {
+        tp.cache_hit_rate = cache_hit_rate(tp.cache_read_tokens, tp.input_tokens);
+        tp.cache_hit_rate_observed = (tp.input_tokens > 0).then_some(tp.cache_hit_rate);
+    }
     let overall_cache_hit_rate = cache_hit_rate(cache_read_tokens, input_tokens);
 
     Ok(ActivityOverview {
@@ -635,14 +694,16 @@ pub async fn overview(hub: &Hub, actor: &Actor, scope: ActivityScope) -> DResult
         matched_proxy_requests: matched_proxy,
         bypassed_local_requests: bypassed_local,
         trend: trend_map.into_values().collect(),
+        bucket_seconds: Some(bucket_seconds as u64),
         heatmap: heatmap_map.into_values().collect(),
+        covered_weekdays,
         rhythm: rhythm_map.into_values().collect(),
         by_model: sort_breakdown(by_model),
         by_account: sort_breakdown(by_account),
         by_client: sort_breakdown(by_client),
         by_model_effort: sort_breakdown(by_model_effort),
         board_tiles: default_overview_tiles(),
-        detail_retention_days: policy.detail_retention_days,
+        detail_retention_days,
     })
 }
 
@@ -1767,6 +1828,40 @@ pub async fn import_evals(hub: &Hub, actor: &Actor, bundle: EvalExportBundle) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overview_plot_buckets_cover_the_scope() {
+        let from = DateTime::parse_from_rfc3339("2026-11-22T23:30:00Z").unwrap().with_timezone(&Utc);
+        let offset = Duration::minutes(90);
+        for (days, seconds, count) in [(1, 3600, 25), (7, 10800, 57), (30, 86400, 31)] {
+            let report = summarize_overview(&[], from, from + Duration::days(days), offset, 30).unwrap();
+            assert_eq!(report.bucket_seconds, Some(seconds));
+            assert_eq!(report.trend.len(), count);
+            assert!(report.trend.iter().all(|p| p.requests == 0
+                && p.input_tokens == 0
+                && p.api_equivalent_cost_usd == 0.0
+                && p.cache_hit_rate_observed.is_none()));
+            assert!(report.trend.windows(2).all(|p| (p[1].bucket_start - p[0].bucket_start).num_seconds() == seconds as i64));
+            assert_eq!(report.covered_weekdays, if days == 1 { vec![0, 1] } else { (0..7).collect::<Vec<_>>() });
+        }
+
+        let failed = ExchangeRow { occurred_at: from + Duration::hours(2), outcome: "rate_limited".into(), ..Default::default() };
+        let ok = ExchangeRow {
+            occurred_at: failed.occurred_at,
+            outcome: "success".into(),
+            input_tokens: 100,
+            cache_read_tokens: 25,
+            cache_write_tokens: 50,
+            ..Default::default()
+        };
+        let report = summarize_overview(&[failed, ok], from, from + Duration::days(1), offset, 30).unwrap();
+        let hourly = &report.trend[2];
+        assert_eq!((hourly.requests, hourly.failures, hourly.cache_write_tokens), (2, 1, 50));
+        assert_eq!(hourly.cache_hit_rate_observed, Some(0.25));
+        assert_eq!(hourly.label, "2026-11-23T01:00:00Z");
+        assert_eq!((report.rhythm[3].requests, report.rhythm[3].failures), (2, 1));
+        assert_eq!(report.heatmap[0].day_of_week, 0);
+    }
 
     #[test]
     fn eval_predicates_handle_contains_not_contains_and_equals() {

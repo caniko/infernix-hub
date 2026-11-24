@@ -425,6 +425,8 @@ async fn fixture_providers_and_activity_over_http() {
     let changed: ProviderSummary = get("providers/claude").send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     assert_eq!(changed.active_account_id.as_deref(), Some(second));
 
+    assert_quota_plot_history(&db, get("providers/claude/quota")).await;
+
     for path in ["overview", "compare", "requests", "traces", "drift", "totals", "thinking", "evals"] {
         let response = get(&format!("activity/{path}")).send().await.unwrap();
         assert_eq!(response.status(), 200, "{path}: {response:?}");
@@ -871,4 +873,75 @@ async fn fixture_providers_and_activity_over_http() {
     db.close().await;
     domain::sqlx::query(&format!("drop database {name} with (force)")).execute(&admin).await.unwrap();
     let _ = std::fs::remove_dir_all(assets);
+}
+
+async fn assert_quota_plot_history(db: &domain::sqlx::PgPool, request: reqwest::RequestBuilder) {
+    use chrono::{DateTime, Duration, Utc};
+
+    let latest = DateTime::from_timestamp((Utc::now() - Duration::minutes(1)).timestamp(), 0).unwrap();
+    domain::sqlx::query(
+        "insert into model_quota_samples
+             (provider_id, account_id, window_key, label, scope_model, used_percent, observed_at, observation_state)
+         select 'claude', 'claude:subscription-2', 'plot-test', 'Plot test', scope_model, used,
+                $1::timestamptz + offset_s * interval '1 second', 'measured'
+         from (
+             select 'pro' as scope_model, 1.0 as used, -7200 - n as offset_s from generate_series(1, 4001) as n
+             union all values ('pro', 80.0, -1800), ('flash', 10.0, -1800), ('pro', 99.0, 0), ('flash', 11.0, 0),
+                              ('pro', 100.0, 3600), (null, 10.0, -60)
+         ) samples",
+    )
+    .bind(latest)
+    .execute(db)
+    .await
+    .unwrap();
+    domain::sqlx::query(
+        "insert into model_quota_samples
+             (provider_id, account_id, window_key, label, scope_model, used_percent, observed_at, observation_state)
+         values ('claude', 'claude:subscription-2', 'plot-test', 'Plot test', '', 12, $1, 'measured')",
+    )
+    .bind(latest - Duration::minutes(1))
+    .execute(db)
+    .await
+    .unwrap();
+    let corrected_id: i64 = domain::sqlx::query_scalar(
+        "insert into model_quota_samples
+             (provider_id, account_id, window_key, label, scope_model, used_percent, observed_at, observation_state)
+         values ('claude', 'claude:subscription-2', 'plot-test', 'Plot test', 'pro', 82, $1, 'measured')
+         returning id",
+    )
+    .bind(latest)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    let report =
+        |hours| request.try_clone().unwrap().query(&[("range_hours", hours), ("lookback_hours", "1"), ("window_key", "plot-test")]).send();
+    let wide: Value = report("24").await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(wide["history_truncated"], true);
+    assert_eq!(wide["samples"].as_array().unwrap().len(), 4000);
+    assert_eq!(wide["samples"][3999]["id"], corrected_id);
+
+    let narrow: Value = report("1").await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(narrow["history_truncated"], false);
+    let samples = narrow["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 5);
+    assert_eq!(samples[4]["id"], corrected_id);
+    assert_eq!(samples[4]["scope_model"], "pro");
+    assert_eq!(samples[3]["scope_model"], "flash");
+    assert_eq!(samples[2]["scope_model"], Value::Null);
+    assert_eq!(samples[2]["used_percent"], 12.0);
+    let account = narrow["accounts"].as_array().unwrap().iter().find(|a| a["id"] == "claude:subscription-2").unwrap();
+    let pro = account["windows"].as_array().unwrap().iter().find(|w| w["window_key"] == "plot-test" && w["scope_model"] == "pro").unwrap();
+    assert_eq!(pro["used_percent"], 82.0, "the report snapshot must also exclude future samples");
+    assert_eq!(narrow["past_windows"], json!([]));
+    for (model, rate) in [("pro", 4.0), ("flash", 2.0)] {
+        for report in [&wide, &narrow] {
+            let forecast = report["forecasts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["scope_model"] == model && f["account_id"] == "claude:subscription-2")
+                .unwrap();
+            assert_eq!(forecast["drain_pct_per_hour"], rate, "a capped history must not starve recent forecasts");
+        }
+    }
 }
