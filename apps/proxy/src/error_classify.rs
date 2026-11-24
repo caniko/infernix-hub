@@ -130,7 +130,9 @@ fn google_array_error(
             let wrapped = item.get("error").or_else(|| item.pointer("/response/error"));
             let code = numeric_code(wrapped.unwrap_or(item));
             (wrapped.is_some_and(Value::is_object)
-                || (wrapped.is_none() && ["status", "code", "details", "message"].iter().any(|key| item.get(key).is_some())))
+                || (wrapped.is_none()
+                    && (text(item, &["status"]).is_some_and(|s| !s.trim().eq_ignore_ascii_case("OK"))
+                        || ["code", "details", "message"].iter().any(|key| item.get(key).is_some()))))
             .then(|| classify(Lane::Google, code.or(status), item, "", html, source, secrets))
         })
         // A quota entry must not hide an account-level rejection in the same response.
@@ -467,6 +469,8 @@ pub(crate) mod tests {
             (r#"[{"message":"Verify your account to continue."}]"#, Some(VerificationRequired)),
             (r#"[{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]"#, None),
             (r#"[{},[{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]]"#, None),
+            (r#"[{"status":"OK"},{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]"#, None),
+            (r#"[{"status":" "},{"status":null},{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]"#, None),
         ] {
             assert_eq!(http(Lane::Google, 403, body, Inference).map(|error| error.kind), expected, "{body}");
         }
