@@ -7,7 +7,7 @@
 //! resolving the rows a source no longer reports. `seq` is the long-poll cursor,
 //! so every change here wakes the waiters after its transaction commits.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use contracts::fleet::{FleetStatus, Health, NightlyOutcome};
 use contracts::{
     AckNotificationsIn, Notification, NotificationPage, RaiseNotificationIn, Role, Severity, SnoozeNotificationIn, SyncNotificationsIn,
@@ -152,7 +152,7 @@ async fn lock_writers(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> DResult
 pub async fn raise(hub: &Hub, raise: &Raise) -> DResult<bool> {
     let mut tx = hub.db.begin().await?;
     lock_writers(&mut tx).await?;
-    let changed = upsert(&mut tx, &hub.config.company_id, None, raise, false).await?;
+    let changed = upsert(&mut tx, &hub.config, None, raise, false).await? > 0;
     tx.commit().await?;
     if changed {
         hub.notified.notify_waiters();
@@ -160,13 +160,25 @@ pub async fn raise(hub: &Hub, raise: &Raise) -> DResult<bool> {
     Ok(changed)
 }
 
+fn daily_summary_date(key: &str) -> Option<NaiveDate> {
+    let day = key.strip_prefix("summary:")?;
+    let bytes = day.as_bytes();
+    if bytes.len() != 10
+        || !bytes.iter().enumerate().all(|(i, byte)| if matches!(i, 4 | 7) { *byte == b'-' } else { byte.is_ascii_digit() })
+    {
+        return None;
+    }
+    NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()
+}
+
 async fn upsert(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    company_id: &str,
+    config: &crate::HubConfig,
     owner: Option<&str>,
     raise: &Raise,
     hide_foreign_owner: bool,
-) -> DResult<bool> {
+) -> DResult<usize> {
+    let company_id = &config.company_id;
     // All callers hold the writer lock through commit.
     let collision: Option<bool> = sqlx::query_scalar(
         "select owner is distinct from $3 from notifications
@@ -184,11 +196,28 @@ async fn upsert(
         }
         return Err(invalid("invalid_dedupe_key", "key belongs to another notification owner or source"));
     }
+    let day = if owner.is_none() && raise.source == "summary" { daily_summary_date(&raise.dedupe_key) } else { None };
+    let (historical, older_keys) = if let Some(day) = day {
+        // Include snoozed and resolved rows: neither makes an older day current again.
+        let keys: Vec<String> = sqlx::query_scalar(
+            "select dedupe_key from notifications
+             where company_id = $1 and owner is null and source = 'summary' and dedupe_key like 'summary:%'",
+        )
+        .bind(company_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let dated: Vec<_> = keys.into_iter().filter_map(|key| daily_summary_date(&key).map(|date| (key, date))).collect();
+        let newest = dated.iter().map(|(_, date)| *date).max().unwrap_or(day).max(day);
+        (day < newest, dated.into_iter().filter(|(_, date)| *date < newest).map(|(key, _)| key).collect::<Vec<_>>())
+    } else {
+        (false, Vec::new())
+    };
+
     // Refresh the display text of an open provider incident without notifying
     // again. A severity change or recurrence starts a new notification.
-    let rows = sqlx::query(
-        "insert into notifications (id, company_id, source, dedupe_key, severity, title, body, subject_type, subject_id, url, owner)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    let mut changed = sqlx::query(
+        "insert into notifications (id, company_id, source, dedupe_key, severity, title, body, subject_type, subject_id, url, owner, resolved_at)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, case when $12 then now() end)
          on conflict (company_id, dedupe_key) do update set
            severity = excluded.severity, title = excluded.title, body = excluded.body,
            subject_type = excluded.subject_type, subject_id = excluded.subject_id, url = excluded.url,
@@ -200,11 +229,11 @@ async fn upsert(
                             and notifications.severity = excluded.severity
                      as preserve_ack) incident
            ),
-           resolved_at = null, updated_at = now()
+           resolved_at = case when $12 then coalesce(notifications.resolved_at, now()) end, updated_at = now()
           where notifications.owner is not distinct from excluded.owner and notifications.source = excluded.source and
-            (notifications.resolved_at is not null
+            ((not $12 and notifications.resolved_at is not null)
              or (notifications.severity, notifications.title, notifications.body)
-                is distinct from (excluded.severity, excluded.title, excluded.body))",
+                 is distinct from (excluded.severity, excluded.title, excluded.body))",
     )
     .bind(Uuid::new_v4())
     .bind(company_id)
@@ -217,10 +246,30 @@ async fn upsert(
     .bind(&raise.subject_id)
     .bind(&raise.url)
     .bind(owner)
+    .bind(historical)
     .execute(&mut **tx)
     .await?
-    .rows_affected();
-    Ok(rows > 0)
+    .rows_affected() as usize;
+    if day.is_some() {
+        // Supersession announces the resolution without making an old summary fresh.
+        if !older_keys.is_empty() {
+            changed += sqlx::query(
+                "update notifications set resolved_at = now(), seq = nextval('notifications_seq')
+                 where company_id = $1 and dedupe_key = any($2) and resolved_at is null",
+            )
+            .bind(company_id)
+            .bind(&older_keys)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected() as usize;
+        }
+        if let Some(hours) = config.summary_stale_hours
+            && has_fresh_daily_summary(tx, company_id, hours).await?
+        {
+            changed += resolve_summary_stale(tx, company_id).await?;
+        }
+    }
+    Ok(changed)
 }
 
 /// One producer pass: upsert the current set for `source`, then resolve every
@@ -244,7 +293,7 @@ async fn sync_owned(hub: &Hub, owner: Option<&str>, source: &str, current: Vec<R
         if raise.source != source {
             return Err(invalid("invalid_source", "notification must belong to the syncing source"));
         }
-        changed += usize::from(upsert(&mut tx, &hub.config.company_id, owner, raise, false).await?);
+        changed += upsert(&mut tx, &hub.config, owner, raise, false).await?;
         // Degradations only: a pending op is an approval for the operator.
         if hub.config.fleet_issues.is_some() && source == "fleet" && !raise.dedupe_key.starts_with("fleet:op:") {
             file_fleet_issue(&mut tx, hub, raise).await?;
@@ -432,7 +481,7 @@ pub async fn sync_secrets(hub: &Hub, current: Vec<(Option<String>, Raise)>) -> D
         if raise.source != "secrets" {
             return Err(invalid("invalid_source", "notification must belong to the secrets source"));
         }
-        changed += usize::from(upsert(&mut tx, &hub.config.company_id, owner.as_deref(), raise, false).await?);
+        changed += upsert(&mut tx, &hub.config, owner.as_deref(), raise, false).await?;
     }
     let keys: Vec<&str> = current.iter().map(|(_, r)| r.dedupe_key.as_str()).collect();
     changed += sqlx::query("update notifications set resolved_at = now(), seq = nextval('notifications_seq'), updated_at = now() where company_id = $1 and source = 'secrets' and resolved_at is null and dedupe_key <> all($2)")
@@ -703,24 +752,42 @@ fn snapshot_age_secs(status: &FleetStatus, now: DateTime<Utc>) -> Option<i64> {
     (age >= -FLEET_CLOCK_SKEW_SECS).then_some(age)
 }
 
-/// `hub:summary-stale` while no `summary` row has been written for
-/// `HUB_SUMMARY_STALE_HOURS`. Unset means the rule is off: the source syncs an
-/// empty set, so any raise it left resolves.
-pub async fn summary_raises(hub: &Hub, stale_hours: Option<u32>) -> DResult<Vec<Raise>> {
-    let Some(hours) = stale_hours else { return Ok(Vec::new()) };
-    let fresh: bool = sqlx::query_scalar(
-        "select exists(
-           select 1 from notifications
-           where company_id = $1 and source = 'summary' and updated_at > now() - make_interval(hours => $2))",
+async fn has_fresh_daily_summary(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, company_id: &str, hours: u32) -> DResult<bool> {
+    // Edits, acknowledgments and snoozes don't count as posting a new daily summary.
+    let keys: Vec<String> = sqlx::query_scalar(
+        "select dedupe_key from notifications
+         where company_id = $1 and owner is null and source = 'summary' and dedupe_key like 'summary:%'
+           and resolved_at is null and created_at > statement_timestamp() - make_interval(hours => $2)",
     )
-    .bind(&hub.config.company_id)
+    .bind(company_id)
     .bind(hours.min(i32::MAX as u32) as i32)
-    .fetch_one(&hub.db)
+    .fetch_all(&mut **tx)
     .await?;
-    Ok(if fresh {
-        Vec::new()
-    } else {
-        vec![Raise {
+    Ok(keys.iter().any(|key| daily_summary_date(key).is_some()))
+}
+
+async fn resolve_summary_stale(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, company_id: &str) -> DResult<usize> {
+    Ok(sqlx::query(
+        "update notifications
+         set resolved_at = now(), seq = nextval('notifications_seq'), updated_at = now()
+         where company_id = $1 and owner is null and resolved_at is null and source = 'hub' and dedupe_key = 'hub:summary-stale'",
+    )
+    .bind(company_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected() as usize)
+}
+
+/// Reconcile staleness under the same writer lock used by summary posts.
+/// Disabling the rule resolves any alert it left behind.
+pub async fn sync_summary_staleness(hub: &Hub, stale_hours: Option<u32>) -> DResult<usize> {
+    let mut tx = hub.db.begin().await?;
+    lock_writers(&mut tx).await?;
+    let company_id = &hub.config.company_id;
+    let changed = if let Some(hours) = stale_hours
+        && !has_fresh_daily_summary(&mut tx, company_id, hours).await?
+    {
+        let raise = Raise {
             source: "hub".into(),
             dedupe_key: "hub:summary-stale".into(),
             severity: Severity::Warning,
@@ -729,8 +796,16 @@ pub async fn summary_raises(hub: &Hub, stale_hours: Option<u32>) -> DResult<Vec<
             subject_type: None,
             subject_id: None,
             url: None,
-        }]
-    })
+        };
+        upsert(&mut tx, &hub.config, None, &raise, false).await?
+    } else {
+        resolve_summary_stale(&mut tx, company_id).await?
+    };
+    tx.commit().await?;
+    if changed > 0 {
+        hub.notified.notify_waiters();
+    }
+    Ok(changed)
 }
 
 /// Clear lapsed snoozes and announce them. Holds the writer lock because the
@@ -936,7 +1011,7 @@ pub async fn post(hub: &Hub, actor: &Actor, input: RaiseNotificationIn) -> DResu
     let entry = api_raise(owner, input)?;
     let mut tx = hub.db.begin().await?;
     lock_writers(&mut tx).await?;
-    let changed = upsert(&mut tx, &hub.config.company_id, owner, &entry, true).await?;
+    let changed = upsert(&mut tx, &hub.config, owner, &entry, true).await? > 0;
     let row: Option<Value> = sqlx::query_scalar(&select("company_id = $1 and dedupe_key = $2 and owner is not distinct from $3"))
         .bind(&hub.config.company_id)
         .bind(&entry.dedupe_key)

@@ -44,6 +44,7 @@ async fn start(db_url: &str, assets: &std::path::Path) -> H {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let mut s = Settings::fixture(db_url, &addr);
+    s.summary_stale_hours = Some(26);
     s.asset_dir = assets.to_path_buf();
     s.registry_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../registry").into();
     s.seed_file = Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../registry/hub.fixture.json").into());
@@ -2873,6 +2874,90 @@ async fn today_failure_details_use_latest_attempt_and_are_stable() {
 }
 
 #[tokio::test]
+async fn operator_regression_today_hides_superseded_generation_failures() {
+    let Some(h) = harness().await else { return };
+    let item = h.brief(None).await;
+    let other_item = h.brief(None).await;
+    let older = h.pipeline(item.id).await;
+    let failed = h.pipeline(item.id).await;
+    let unrelated = h.pipeline(other_item.id).await;
+    let windmill =
+        GenerateIn { workflow_id: h.workflow("poster-txt2img").await.id, inputs: json!({ "prompt": "a kiln at dusk" }), variants: 1 };
+    let other_workflow = h.op.generate(item.id, &windmill).await.unwrap();
+
+    domain::sqlx::query("update generation_requests set state = 'succeeded' where id = $1")
+        .bind(older.id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    let mut outboxes = Vec::new();
+    for (generation, state, outbox_state) in [(&failed, "failed", "dead"), (&unrelated, "outcome_unknown", "pending")] {
+        domain::sqlx::query("update generation_requests set state = $2 where id = $1")
+            .bind(generation.id)
+            .bind(state)
+            .execute(&h.hub.db)
+            .await
+            .unwrap();
+        let outbox: Uuid = domain::sqlx::query_scalar(
+            "update outbox set state = $2, attempts = 3
+             where topic = 'pipeline_run' and payload #>> '{request,generation_request_id}' = $1 returning id",
+        )
+        .bind(generation.id.to_string())
+        .bind(outbox_state)
+        .fetch_one(&h.hub.db)
+        .await
+        .unwrap();
+        outboxes.push(outbox);
+    }
+    domain::sqlx::query("update generation_requests set state = 'outcome_unknown' where id = $1")
+        .bind(other_workflow.id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    let windmill_outbox: Uuid = domain::sqlx::query_scalar(
+        "update outbox set attempts = 3
+         where topic = 'windmill.run_generation' and payload ->> 'generation_request_id' = $1 returning id",
+    )
+    .bind(other_workflow.id.to_string())
+    .fetch_one(&h.hub.db)
+    .await
+    .unwrap();
+
+    let before = h.op.today().await.unwrap().failed_operations;
+    assert!(before.iter().any(|row| row.subject_id == item.id && row.status == "failed"));
+    for id in [other_item.id, outboxes[0], outboxes[1], windmill_outbox] {
+        assert!(before.iter().any(|row| row.subject_id == id), "missing failure for {id}");
+    }
+
+    let replacement = h.pipeline(item.id).await;
+    domain::sqlx::query("update generation_requests set state = 'succeeded' where id = $1")
+        .bind(replacement.id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+
+    let after = h.op.today().await.unwrap().failed_operations;
+    assert!(!after.iter().any(|row| row.subject_id == item.id && row.status == "failed"));
+    assert!(!after.iter().any(|row| row.subject_id == outboxes[0]));
+    assert!(after.iter().any(|row| row.subject_id == item.id && row.status == "outcome_unknown"));
+    for id in [other_item.id, outboxes[1], windmill_outbox] {
+        assert!(after.iter().any(|row| row.subject_id == id), "unrelated failure hidden for {id}");
+    }
+
+    let replacement = h.op.generate(item.id, &windmill).await.unwrap();
+    domain::sqlx::query("update generation_requests set state = 'succeeded' where id = $1")
+        .bind(replacement.id)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    let after = h.op.today().await.unwrap().failed_operations;
+    assert!(!after.iter().any(|row| [item.id, windmill_outbox].contains(&row.subject_id)));
+    for id in [other_item.id, outboxes[1]] {
+        assert!(after.iter().any(|row| row.subject_id == id), "unrelated failure hidden for {id}");
+    }
+}
+
+#[tokio::test]
 async fn today_lists_open_calls_due_within_two_weeks() {
     let Some(h) = harness().await else { return };
     let soon = h.ingest.ingest_opportunity(&opportunity_in("soon", Some(Utc::now() + chrono::Duration::days(3)))).await.unwrap();
@@ -3505,6 +3590,156 @@ async fn summary_notification_replaces_its_day() {
     assert_eq!(h.op.notifications(None, 0, true).await.unwrap().items.len(), 2);
     assert!(fleetix_hubd::mcp::summary_input("2026-13-01", "bad", Severity::Info).is_err());
     assert!(fleetix_hubd::mcp::summary_input("2026-11-15x", "bad", Severity::Info).is_err());
+}
+
+#[tokio::test]
+async fn operator_regression_posting_summary_resolves_previous_summaries_and_staleness() {
+    let Some(h) = harness().await else { return };
+    // Seed rows left open by earlier versions, including the producer's stale alert.
+    let prior = [("summary", "summary:2026-11-19"), ("summary", "summary:2026-11-21"), ("hub", "hub:summary-stale")];
+    for (source, key) in prior {
+        domain::sqlx::query(
+            "insert into notifications (id, company_id, source, dedupe_key, severity, title, body)
+             values ($1, $2, $3, $4, 'info', $4, '')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&h.hub.config.company_id)
+        .bind(source)
+        .bind(key)
+        .execute(&h.hub.db)
+        .await
+        .unwrap();
+    }
+    let unrelated = h.op.raise_notification(&notification_in("summary:unrelated", "")).await.unwrap();
+    let cursor = h.op.notifications(None, 0, true).await.unwrap().cursor;
+
+    let input = fleetix_hubd::mcp::summary_input("2026-11-23", "today's summary", Severity::Info).unwrap();
+    let posted = h.op.raise_notification(&input).await.unwrap();
+    assert!(posted.open);
+
+    let changes = h.op.notifications(Some(cursor), 0, true).await.unwrap().items;
+    for (_, key) in prior {
+        let row = changes.iter().find(|row| row.dedupe_key == key).unwrap_or_else(|| panic!("no feed update for {key}"));
+        assert!(row.resolved_at.is_some() && !row.open);
+    }
+    let all = h.op.notifications(None, 0, true).await.unwrap().items;
+    assert!(all.iter().any(|row| row.id == unrelated.id && row.open));
+}
+
+#[tokio::test]
+async fn summary_supersession_resolves_a_snoozed_day() {
+    let Some(h) = harness().await else { return };
+    let older = fleetix_hubd::mcp::summary_input("2026-11-21", "older", Severity::Info).unwrap();
+    let newer = fleetix_hubd::mcp::summary_input("2026-11-23", "newer", Severity::Info).unwrap();
+    let posted = h.op.raise_notification(&older).await.unwrap();
+    let until = SnoozeNotificationIn { until: Utc::now() + chrono::Duration::hours(1) };
+    let snoozed = h.op.snooze_notification(posted.id, &until).await.unwrap();
+    assert!(!snoozed.open && snoozed.resolved_at.is_none());
+
+    let latest = h.op.raise_notification(&newer).await.unwrap();
+    let all = h.op.notifications(None, 0, true).await.unwrap().items;
+    let retired = all.iter().find(|row| row.id == posted.id).unwrap();
+    assert!(retired.resolved_at.is_some() && !retired.open);
+    assert!(retired.seq > snoozed.seq);
+
+    h.op.snooze_notification(latest.id, &until).await.unwrap();
+    let reposted = h.op.raise_notification(&older).await.unwrap();
+    assert_eq!((reposted.resolved_at, reposted.seq), (retired.resolved_at, retired.seq));
+}
+
+#[tokio::test]
+async fn summary_out_of_order_repost_keeps_the_newest_day_open() {
+    let Some(h) = harness().await else { return };
+    let older = fleetix_hubd::mcp::summary_input("2026-11-21", "older", Severity::Info).unwrap();
+    let newer = fleetix_hubd::mcp::summary_input("2026-11-23", "newer", Severity::Info).unwrap();
+    h.op.raise_notification(&older).await.unwrap();
+    let latest = h.op.raise_notification(&newer).await.unwrap();
+
+    let before = h.op.notifications(None, 0, true).await.unwrap();
+    let retired = before.items.iter().find(|row| row.dedupe_key == older.dedupe_key).unwrap();
+    let reposted = h.op.raise_notification(&older).await.unwrap();
+    assert!(!reposted.open && reposted.resolved_at.is_some());
+    assert_eq!((reposted.seq, reposted.updated_at), (retired.seq, retired.updated_at));
+    let corrected = RaiseNotificationIn { body: "corrected older summary".into(), ..older };
+    let corrected = h.op.raise_notification(&corrected).await.unwrap();
+    assert!(!corrected.open && corrected.resolved_at.is_some());
+    assert_eq!(corrected.body, "corrected older summary");
+    let backfill = fleetix_hubd::mcp::summary_input("2026-11-22", "late first post", Severity::Info).unwrap();
+    let backfill = h.op.raise_notification(&backfill).await.unwrap();
+    assert!(!backfill.open && backfill.resolved_at.is_some());
+    let open = h.op.notifications(None, 0, false).await.unwrap().items;
+    assert_eq!(open.iter().map(|row| row.id).collect::<Vec<_>>(), vec![latest.id]);
+}
+
+#[tokio::test]
+async fn summary_non_daily_keys_do_not_participate_in_supersession() {
+    let Some(h) = harness().await else { return };
+    let daily = fleetix_hubd::mcp::summary_input("2026-11-23", "daily", Severity::Info).unwrap();
+    let posted = h.op.raise_notification(&daily).await.unwrap();
+    for key in ["summary:weekly", "summary:2026-02-30", "summary:2026-1-02"] {
+        let other = RaiseNotificationIn { source: Some("summary".into()), ..notification_in(key, "other") };
+        h.op.raise_notification(&other).await.unwrap();
+        assert!(h.op.notifications(None, 0, false).await.unwrap().items.iter().any(|row| row.id == posted.id), "{key}");
+    }
+    h.op.raise_notification(&daily).await.unwrap();
+    assert_eq!(h.op.notifications(None, 0, false).await.unwrap().open, 4, "daily posts leave non-daily rows alone too");
+}
+
+#[tokio::test]
+async fn summary_identical_stale_repost_does_not_resolve_the_alert() {
+    let Some(h) = harness().await else { return };
+    let input = fleetix_hubd::mcp::summary_input("2026-11-23", "unchanged", Severity::Info).unwrap();
+    let posted = h.op.raise_notification(&input).await.unwrap();
+    domain::sqlx::query(
+        "update notifications set created_at = now() - interval '30 hours', updated_at = now() - interval '30 hours' where id = $1",
+    )
+    .bind(posted.id)
+    .execute(&h.hub.db)
+    .await
+    .unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, None, Some(26)).await;
+    let open = h.op.notifications(None, 0, false).await.unwrap().items;
+    let stale = open.iter().find(|row| row.dedupe_key == "hub:summary-stale").unwrap();
+
+    let reposted = h.op.raise_notification(&input).await.unwrap();
+    assert_eq!(reposted.seq, posted.seq);
+    let open = h.op.notifications(None, 0, false).await.unwrap().items;
+    assert!(open.iter().any(|row| row.id == stale.id && row.seq == stale.seq));
+
+    h.op.ack_notifications(&AckNotificationsIn { ids: vec![posted.id], all: false }).await.unwrap();
+    let reposted = h.op.raise_notification(&input).await.unwrap();
+    assert!(reposted.read_at.is_some());
+    let open = h.op.notifications(None, 0, false).await.unwrap().items;
+    assert!(open.iter().any(|row| row.id == stale.id && row.seq == stale.seq), "an ack and unchanged repost do not clear staleness");
+
+    let snoozed =
+        h.op.snooze_notification(posted.id, &SnoozeNotificationIn { until: Utc::now() + chrono::Duration::hours(1) }).await.unwrap();
+    let reposted = h.op.raise_notification(&input).await.unwrap();
+    assert_eq!(reposted.seq, snoozed.seq);
+    fleetix_hubd::notify_pass(&h.hub, None, None, Some(26)).await;
+    let open = h.op.notifications(None, 0, false).await.unwrap().items;
+    assert!(open.iter().any(|row| row.id == stale.id && row.seq == stale.seq), "a snooze and unchanged repost do not clear staleness");
+
+    let weekly = RaiseNotificationIn { source: Some("summary".into()), ..notification_in("summary:weekly", "weekly") };
+    h.op.raise_notification(&weekly).await.unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, None, Some(26)).await;
+    let open = h.op.notifications(None, 0, false).await.unwrap().items;
+    assert!(open.iter().any(|row| row.id == stale.id && row.seq == stale.seq), "a weekly summary is not fresh daily evidence");
+
+    let backfill = fleetix_hubd::mcp::summary_input("2026-11-22", "late first post", Severity::Info).unwrap();
+    assert!(h.op.raise_notification(&backfill).await.unwrap().resolved_at.is_some());
+    let open = h.op.notifications(None, 0, false).await.unwrap().items;
+    assert!(open.iter().any(|row| row.id == stale.id && row.seq == stale.seq), "a resolved backfill does not clear staleness");
+
+    let refreshed = RaiseNotificationIn { body: "changed".into(), ..input };
+    h.op.raise_notification(&refreshed).await.unwrap();
+    let open = h.op.notifications(None, 0, false).await.unwrap().items;
+    assert!(open.iter().any(|row| row.id == stale.id && row.seq == stale.seq), "editing the old day does not clear staleness");
+
+    let next = fleetix_hubd::mcp::summary_input("2026-11-24", "new day", Severity::Info).unwrap();
+    h.op.raise_notification(&next).await.unwrap();
+    let all = h.op.notifications(None, 0, true).await.unwrap().items;
+    assert!(all.iter().any(|row| row.id == stale.id && row.resolved_at.is_some()));
 }
 
 #[tokio::test]
