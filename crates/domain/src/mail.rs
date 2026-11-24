@@ -393,16 +393,17 @@ impl Hub {
         Ok(detail)
     }
 
-    pub async fn list_unenriched_signal_messages(&self, actor: &Actor, owner: &str, limit: u32) -> DResult<Vec<MailMessageDetail>> {
+    pub async fn list_unenriched_mail(&self, actor: &Actor, owner: &str, limit: u32, skip_junk: bool) -> DResult<Vec<MailMessageDetail>> {
         let owner = Self::sync_owner(actor, owner)?;
         decode(
             sqlx::query_scalar(&format!(
                 "select to_jsonb(t) from (select {MESSAGE_SUMMARY},{MESSAGE_DETAIL} {MESSAGE_SCOPE}
-             and not coalesce(n.user_override_junk,n.is_junk) and n.analyzer_kind='heuristic'
+             and (not $3 or not coalesce(n.user_override_junk,n.is_junk)) and n.analyzer_kind='heuristic'
              order by m.received_at desc,m.id limit $2) t",
             ))
             .bind(owner)
             .bind(i64::from(limit.clamp(1, 100)))
+            .bind(skip_junk)
             .fetch_all(&self.db)
             .await?,
         )
@@ -450,10 +451,16 @@ impl Hub {
                 select * from scoped where not junk and classification in ('business','financial','invoice','receipt','legal','action_required')
              ), financial as (
                 select * from business where classification in ('financial','invoice','receipt')
+             ), vendors as (
+                select entities->>'vendor' as vendor,count(*) as message_count from financial
+                where nullif(entities->>'vendor','') is not null group by 1 having count(*)>=2
              )
              select jsonb_build_object(
                 'total_count',count(*), 'signal_count',count(*) filter(where not junk),
                 'junk_count',count(*) filter(where junk), 'unread_count',count(*) filter(where not is_read),
+                'unread_signal_count',count(*) filter(where not is_read and not junk),
+                'recurring_vendor_count',(select count(*) from vendors),
+                'open_action_item_count',coalesce(sum(jsonb_array_length(actions)) filter(where not junk),0),
                 'by_provider',coalesce((select jsonb_object_agg(provider,n) from
                     (select provider,count(*) as n from scoped group by provider) x),'{}'),
                 'by_classification',coalesce((select jsonb_object_agg(classification,n) from
@@ -465,8 +472,7 @@ impl Hub {
                     (select lower(from_addr) as key,count(*) as message_count from business where from_addr<>''
                      group by 1 order by 2 desc,1 limit 10) x),'[]'),
                 'recurring_vendors',coalesce((select jsonb_agg(to_jsonb(x) order by message_count desc,vendor) from
-                    (select entities->>'vendor' as vendor,count(*) as message_count from financial
-                     where nullif(entities->>'vendor','') is not null group by 1 having count(*)>=2 order by 2 desc,1 limit 10) x),'[]'),
+                    (select * from vendors order by message_count desc,vendor limit 10) x),'[]'),
                 'recent_amounts',coalesce((select jsonb_agg(amount order by received_at desc,id,ord) from
                     (select amount,received_at,id,ord from financial cross join lateral
                      jsonb_array_elements(entities->'amounts') with ordinality as v(amount,ord)

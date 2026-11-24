@@ -269,11 +269,223 @@
   # Only the publisher has a real disabled mode (the hub refuses the others).
   mode = types.enum ["fixture" "live"];
   publisherMode = types.enum ["fixture" "live" "disabled"];
+
+  nullableString = description:
+    mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      inherit description;
+    };
+  positive = default: description:
+    mkOption {
+      type = types.ints.positive;
+      inherit default description;
+    };
+  jsonFile = name: value: pkgs.writeText "fleetix-hub-${name}.json" (builtins.toJSON value);
+  nonSecretHttpUrl = url:
+    builtins.match ''https?://[^/@?#\\[:space:][:cntrl:]]+(/[^?#\\[:space:][:cntrl:]]*)?'' url
+    != null
+    && !lib.hasInfix "/private-" url;
+  mail = cfg.mail;
+  calendar = cfg.calendar;
+  mailConfig = {
+    sync_interval_seconds = mail.syncIntervalSeconds;
+    archive_raw_dir = mail.archiveRawDir;
+    accounts = lib.mapAttrsToList (_: account:
+      {
+        inherit (account) owner label provider transport address enabled;
+        password_file = runtimeCredential account.passwordFile;
+        export_dir = account.exportDir;
+      }
+      // optionalAttrs (account.transport == "imap") {
+        inherit (account.imap) host port username folders;
+        tls_mode = account.imap.tls;
+      })
+    mail.accounts;
+    bi = {
+      inherit (mail.bi) enable;
+      interval_seconds = mail.bi.llm.intervalSeconds;
+      max_batch_per_tick = mail.bi.llm.maxBatchPerTick;
+      skip_junk = mail.bi.llm.skipJunk;
+      llm = {
+        inherit (mail.bi.llm) enable model;
+        base_url =
+          if nonSecretHttpUrl mail.bi.llm.baseUrl
+          then mail.bi.llm.baseUrl
+          else throw "fleetix-hub: mail.bi.llm.baseUrl must be a credential-free HTTP(S) endpoint.";
+      };
+    };
+  };
+  calendarConfig = {
+    sync_interval_seconds = calendar.syncIntervalSeconds;
+    sources =
+      lib.mapAttrsToList (_: source: {
+        inherit (source) owner label provider visibility color enabled username;
+        # Only an explicitly public URL can be rendered into a store file.
+        url =
+          if source.urlFile != null
+          then null
+          else if source.url == null || (source.provider != "google_ics" && nonSecretHttpUrl source.url)
+          then source.url
+          else throw "fleetix-hub: use calendar.sources.<name>.urlFile for private, Google ICS, or credential-bearing URLs.";
+        url_file = runtimeCredential source.urlFile;
+        password_file = runtimeCredential source.passwordFile;
+        service_account_file = runtimeCredential source.serviceAccountFile;
+        calendar_id = source.calendarId;
+      })
+      calendar.sources;
+  };
+  runtimeFiles = lib.filter (path: path != null) (
+    lib.optionals mail.enable (map (account: account.passwordFile) (lib.attrValues mail.accounts))
+    ++ lib.optionals calendar.enable (lib.concatMap (source: [source.urlFile source.passwordFile source.serviceAccountFile]) (lib.attrValues calendar.sources))
+  );
+  runtimeCredential = path:
+    if path == null || (builtins.match "/[^[:cntrl:]]+" path != null && !builtins.hasContext path && !(lib.hasPrefix "/nix/store/" path) && path != "/nix/store")
+    then path
+    else throw "fleetix-hub: credential files must be absolute runtime paths outside the Nix store.";
+  optionalRuntimePath = path: let
+    value = "-${lib.replaceStrings ["%"] ["%%"] (runtimeCredential path)}";
+  in
+    if builtins.match ''[^[:space:]"\\]+'' value != null
+    then value
+    else builtins.toJSON value;
+  archiveEnabled = mail.enable && mail.archiveRawDir != null;
+
+  ownerOption = mkOption {
+    type = types.str;
+    description = "Hub owner to whom the data belongs.";
+  };
+  labelOption = name:
+    mkOption {
+      type = types.str;
+      default = name;
+      description = "Display label, unique per owner.";
+    };
+  enabledOption = mkOption {
+    type = types.bool;
+    default = true;
+    description = "Whether this entry participates in sync.";
+  };
 in {
   imports = [harbor-db.nixosModules.default];
 
   options.services.fleetix-hub = {
     enable = mkEnableOption "fleetix-hub content operations hub";
+
+    principalOwners = mkOption {
+      type = types.attrsOf types.str;
+      default = {};
+      description = "Map authenticated principal names to mail and calendar owners.";
+    };
+
+    mail = {
+      enable = mkEnableOption "Fleetix Hub mail ingestion";
+      syncIntervalSeconds = positive 300 "Seconds between mail sync passes.";
+      archiveRawDir = nullableString "Directory for optional private raw mail archival.";
+      accounts = mkOption {
+        type = types.attrsOf (types.submodule ({name, ...}: {
+          options = {
+            owner = ownerOption;
+            label = labelOption name;
+            enabled = enabledOption;
+            provider = mkOption {
+              type = types.enum ["gmail" "protonmail" "tutanota" "imap" "export_dir"];
+              description = "Mail provider.";
+            };
+            transport = mkOption {
+              type = types.enum ["imap" "export_dir" "client_push"];
+              description = "How messages are ingested.";
+            };
+            address = mkOption {
+              type = types.str;
+              description = "Account email address.";
+            };
+            imap = {
+              host = nullableString "IMAP server host, without a scheme.";
+              port = mkOption {
+                type = types.nullOr types.port;
+                default = null;
+                description = "IMAP port; null uses the daemon's transport default.";
+              };
+              tls = mkOption {
+                type = types.enum ["tls" "starttls" "plain"];
+                default = "tls";
+                description = "IMAP security mode. Plain transport is restricted to loopback.";
+              };
+              username = nullableString "IMAP login name.";
+              folders = mkOption {
+                type = types.listOf types.str;
+                default = ["INBOX"];
+                description = "IMAP folders to sync.";
+              };
+            };
+            passwordFile = nullableString "Runtime path to the IMAP password.";
+            exportDir = nullableString "Runtime directory containing exported mail.";
+          };
+        }));
+        default = {};
+        description = "Mail accounts managed by the Hub.";
+      };
+      bi = {
+        enable = mkEnableOption "background mail business intelligence";
+        llm = {
+          enable = mkEnableOption "local LLM enrichment for mail";
+          baseUrl = mkOption {
+            type = types.str;
+            default = "http://127.0.0.1:8013/v1";
+            description = "Local OpenAI-compatible endpoint for mail enrichment.";
+          };
+          model = mkOption {
+            type = types.str;
+            default = "";
+            description = "Model to use when LLM enrichment is enabled.";
+          };
+          maxBatchPerTick = positive 10 "Maximum messages enriched per pass (the daemon caps this at 100).";
+          intervalSeconds = positive 120 "Seconds between enrichment passes.";
+          skipJunk = mkOption {
+            type = types.bool;
+            default = true;
+            description = "Do not send messages classified as junk to the local LLM.";
+          };
+        };
+      };
+    };
+
+    calendar = {
+      enable = mkEnableOption "Fleetix Hub calendar ingestion";
+      syncIntervalSeconds = positive 300 "Seconds between calendar sync passes.";
+      sources = mkOption {
+        type = types.attrsOf (types.submodule ({name, ...}: {
+          options = {
+            owner = ownerOption;
+            label = labelOption name;
+            enabled = enabledOption;
+            provider = mkOption {
+              type = types.enum ["google_ics" "caldav" "google_api" "ics_url"];
+              description = "Calendar sync protocol.";
+            };
+            visibility = mkOption {
+              type = types.enum ["private" "shared"];
+              default = "private";
+              description = "Who can read the synced calendar.";
+            };
+            color = mkOption {
+              type = types.str;
+              default = "#4f8cff";
+              description = "Calendar source display color.";
+            };
+            url = nullableString "Public, non-secret calendar URL only; written to the Nix store. For any private URL or token in a URL, use urlFile.";
+            urlFile = nullableString "Runtime path to the calendar URL; takes precedence over url.";
+            username = nullableString "Calendar login name.";
+            passwordFile = nullableString "Runtime path to the calendar password.";
+            serviceAccountFile = nullableString "Runtime path to Google service account JSON.";
+            calendarId = nullableString "Google Calendar API calendar ID.";
+          };
+        }));
+        default = {};
+        description = "Calendar sources managed by the Hub.";
+      };
+    };
 
     package = mkOption {
       type = types.package;
@@ -918,9 +1130,9 @@ in {
         group = runtimeGroup;
       };
 
-      systemd.tmpfiles.rules = [
-        "d ${toString cfg.assetDir} 0750 ${runtimeUser} ${runtimeGroup} -"
-      ];
+      systemd.tmpfiles.rules =
+        ["d ${toString cfg.assetDir} 0750 ${runtimeUser} ${runtimeGroup} -"]
+        ++ optional archiveEnabled "d ${cfg.mail.archiveRawDir} 0700 ${runtimeUser} ${runtimeGroup} -";
 
       systemd.services.fleetix-hub = {
         description = "fleetix-hub API and integration worker";
@@ -958,6 +1170,9 @@ in {
             // optionalAttrs (cfg.fleetIssues.assigneeAgentId != null) {HUB_FLEET_ISSUE_AGENT_ID = cfg.fleetIssues.assigneeAgentId;})
           // optionalAttrs (cfg.secretInventoryFile != null) {HUB_SECRET_INVENTORY_FILE = toString cfg.secretInventoryFile;}
           // optionalAttrs (feedsFile != null) {HUB_FEEDS_CONFIG = toString feedsFile;}
+          // optionalAttrs (cfg.principalOwners != {}) {HUB_PRINCIPAL_OWNERS_CONFIG = toString (jsonFile "principal-owners" cfg.principalOwners);}
+          // optionalAttrs mail.enable {HUB_MAIL_CONFIG = toString (jsonFile "mail" mailConfig);}
+          // optionalAttrs calendar.enable {HUB_CALENDAR_CONFIG = toString (jsonFile "calendar" calendarConfig);}
           // optionalAttrs (cfg.database.urlFile == null) {DATABASE_URL = cfg.database.url;}
           // optionalAttrs cfg.migrations.enable {HUB_MIGRATE_ON_START = "0";}
           // optionalAttrs (cfg.integrations.assistant == "live" && llmUrl != null) {
@@ -988,7 +1203,10 @@ in {
             RestrictAddressFamilies = ["AF_UNIX" "AF_INET" "AF_INET6"];
             PrivateDevices = true;
             SystemCallFilter = ["@system-service" "~@privileged"];
-            ReadWritePaths = [(toString cfg.assetDir)];
+            ReadWritePaths = [(toString cfg.assetDir)] ++ optional archiveEnabled cfg.mail.archiveRawDir;
+          }
+          // optionalAttrs (runtimeFiles != []) {
+            ReadOnlyPaths = map optionalRuntimePath (lib.unique runtimeFiles);
           }
           // optionalAttrs (cfg.fleetStatusFile != null || cfg.secretInventoryFile != null) {
             # Bind the directory, not the file: atomic replacement gives the

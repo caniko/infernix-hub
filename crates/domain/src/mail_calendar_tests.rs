@@ -142,10 +142,17 @@ async fn mail_calendar_postgres() {
     let overview = hub.mail_bi_overview(&alice).await.unwrap();
     assert_eq!(overview.recurring_vendors[0].message_count, 2);
     assert_eq!(overview.open_action_items.len(), 2);
+    assert_eq!((overview.unread_signal_count, overview.recurring_vendor_count, overview.open_action_item_count), (2, 1, 2));
     assert_eq!(hub.mail_bi_overview(&bob).await.unwrap().total_count, 0);
     hub.override_mail_triage(&alice, id, &MailTriageOverride { classification: None, is_junk: Some(Some(true)) }).await.unwrap();
     assert!(hub.list_mail_messages(&alice, &search).await.unwrap().is_empty());
-    assert_eq!(hub.list_unenriched_signal_messages(&system, "alice", 100).await.unwrap().len(), 1);
+    let overview = hub.mail_bi_overview(&alice).await.unwrap();
+    assert_eq!(
+        (overview.unread_count, overview.unread_signal_count, overview.recurring_vendor_count, overview.open_action_item_count),
+        (2, 1, 0, 1)
+    );
+    assert_eq!(hub.list_unenriched_mail(&system, "alice", 100, true).await.unwrap().len(), 1);
+    assert_eq!(hub.list_unenriched_mail(&system, "alice", 100, false).await.unwrap().len(), 2);
     let analysis = hub.get_mail_message(&alice, id).await.unwrap().analysis;
     assert!(matches!(hub.save_llm_analysis(&system, "bob", id, "local-test", &analysis).await, Err(DomainError::NotFound(_))));
     hub.save_llm_analysis(&system, "alice", id, "local-test", &analysis).await.unwrap();

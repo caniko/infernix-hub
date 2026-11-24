@@ -217,6 +217,12 @@ pub struct MailBiOverview {
     pub signal_count: i64,
     pub junk_count: i64,
     pub unread_count: i64,
+    #[serde(default)]
+    pub unread_signal_count: i64,
+    #[serde(default)]
+    pub recurring_vendor_count: i64,
+    #[serde(default)]
+    pub open_action_item_count: i64,
     pub by_provider: BTreeMap<String, i64>,
     pub by_classification: BTreeMap<String, i64>,
     pub business_domains: Vec<MailBiDomainStat>,

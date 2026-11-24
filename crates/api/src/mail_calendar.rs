@@ -76,12 +76,13 @@ struct BiConfig {
     enable: bool,
     interval_seconds: u64,
     max_batch_per_tick: u32,
+    skip_junk: bool,
     llm: LlmConfig,
 }
 
 impl Default for BiConfig {
     fn default() -> Self {
-        Self { enable: false, interval_seconds: 120, max_batch_per_tick: 10, llm: LlmConfig::default() }
+        Self { enable: false, interval_seconds: 120, max_batch_per_tick: 10, skip_junk: true, llm: LlmConfig::default() }
     }
 }
 
@@ -235,7 +236,7 @@ impl Runtime {
             if remaining == 0 {
                 break;
             }
-            for message in hub.list_unenriched_signal_messages(&actor, &owner, remaining).await? {
+            for message in hub.list_unenriched_mail(&actor, &owner, remaining, self.mail.bi.skip_junk).await? {
                 let snippet: String = message.body_text.chars().take(4000).collect();
                 let input = json!({"subject": message.message.subject, "from": message.message.from_addr, "snippet": snippet});
                 let Ok(model) = local_llm_bi::analyze(&self.client, &llm.base_url, &llm.model, &input.to_string()).await else {

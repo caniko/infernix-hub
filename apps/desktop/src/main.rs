@@ -419,6 +419,7 @@ fn App() -> Element {
                         Workspace::News => rsx! { workspaces::news::NewsView {} },
                         Workspace::Studio => rsx! { workspaces::studio::StudioView {} },
                         Workspace::Calendar => rsx! { workspaces::calendar::CalendarView {} },
+                        Workspace::Mail => rsx! { workspaces::mail::MailView {} },
                         Workspace::Relationships => rsx! { workspaces::relationships::RelationshipsView {} },
                         Workspace::Projects => rsx! { workspaces::projects::ProjectsView {} },
                         Workspace::Library => rsx! { workspaces::library::LibraryView {} },

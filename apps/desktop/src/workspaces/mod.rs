@@ -5,6 +5,7 @@ pub mod calendar;
 pub mod fleet;
 pub mod individual;
 pub mod library;
+pub mod mail;
 pub mod news;
 pub mod notifications;
 pub mod projects;

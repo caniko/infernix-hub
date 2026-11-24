@@ -141,5 +141,7 @@
 
     nixosModules.default = import ./nix/module.nix {inherit self harbor-rs harbor-db;};
     nixosModules.fleetix-hub = self.nixosModules.default;
+    homeModules.default = import ./nix/home-module.nix {inherit self;};
+    homeModules.fleetix-hub = self.homeModules.default;
   };
 }
