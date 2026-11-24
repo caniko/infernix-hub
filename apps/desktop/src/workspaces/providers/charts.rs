@@ -1,5 +1,9 @@
 //! SVGs use measured/estimated contract data and have equivalent text tables.
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write,
+    rc::Rc,
+};
 
 use chrono::{DateTime, TimeDelta, Utc};
 
@@ -124,7 +128,7 @@ pub(super) fn ResetTime(at: Option<DateTime<Utc>>) -> Element {
 }
 
 #[component]
-pub(super) fn QuotaLimitBar(window: QuotaWindow) -> Element {
+pub(super) fn QuotaLimitBar(window: QuotaWindow, #[props(default)] forecast: Option<QuotaForecast>) -> Element {
     let (remaining, used) = quota_values(window.observation_state, window.remaining_percent, window.used_percent);
     let (label, tone) = freshness(&window);
     let status_label = quota_status_label(window.status);
@@ -141,8 +145,9 @@ pub(super) fn QuotaLimitBar(window: QuotaWindow) -> Element {
                 if let Some(status) = status_label { span { class: "muted", "{status}" } }
             }
             if let (Some(left), Some(used)) = (remaining, used) {
-                Meter { left, used }
-            } else if window.observation_state == QuotaObservationState::Measured {
+                Meter { left, used, resets_at: window.resets_at, window_seconds: window.window_duration_mins.map(|mins| u64::from(mins) * 60),
+                    forecast: forecast.filter(|_| !window.stale && window.observation_state == QuotaObservationState::Measured) }
+            } else if matches!(window.observation_state, QuotaObservationState::Measured | QuotaObservationState::StaleLastGood) {
                 p { class: "muted", "Percentage not observed" }
             }
             if matches!(window.observation_state, QuotaObservationState::Measured | QuotaObservationState::StaleLastGood)
@@ -159,8 +164,42 @@ pub(super) fn QuotaLimitBar(window: QuotaWindow) -> Element {
     }
 }
 
+fn pace_tick(now: DateTime<Utc>, reset: Option<DateTime<Utc>>, seconds: Option<u64>) -> Option<f64> {
+    let duration = seconds.filter(|s| *s > 0)? as f64;
+    Some((1.0 - (reset? - now).as_seconds_f64() / duration).clamp(0.0, 1.0) * 100.0)
+}
+
+fn window_end_estimate(forecast: &QuotaForecast, left: f64, reset: DateTime<Utc>, now: DateTime<Utc>) -> Option<(f64, bool)> {
+    let first = forecast.points.first()?;
+    let rate = forecast.drain_pct_per_hour;
+    // The pool's rate/anchor may describe a different cohort than the weighted reading.
+    if reset <= now
+        || first.at >= reset
+        || !first.remaining_percent.is_finite()
+        || (first.remaining_percent - left).abs() > 0.05
+        || !rate.is_finite()
+        || rate < 0.0
+    {
+        return None;
+    }
+    let end = (first.remaining_percent - rate * (reset - first.at).as_seconds_f64() / 3600.0).clamp(0.0, left.clamp(0.0, 100.0));
+    let runs_out = forecast.projected_exhaustion_at.is_some_and(|at| at < reset);
+    Some((end, runs_out))
+}
+
 #[component]
-pub(super) fn Meter(left: f64, used: f64) -> Element {
+pub(super) fn Meter(
+    left: f64,
+    used: f64,
+    resets_at: Option<DateTime<Utc>>,
+    window_seconds: Option<u64>,
+    forecast: Option<QuotaForecast>,
+) -> Element {
+    let hatch = use_hook(|| format!("quota-hatch-{}", Uuid::new_v4().simple()));
+    let now = Utc::now();
+    let pace = pace_tick(now, resets_at, window_seconds);
+    let pace_label = pace.map(|pct| format!("Window pace: {pct:.0}% elapsed"));
+    let estimate = forecast.as_ref().zip(resets_at).and_then(|(f, reset)| window_end_estimate(f, left, reset, now));
     let width = left.clamp(0.0, 100.0);
     let fill_class = if width < 10.0 {
         "quota-left bad"
@@ -175,485 +214,807 @@ pub(super) fn Meter(left: f64, used: f64) -> Element {
             strong { class: "mono nowrap-unit", "{left:.1}% left" }
             span { class: "form-help nowrap-unit", "{used_caption}" }
         }
-        svg { class: "quota-meter", view_box: "0 0 100 6", preserve_aspect_ratio: "none", "aria-hidden": "true",
-            rect { width: "100", height: "6", rx: "3", class: "quota-track" }
-            rect { width: "{width}", height: "6", rx: "3", class: "{fill_class}" }
-        }
-    }
-}
-
-type Point = (DateTime<Utc>, f64);
-
-const QUOTA_W: f64 = 620.0;
-const QUOTA_LEFT: f64 = 44.0;
-const QUOTA_RIGHT: f64 = 604.0;
-const QUOTA_TOP: f64 = 16.0;
-const QUOTA_BOTTOM: f64 = 148.0;
-
-fn line(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>) -> String {
-    let mut previous = None;
-    points
-        .iter()
-        .map(|&(at, value)| {
-            let move_to = previous.is_none_or(|prev| at - prev > TimeDelta::hours(4));
-            previous = Some(at);
-            format!("{}{:.2} {:.2}", if move_to { 'M' } else { 'L' }, x(at, start, end), y(value))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn area_segments(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<String> {
-    let mut runs: Vec<Vec<Point>> = Vec::new();
-    for &pt in points {
-        let break_run = runs.last().and_then(|r| r.last()).is_none_or(|prev| pt.0 - prev.0 > TimeDelta::hours(4));
-        if break_run {
-            runs.push(vec![pt]);
-        } else if let Some(last) = runs.last_mut() {
-            last.push(pt);
-        }
-    }
-    runs.into_iter()
-        .filter(|run| run.len() >= 2)
-        .map(|run| {
-            let first_x = x(run[0].0, start, end);
-            let last_x = x(run[run.len() - 1].0, start, end);
-            let mut d = format!("M{first_x:.2} {QUOTA_BOTTOM:.2}");
-            for (at, value) in &run {
-                d.push_str(&format!(" L{:.2} {:.2}", x(*at, start, end), y(*value)));
+        svg { class: "quota-meter", view_box: "0 0 100 10", preserve_aspect_ratio: "none", "aria-hidden": "true",
+            rect { y: "2", width: "100", height: "6", class: "quota-track" }
+            rect { y: "2", width: "{width}", height: "6", class: "{fill_class}" }
+            if let Some((end, risk)) = estimate {
+                defs {
+                    pattern { id: "{hatch}", width: "1.8", height: "6", pattern_units: "userSpaceOnUse",
+                        path { d: "M-1.8 6L0 0 M0 6L1.8 0 M1.8 6L3.6 0",
+                            class: if risk { "quota-hatch bad" } else { "quota-hatch" } }
+                    }
+                }
+                rect { x: "{end}", y: "2", width: "{width - end}", height: "6", fill: "url(#{hatch})" }
             }
-            d.push_str(&format!(" L{last_x:.2} {QUOTA_BOTTOM:.2} Z"));
-            d
-        })
-        .collect()
+            if let (Some(pace), Some(label)) = (pace, &pace_label) {
+                {
+                    // The track runs from 0% left to 100% left, so pace is the remaining-time benchmark.
+                    let x = (100.0 - pace).clamp(0.3, 99.7);
+                    rsx! { line { x1: "{x}", x2: "{x}", y1: "0", y2: "10", class: "quota-pace", title { "{label}" } } }
+                }
+            }
+        }
+        if pace_label.is_some() || estimate.is_some() {
+            div { class: "row quota-meter-meta",
+                if let Some(label) = &pace_label { span { "{label}" } }
+                if let Some((end, risk)) = estimate {
+                    span { class: if risk { "quota-risk" } else { "" }, title: "Estimate at the reported reset, assuming the recent drain rate continues.",
+                        if risk { "Runs out before reset" } else { "Ends ~{end:.0}% left" }
+                    }
+                }
+            }
+        }
+    }
 }
 
-fn x(at: DateTime<Utc>, start: DateTime<Utc>, end: DateTime<Utc>) -> f64 {
-    QUOTA_LEFT + (QUOTA_RIGHT - QUOTA_LEFT) * (at - start).num_seconds() as f64 / (end - start).num_seconds().max(1) as f64
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TimeBounds {
+    pub(super) start: DateTime<Utc>,
+    pub(super) end: DateTime<Utc>,
 }
 
-fn y(value: f64) -> f64 {
-    QUOTA_BOTTOM - (QUOTA_BOTTOM - QUOTA_TOP) * value.clamp(0.0, 100.0) / 100.0
+impl TimeBounds {
+    pub(super) fn at(self, fraction: f64) -> DateTime<Utc> {
+        self.start + TimeDelta::microseconds(((self.end - self.start).as_seconds_f64() * fraction * 1e6).round() as i64)
+    }
+
+    pub(super) fn fraction(self, at: DateTime<Utc>) -> f64 {
+        (at - self.start).as_seconds_f64() / (self.end - self.start).as_seconds_f64().max(1e-6)
+    }
+
+    fn contains(self, at: DateTime<Utc>) -> bool {
+        (self.start..=self.end).contains(&at)
+    }
+
+    fn fit(self, start: DateTime<Utc>, span: TimeDelta) -> Self {
+        let start = start.clamp(self.start, self.end - span);
+        Self { start, end: start + span }
+    }
+
+    pub(super) fn zoom(self, full: Self, anchor: f64, factor: f64) -> Self {
+        let max = full.end - full.start;
+        let anchor = anchor.clamp(0.0, 1.0);
+        let span = TimeDelta::microseconds(((self.end - self.start).as_seconds_f64() * factor * 1e6).round() as i64)
+            .clamp(TimeDelta::minutes(5).min(max), max);
+        let offset = TimeDelta::microseconds((span.as_seconds_f64() * anchor * 1e6).round() as i64);
+        full.fit(self.at(anchor) - offset, span)
+    }
+
+    pub(super) fn pan(self, full: Self, fraction: f64) -> Self {
+        full.fit(self.at(fraction), (self.end - self.start).min(full.end - full.start))
+    }
+
+    fn timestamps(self, sorted: &[DateTime<Utc>]) -> &[DateTime<Utc>] {
+        &sorted[sorted.partition_point(|t| *t < self.start)..sorted.partition_point(|t| *t <= self.end)]
+    }
 }
+
+pub(super) fn nearest_timestamp(sorted: &[DateTime<Utc>], cursor: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let next = sorted.partition_point(|t| *t < cursor);
+    match (next.checked_sub(1).and_then(|i| sorted.get(i)), sorted.get(next)) {
+        (Some(&a), Some(&b)) => Some(if cursor - a <= b - cursor { a } else { b }),
+        (a, b) => a.or(b).copied(),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct TimeCursor {
+    at: DateTime<Utc>,
+    panel: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct TimeScrub {
+    view: Signal<Option<TimeBounds>>,
+    cursor: Signal<Option<TimeCursor>>,
+    drag: Signal<Option<(f64, TimeBounds)>>,
+}
+
+pub(super) fn use_time_scrub() -> TimeScrub {
+    TimeScrub { view: use_signal(|| None), cursor: use_signal(|| None), drag: use_signal(|| None) }
+}
+
+impl TimeScrub {
+    pub(super) fn bounds(self, full: TimeBounds) -> TimeBounds {
+        self.view.read().map_or(full, |v| v.pan(full, 0.0))
+    }
+
+    pub(super) fn active(self) -> Option<DateTime<Utc>> {
+        (*self.cursor.read()).map(|cursor| cursor.at)
+    }
+
+    pub(super) fn clear(mut self) {
+        self.cursor.set(None);
+        self.drag.set(None);
+    }
+
+    pub(super) fn reset(mut self) {
+        self.view.set(None);
+        self.clear();
+    }
+
+    pub(super) fn key(mut self, event: KeyboardEvent, full: TimeBounds, sorted: &[DateTime<Utc>]) {
+        let view = self.bounds(full);
+        match event.key() {
+            Key::Named(key @ (NamedKey::ArrowLeft | NamedKey::ArrowRight)) => {
+                let visible = view.timestamps(sorted);
+                let previous = *self.cursor.peek();
+                let idx = match (previous, key == NamedKey::ArrowRight) {
+                    (Some(cursor), true) => visible.partition_point(|t| *t <= cursor.at).min(visible.len().saturating_sub(1)),
+                    (Some(cursor), false) => visible.partition_point(|t| *t < cursor.at).saturating_sub(1),
+                    (None, true) => 0,
+                    (None, false) => visible.len().saturating_sub(1),
+                };
+                self.cursor.set(visible.get(idx).map(|&at| TimeCursor { at, panel: previous.map_or(0, |c| c.panel) }));
+            }
+            Key::Character(key) if matches!(key.as_str(), "+" | "=" | "-") => {
+                let anchor = self.active().map_or(0.5, |at| view.fraction(at));
+                self.view.set(Some(view.zoom(full, anchor, if key == "-" { 1.25 } else { 0.8 })));
+            }
+            Key::Character(key) if key == "0" => self.reset(),
+            Key::Named(NamedKey::Escape) => self.reset(),
+            _ => return,
+        }
+        event.prevent_default();
+    }
+
+    fn scrub(mut self, at: Option<DateTime<Utc>>, panel: usize) {
+        let next = at.map(|at| TimeCursor { at, panel });
+        let unchanged = *self.cursor.peek() == next;
+        if !unchanged {
+            self.cursor.set(next);
+        }
+    }
+}
+
+/// Pixel coordinates in a width-matched SVG viewBox (no letterboxing).
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct TimePlotBox {
+    pub(super) left: f64,
+    pub(super) right: f64,
+    pub(super) top: f64,
+    pub(super) bottom: f64,
+}
+
+impl TimePlotBox {
+    pub(super) fn x(self, view: TimeBounds, at: DateTime<Utc>) -> f64 {
+        self.left + (self.right - self.left) * view.fraction(at)
+    }
+
+    pub(super) fn axis_padding(self, view: TimeBounds) -> f64 {
+        let day_line = if view.end - view.start > TimeDelta::hours(48) { 13.0 } else { 0.0 };
+        let stagger = if self.right - self.left < 220.0 { 14.0 + day_line } else { 0.0 };
+        33.0 + day_line + stagger
+    }
+}
+
+#[component]
+pub(super) fn TimeAxis(plot: TimePlotBox, view: TimeBounds) -> Element {
+    let width = plot.right - plot.left;
+    let ticks = if width < 340.0 {
+        5
+    } else if width < 600.0 || view.end - view.start < TimeDelta::minutes(6) {
+        6
+    } else {
+        7
+    };
+    let multiday = view.end - view.start > TimeDelta::hours(48);
+    rsx! {
+        g { class: "time-axis", pointer_events: "none",
+            for i in 0..ticks {
+                {
+                    let fraction = f64::from(i) / f64::from(ticks - 1);
+                    let at = view.at(fraction);
+                    let day_label = at.format("%b %d");
+                    let clock_label = at.format("%H:%M");
+                    let x = plot.left + width * fraction;
+                    let stagger = if width < 220.0 && i % 2 == 1 { if multiday { 27.0 } else { 14.0 } } else { 0.0 };
+                    let day_y = plot.bottom + 24.0 + stagger;
+                    let time_y = day_y + if multiday { 13.0 } else { 0.0 };
+                    let anchor = if i == 0 { "start" } else if i == ticks - 1 { "end" } else { "middle" };
+                    rsx! {
+                        line { x1: "{x}", x2: "{x}", y1: "{plot.top}", y2: "{plot.bottom}", class: "chart-gridline subtle time-gridline" }
+                        if multiday {
+                            text { x: "{x}", y: "{day_y}", text_anchor: anchor, "{day_label}" }
+                        }
+                        text { x: "{x}", y: "{time_y}", text_anchor: anchor, "{clock_label}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+pub(super) fn TimeCrosshair(plot: TimePlotBox, x: f64) -> Element {
+    rsx! { line { x1: "{x}", x2: "{x}", y1: "{plot.top}", y2: "{plot.bottom + 8.0}", class: "chart-crosshair time-crosshair", pointer_events: "none" } }
+}
+
+#[component]
+pub(super) fn TimePlotHit(
+    plot: TimePlotBox,
+    origin: Signal<(f64, f64)>,
+    full: TimeBounds,
+    sorted: Rc<Vec<DateTime<Utc>>>,
+    mut scrub: TimeScrub,
+    #[props(default)] panel: usize,
+    #[props(default)] rail_times: Rc<Vec<DateTime<Utc>>>,
+) -> Element {
+    use dioxus::html::{
+        geometry::WheelDelta,
+        input_data::MouseButton,
+        point_interaction::{InteractionLocation, PointerInteraction},
+    };
+    let zoomed = scrub.bounds(full) != full;
+    let width = plot.right - plot.left;
+    let fraction = move |client_x| (client_x - origin().0 - plot.left) / width;
+    let hover_times = sorted.clone();
+    rsx! {
+        rect {
+            x: "{plot.left}", y: "{plot.top}", width: "{width}", height: "{plot.bottom - plot.top + 10.0}", fill: "transparent",
+            class: if scrub.drag.read().is_some() { "time-hit panning" } else if zoomed { "time-hit zoomed" } else { "time-hit" },
+            onmousemove: move |e: MouseEvent| {
+                let f = fraction(e.client_coordinates().x);
+                let drag = *scrub.drag.peek();
+                if let Some((start, initial)) = drag && e.held_buttons().contains(MouseButton::Primary) {
+                    scrub.view.set(Some(initial.pan(full, start - f)));
+                    return;
+                }
+                if drag.is_some() { scrub.drag.set(None); }
+                let view = scrub.bounds(full);
+                let at = view.at(f.clamp(0.0, 1.0));
+                let near_rail = e.client_coordinates().y - origin().1 >= plot.bottom + 2.0;
+                let event = near_rail.then(|| nearest_timestamp(view.timestamps(&rail_times), at))
+                    .flatten().filter(|time| (view.fraction(*time) - f).abs() * width <= 6.0);
+                scrub.scrub(event.or_else(|| nearest_timestamp(view.timestamps(&hover_times), at)), panel);
+            },
+            onmouseleave: move |_| scrub.clear(),
+            onmousedown: move |e: MouseEvent| {
+                let view = scrub.bounds(full);
+                if view != full && e.trigger_button() == Some(MouseButton::Primary) {
+                    let f = fraction(e.client_coordinates().x);
+                    scrub.clear();
+                    scrub.drag.set(Some((f, view)));
+                }
+            },
+            onmouseup: move |_| { if scrub.drag.peek().is_some() { scrub.drag.set(None); } },
+            onwheel: move |e: WheelEvent| {
+                let delta = match e.delta() {
+                    WheelDelta::Pixels(v) => v.y / 100.0,
+                    WheelDelta::Lines(v) => v.y / 3.0,
+                    WheelDelta::Pages(v) => v.y,
+                };
+                if delta == 0.0 { return; }
+                e.prevent_default();
+                let f = fraction(e.client_coordinates().x);
+                let view = scrub.bounds(full).zoom(full, f, 1.25_f64.powf(delta.clamp(-3.0, 3.0)));
+                scrub.drag.set(None);
+                scrub.view.set(Some(view));
+                scrub.scrub(nearest_timestamp(view.timestamps(&sorted), view.at(f.clamp(0.0, 1.0))), panel);
+            },
+            ondoubleclick: move |_| scrub.reset(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Reading {
+    at: DateTime<Utc>,
+    left: f64,
+    reset: Option<DateTime<Utc>>,
+}
+
+fn same_quota_run(previous: &Reading, next: &Reading) -> bool {
+    next.at - previous.at <= TimeDelta::hours(4)
+        && !previous.reset.zip(next.reset).is_some_and(|(a, b)| b > a)
+        && next.left - previous.left <= 20.0
+}
+
+fn measured_at(history: &[Reading], at: DateTime<Utc>) -> Option<Reading> {
+    let next = history.partition_point(|p| p.at <= at);
+    let point = *history.get(next.checked_sub(1)?)?;
+    (point.at == at || history.get(next).is_some_and(|later| same_quota_run(&point, later))).then_some(point)
+}
+
+pub(super) type QuotaSeriesKey = (String, Option<String>);
 
 #[derive(Clone, PartialEq)]
-enum QuotaHover {
-    Point {
-        series_idx: usize,
-        label: String,
-        at: DateTime<Utc>,
-        left: f64,
-        cx: f64,
-        cy: f64,
-        projected: bool,
-    },
-    Segment {
-        series_idx: usize,
-        seg_idx: usize,
-        label: String,
-        from_at: DateTime<Utc>,
-        from_left: f64,
-        to_at: DateTime<Utc>,
-        to_left: f64,
-        x1: f64,
-        y1: f64,
-        x2: f64,
-        y2: f64,
-        projected: bool,
-    },
-    Marker {
-        label: String,
-        at: DateTime<Utc>,
-        cx: f64,
-        exhaustion: bool,
-    },
+struct QuotaSeries {
+    key: QuotaSeriesKey,
+    label: String,
+    history: Vec<Reading>,
+    forecast: Vec<Reading>,
+    exhaustion: Option<DateTime<Utc>>,
+    next_reset: Option<DateTime<Utc>>,
+    latest: Option<Reading>,
+    resets: BTreeSet<DateTime<Utc>>,
 }
 
-impl QuotaHover {
-    fn readout(&self) -> String {
-        match self {
-            Self::Point { label, at, left, projected, .. } => {
-                let tag = if *projected { " (est.)" } else { "" };
-                format!("{label}{tag} · {} · {left:.1}% left ({:.1}% used)", fmt_dt(*at), 100.0 - left)
-            }
-            Self::Segment { label, from_at, from_left, to_at, to_left, projected, .. } => {
-                let delta = to_left - from_left;
-                let tag = if *projected { " (est.)" } else { "" };
-                format!("{label}{tag} · {from_left:.1}% → {to_left:.1}% ({delta:+.1} pp) · {} → {}", fmt_dt(*from_at), fmt_dt(*to_at))
-            }
-            Self::Marker { label, at, exhaustion, .. } => {
-                if *exhaustion {
-                    format!("{label} · Projected exhaustion {}", fmt_dt(*at))
-                } else {
-                    format!("Quota reset · {}", fmt_dt(*at))
-                }
-            }
-        }
+impl QuotaSeries {
+    fn color(index: usize, focused: bool) -> &'static str {
+        const PALETTE: [&str; 8] = ["#8cafb0", "#98b27a", "#b0a1cb", "#b7a183", "#81a5cc", "#c696ac", "#90b69d", "#c0bb87"];
+        if focused { "var(--honey)" } else { PALETTE[index % PALETTE.len()] }
     }
 
-    fn tooltip(&self) -> TooltipSpec {
-        match self {
-            Self::Point { label, at, left, cx, cy, projected, .. } => TooltipSpec {
-                x: *cx,
-                y: *cy,
-                crosshair_x: Some(*cx),
-                y_top: QUOTA_TOP,
-                y_bottom: QUOTA_BOTTOM,
-                view_w: QUOTA_W,
-                title: if *projected { format!("{label} (projected)") } else { label.clone() },
-                detail: format!("{left:.1}% left · {:.1}% used", 100.0 - left),
-                subdetail: Some(fmt_dt(*at)),
-            },
-            Self::Segment { label, from_at, from_left, to_at, to_left, x1, y1, x2, y2, projected, .. } => {
-                let mid_x = (x1 + x2) / 2.0;
-                let mid_y = (y1 + y2) / 2.0;
-                let delta = to_left - from_left;
-                TooltipSpec {
-                    x: mid_x,
-                    y: mid_y,
-                    crosshair_x: Some(mid_x),
-                    y_top: QUOTA_TOP,
-                    y_bottom: QUOTA_BOTTOM,
-                    view_w: QUOTA_W,
-                    title: if *projected { format!("{label} (projected segment)") } else { format!("{label} · segment") },
-                    detail: format!("{from_left:.1}% → {to_left:.1}% ({delta:+.1} pp)"),
-                    subdetail: Some(format!("{} → {}", fmt_dt(*from_at), fmt_dt(*to_at))),
-                }
-            }
-            Self::Marker { label, at, cx, exhaustion } => TooltipSpec {
-                x: *cx,
-                y: QUOTA_TOP + 24.0,
-                crosshair_x: Some(*cx),
-                y_top: QUOTA_TOP,
-                y_bottom: QUOTA_BOTTOM,
-                view_w: QUOTA_W,
-                title: if *exhaustion { format!("{label} · exhaustion") } else { "Quota reset".into() },
-                detail: fmt_dt(*at),
-                subdetail: None,
-            },
+    fn at(&self, at: DateTime<Utc>, future: bool) -> Option<Reading> {
+        if !future {
+            return measured_at(&self.history, at);
+        }
+        let next = self.forecast.partition_point(|p| p.at < at);
+        let to = *self.forecast.get(next)?;
+        if to.at == at {
+            return Some(to);
+        }
+        let from = self.forecast.get(next.checked_sub(1)?)?;
+        if !same_forecast_run(from, &to) {
+            return None;
+        }
+        let time = (at - from.at).as_seconds_f64() / (to.at - from.at).as_seconds_f64();
+        Some(Reading { at, left: from.left + (to.left - from.left) * time, reset: to.reset })
+    }
+}
+
+fn same_forecast_run(a: &Reading, b: &Reading) -> bool {
+    a.reset == b.reset && b.left - a.left <= 20.0
+}
+
+fn quota_series(
+    samples: &[QuotaSample],
+    forecasts: &[QuotaForecast],
+    names: &BTreeMap<String, String>,
+    history: TimeBounds,
+) -> Vec<QuotaSeries> {
+    let mut groups = BTreeMap::<QuotaSeriesKey, Vec<Reading>>::new();
+    for row in samples {
+        if history.contains(row.observed_at)
+            && !row.stale
+            && row.observation_state == QuotaObservationState::Measured
+            && let (Some(left), _) = quota_values(row.observation_state, row.remaining_percent, row.used_percent)
+        {
+            groups.entry((row.account_id.clone(), row.scope_model.clone())).or_default().push(Reading {
+                at: row.observed_at,
+                left,
+                reset: row.resets_at,
+            });
         }
     }
+    for forecast in forecasts {
+        if let Some(account) = &forecast.account_id {
+            groups.entry((account.clone(), forecast.scope_model.clone())).or_default();
+        }
+    }
+    let show_model = groups.keys().map(|(_, model)| model).collect::<BTreeSet<_>>().len() > 1;
+    let mut series: Vec<_> = groups
+        .into_iter()
+        .map(|(key, mut points)| {
+            points.sort_by_key(|p| p.at);
+            let (account, model) = &key;
+            let name = names.get(account).unwrap_or(account);
+            let label = if show_model { format!("{name} · {}", model.as_deref().unwrap_or("Unscoped")) } else { name.clone() };
+            let reset = points.last().and_then(|p| p.reset);
+            QuotaSeries {
+                key,
+                label,
+                next_reset: reset.filter(|at| *at > history.end),
+                latest: points.last().copied(),
+                resets: points.iter().filter_map(|p| p.reset).collect(),
+                history: points,
+                forecast: Vec::new(),
+                exhaustion: None,
+            }
+        })
+        .collect();
+    series.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.key.cmp(&b.key)));
+    series
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct QuotaChartScope {
+    pub(super) history: TimeBounds,
+    pub(super) forecast_until: Option<DateTime<Utc>>,
+    pub(super) history_truncated: bool,
+    pub(super) pool: bool,
 }
 
 #[component]
 pub(super) fn QuotaHistoryChart(
     samples: Vec<QuotaSample>,
     forecasts: Vec<QuotaForecast>,
-    resets: Vec<DateTime<Utc>>,
-    from: DateTime<Utc>,
-    until: DateTime<Utc>,
     names: BTreeMap<String, String>,
+    scope: QuotaChartScope,
+    #[props(default)] current: Vec<ModelAccount>,
+    #[props(default)] window_key: String,
 ) -> Element {
-    let mut hovered = use_signal(|| None::<QuotaHover>);
-    let grad_id = use_hook(|| format!("chart-quota-fill-{}", Uuid::new_v4().simple()));
-    let grad_url = format!("url(#{grad_id})");
-    let mut groups = BTreeMap::<String, Vec<Point>>::new();
-    for row in &samples {
-        if row.observed_at >= from
-            && row.observed_at <= until
-            && !row.stale
-            && row.observation_state == QuotaObservationState::Measured
-            && let (Some(left), _) = quota_values(row.observation_state, row.remaining_percent, row.used_percent)
+    let as_of = scope.history.end;
+    let full = TimeBounds { start: scope.history.start, end: scope.forecast_until.unwrap_or(as_of) };
+    let mut series = quota_series(&samples, &forecasts, &names, scope.history);
+    for series in &mut series {
+        if let Some(window) = current
+            .iter()
+            .find(|a| a.id == series.key.0)
+            .and_then(|a| a.windows.iter().find(|w| w.window_key == window_key && w.scope_model == series.key.1))
+            && let Some(at) = window.observed_at.filter(|at| *at <= as_of)
+            && let Some(left) = quota_values(window.observation_state, window.remaining_percent, window.used_percent).0
+            && series.latest.is_none_or(|r| r.at <= at)
         {
-            groups.entry(row.account_id.clone()).or_default().push((row.observed_at, left));
+            series.latest = Some(Reading { at, left, reset: window.resets_at });
+            series.next_reset = window.resets_at.filter(|at| *at > as_of);
+            series.resets.extend(window.resets_at);
+        }
+        if let Some(f) = forecasts.iter().find(|f| f.account_id.as_ref() == Some(&series.key.0) && f.scope_model == series.key.1) {
+            series.exhaustion = f.projected_exhaustion_at.filter(|at| series.next_reset.is_some_and(|reset| *at < reset));
+            series.forecast = f
+                .points
+                .iter()
+                .filter(|p| p.at >= as_of && p.remaining_percent.is_finite())
+                .map(|p| Reading { at: p.at, left: p.remaining_percent, reset: series.next_reset.filter(|reset| p.at >= *reset) })
+                .collect();
+            series.forecast.sort_by_key(|p| p.at);
         }
     }
-    for points in groups.values_mut() {
-        points.sort_by_key(|p| p.0);
-    }
-    let series_list: Vec<(String, String, Vec<Point>)> = groups
-        .into_iter()
-        .map(|(id, pts)| {
-            let label = names.get(&id).cloned().unwrap_or_else(|| id.clone());
-            (id, label, pts)
+    series.retain(|s| s.latest.is_some() || !s.history.is_empty() || (scope.forecast_until.is_some() && !s.forecast.is_empty()));
+    let times = series
+        .iter()
+        .flat_map(|s| {
+            s.history
+                .iter()
+                .map(|r| r.at)
+                .chain(s.forecast.iter().filter(|r| r.at > as_of).map(|r| r.at))
+                .chain(s.resets.iter().copied())
+                .chain(s.exhaustion)
         })
-        .collect();
-    let reset_times: BTreeSet<_> = resets.into_iter().filter(|t| *t >= from && *t <= until).collect();
-    let reset_labels = reset_times.iter().map(|at| fmt_dt(*at)).collect::<Vec<_>>().join(", ");
-    let mid_time = from + TimeDelta::seconds((until - from).num_seconds() / 2);
-    let name = |id: &str| names.get(id).map_or_else(|| id.to_string(), Clone::clone);
-    let active = hovered();
+        .filter(|at| full.contains(*at))
+        .collect::<BTreeSet<_>>();
+    let sorted = Rc::new(times.into_iter().collect());
+    let series = Rc::new(series);
     rsx! {
-        figure { class: "provider-chart chart-stage",
-            div { class: "chart-header",
-                figcaption {
-                    "Remaining quota (%) · " span { class: "nowrap-unit", "{fmt_dt(from)}" }
-                    " → " span { class: "nowrap-unit", "{fmt_dt(until)}" }
+        figure { class: "provider-chart chart-stage quota-history",
+            figcaption { "Remaining quota · UTC" }
+            if scope.history_truncated { Chip { label: "Showing newest 4,000 samples".to_string(), tone: Some("amber".to_string()) } }
+            if !series.iter().any(|s| !s.history.is_empty()) {
+                p { class: "form-help", "No measured percentage samples for this window and time range." }
+            }
+            QuotaExplorer { series: series.clone(), sorted, full, as_of, pool: scope.pool }
+            QuotaHistoryTables { series, show_forecast: scope.forecast_until.is_some() }
+        }
+    }
+}
+
+#[component]
+fn QuotaExplorer(
+    series: Rc<Vec<QuotaSeries>>,
+    sorted: Rc<Vec<DateTime<Utc>>>,
+    full: TimeBounds,
+    as_of: DateTime<Utc>,
+    pool: bool,
+) -> Element {
+    let scrub = use_time_scrub();
+    let mut focus = use_signal(|| None::<QuotaSeriesKey>);
+    let mut multiples = use_signal(|| series.len() >= 10);
+    let future = full.end > as_of;
+    use_effect(use_reactive((&future,), move |_| scrub.reset()));
+    let focus_key = focus.read();
+    let selected = series.iter().position(|s| focus_key.as_ref() == Some(&s.key));
+    let view = scrub.bounds(full);
+    let has_layout_choice = pool && series.len() >= 4;
+    let small = has_layout_choice && multiples();
+    let summary = selected.or_else(|| (series.len() == 1).then_some(0));
+    let keyboard_times = sorted.clone();
+    if series.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        if let Some(s) = summary.and_then(|i| series.get(i)) {
+            div { class: "row quota-decision",
+                if let Some(r) = s.latest {
+                    strong { class: "mono", "{r.left:.1}% left" }
+                } else {
+                    strong { "Not observed" }
                 }
-                if let Some(active) = &active {
-                    span { class: "chart-readout active mono", "{active.readout()}" }
-                } else if !series_list.is_empty() || !forecasts.is_empty() || !reset_times.is_empty() {
-                    span { class: "form-help", "Hover a line, segment, or point to inspect" }
+                span { "Next reset: {date(s.next_reset)}" }
+                span { "Last observed: {date(s.latest.map(|r| r.at))}" }
+                if s.exhaustion.is_some() { span { class: "quota-risk", "May run out before reset" } }
+            }
+        } else {
+            div { class: "row quota-decision",
+                span { "{series.len()} separate quota traces · select a series for its latest reading and next reset" }
+                if series.iter().any(|s| s.exhaustion.is_some()) { span { class: "quota-risk", "May run out before reset" } }
+            }
+        }
+        div { class: "filter-row quota-series-chips", role: "group", aria_label: "Focus quota series",
+            if series.len() > 1 {
+                button { class: "filter-chip", aria_pressed: selected.is_none(), onclick: move |_| focus.set(None), "All" }
+            }
+            for (i, s) in series.iter().enumerate() {
+                {
+                    let key = s.key.clone();
+                    let active = selected == Some(i);
+                    let color = QuotaSeries::color(i, active);
+                    rsx! {
+                        button { key: "{i}", class: "filter-chip", aria_pressed: active,
+                            style: "--chart-accent: {color}", onclick: move |_| focus.set(if active { None } else { Some(key.clone()) }),
+                            span { class: "chart-swatch", aria_hidden: "true" } "{s.label}"
+                        }
+                    }
                 }
             }
-            if !series_list.is_empty() || !forecasts.is_empty() {
-                div { class: "chart-legend",
-                    for (i, (_, label, _)) in series_list.iter().enumerate() {
-                        span { key: "leg-{i}", class: "chart-legend-item chart-series-{i % 4}",
-                            span { class: "chart-swatch" }
-                            "{label}"
-                        }
-                    }
-                    if !forecasts.is_empty() {
-                        span { class: "chart-legend-item",
-                            span { class: "chart-swatch dashed" }
-                            "Estimated projection"
-                        }
-                    }
-                    if !reset_times.is_empty() {
-                        span { class: "chart-legend-item",
-                            span { class: "chart-swatch reset" }
-                            "Reset"
-                        }
-                    }
+        }
+        div { class: "row quota-plot-controls",
+            if has_layout_choice {
+                div { class: "segmented", role: "group", aria_label: "Quota chart layout",
+                    button { class: "seg-btn", aria_pressed: !small, onclick: move |_| { multiples.set(false); scrub.clear(); }, "Overlay" }
+                    button { class: "seg-btn", aria_pressed: small, onclick: move |_| { multiples.set(true); scrub.clear(); }, "Small multiples" }
                 }
             }
-            if series_list.is_empty() && forecasts.is_empty() {
-                p { class: "muted", "No measured percentage samples for this window and time range." }
+            if view != full {
+                button { class: "filter-chip", onclick: move |_| scrub.reset(), "Reset zoom" }
             }
-            svg {
-                view_box: "0 0 620 174",
-                role: "img",
-                "aria-label": "Measured remaining quota; dashed lines are estimated projections. Data table follows.",
-                onmouseleave: move |_| hovered.set(None),
-                defs {
-                    linearGradient { id: "{grad_id}", x1: "0", y1: "0", x2: "0", y2: "1",
-                        stop { offset: "0%", stop_color: "var(--honey)", stop_opacity: "0.22" }
-                        stop { offset: "100%", stop_color: "var(--honey)", stop_opacity: "0.0" }
+            if future {
+                span { class: "chart-legend-item", span { class: "chart-swatch dashed" } "Forecast (estimate)" }
+            }
+            span { class: "form-help", "Hover or focus chart and use ←/→ · wheel or +/− to zoom · drag to pan · 0 to reset" }
+        }
+        div { class: if small { "quota-plots multiples" } else { "quota-plots" },
+            tabindex: "0", role: "group", aria_label: "Quota timeline. Arrow keys scrub, plus or minus zooms, zero or Escape resets.",
+            onkeydown: move |e| scrub.key(e, full, &keyboard_times),
+            onblur: move |_| scrub.clear(),
+            if small {
+                for (i, s) in series.iter().enumerate() {
+                    QuotaPlot { key: "{i}", series: series.clone(), sorted: sorted.clone(), full, as_of, scrub, selected, single: Some(i), label: s.label.clone() }
+                }
+            } else {
+                QuotaPlot { series, sorted, full, as_of, scrub, selected, single: None, label: "Remaining quota".to_string() }
+            }
+        }
+    }
+}
+
+/// Measure the CSS box; resize updates keep the viewBox and hit target in CSS pixels.
+#[derive(Clone, Copy)]
+pub(super) struct TimePlotMeasure {
+    mounted: Signal<Option<Rc<MountedData>>>,
+    pub(super) width: Signal<f64>,
+    pub(super) origin: Signal<(f64, f64)>,
+}
+
+pub(super) fn use_time_plot_measure() -> TimePlotMeasure {
+    TimePlotMeasure { mounted: use_signal(|| None), width: use_signal(|| 620.0), origin: use_signal(|| (0.0, 0.0)) }
+}
+
+impl TimePlotMeasure {
+    pub(super) async fn mount(mut self, event: MountedEvent) {
+        self.mounted.set(Some(event.data()));
+        self.refresh().await;
+    }
+
+    pub(super) async fn refresh(mut self) {
+        let mounted = self.mounted.peek().clone();
+        if let Some(el) = mounted
+            && let Ok(rect) = el.get_client_rect().await
+        {
+            if rect.size.width > 0.0 && *self.width.peek() != rect.size.width {
+                self.width.set(rect.size.width);
+            }
+            let origin = (rect.origin.x, rect.origin.y);
+            if *self.origin.peek() != origin {
+                self.origin.set(origin);
+            }
+        }
+    }
+}
+
+fn quota_y(plot: TimePlotBox, pct: f64) -> f64 {
+    plot.bottom - (plot.bottom - plot.top) * pct.clamp(0.0, 100.0) / 100.0
+}
+
+#[component]
+fn QuotaTraces(
+    series: Rc<Vec<QuotaSeries>>,
+    plot: TimePlotBox,
+    view: TimeBounds,
+    as_of: DateTime<Utc>,
+    selected: Option<usize>,
+    single: Option<usize>,
+) -> Element {
+    let show_future = view.end > as_of;
+    let rail = plot.bottom + 7.0;
+    // Paint the highlighted trace last so a context line cannot cover it.
+    let indices = (0..series.len()).filter(|i| Some(*i) != selected).chain(selected);
+    rsx! {
+        for i in indices.filter(|i| single.is_none_or(|j| j == *i)) {
+            {
+                let s = &series[i];
+                let focused = selected == Some(i);
+                let color = QuotaSeries::color(i, focused);
+                let mut path = String::new();
+                let mut projected = String::new();
+                for run in s.history.chunk_by(same_quota_run).filter(|run| run.len() > 1) {
+                    let first = run[0];
+                    let _ = write!(path, "M{:.2} {:.2}", plot.x(view, first.at), quota_y(plot, first.left));
+                    for point in &run[1..] {
+                        let _ = write!(path, "H{:.2}V{:.2}", plot.x(view, point.at), quota_y(plot, point.left));
                     }
                 }
-                for pct in [0.0, 25.0, 50.0, 75.0, 100.0] {
-                    line {
-                        x1: "{QUOTA_LEFT}",
-                        x2: "{QUOTA_RIGHT}",
-                        y1: "{y(pct):.2}",
-                        y2: "{y(pct):.2}",
-                        class: if pct == 0.0 || pct == 100.0 { "chart-gridline" } else { "chart-gridline subtle" },
-                    }
-                    if pct == 0.0 || pct == 50.0 || pct == 100.0 {
-                        text { x: "{QUOTA_LEFT - 6.0}", y: "{y(pct) + 3.5:.2}", text_anchor: "end", "{pct:.0}%" }
-                    }
-                }
-                text { x: "{QUOTA_LEFT}", y: "166", "{fmt_dt(from)}" }
-                text { x: "{(QUOTA_LEFT + QUOTA_RIGHT) / 2.0:.1}", y: "166", text_anchor: "middle", "{fmt_dt(mid_time)}" }
-                text { x: "{QUOTA_RIGHT}", y: "166", text_anchor: "end", "{fmt_dt(until)}" }
-                for &at in &reset_times {
-                    {
-                        let rx = x(at, from, until);
-                        rsx! {
-                            line { x1: "{rx:.2}", x2: "{rx:.2}", y1: "{QUOTA_TOP}", y2: "{QUOTA_BOTTOM}", class: "chart-reset",
-                                title { "Reset: {fmt_dt(at)}" }
-                            }
-                            line {
-                                x1: "{rx:.2}", x2: "{rx:.2}", y1: "{QUOTA_TOP}", y2: "{QUOTA_BOTTOM}",
-                                class: "chart-hit",
-                                stroke: "transparent",
-                                stroke_width: "10",
-                                onmouseenter: move |_| hovered.set(Some(QuotaHover::Marker { label: "Reset".into(), at, cx: rx, exhaustion: false })),
-                            }
+                if show_future {
+                    for run in s.forecast.chunk_by(same_forecast_run).filter(|run| run.len() > 1) {
+                        for (i, point) in run.iter().enumerate() {
+                            let _ = write!(projected, "{}{:.2} {:.2}", if i == 0 { 'M' } else { 'L' }, plot.x(view, point.at), quota_y(plot, point.left));
                         }
                     }
                 }
-                for (i, (_, label, points)) in series_list.iter().enumerate() {
-                    g { key: "series-{i}", class: "chart-series chart-series-{i % 4}",
-                        if series_list.len() == 1 {
-                            for area_d in area_segments(points, from, until) {
-                                path { d: "{area_d}", fill: "{grad_url}", pointer_events: "none" }
+                rsx! {
+                    g { key: "{i}", class: if focused { "quota-trace focused" } else { "quota-trace" }, style: "color: {color}",
+                        opacity: if selected.is_some() && !focused { 0.22 } else { 1.0 },
+                        path { class: "chart-line", d: "{path}" }
+                        for run in s.history.chunk_by(same_quota_run).filter(|run| run.len() == 1 && view.contains(run[0].at)) {
+                            circle { cx: "{plot.x(view, run[0].at)}", cy: "{quota_y(plot, run[0].left)}", r: "2.4", class: "chart-point" }
+                        }
+                        if show_future {
+                            path { class: "chart-line chart-projection", d: "{projected}" }
+                            for run in s.forecast.chunk_by(same_forecast_run).filter(|run| run.len() == 1 && view.contains(run[0].at)) {
+                                circle { cx: "{plot.x(view, run[0].at)}", cy: "{quota_y(plot, run[0].left)}", r: "2.4", class: "chart-point quota-forecast-point" }
+                            }
+                            if let Some(at) = s.exhaustion.filter(|at| view.contains(*at)) {
+                                line { class: "chart-exhaustion", x1: "{plot.x(view, at)}", x2: "{plot.x(view, at)}", y1: "{plot.bottom - 9.0}", y2: "{rail}" }
                             }
                         }
-                        path { class: "chart-line", d: line(points, from, until), title { "{label}" } }
-                        for (seg_idx, pair) in points.windows(2).enumerate() {
-                            if pair[1].0 - pair[0].0 <= TimeDelta::hours(4) {
-                                {
-                                    let x1 = x(pair[0].0, from, until);
-                                    let y1 = y(pair[0].1);
-                                    let x2 = x(pair[1].0, from, until);
-                                    let y2 = y(pair[1].1);
-                                    let is_seg = matches!(active, Some(QuotaHover::Segment { series_idx, seg_idx: s, projected: false, .. }) if series_idx == i && s == seg_idx);
-                                    let seg_label = label.clone();
-                                    let p0 = pair[0];
-                                    let p1 = pair[1];
-                                    rsx! {
-                                        if is_seg {
-                                            line { x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}", class: "chart-line chart-segment-active", pointer_events: "none" }
-                                        }
-                                        line {
-                                            x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}",
-                                            class: "chart-hit",
-                                            stroke: "transparent",
-                                            stroke_width: "12",
-                                            onmouseenter: move |_| hovered.set(Some(QuotaHover::Segment {
-                                                series_idx: i,
-                                                seg_idx,
-                                                label: seg_label.clone(),
-                                                from_at: p0.0,
-                                                from_left: p0.1,
-                                                to_at: p1.0,
-                                                to_left: p1.1,
-                                                x1,
-                                                y1,
-                                                x2,
-                                                y2,
-                                                projected: false,
-                                            })),
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        for &(at, left) in points {
+                        for &at in s.resets.iter().filter(|&&at| view.contains(at)) {
                             {
-                                let cx = x(at, from, until);
-                                let cy = y(left);
-                                let is_pt = matches!(active, Some(QuotaHover::Point { series_idx, at: a, projected: false, .. }) if series_idx == i && a == at);
-                                let pt_label = label.clone();
-                                rsx! {
-                                    circle {
-                                        cx: "{cx:.2}",
-                                        cy: "{cy:.2}",
-                                        r: if is_pt { "4.2" } else { "2.4" },
-                                        class: if is_pt { "chart-point active" } else { "chart-point" },
-                                        title { "{label} · {fmt_dt(at)} · {left:.1}% remaining" }
-                                    }
-                                    circle {
-                                        cx: "{cx:.2}",
-                                        cy: "{cy:.2}",
-                                        r: "7.5",
-                                        fill: "transparent",
-                                        class: "chart-hit",
-                                        onmouseenter: move |_| hovered.set(Some(QuotaHover::Point {
-                                            series_idx: i,
-                                            label: pt_label.clone(),
-                                            at,
-                                            left,
-                                            cx,
-                                            cy,
-                                            projected: false,
-                                        })),
-                                    }
-                                }
+                                let x = plot.x(view, at);
+                                rsx! { path { class: "quota-reset-mark", d: "M{x} {rail - 3.0}l3 3-3 3-3-3z" } }
                             }
                         }
                     }
                 }
-                for (fi, forecast) in forecasts.iter().enumerate() {
+            }
+        }
+    }
+}
+
+#[component]
+fn QuotaPlot(
+    series: Rc<Vec<QuotaSeries>>,
+    sorted: Rc<Vec<DateTime<Utc>>>,
+    full: TimeBounds,
+    as_of: DateTime<Utc>,
+    scrub: TimeScrub,
+    selected: Option<usize>,
+    single: Option<usize>,
+    label: String,
+) -> Element {
+    let measure = use_time_plot_measure();
+    let clip_id = use_hook(|| format!("quota-clip-{}", Uuid::new_v4().simple()));
+    let width = (measure.width)().max(100.0);
+    let plot = TimePlotBox { left: 38.0, right: width - 8.0, top: 22.0, bottom: if single.is_some() { 94.0 } else { 158.0 } };
+    let view = scrub.bounds(full);
+    let height = plot.bottom + plot.axis_padding(full);
+    let active = scrub.active().filter(|at| view.contains(*at));
+    let active_x = active.map(|at| plot.x(view, at));
+    let panel = single.unwrap_or(0);
+    let tooltip = (*scrub.cursor.read()).filter(|c| c.panel == panel && view.contains(c.at));
+    let show_future = view.end > as_of;
+    let now_x = plot.x(view, as_of).max(plot.left);
+    let badge_x = now_x.clamp(plot.left + 16.0, plot.right - 16.0);
+    let rail = plot.bottom + 7.0;
+    let rail_times = Rc::new(
+        series
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| single.is_none_or(|j| *i == j))
+            .flat_map(|(_, s)| s.resets.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    );
+    rsx! {
+        div { class: "quota-plot",
+            if single.is_some() { strong { class: "quota-plot-label", "{label}" } }
+            div { class: "quota-plot-surface",
+                onmounted: move |e| measure.mount(e),
+                onresize: move |_| measure.refresh(),
+                onmouseenter: move |_| measure.refresh(),
+                svg { role: "img", "aria-label": "{label}. Remaining quota, 0 to 100 percent. Data tables follow.",
+                    width: "100%", height: "{height}", view_box: "0 0 {width} {height}", preserve_aspect_ratio: "none",
+                    defs { clipPath { id: "{clip_id}", rect { x: "{plot.left}", y: "{plot.top - 3.0}",
+                        width: "{plot.right - plot.left}", height: "{rail - plot.top + 6.0}" } } }
+                    if show_future {
+                        rect { x: "{now_x}", y: "{plot.top}", width: "{plot.right - now_x}", height: "{plot.bottom - plot.top}", class: "quota-future" }
+                    }
+                    TimeAxis { plot, view }
+                    for pct in [0.0, 25.0, 50.0, 75.0, 100.0] {
+                        {
+                            let y = quota_y(plot, pct);
+                            rsx! {
+                                line { x1: "{plot.left}", x2: "{plot.right}", y1: "{y}", y2: "{y}",
+                                    class: if pct == 0.0 { "chart-gridline" } else { "chart-gridline subtle" } }
+                                if pct % 50.0 == 0.0 {
+                                    text { x: "{plot.left - 5.0}", y: "{y + 3.5}", text_anchor: "end", "{pct:.0}%" }
+                                }
+                            }
+                        }
+                    }
+                    line { x1: "{plot.left}", x2: "{plot.right}", y1: "{rail}", y2: "{rail}", class: "chart-gridline" }
+                    g { clip_path: "url(#{clip_id})", pointer_events: "none",
+                        QuotaTraces { series: series.clone(), plot, view, as_of, selected, single }
+                    }
+                    if show_future && view.contains(as_of) {
+                        line { x1: "{now_x}", x2: "{now_x}", y1: "18", y2: "{plot.bottom}", class: "quota-now-line" }
+                        rect { x: "{badge_x - 16.0}", y: "2", width: "32", height: "16", rx: "4", class: "quota-now-badge" }
+                        text { x: "{badge_x}", y: "14", text_anchor: "middle", "Now" }
+                    }
+                    if let (Some(at), Some(x)) = (active, active_x) {
+                        TimeCrosshair { plot, x }
+                        for (i, s) in series.iter().enumerate().filter(|(i, _)| single.is_none_or(|j| j == *i)) {
+                            if let Some(r) = s.at(at, at > as_of) {
+                                circle { key: "{i}", cx: "{x}", cy: "{quota_y(plot, r.left)}", r: "3.6", pointer_events: "none",
+                                    class: if at > as_of { "chart-point active quota-forecast-point" } else { "chart-point active" },
+                                    style: "color: {QuotaSeries::color(i, selected == Some(i))}" }
+                            }
+                        }
+                    }
+                    TimePlotHit { plot, origin: measure.origin, full, sorted, scrub, panel, rail_times }
+                }
+                div { role: "status",
+                    if let Some(cursor) = tooltip {
+                        QuotaReadout { series, at: cursor.at, as_of, selected, right: view.fraction(cursor.at) < 0.5 }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn QuotaReadout(series: Rc<Vec<QuotaSeries>>, at: DateTime<Utc>, as_of: DateTime<Utc>, selected: Option<usize>, right: bool) -> Element {
+    let future = at > as_of;
+    let timestamp = at.format("%Y-%m-%d %H:%M:%S UTC");
+    let side = if right { "right" } else { "" };
+    let density = if series.len() > 10 { "dense" } else { "" };
+    rsx! {
+        div { class: "quota-readout {side} {density}",
+            strong { class: "mono", "{timestamp}" if future { " · Estimated" } }
+            ul {
+                for (i, s) in series.iter().enumerate() {
                     {
-                        let points: Vec<_> = forecast.points.iter().filter(|p| p.at >= from && p.at <= until && p.remaining_percent.is_finite())
-                            .map(|p| (p.at, p.remaining_percent)).collect();
-                        let coords = points.iter().map(|(at, value)| format!("{:.2},{:.2}", x(*at, from, until), y(*value))).collect::<Vec<_>>().join(" ");
-                        let label = forecast.account_id.as_deref().map(name).unwrap_or_else(|| "Pool".into());
-                        let exh_label = label.clone();
+                        let r = s.at(at, future);
+                        let color = QuotaSeries::color(i, selected == Some(i));
                         rsx! {
-                            polyline { class: "chart-line chart-projection", points: coords, title { "{label} · Estimated projection" } }
-                            for (seg_idx, pair) in points.windows(2).enumerate() {
-                                {
-                                    let x1 = x(pair[0].0, from, until);
-                                    let y1 = y(pair[0].1);
-                                    let x2 = x(pair[1].0, from, until);
-                                    let y2 = y(pair[1].1);
-                                    let seg_label = label.clone();
-                                    let p0 = pair[0];
-                                    let p1 = pair[1];
-                                    rsx! {
-                                        line {
-                                            x1: "{x1:.2}", y1: "{y1:.2}", x2: "{x2:.2}", y2: "{y2:.2}",
-                                            class: "chart-hit",
-                                            stroke: "transparent",
-                                            stroke_width: "12",
-                                            onmouseenter: move |_| hovered.set(Some(QuotaHover::Segment {
-                                                series_idx: fi,
-                                                seg_idx,
-                                                label: seg_label.clone(),
-                                                from_at: p0.0,
-                                                from_left: p0.1,
-                                                to_at: p1.0,
-                                                to_left: p1.1,
-                                                x1,
-                                                y1,
-                                                x2,
-                                                y2,
-                                                projected: true,
-                                            })),
-                                        }
-                                    }
+                            li { key: "{i}", style: "--chart-accent: {color}",
+                                span { class: "chart-swatch", aria_hidden: "true" }
+                                span { "{s.label}" }
+                                span { class: "mono",
+                                    if let Some(r) = r { "{r.left:.1}% left" } else { "—" }
                                 }
-                            }
-                            for &(at, left) in &points {
-                                {
-                                    let cx = x(at, from, until);
-                                    let cy = y(left);
-                                    let pt_label = label.clone();
-                                    rsx! {
-                                        circle {
-                                            cx: "{cx:.2}", cy: "{cy:.2}", r: "6.5", fill: "transparent", class: "chart-hit",
-                                            onmouseenter: move |_| hovered.set(Some(QuotaHover::Point {
-                                                series_idx: fi,
-                                                label: pt_label.clone(),
-                                                at,
-                                                left,
-                                                cx,
-                                                cy,
-                                                projected: true,
-                                            })),
-                                        }
-                                    }
+                                if let Some(r) = r.filter(|r| r.at != at) {
+                                    small { {format!("Held from {}", r.at.format("%H:%M:%S UTC"))} }
                                 }
-                            }
-                            if let Some(at) = forecast.projected_exhaustion_at.filter(|at| *at >= from && *at <= until) {
-                                {
-                                    let ex = x(at, from, until);
-                                    rsx! {
-                                        line { x1: "{ex:.2}", x2: "{ex:.2}", y1: "{QUOTA_TOP}", y2: "{QUOTA_BOTTOM}", class: "chart-exhaustion",
-                                            title { "{exh_label} · Projected exhaustion {fmt_dt(at)}" }
-                                        }
-                                        line {
-                                            x1: "{ex:.2}", x2: "{ex:.2}", y1: "{QUOTA_TOP}", y2: "{QUOTA_BOTTOM}",
-                                            class: "chart-hit",
-                                            stroke: "transparent",
-                                            stroke_width: "10",
-                                            onmouseenter: move |_| hovered.set(Some(QuotaHover::Marker {
-                                                label: exh_label.clone(),
-                                                at,
-                                                cx: ex,
-                                                exhaustion: true,
-                                            })),
-                                        }
-                                    }
+                                if s.resets.contains(&at) {
+                                    small { if future { "Scheduled reset" } else { "Reported reset" } }
                                 }
+                                if s.exhaustion == Some(at) { small { class: "quota-risk", "Projected exhaustion" } }
                             }
                         }
                     }
                 }
-                if let Some(spec) = active.as_ref().map(QuotaHover::tooltip) {
-                    SvgTooltip { spec }
-                }
             }
-            if !forecasts.is_empty() {
-                p { class: "label-tech", "Estimated projection · dashed · not a provider guarantee" }
-                for forecast in &forecasts {
-                    p { {format!("{} · {:.2} percentage points/hour · projected exhaustion {}", forecast.account_id.as_deref().map(name).unwrap_or_else(|| "Pool".into()), forecast.drain_pct_per_hour, date(forecast.projected_exhaustion_at))}
-                        if forecast.resets_before_exhaustion { " · resets first" }
-                    }
-                }
-                details {
-                    summary { "Estimated projection data table" }
-                    Table { label: "Estimated projection", headers: &["Scope", "Projected time", "Remaining %", "Used %"],
-                        rows: forecasts.iter().flat_map(|forecast| {
-                            let scope = forecast.account_id.as_deref().map(name).unwrap_or_else(|| "Pool".into());
-                            forecast.points.iter().map(move |point| vec![
-                                scope.clone(), fmt_dt(point.at), number(Some(point.remaining_percent)), number(Some(point.used_percent))
-                            ])
-                        }).collect() }
-                }
-            }
-            if !reset_times.is_empty() {
-                p { class: "muted", "Reset markers: {reset_labels}" }
-            }
+        }
+    }
+}
+
+#[component]
+fn QuotaHistoryTables(series: Rc<Vec<QuotaSeries>>, show_forecast: bool) -> Element {
+    rsx! {
+        if show_forecast {
             details {
-                summary { "Measured history data table" }
-                Table { label: "Measured quota", headers: &["Account", "Observed", "Remaining %"],
-                    rows: series_list.iter().flat_map(|(_, label, points)| points.iter().map(move |(at, val)| vec![label.clone(), fmt_dt(*at), number(Some(*val))])).collect() }
+                summary { "Estimated projection data table" }
+                Table { label: "Estimated projection", headers: &["Series", "Projected time", "Remaining %"],
+                    rows: series.iter().flat_map(|s| s.forecast.iter().map(|r| vec![s.label.clone(), fmt_dt(r.at), number(Some(r.left))])).collect() }
             }
+        }
+        details {
+            summary { "Measured history data table" }
+            Table { label: "Measured quota", headers: &["Series", "Observed", "Remaining %", "Reported reset"],
+                rows: series.iter().flat_map(|s| s.history.iter().map(|r| vec![s.label.clone(), fmt_dt(r.at), number(Some(r.left)), date(r.reset)])).collect() }
         }
     }
 }
@@ -1550,12 +1911,97 @@ mod tests {
     }
 
     #[test]
-    fn quota_lines_break_only_after_four_hours() {
+    fn measured_steps_break_at_gaps_resets_and_sharp_refills() {
         let start = DateTime::UNIX_EPOCH;
-        let end = start + TimeDelta::hours(12);
-        let points = [(start, 90.0), (start + TimeDelta::hours(4), 80.0), (start + TimeDelta::hours(9), 70.0)];
-        assert_eq!(line(&points, start, end).matches('M').count(), 2);
-        assert_eq!(line(&points, start, end).matches('L').count(), 1);
+        let at = |h| start + TimeDelta::hours(h);
+        let mk = |h, left, reset| Reading { at: at(h), left, reset: Some(at(reset)) };
+        let points = [mk(0, 90.0, 5), mk(4, 80.0, 5), mk(5, 89.0, 10), mk(6, 30.0, 10), mk(7, 95.0, 10), mk(12, 92.0, 10)];
+        assert_eq!(points.chunk_by(same_quota_run).map(<[_]>::len).collect::<Vec<_>>(), [2, 2, 1, 1]);
+        assert_eq!(measured_at(&points, at(2)), Some(points[0]));
+        assert_eq!(measured_at(&points, at(9)), None);
+    }
+
+    #[test]
+    fn scope_models_get_separate_series_even_with_the_same_account_and_window() {
+        let at = DateTime::UNIX_EPOCH;
+        let sample = |model: &str| -> QuotaSample {
+            serde_json::from_value(serde_json::json!({
+                "id": 1, "provider_id": "example", "account_id": "a", "window_key": "weekly",
+                "scope_model": model, "label": "Weekly", "kind": "weekly", "unit": "percent", "remaining_percent": 75.0,
+                "cadence": "unknown", "status": "unknown", "observation_state": "measured", "observed_at": at,
+                "recorded_at": at, "stale": false
+            }))
+            .unwrap()
+        };
+        let groups = quota_series(&[sample("opus"), sample("sonnet")], &[], &BTreeMap::new(), TimeBounds { start: at, end: at });
+        assert_eq!(groups.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), ["a · opus", "a · sonnet"]);
+        assert!(groups.iter().all(|s| s.history.len() == 1));
+    }
+
+    #[test]
+    fn zoom_preserves_cursor_time_and_pan_stays_inside_full_bounds() {
+        let start = DateTime::UNIX_EPOCH;
+        let at = |h| start + TimeDelta::hours(h);
+        let full = TimeBounds { start, end: at(24) };
+        let zoom = full.zoom(full, 0.25, 0.5);
+        assert_eq!(zoom.at(0.25), at(6));
+        assert_eq!(zoom.pan(full, -2.0), TimeBounds { start, end: at(12) });
+        assert_eq!(zoom.pan(full, 2.0), TimeBounds { start: at(12), end: at(24) });
+        assert_eq!(zoom.zoom(full, 0.25, 10.0), full);
+        assert_eq!(zoom.zoom(full, 0.25, 0.0).end - zoom.zoom(full, 0.25, 0.0).start, TimeDelta::minutes(5));
+    }
+
+    #[test]
+    fn pace_is_elapsed_window_fraction_and_rejects_unknown_duration() {
+        let now = DateTime::UNIX_EPOCH;
+        let reset = |hours| Some(now + TimeDelta::hours(hours));
+        assert_eq!(pace_tick(now, reset(2), Some(14_400)), Some(50.0));
+        assert_eq!(pace_tick(now, reset(8), Some(14_400)), Some(0.0));
+        assert_eq!(pace_tick(now, reset(-1), Some(14_400)), Some(100.0));
+        assert_eq!(pace_tick(now, reset(2), Some(0)), None);
+        assert_eq!(pace_tick(now, None, Some(14_400)), None);
+    }
+
+    fn forecast(at: DateTime<Utc>, left: f64) -> QuotaForecast {
+        let point = |at, left| ForecastPoint { at, remaining_percent: left, used_percent: 100.0 - left };
+        QuotaForecast {
+            window_key: "weekly".into(),
+            account_id: Some("a".into()),
+            scope_model: Some("opus".into()),
+            drain_pct_per_hour: 10.0,
+            projected_exhaustion_at: Some(at + TimeDelta::hours(5)),
+            resets_before_exhaustion: true,
+            lookback_hours: 6,
+            horizon_hours: 12,
+            points: vec![point(at, left), point(at + TimeDelta::hours(1), left - 10.0), point(at + TimeDelta::hours(12), 95.0)],
+            is_estimate: true,
+        }
+    }
+
+    #[test]
+    fn meter_estimates_the_pre_reset_balance_only_for_the_same_reading() {
+        let now = DateTime::UNIX_EPOCH;
+        let f = forecast(now, 50.0);
+        assert_eq!(window_end_estimate(&f, 50.0, now + TimeDelta::hours(4), now), Some((10.0, false)));
+        assert_eq!(window_end_estimate(&f, 50.0, now + TimeDelta::hours(5), now), Some((0.0, false)));
+        assert_eq!(window_end_estimate(&f, 50.0, now + TimeDelta::hours(6), now), Some((0.0, true)));
+        assert_eq!(window_end_estimate(&f, 60.0, now + TimeDelta::hours(4), now), None);
+    }
+
+    #[test]
+    fn projection_is_drawn_only_when_the_future_is_enabled() {
+        fn app() -> Element {
+            let now = DateTime::UNIX_EPOCH;
+            let history = TimeBounds { start: now - TimeDelta::hours(6), end: now };
+            rsx! {
+                for forecast_until in [None, Some(now + TimeDelta::hours(12))] {
+                    QuotaHistoryChart { samples: vec![], forecasts: vec![forecast(now, 50.0)], names: BTreeMap::new(),
+                        scope: QuotaChartScope { history, forecast_until, history_truncated: false, pool: true } }
+                }
+            }
+        }
+        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        assert_eq!(rendered.matches("M229.33").count(), 1); // Now is one-third of a 6h history + 12h forecast.
     }
 
     #[test]
@@ -1778,7 +2224,10 @@ mod tests {
                 },
             ];
             rsx! {
-                QuotaHistoryChart { samples, forecasts: vec![], resets: vec![], from, until: now, names: BTreeMap::from([("ag-a".into(), "Alpha".into())]) }
+                QuotaHistoryChart { samples, forecasts: vec![], names: BTreeMap::from([("ag-a".into(), "Alpha".into())]),
+                    scope: QuotaChartScope {
+                        history: TimeBounds { start: from, end: now }, forecast_until: None, history_truncated: true, pool: false,
+                    } }
                 CacheHitRateChart { points: trend.clone() }
                 ActivityTrendChart { points: trend, metric: Metric::CacheHitRate }
                 ActivityHeatmap { cells, metric: Metric::CacheHitRate }
@@ -1787,6 +2236,9 @@ mod tests {
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
         assert!(rendered.contains("chart-stage"));
+        assert!(rendered.contains("Showing newest 4,000 samples"));
+        assert!(rendered.contains("55.0% left"));
+        assert!(!rendered.contains("Estimated projection data table"));
         assert!(rendered.contains("chart-readout"));
         assert!(rendered.contains("chart-hit"));
         assert!(rendered.contains("Daily cache hit rate (%)"));

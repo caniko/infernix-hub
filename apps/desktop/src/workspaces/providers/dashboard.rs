@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
 use chrono::TimeDelta;
 
@@ -121,6 +125,7 @@ pub(super) fn sorted_accounts(provider: &ProviderSummary, sort: AccountSortOrder
 
 #[component]
 fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
+    let client = use_context::<HubClient>();
     let panel = use_context::<PanelState>();
     let prefs = (panel.settings)();
     let mut selected = use_signal(|| None::<String>);
@@ -138,6 +143,24 @@ fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
     let has_quota = provider.descriptor.evidence_kinds.contains(&EvidenceKind::QuotaWindows)
         || !provider.pools.is_empty()
         || provider.accounts.iter().any(|a| !a.windows.is_empty());
+    let provider_id = segment(id);
+    let has_meter = provider.accounts.iter().flat_map(|a| &a.windows).any(|w| w.resets_at.is_some());
+    // Overview does not carry forecasts. Use one short report for all meter scopes;
+    // the explorer still fetches its own window-specific history and lookback.
+    let meter_forecasts = use_resource(use_reactive((&provider_id, &has_meter), move |(provider_id, has_meter)| {
+        let _ = (panel.epoch)();
+        let lookback = panel.settings.read().drain_lookback_hours;
+        let client = client.clone();
+        async move {
+            if !has_meter {
+                return None;
+            }
+            let query = QuotaQuery { range_hours: Some(1), lookback_hours: Some(lookback), horizon_hours: Some(1), ..Default::default() };
+            let report = timed(client.provider_quota(&path_id(provider_id).ok()?, &query)).await.ok()?;
+            Some(Rc::new(report.forecasts))
+        }
+    }));
+    let forecasts = meter_forecasts.read().as_ref().and_then(Clone::clone).unwrap_or_default();
     let count = provider.account_count;
     let account_label = if count == 1 { "account" } else { "accounts" };
     rsx! {
@@ -178,14 +201,16 @@ fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
                         horizon_default: prefs.forecast_horizon_hours,
                     } }}
                 }
-                if provider.pools.is_empty() { p { class: "muted", if has_quota { "No pool readings yet." } else { "Quota windows not reported." } } }
+                if provider.pools.is_empty() { p { class: "muted", if has_quota { "No pool readings yet." } else { "No quota reported" } } }
                 for pool in provider.pools.iter().filter(|p| !is_extra(p.kind)) {
-                    PoolWindow { key: "{pool.window_key}", pool: pool.clone() }
+                    PoolWindow { key: "{pool.window_key}:{pool.scope_model:?}", pool: pool.clone(),
+                        forecast: meter_forecast(&forecasts, None, &pool.window_key, pool.scope_model.as_deref()) }
                 }
                 if provider.pools.iter().any(|p| is_extra(p.kind)) {
                     details { summary { "Model and spend windows" }
                         for pool in provider.pools.iter().filter(|p| is_extra(p.kind)) {
-                            PoolWindow { key: "{pool.window_key}", pool: pool.clone() }
+                            PoolWindow { key: "{pool.window_key}:{pool.scope_model:?}", pool: pool.clone(),
+                                forecast: meter_forecast(&forecasts, None, &pool.window_key, pool.scope_model.as_deref()) }
                         }
                     }
                 }
@@ -197,6 +222,7 @@ fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
                         {
                             let account_id = account.id.clone();
                             rsx! { AccountSummary { key: "{account.id}", provider: provider.clone(), account: account.clone(), mask: prefs.mask_emails,
+                                forecasts: forecasts.clone(),
                                 chart: move |_| selected.set(Some(account_id.clone())) } }
                         }
                     }
@@ -210,8 +236,12 @@ fn ProviderCard(provider: ProviderSummary, stale: bool) -> Element {
     }
 }
 
+fn meter_forecast(forecasts: &[QuotaForecast], account: Option<&str>, window: &str, model: Option<&str>) -> Option<QuotaForecast> {
+    forecasts.iter().find(|f| f.account_id.as_deref() == account && f.window_key == window && f.scope_model.as_deref() == model).cloned()
+}
+
 #[component]
-fn PoolWindow(pool: PoolWindowSummary) -> Element {
+fn PoolWindow(pool: PoolWindowSummary, forecast: Option<QuotaForecast>) -> Element {
     let weight_label = match pool.capacity_basis.as_str() {
         "equal_entitlements" => "Equal weights",
         "plan_tier_multiplier" | "plan_multiplier" => "Plan-tier weights",
@@ -219,9 +249,12 @@ fn PoolWindow(pool: PoolWindowSummary) -> Element {
     };
     rsx! {
         div { class: "quota-window", style: "padding-block: 4px;",
-            strong { "{window_label(&pool.label)}" }
+            div { class: "row",
+                strong { "{window_label(&pool.label)}" }
+                if let Some(model) = &pool.scope_model { span { class: "muted", "{model}" } }
+            }
             if let (Some(left), Some(used)) = quota_values(QuotaObservationState::Measured, pool.weighted_remaining_percent, pool.weighted_used_percent) {
-                Meter { left, used }
+                Meter { left, used, resets_at: pool.next_reset_at, window_seconds: pool.window_seconds, forecast: forecast.or(pool.forecast) }
             } else { span { class: "form-help", "Not observed" } }
             p { class: "muted",
                 if pool.is_estimate { "Estimated pool · " }
@@ -288,7 +321,13 @@ pub(super) fn AccountIdentity(
 }
 
 #[component]
-fn AccountSummary(provider: ProviderSummary, account: ModelAccount, mask: bool, chart: EventHandler<()>) -> Element {
+fn AccountSummary(
+    provider: ProviderSummary,
+    account: ModelAccount,
+    mask: bool,
+    chart: EventHandler<()>,
+    forecasts: Rc<Vec<QuotaForecast>>,
+) -> Element {
     rsx! {
         section { class: "provider-inset stack",
             div { class: "row",
@@ -304,15 +343,17 @@ fn AccountSummary(provider: ProviderSummary, account: ModelAccount, mask: bool, 
                 }
             }
             if account.windows.is_empty() {
-                p { class: "muted", "No quota windows · {fmt_count(account.success_count)} successes · {fmt_count(account.failure_count)} failures" }
+                p { class: "muted", "No quota reported · {fmt_count(account.success_count)} successes · {fmt_count(account.failure_count)} failures" }
             }
             for window in account.windows.iter().filter(|w| !is_extra(w.kind)) {
-                QuotaLimitBar { key: "{window.window_key}", window: window.clone() }
+                QuotaLimitBar { key: "{window.window_key}:{window.scope_model:?}", window: window.clone(),
+                    forecast: meter_forecast(&forecasts, Some(&account.id), &window.window_key, window.scope_model.as_deref()) }
             }
             if account.windows.iter().any(|w| is_extra(w.kind)) {
                 details { summary { "Model and spend windows" }
                     for window in account.windows.iter().filter(|w| is_extra(w.kind)) {
-                        QuotaLimitBar { key: "{window.window_key}", window: window.clone() }
+                        QuotaLimitBar { key: "{window.window_key}:{window.scope_model:?}", window: window.clone(),
+                            forecast: meter_forecast(&forecasts, Some(&account.id), &window.window_key, window.scope_model.as_deref()) }
                     }
                 }
             }
@@ -334,6 +375,12 @@ fn AccountSummary(provider: ProviderSummary, account: ModelAccount, mask: bool, 
     }
 }
 
+fn chart_forecast(f: &QuotaForecast, query: &QuotaQuery) -> bool {
+    f.account_id.is_some()
+        && query.account_id.as_ref().is_none_or(|id| f.account_id.as_ref() == Some(id))
+        && query.window_key.as_ref() == Some(&f.window_key)
+}
+
 #[component]
 fn QuotaPanel(provider: ProviderSummary, account: Option<ModelAccount>, lookback_default: u32, horizon_default: u32) -> Element {
     let client = use_context::<HubClient>();
@@ -343,18 +390,23 @@ fn QuotaPanel(provider: ProviderSummary, account: Option<ModelAccount>, lookback
     let mut lookback = use_signal(|| lookback_default);
     let mut horizon = use_signal(|| horizon_default);
     let mut range = use_signal(|| 24u32);
-    let windows: BTreeMap<String, String> = if let Some(account) = &account {
-        account.windows.iter().map(|w| (w.window_key.clone(), window_label(&w.label).to_string())).collect()
-    } else {
-        provider
-            .pools
-            .iter()
-            .map(|w| (w.window_key.clone(), window_label(&w.label).to_string()))
-            .chain(
-                provider.accounts.iter().flat_map(|a| a.windows.iter().map(|w| (w.window_key.clone(), window_label(&w.label).to_string()))),
-            )
-            .collect()
-    };
+    let mut show_forecast = use_signal(|| false);
+    let mut by_key = BTreeMap::<&str, (&str, BTreeSet<Option<&str>>)>::new();
+    let rows = account.as_ref().map_or(provider.accounts.as_slice(), std::slice::from_ref);
+    for window in rows.iter().flat_map(|a| &a.windows) {
+        by_key.entry(&window.window_key).or_insert_with(|| (&window.label, BTreeSet::new())).1.insert(window.scope_model.as_deref());
+    }
+    if account.is_none() {
+        for pool in &provider.pools {
+            by_key.entry(&pool.window_key).or_insert_with(|| (&pool.label, BTreeSet::new())).1.insert(pool.scope_model.as_deref());
+        }
+    }
+    let windows: BTreeMap<_, _> = by_key
+        .into_iter()
+        .map(|(key, (label, models))| {
+            (key.to_string(), if models.len() > 1 { format!("{key} · model scopes") } else { window_label(label).to_string() })
+        })
+        .collect();
     let mut window = use_signal(String::new);
     let chosen = window.cloned();
     let chosen = windows.get_key_value(&chosen).or_else(|| windows.first_key_value()).map(|(key, _)| key.clone()).unwrap_or_default();
@@ -362,7 +414,7 @@ fn QuotaPanel(provider: ProviderSummary, account: Option<ModelAccount>, lookback
     let query = use_memo(use_reactive((&chosen, &account_id), move |(chosen, account_id)| QuotaQuery {
         account_id,
         window_key: optional(&chosen),
-        range_hours: Some(range().max(lookback())),
+        range_hours: Some(range()),
         lookback_hours: Some(lookback()),
         horizon_hours: Some(horizon()),
     }));
@@ -380,6 +432,13 @@ fn QuotaPanel(provider: ProviderSummary, account: Option<ModelAccount>, lookback
     });
     let current_query = query();
     let result = data.read();
+    let available = result.as_ref().and_then(|r| r.as_ref().ok()).and_then(Option::as_ref).is_some_and(|(submitted, report)| {
+        *submitted == current_query
+            && report.forecasts.iter().any(|f| {
+                chart_forecast(f, &current_query) && f.points.iter().any(|p| p.at > report.as_of && p.remaining_percent.is_finite())
+            })
+    });
+    let future = available && show_forecast();
     let mask = panel.settings.read().mask_emails;
     rsx! {
         div { class: "form-grid-2", style: "grid-template-columns: repeat(auto-fit, minmax(min(100%, 5.75rem), 1fr)); gap: 4px 6px;",
@@ -387,29 +446,35 @@ fn QuotaPanel(provider: ProviderSummary, account: Option<ModelAccount>, lookback
             Choice { label: "History", value: range().to_string(), options: pairs(&[("6", "6h"), ("12", "12h"), ("24", "24h"), ("48", "48h"), ("168", "7d")]), change: move |v: String| if let Ok(n) = v.parse() { range.set(n); } }
             Choice { label: "Drain lookback", value: lookback().to_string(), options: pairs(LOOKBACK), change: move |v: String| if let Ok(n) = v.parse() { lookback.set(n); } }
             Choice { label: "Forecast horizon", value: horizon().to_string(), options: pairs(HORIZON), change: move |v: String| if let Ok(n) = v.parse() { horizon.set(n); } }
+            label { class: "provider-field quota-forecast-toggle",
+                span { "Projection" }
+                span { class: "row",
+                    input { r#type: "checkbox", checked: future, disabled: !available,
+                        onchange: move |e| show_forecast.set(e.checked()) }
+                    "Show forecast"
+                }
+                if !available { small { "No forecast available" } }
+            }
         }
         {read_view(result.as_ref(), |data| {
             let Some((submitted, report)) = data else { return rsx! { p { class: "muted", "No quota window observed yet." } }; };
             if *submitted != current_query { return rsx! { Loading { text: "Loading quota range…".to_string() } }; }
-            let forecasts = if account.is_some() {
-                report.forecasts.iter().filter(|f| f.window_key == chosen && f.account_id == current_query.account_id).cloned().collect()
-            } else {
-                report.pools.iter().filter(|p| p.window_key == chosen).filter_map(|p| p.forecast.clone()).collect()
-            };
+            let forecasts = report.forecasts.iter().filter(|f| chart_forecast(f, &current_query)).cloned().collect();
             let names: BTreeMap<_, _> = report.accounts.iter().map(|a| (a.id.clone(), account_name(a, mask))).collect();
-            let resets = report.samples.iter().filter(|s| s.observation_state == QuotaObservationState::Measured && !s.stale)
-                .filter_map(|s| s.resets_at).chain(report.accounts.iter()
-                    .filter(|a| current_query.account_id.as_ref().is_none_or(|id| id == &a.id))
-                    .flat_map(|a| a.windows.iter()).filter(|w| w.window_key == chosen && !w.stale && w.observation_state == QuotaObservationState::Measured)
-                    .filter_map(|w| w.resets_at)).collect();
+            let history = TimeBounds { start: report.as_of - TimeDelta::hours(range().into()), end: report.as_of };
             rsx! {
-                QuotaHistoryChart { samples: report.samples.clone(), forecasts, resets, names: names.clone(),
-                    from: report.as_of - TimeDelta::hours(range().into()), until: report.as_of + TimeDelta::hours(horizon().into()) }
+                QuotaHistoryChart { key: "{chosen}-{range()}-{lookback()}-{horizon()}", samples: report.samples.clone(),
+                    forecasts, names: names.clone(), current: report.accounts.clone(), window_key: chosen.clone(),
+                    scope: QuotaChartScope {
+                        history, forecast_until: future.then(|| report.as_of + TimeDelta::hours(horizon().into())),
+                        history_truncated: report.history_truncated, pool: account.is_none(),
+                    } }
                 details { summary { "Past Windows" }
                     if account.is_none() { p { class: "form-help", "Pool history plots each account separately; incompatible quota windows aren’t averaged." } }
-                    Table { label: "Past windows", headers: &["Account", "Window", "Started", "Ended", "Peak used %", "Exhausted", "Early replacement", "Samples"],
+                    Table { label: "Past windows", headers: &["Account", "Window", "Model", "Started", "Ended", "Peak used %", "Exhausted", "Early replacement", "Samples"],
                         rows: report.past_windows.iter().rev().map(|w| vec![
-                            names.get(&w.account_id).cloned().unwrap_or_else(|| w.account_id.clone()), window_label(&w.label).to_string(), fmt_dt(w.started_at),
+                            names.get(&w.account_id).cloned().unwrap_or_else(|| w.account_id.clone()), window_label(&w.label).to_string(),
+                            w.scope_model.clone().unwrap_or_else(|| "—".into()), fmt_dt(w.started_at),
                             fmt_dt(w.ended_at), number(w.peak_used_percent), date(w.exhausted_at), if w.early_replaced { "Yes" } else { "No" }.into(), w.sample_count.to_string()
                         ]).collect() }
                 }

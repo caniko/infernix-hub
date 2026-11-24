@@ -910,11 +910,16 @@ select.input option { background: var(--card); color: var(--text); }
 .quota-window { display: grid; gap: 3px; padding: 7px 0; border-top: 1px solid var(--border); }
 .quota-window.row { display: flex; }
 .quota-window p { font-size: 12px; margin: 0; }
-.quota-meter { width: 100%; height: 6px; border-radius: 3px; }
+.quota-meter { display: block; width: 100%; height: 10px; border-radius: 3px; }
 .quota-track { fill: var(--elevated); }
 .quota-left { fill: var(--ok); }
 .quota-left.warn { fill: var(--warn); }
 .quota-left.bad { fill: var(--bad); }
+.quota-pace { stroke: var(--text); stroke-width: 1.4; vector-effect: non-scaling-stroke; }
+.quota-hatch { fill: none; stroke: var(--panel); stroke-width: 1.5; opacity: .7; }
+.quota-hatch.bad { stroke: var(--bad); opacity: 1; }
+.quota-meter-meta { justify-content: space-between; color: var(--text-muted); font-size: 11px; }
+.quota-risk { color: var(--bad); font-weight: 600; }
 .cache-meter-fill { fill: var(--ok); }
 .provider-chart { margin: 0; min-width: 0; }
 .chart-stage {
@@ -992,6 +997,59 @@ select.input option { background: var(--card); color: var(--text); }
 .chart-band { fill: var(--info); opacity: .20; }
 .chart-outlier { fill: var(--bad); stroke: var(--panel); stroke-width: 1.2; }
 .chart-median { stroke: var(--info); stroke-width: 2; }
+.quota-history > :is(figcaption, .chip) { display: inline-flex; margin: 0 8px 5px 0; }
+.quota-forecast-toggle { align-content: start; }
+.quota-forecast-toggle .row { min-height: 36px; }
+.quota-forecast-toggle input { margin: 0; }
+.quota-forecast-toggle:has(input:disabled) { color: var(--text-dim); }
+.quota-forecast-toggle small { font-size: 11px; }
+.quota-decision { padding: 6px 0 9px; color: var(--text-muted); font-size: 12px; }
+.quota-decision strong { color: var(--text); font-size: 15px; }
+.quota-series-chips { gap: 5px; }
+.quota-series-chips .filter-chip { display: inline-flex; align-items: center; gap: 6px; white-space: normal; text-align: start; }
+.quota-series-chips .chart-swatch { flex: none; }
+.quota-plot-controls { margin-block: 7px 2px; color: var(--text-muted); font-size: 11px; }
+.quota-plots { border-radius: 4px; }
+.quota-plots.multiples {
+  display: grid; gap: 6px 12px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, max(176px, calc((100% - 24px) / 3))), 1fr));
+}
+.quota-plot { min-width: 0; }
+.quota-plots.multiples .quota-plot { border-top: 1px solid var(--line-subtle); }
+.quota-plot-label { display: block; padding-top: 5px; color: var(--text-muted); font-size: 11px; }
+.quota-plot-surface { position: relative; }
+.quota-plot-surface > svg { display: block; width: 100%; }
+.time-axis text { font-size: 11px; font-variant-numeric: tabular-nums; }
+.time-gridline { stroke: var(--line-subtle); stroke-dasharray: none !important; }
+.time-crosshair { stroke-dasharray: none; opacity: .85; }
+.time-hit { cursor: crosshair; user-select: none; }
+.time-hit.zoomed { cursor: grab; }
+.time-hit.panning { cursor: grabbing; }
+.quota-trace .chart-line { stroke-width: 1.6; }
+.quota-trace.focused .chart-line { stroke-width: 2.4; }
+.quota-forecast-point { fill: var(--honey); }
+.quota-future { fill: var(--honey); opacity: .065; }
+.quota-now-line { stroke: var(--text-dim); stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+.quota-now-badge { fill: var(--elevated); }
+.quota-reset-mark { fill: var(--text-dim); opacity: .85; }
+.quota-readout {
+  position: absolute; top: 4px; left: 4px; z-index: 2;
+  width: max-content; max-width: min(290px, 90%);
+  padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel); color: var(--text);
+  box-shadow: 0 4px 16px #0007; font-size: 11px;
+  pointer-events: none;
+}
+.quota-readout.right { left: auto; right: 4px; }
+.quota-readout.dense { width: min(450px, 90%); max-width: none; }
+.quota-readout.dense ul { columns: 2 135px; }
+.quota-readout ul { margin: 3px 0 0; padding: 0; list-style: none; }
+.quota-readout li {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center;
+  gap: 0 6px; padding-block: 2px; border-top: 1px solid var(--line-subtle); break-inside: avoid;
+}
+.quota-readout li small { grid-column: 2 / -1; color: var(--text-muted); }
+.quota-readout li small.quota-risk { color: var(--bad); }
 .activity-board { display: grid; gap: 12px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .activity-board > * { min-width: 0; }
 .activity-span-2 { grid-column: span 2; }
