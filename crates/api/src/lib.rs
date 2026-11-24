@@ -39,6 +39,7 @@ pub struct AppState {
     /// Fleet snapshot path; `None` means the hub serves no fleet section.
     pub fleet_status_file: Option<std::path::PathBuf>,
     pub secret_inventory_file: Option<std::path::PathBuf>,
+    pub mail_calendar: Arc<mail_calendar::Runtime>,
 }
 
 /// An API failure in the wire error shape. Domain outcomes keep their stable
@@ -127,6 +128,8 @@ macro_rules! call {
     };
 }
 
+pub mod mail_calendar;
+
 pub fn router(state: AppState) -> Router {
     router_with(state, Vec::new())
 }
@@ -208,7 +211,8 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/chat/{subject_type}/{id}", get(chat).post(send_chat))
         .route("/fixtures/paperclip/approvals", get(fixture_approvals))
         .route("/fixtures/paperclip/approvals/{id}/decide", post(fixture_decide))
-        .merge(providers::routes());
+        .merge(providers::routes())
+        .merge(mail_calendar::routes());
     for (id, routes) in pack_routes {
         v1 = v1.nest(&format!("/p/{id}"), routes);
     }
@@ -306,6 +310,7 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
         None => Vec::new(),
     };
     if !settings.no_worker {
+        state.mail_calendar.spawn(state.hub.clone());
         if let Ok(mut states) = state.hub.feeds.write() {
             *states = feeds::pending_states(&feeds);
         }

@@ -75,6 +75,17 @@ impl Hub {
         )
     }
 
+    pub async fn mail_account_system(&self, actor: &Actor, owner: &str, label: &str) -> DResult<MailAccount> {
+        let owner = Self::sync_owner(actor, owner)?;
+        let row = sqlx::query_scalar("select to_jsonb(a) from mail_accounts a where owner=$1 and label=$2")
+            .bind(owner)
+            .bind(label)
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or(DomainError::NotFound("mail account"))?;
+        decode_one(row)
+    }
+
     /// Returns a unique token for this acquisition, not a stable worker ID.
     pub async fn acquire_mail_sync_lease(&self, actor: &Actor, owner: &str, id: Uuid, seconds: u32) -> DResult<Option<Uuid>> {
         let owner = Self::sync_owner(actor, owner)?;
@@ -164,6 +175,39 @@ impl Hub {
         self.ingest_mail_for_owner(&self.resolve_owner(actor)?, None, request).await
     }
 
+    pub async fn ingest_named_mail_messages(&self, actor: &Actor, input: MailNamedIngestRequest) -> DResult<MailIngestResult> {
+        let owner = self.resolve_owner(actor)?;
+        let account = input.account.trim();
+        let address = input.address.as_deref().unwrap_or_default();
+        let provider = input.provider.as_deref().unwrap_or("export_dir");
+        if account.is_empty()
+            || account.len() > 128
+            || address.len() > 512
+            || account.chars().chain(address.chars()).any(char::is_control)
+            || !matches!(provider, "gmail" | "protonmail" | "tutanota" | "imap" | "export_dir")
+            || input.messages.len() > 100
+        {
+            return Err(invalid("mail_ingest", "invalid account metadata or batch size"));
+        }
+        // A client can create its own push account, but cannot reconfigure one.
+        sqlx::query(
+            "insert into mail_accounts (owner,label,provider,transport,address)
+            values ($1,$2,$3,'client_push',$4) on conflict (owner,label) do nothing",
+        )
+        .bind(&owner)
+        .bind(account)
+        .bind(provider)
+        .bind(address)
+        .execute(&self.db)
+        .await?;
+        let account_id = sqlx::query_scalar("select id from mail_accounts where owner=$1 and label=$2")
+            .bind(&owner)
+            .bind(account)
+            .fetch_one(&self.db)
+            .await?;
+        self.ingest_mail_for_owner(&owner, None, &MailIngestRequest { account_id, messages: input.messages }).await
+    }
+
     pub async fn ingest_mail_messages_system(
         &self,
         actor: &Actor,
@@ -198,6 +242,7 @@ impl Hub {
             }
         }
         let mut inserted = 0;
+        let mut junk = 0;
         for message in &request.messages {
             let sha = content_hash(message)?;
             let body = bounded_body(&message.body_text);
@@ -242,7 +287,9 @@ impl Hub {
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(id) = id {
-                save_analysis(&mut tx, owner, id, &analyze_message(message, Utc::now()), None).await?;
+                let analysis = analyze_message(message, Utc::now());
+                junk += usize::from(analysis.is_junk);
+                save_analysis(&mut tx, owner, id, &analysis, None).await?;
                 inserted += 1;
             }
             if let Some(location) = &message.imap_location {
@@ -275,7 +322,7 @@ impl Hub {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(MailIngestResult { inserted, duplicates: request.messages.len() - inserted })
+        Ok(MailIngestResult { inserted, duplicates: request.messages.len() - inserted, junk })
     }
 
     pub async fn list_mail_messages(&self, actor: &Actor, query: &MailSearchQuery) -> DResult<Vec<MailMessageSummary>> {
@@ -359,6 +406,11 @@ impl Hub {
             .fetch_all(&self.db)
             .await?,
         )
+    }
+
+    pub async fn mail_owners_system(&self, actor: &Actor) -> DResult<Vec<String>> {
+        Self::sync_owner(actor, "worker")?;
+        Ok(sqlx::query_scalar("select distinct owner from mail_accounts order by owner").fetch_all(&self.db).await?)
     }
 
     pub async fn save_llm_analysis(&self, actor: &Actor, owner: &str, id: Uuid, model: &str, analysis: &MailAnalysisView) -> DResult<()> {
@@ -447,7 +499,8 @@ impl Hub {
                 "insert into mail_bi_digests as d (owner,period_kind,period_start,period_end,summary_markdown,metrics_json,highlights_json)
              values ($1,$2,$3,$4,$5,$6,$7)
              on conflict (owner,period_kind,period_start,period_end) do update set
-               summary_markdown=excluded.summary_markdown,metrics_json=excluded.metrics_json,highlights_json=excluded.highlights_json
+               summary_markdown=excluded.summary_markdown,metrics_json=excluded.metrics_json,highlights_json=excluded.highlights_json,
+               generated_by=excluded.generated_by
              returning to_jsonb(d)",
             )
             .bind(owner)
@@ -460,6 +513,22 @@ impl Hub {
             .fetch_one(&self.db)
             .await?,
         )
+    }
+
+    pub async fn summarize_mail_bi_digest(&self, actor: &Actor, id: Uuid, model: &str, summary: &str) -> DResult<MailBiDigest> {
+        let owner = self.resolve_owner(actor)?;
+        let summary = crate::mail_bi::markdown_literal(summary);
+        let row = sqlx::query_scalar(
+            "update mail_bi_digests d set summary_markdown=$3,generated_by=$4 where owner=$1 and id=$2 returning to_jsonb(d)",
+        )
+        .bind(owner)
+        .bind(id)
+        .bind(summary)
+        .bind(model)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or(DomainError::NotFound("mail BI digest"))?;
+        decode_one(row)
     }
 
     pub async fn list_mail_bi_digests(&self, actor: &Actor) -> DResult<Vec<MailBiDigest>> {

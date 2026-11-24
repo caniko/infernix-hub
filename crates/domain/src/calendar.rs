@@ -92,6 +92,17 @@ impl Hub {
         )
     }
 
+    pub async fn calendar_source_system(&self, actor: &Actor, owner: &str, label: &str) -> DResult<CalendarSource> {
+        let owner = Self::sync_owner(actor, owner)?;
+        let row = sqlx::query_scalar("select to_jsonb(s) from calendar_sources s where owner=$1 and label=$2")
+            .bind(owner)
+            .bind(label)
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or(DomainError::NotFound("calendar source"))?;
+        decode_one(row)
+    }
+
     /// Returns the exact database expiry as the fence for the acquired lease.
     pub async fn acquire_calendar_sync_lease(&self, actor: &Actor, owner: &str, id: Uuid, seconds: u32) -> DResult<Option<DateTime<Utc>>> {
         let owner = Self::sync_owner(actor, owner)?;
@@ -184,6 +195,19 @@ impl Hub {
 
     /// Store a sanitized diagnostic; never mutate events, ETag or last successful sync.
     pub async fn record_calendar_sync_error(&self, actor: &Actor, owner: &str, id: Uuid, lease: DateTime<Utc>, error: &str) -> DResult<()> {
+        self.finish_calendar_sync(actor, owner, id, lease, false, Some(error)).await
+    }
+
+    /// Release a non-replacing sync: no credentials, a fetch error, or HTTP 304.
+    pub async fn finish_calendar_sync(
+        &self,
+        actor: &Actor,
+        owner: &str,
+        id: Uuid,
+        lease: DateTime<Utc>,
+        unchanged: bool,
+        error: Option<&str>,
+    ) -> DResult<()> {
         let owner = Self::sync_owner(actor, owner)?;
         let mut tx = self.db.begin().await?;
         let (_, active, expiry) = calendar_lease(&mut tx, owner, id).await?;
@@ -191,11 +215,19 @@ impl Hub {
             return Err(conflict("calendar_sync_lease", "calendar sync lease is no longer held"));
         }
         sqlx::query(
-            "update calendar_sources set status='error',last_error=$3,sync_leased_until=null,updated_at=now() where owner=$1 and id=$2",
+            "update calendar_sources set status=$3,last_error=$4,sync_leased_until=null,updated_at=now(),
+             last_sync_at=case when $3='ok' then now() else last_sync_at end where owner=$1 and id=$2",
         )
         .bind(owner)
         .bind(id)
-        .bind(crate::mail_bi::bounded_snippet(error, ""))
+        .bind(if unchanged {
+            "ok"
+        } else if error.is_some() {
+            "error"
+        } else {
+            "awaiting_credentials"
+        })
+        .bind(error.map(|e| crate::mail_bi::bounded_snippet(e, "")))
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

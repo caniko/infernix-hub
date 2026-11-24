@@ -333,19 +333,20 @@ fn extract_amounts(subject: &str, body: &str) -> Vec<MonetaryAmount> {
     amounts
 }
 
+pub(crate) fn markdown_literal(text: &str) -> String {
+    // Keep untrusted text literal in Markdown; never produce links/HTML.
+    text.chars()
+        .flat_map(|c| if c.is_ascii_punctuation() { [Some('\\'), Some(c)] } else { [None, Some(if c.is_control() { ' ' } else { c })] })
+        .flatten()
+        .collect()
+}
+
 pub fn executive_digest(overview: &MailBiOverview) -> String {
     let mut output = format!(
         "# Mail intelligence digest\n\n{} messages · {} signal · {} junk · {} unread\n",
         overview.total_count, overview.signal_count, overview.junk_count, overview.unread_count,
     );
-    // Keep untrusted message text literal in Markdown; never produce links/HTML.
-    let literal = |text: &str| -> String {
-        text.chars()
-            .take(300)
-            .flat_map(|c| if c.is_ascii_punctuation() { [Some('\\'), Some(c)] } else { [None, Some(if c.is_control() { ' ' } else { c })] })
-            .flatten()
-            .collect()
-    };
+    let literal = |text: &str| markdown_literal(&bounded_snippet(text, ""));
     output.push_str("\n## Recurring vendors\n");
     for vendor in &overview.recurring_vendors {
         let _ = writeln!(output, "- {}: {} messages", literal(&vendor.vendor), vendor.message_count);

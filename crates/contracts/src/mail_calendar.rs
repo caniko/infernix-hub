@@ -63,6 +63,7 @@ pub struct MailMessageIn {
     pub folder: String,
     pub from_addr: String,
     pub from_name: String,
+    pub from_domain: String,
     pub to_addrs: Vec<String>,
     pub cc_addrs: Vec<String>,
     pub subject: String,
@@ -97,6 +98,18 @@ pub struct MailIngestRequest {
 pub struct MailIngestResult {
     pub inserted: usize,
     pub duplicates: usize,
+    /// Newly inserted messages flagged as junk by the initial classifier.
+    #[serde(default)]
+    pub junk: usize,
+}
+
+/// First-time local imports can name an account instead of supplying its UUID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailNamedIngestRequest {
+    pub account: String,
+    pub provider: Option<String>,
+    pub address: Option<String>,
+    pub messages: Vec<MailMessageIn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

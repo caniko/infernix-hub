@@ -4,8 +4,12 @@
 //! never evidence that a live integration works.
 
 pub mod assistant;
+pub mod calendar_sync;
 pub mod fixture;
 pub mod gpu_peer;
+pub mod imap_sync;
 pub mod live;
+pub mod local_llm_bi;
+pub mod mail_parse;
 pub mod providers;
 pub mod store;
