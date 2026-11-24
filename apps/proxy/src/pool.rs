@@ -630,14 +630,14 @@ fn parse_credentials_for_lane(name: &str, raw: &Value, local: bool, known_lane: 
         let auth_types = [raw, entry].into_iter().flat_map(|value| {
             ["type", "auth_type", "auth_mode"].into_iter().filter_map(|field| text(value, &[field]).map(str::to_ascii_lowercase))
         });
-        let api_key = forced_api_key
-            || (lane != Lane::Go
-                && (key.is_some()
-                    || is_group
-                    || matches!(kind, "api_key" | "api-key")
-                    || (lane == Lane::Codex
-                        && (access.starts_with("sk-")
-                            || auth_types.clone().any(|kind| matches!(kind.as_str(), "api" | "apikey" | "api_key" | "api-key"))))));
+        let api_key = lane != Lane::Go
+            && (forced_api_key
+                || key.is_some()
+                || is_group
+                || matches!(kind, "api_key" | "api-key")
+                || (lane == Lane::Codex
+                    && (access.starts_with("sk-")
+                        || auth_types.clone().any(|kind| matches!(kind.as_str(), "api" | "apikey" | "api_key" | "api-key")))));
         let codex_oauth_explicit = lane == Lane::Codex
             && !api_key
             && auth_types.into_iter().any(|kind| matches!(kind.as_str(), "oauth" | "oauth2" | "chatgpt" | "chatgptauthtokens"));

@@ -386,8 +386,8 @@ impl<'de> Visitor<'de> for StrictJson {
     fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Value, A::Error> {
         let mut object = Map::new();
         while let Some(key) = access.next_key::<String>()? {
-            // Do not let serde_json reinterpret a field as raw JSON or a number.
-            if matches!(key.as_str(), "$serde_json::private::RawValue" | "$serde_json::private::Number") || object.contains_key(&key) {
+            // Reject every serde_json private marker key at every depth.
+            if key.starts_with("$serde_json::private::") || object.contains_key(&key) {
                 return Err(de::Error::custom("duplicate or reserved JSON object key"));
             }
             let StrictValue(value) = access.next_value()?;

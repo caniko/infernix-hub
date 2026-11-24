@@ -545,6 +545,10 @@ async fn scoped_worker_rejects_single_entry_api_key_wrappers() {
         assert_eq!((result.status(), calls.load(Ordering::SeqCst)), (StatusCode::SERVICE_UNAVAILABLE, 0));
         assert!(proxy.state.read().await.pool.accounts["wrapped.json"].api_key);
     }
+    let wrapped_go =
+        pool::parse_credentials("wrapped-go.json", &json!({"type":"opencode-go","api_key":{"access_token":"go-fixture"}}), false).unwrap();
+    assert_eq!(wrapped_go.len(), 1);
+    assert!(!wrapped_go[0].api_key);
 }
 
 #[tokio::test]
@@ -655,6 +659,7 @@ async fn scoped_worker_denies_all_other_routes_models_and_overrides_before_forwa
         (r#"{"model":{"$serde_json::private::RawValue":"\"gpt-6.2-sol\""}}"#, 403),
         (r#"{"model":"gpt-6.2-sol","$serde_json::private::Number":"1"}"#, 403),
         (r#"{"model":"gpt-6.2-sol","metadata":{"$serde_json::private::RawValue":"1"}}"#, 403),
+        (r#"{"model":"gpt-6.2-sol","metadata":{"$serde_json::private::Other":"1"}}"#, 403),
         (r#"{"model":"gpt-6.2-sol","metadata":{"a":1,"\u0061":2}}"#, 403),
         (r#"{"model":"gpt-6.2-sol","meta":{"a":1,"a":2}}"#, 403),
         (r#"{"model":"gpt-6.2-sol","input":[{"a":1,"a":2}]}"#, 403),
