@@ -344,6 +344,11 @@ fn classify(
     {
         return None;
     }
+    // OpenAI refuses an endpoint the ChatGPT grant has no scope for (api.model.read on
+    // /v1/models) identically on every account: the request is refused, not the account.
+    if lane == Lane::Codex && source == Inference && http == Some(403) && says(&["missing scopes"]) {
+        return None;
+    }
     let mut result = local_error(kind, source, "");
     result.http_status = http;
     result.provider_code = if kind == VerificationRequired && lane == Lane::Google {
@@ -472,6 +477,15 @@ pub(crate) mod tests {
         }
         assert_eq!(http(Lane::Google, 404, "", QuotaProbe).unwrap().kind, ProbeFailed);
         assert_eq!(http(Lane::Google, 302, "", Inference).unwrap().kind, Other);
+    }
+
+    #[test]
+    fn codex_missing_scope_403_is_request_scoped() {
+        let body = r#"{"error":{"message":"You have insufficient permissions for this operation. Missing scopes: api.model.read.","type":"invalid_request_error"}}"#;
+        assert!(http(Lane::Codex, 403, body, Inference).is_none());
+        assert_eq!(http(Lane::Codex, 403, body, QuotaProbe).unwrap().kind, PermissionDenied);
+        let region = r#"{"error":{"code":"unsupported_country_region_territory"}}"#;
+        assert_eq!(http(Lane::Codex, 403, region, Inference).unwrap().kind, PermissionDenied);
     }
 
     #[test]

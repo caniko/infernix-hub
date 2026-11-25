@@ -5285,6 +5285,26 @@ async fn google_permission_error_array_quarantines_without_quota_proof() {
 }
 
 #[tokio::test]
+async fn codex_missing_scope_403_reaches_the_client_without_quarantining_the_pool() {
+    let reply = json!({"error":{"message":"You have insufficient permissions for this operation. Missing scopes: api.model.read.","type":"invalid_request_error"}});
+    let upstream = reply.clone();
+    let mock = serve(Router::new().route("/v1/models", get(move || async move { (StatusCode::FORBIDDEN, axum::Json(upstream)) }))).await;
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    for name in ["codex-a.json", "codex-b.json"] {
+        let credential = json!({"type":"codex","access_token":name,"account_id":name});
+        proxy.state.write().await.pool.insert(pool::parse_credentials(name, &credential, true).unwrap());
+    }
+    let server = serve(proxy.clone().app()).await;
+    let res = Http::new(&server).request("GET", "/v1/models").bearer_auth("inference-fixture").send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(res.json::<Value>().await.unwrap(), reply);
+    let state = proxy.state.read().await;
+    assert!(state.pool.accounts.values().all(|a| a.last_error.is_none()));
+    assert_eq!(state.activity.back().unwrap().attempts.len(), 1);
+}
+
+#[tokio::test]
 async fn google_request_scoped_403_reaches_the_client_without_quarantining_the_pool() {
     let mock = serve(Router::new().route(
         "/v1internal:generateContent",
