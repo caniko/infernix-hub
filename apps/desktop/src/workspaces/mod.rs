@@ -4,6 +4,7 @@
 pub mod calendar;
 pub mod fleet;
 pub mod individual;
+pub mod intelligence;
 pub mod library;
 pub mod mail;
 pub mod news;

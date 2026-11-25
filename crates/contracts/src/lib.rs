@@ -255,6 +255,9 @@ macro_rules! wire_enum {
     };
 }
 
+pub mod intel;
+pub use intel::*;
+
 wire_enum!(
     /// Who is calling. Agents get scoped hub tools only; publisher and human
     /// approval credentials never map to `Agent`. A member is a second human:
@@ -1603,6 +1606,8 @@ pub struct Today {
     /// Renewals that are unknown or inside their warn window (additive field).
     #[serde(default)]
     pub renewals: Vec<TodayItem>,
+    #[serde(default)]
+    pub intelligence: Vec<TodayItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

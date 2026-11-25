@@ -95,8 +95,8 @@ fn secret_custodian_requires_a_member_principal() {
 
 /// Producer keys belong to the loop; an HTTP caller that could write them would
 /// fake a source's state, and the next pass would resolve it away.
-const RESERVED_SOURCES: &[&str] = &["today", "fleet", "hub", "secrets", "monitor", "paperclip"];
-const RESERVED_PREFIXES: &[&str] = &["today:", "fleet:", "hub:", "secrets:", "monitor:", "provider:", "paperclip:"];
+const RESERVED_SOURCES: &[&str] = &["today", "fleet", "hub", "secrets", "monitor", "paperclip", "intel"];
+const RESERVED_PREFIXES: &[&str] = &["today:", "fleet:", "hub:", "secrets:", "monitor:", "provider:", "paperclip:", "intel:"];
 
 fn reserved_source(source: &str) -> bool {
     RESERVED_SOURCES.contains(&source) || ["providers:", "providers-health:", "providers-poller:"].iter().any(|p| source.starts_with(p))
@@ -1434,6 +1434,7 @@ mod tests {
     fn producers_map_every_bucket_once() {
         let id = Uuid::from_u128;
         let today = Today {
+            intelligence: Vec::new(),
             pending_reviews: vec![today_item("release_review", "content", id(1), "draft")],
             // Informational buckets: present in Today, never notified.
             active_production: vec![today_item("generation", "content", id(9), "running")],

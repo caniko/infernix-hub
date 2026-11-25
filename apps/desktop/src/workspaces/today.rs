@@ -1,6 +1,6 @@
 //! Today: the operator's queue from `GET /v1/today`.
 
-use contracts::{Today, TodayItem};
+use contracts::{Severity, Today, TodayItem};
 use dioxus::prelude::*;
 
 use crate::{
@@ -10,7 +10,9 @@ use crate::{
     state::{Store, Workspace},
 };
 
-fn buckets(today: &Today) -> [(&'static str, &'static str, &[TodayItem]); 7] {
+const INTELLIGENCE: &str = "Intelligence";
+
+fn buckets(today: &Today) -> [(&'static str, &'static str, &[TodayItem]); 8] {
     [
         ("Pending reviews", "severity-warn", &today.pending_reviews),
         ("Active production", "severity-info", &today.active_production),
@@ -19,6 +21,7 @@ fn buckets(today: &Today) -> [(&'static str, &'static str, &[TodayItem]); 7] {
         ("Overdue interactions", "severity-warn", &today.overdue_interactions),
         ("Opportunity deadlines", "severity-warn", &today.opportunities),
         ("Renewals due", "severity-warn", &today.renewals),
+        (INTELLIGENCE, "severity-warn", &today.intelligence),
     ]
 }
 
@@ -115,7 +118,7 @@ pub fn TodayView() -> Element {
                                         EmptyState { title: format!("No {}.", label.to_lowercase()), hint: None }
                                     }
                                     for (index, item) in items.iter().enumerate() {
-                                        TodayRow { key: "{item.subject_id}-{index}", item: item.clone(), severity: tone }
+                                        TodayRow { key: "{item.subject_id}-{index}", item: item.clone(), severity: tone, intelligence: label == INTELLIGENCE }
                                     }
                                 }
                             }
@@ -133,10 +136,14 @@ pub fn TodayView() -> Element {
 }
 
 #[component]
-fn TodayRow(item: TodayItem, severity: &'static str) -> Element {
+fn TodayRow(item: TodayItem, severity: &'static str, intelligence: bool) -> Element {
     let store = use_context::<Store>();
+    let mut selected_signal = store.selected_signal;
     let subject_type = item.subject_type.clone();
-    let tone = labels::status_tone(&item.status).to_string();
+    let action = if intelligence { Some("Open in Intelligence ›") } else { row_action(&subject_type) };
+    let signal_severity = intelligence.then(|| Severity::parse(&item.status)).flatten();
+    let severity = if signal_severity == Some(Severity::Critical) { "severity-crit" } else { severity };
+    let tone = signal_severity.map_or_else(|| labels::status_tone(&item.status), |value| labels::severity(value).1).to_string();
     let kind = item.kind.replace('_', " ");
     rsx! {
         div { class: "severity-row {severity} today-row", style: "overflow-wrap: anywhere;",
@@ -157,12 +164,15 @@ fn TodayRow(item: TodayItem, severity: &'static str) -> Element {
                     }
                 }
                 div { class: "spacer" }
-                if let Some(label) = row_action(&subject_type) {
+                if let Some(label) = action {
                     button {
                         class: "btn btn-glass btn-xs",
                         aria_label: "{label}: {item.title}",
                         onclick: move |_| {
-                            if subject_type == "renewal" {
+                            if intelligence {
+                                selected_signal.set(Some(item.subject_id));
+                                store.set_workspace(Workspace::Intelligence);
+                            } else if subject_type == "renewal" {
                                 store.set_workspace(Workspace::Notifications);
                             } else {
                                 actions::open_subject(store, &subject_type, item.subject_id);

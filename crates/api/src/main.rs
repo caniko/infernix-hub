@@ -29,6 +29,9 @@ enum Cmd {
         mail_config: Option<std::path::PathBuf>,
         #[arg(long)]
         calendar_config: Option<std::path::PathBuf>,
+        /// Intel source policy and grants JSON file (or HUB_INTEL_CONFIG).
+        #[arg(long)]
+        intel_config: Option<std::path::PathBuf>,
     },
     /// Run the worker only.
     Worker,
@@ -117,13 +120,14 @@ async fn run() -> anyhow::Result<()> {
                 None => println!("{}", domain::system::issue_token(&db, &name, role, None).await?),
             }
         }
-        Cmd::Serve { no_worker, packs_config, principal_owners_config, mail_config, calendar_config } => {
+        Cmd::Serve { no_worker, packs_config, principal_owners_config, mail_config, calendar_config, intel_config } => {
             let mut s = Settings::from_env()?;
             s.no_worker |= no_worker;
             s.packs_config = packs_config.or(s.packs_config);
             s.principal_owners_config = principal_owners_config.or(s.principal_owners_config);
             s.mail_config = mail_config.or(s.mail_config);
             s.calendar_config = calendar_config.or(s.calendar_config);
+            s.intel_config = intel_config.or(s.intel_config);
             fleetix_hubd::run(s, Vec::new()).await?;
         }
         Cmd::Worker => {

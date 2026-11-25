@@ -29,6 +29,7 @@ pub fn workspace(w: Workspace) -> &'static str {
         Workspace::Providers => USAGE,
         Workspace::Today => SUN,
         Workspace::News => DOCUMENTS,
+        Workspace::Intelligence => USAGE,
         Workspace::Studio => SPARKLES,
         Workspace::Calendar => CALENDAR,
         Workspace::Mail => MAIL,

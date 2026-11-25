@@ -60,11 +60,12 @@ impl ApiErr {
     /// their errors look like core ones.
     pub fn domain(error: DomainError, correlation_id: Option<String>) -> Self {
         let status = match &error {
-            DomainError::Forbidden(_) => StatusCode::FORBIDDEN,
+            DomainError::Forbidden(_) | DomainError::Denied { .. } => StatusCode::FORBIDDEN,
             DomainError::NotFound(_) => StatusCode::NOT_FOUND,
             DomainError::Conflict { .. } => StatusCode::CONFLICT,
             DomainError::Invalid { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             DomainError::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            DomainError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             DomainError::Db(_) | DomainError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let message = match &error {
@@ -131,6 +132,7 @@ macro_rules! call {
     };
 }
 
+mod intel;
 pub mod mail_calendar;
 
 pub fn router(state: AppState) -> Router {
@@ -147,6 +149,11 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/secrets", get(secrets))
         .route("/system/pause", post(set_pause))
         .route("/today", get(today))
+        .route("/intel/signals", intel::signals())
+        .route("/intel/signals/{id}", get(intel::detail))
+        .route("/intel/signals/{id}/decision", post(intel::decide))
+        .route("/intel/signals/{id}/clearance", post(intel::clear))
+        .route("/intel/sources", get(intel::sources))
         .route("/search", get(search))
         .route("/history/{subject_type}/{id}", get(history))
         .route("/ingest/news", post(ingest_news))

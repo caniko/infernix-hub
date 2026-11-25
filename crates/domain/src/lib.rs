@@ -20,6 +20,7 @@ pub mod engagement;
 pub mod feeds;
 pub mod hash;
 mod humanizer;
+pub mod intel;
 pub mod look;
 pub mod mail;
 pub mod mail_bi;
@@ -37,6 +38,8 @@ pub mod soul;
 pub mod system;
 
 #[cfg(test)]
+mod intel_tests;
+#[cfg(test)]
 mod mail_calendar_tests;
 
 pub use sqlx;
@@ -45,6 +48,8 @@ pub use sqlx;
 pub enum DomainError {
     #[error("forbidden: {0}")]
     Forbidden(String),
+    #[error("{code}: {message}")]
+    Denied { code: &'static str, message: String },
     #[error("{0} not found")]
     NotFound(&'static str),
     #[error("{code}: {message}")]
@@ -54,6 +59,8 @@ pub enum DomainError {
     /// A required external read failed; we fail closed.
     #[error("{code}: {message}")]
     Unavailable { code: &'static str, message: String },
+    #[error("{code}: {message}")]
+    RateLimited { code: &'static str, message: String },
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
     #[error("internal: {0}")]
@@ -66,6 +73,7 @@ impl DomainError {
             DomainError::Forbidden(_) => "forbidden",
             DomainError::NotFound(_) => "not_found",
             DomainError::Conflict { code, .. } | DomainError::Invalid { code, .. } | DomainError::Unavailable { code, .. } => code,
+            DomainError::Denied { code, .. } | DomainError::RateLimited { code, .. } => code,
             DomainError::Db(_) => "database",
             DomainError::Internal(_) => "internal",
         }
@@ -90,6 +98,7 @@ pub struct HubConfig {
     /// URL external procedures use to reach this hub (receipts, dispatch).
     pub public_url: String,
     pub company_id: String,
+    pub intel: intel::IntelConfig,
     /// Adapter name → (mode, verification, detail) for the status report.
     pub integrations: Vec<contracts::IntegrationStatus>,
     /// Opt in to applying verified rewrites to assistant engagement drafts.
@@ -253,6 +262,9 @@ pub(crate) async fn audit(
 }
 
 pub async fn history(db: &PgPool, subject_type: &str, subject_id: &str) -> DResult<Vec<contracts::HistoryEntry>> {
+    if matches!(subject_type, "signal" | "intel_source") {
+        return Err(DomainError::NotFound("history"));
+    }
     // Fail closed: only an existing ownerless renewal has readable history, so a
     // member's renewal stays hidden even after its row is gone.
     if subject_type == "renewal" {

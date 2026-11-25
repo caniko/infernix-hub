@@ -8,7 +8,8 @@ use std::{future::Future, time::Duration};
 
 use chrono::{DateTime, Utc};
 use contracts::{
-    AckNotificationsIn, Asset, AssetState, ContentItem, PublicationIntent, RenewalRenewedIn, SnoozeNotificationIn,
+    AckNotificationsIn, Asset, AssetState, ContentItem, IntelSignal, IntelSignalDetail, IntelSignalPage, IntelSignalQuery,
+    IntelSourceStatus, PublicationIntent, RenewalRenewedIn, SignalClearanceIn, SignalDecisionIn, SnoozeNotificationIn,
     client::{ClientError, HubClient},
 };
 use dioxus::prelude::*;
@@ -45,6 +46,26 @@ pub async fn timed_for<T>(limit: Duration, future: impl Future<Output = Result<T
         Ok(Err(error)) => Err(UiError::from_client(error)),
         Err(_) => Err(UiError::new("timeout", format!("the hub did not answer within {}s", limit.as_secs()))),
     }
+}
+
+pub async fn intel_sources(client: &HubClient) -> Result<Vec<IntelSourceStatus>, UiError> {
+    timed(client.intel_sources()).await
+}
+
+pub async fn intel_signals(client: &HubClient, query: &IntelSignalQuery) -> Result<IntelSignalPage, UiError> {
+    timed(client.intel_signals(query)).await
+}
+
+pub async fn intel_signal(client: &HubClient, id: Uuid) -> Result<IntelSignalDetail, UiError> {
+    timed(client.intel_signal(id)).await
+}
+
+pub async fn intel_decide(client: &HubClient, id: Uuid, input: &SignalDecisionIn) -> Result<IntelSignal, UiError> {
+    timed(client.intel_decide(id, input)).await
+}
+
+pub async fn intel_clear(client: &HubClient, id: Uuid, input: &SignalClearanceIn) -> Result<IntelSignal, UiError> {
+    timed(client.intel_clear(id, input)).await
 }
 
 pub async fn create_persona(client: &HubClient, name: &str) -> Result<contracts::Persona, UiError> {

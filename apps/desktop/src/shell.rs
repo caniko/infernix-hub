@@ -70,7 +70,7 @@ pub fn Sidebar(workspace: Signal<Workspace>, mut nav_open: Signal<bool>, narrow:
             }
             div { class: "sidebar-foot",
                 p { "Ctrl+K · Commands" }
-                p { "Keys: 1–9, 0 · N · U · P" }
+                p { "Keys: 1–9, 0 · N · U · I · P" }
             }
         }
     }

@@ -22,6 +22,7 @@ pub enum Workspace {
     Providers,
     Today,
     News,
+    Intelligence,
     Studio,
     Calendar,
     Mail,
@@ -31,7 +32,7 @@ pub enum Workspace {
 }
 
 impl Workspace {
-    pub const ALL: [Workspace; 14] = [
+    pub const ALL: [Workspace; 15] = [
         Workspace::Notifications,
         Workspace::Command,
         Workspace::Hosts,
@@ -40,6 +41,7 @@ impl Workspace {
         Workspace::Providers,
         Workspace::Today,
         Workspace::News,
+        Workspace::Intelligence,
         Workspace::Studio,
         Workspace::Calendar,
         Workspace::Mail,
@@ -58,6 +60,7 @@ impl Workspace {
             Workspace::Providers => "AI Usage",
             Workspace::Today => "Today",
             Workspace::News => "News",
+            Workspace::Intelligence => "Intelligence",
             Workspace::Studio => "Studio",
             Workspace::Calendar => "Calendar",
             Workspace::Mail => "Mail",
@@ -79,6 +82,7 @@ impl Workspace {
             Workspace::Providers => "providers",
             Workspace::Today => "today",
             Workspace::News => "news",
+            Workspace::Intelligence => "intelligence",
             Workspace::Studio => "studio",
             Workspace::Calendar => "calendar",
             Workspace::Mail => "mail",
@@ -104,6 +108,7 @@ impl Workspace {
             Workspace::Providers => "u",
             Workspace::Today => "5",
             Workspace::News => "6",
+            Workspace::Intelligence => "i",
             Workspace::Studio => "7",
             Workspace::Calendar => "8",
             Workspace::Mail => "m",
@@ -131,6 +136,7 @@ impl Workspace {
             Workspace::Providers => "Model provider accounts, remaining quota, activity, routing and exports",
             Workspace::Today => "Reviews, production, due releases, failed work and overdue replies",
             Workspace::News => "Coverage, evidence and brief creation",
+            Workspace::Intelligence => "Source health, signal review and audience clearance",
             Workspace::Studio => "Briefs, generation, assets, release freeze and scheduling",
             Workspace::Calendar => "Personal agenda and scheduled posts",
             Workspace::Mail => "Inbox, message triage and business insights",
@@ -297,6 +303,7 @@ pub struct Store {
 
     pub selected_content: Signal<Option<Uuid>>,
     pub selected_news: Signal<Option<Uuid>>,
+    pub selected_signal: Signal<Option<Uuid>>,
     pub selected_persona: Signal<Option<Uuid>>,
     pub selected_project: Signal<Option<Uuid>>,
     pub projects_show_individual: Signal<bool>,
@@ -537,6 +544,8 @@ mod tests {
         assert_eq!(Workspace::Library.key(), "0");
         assert_eq!(start_workspace(&args(&["app", "--workspace", "mail"])).0.slug(), "mail");
         assert_eq!(Workspace::from_key("m").map(Workspace::slug), Some("mail"));
+        assert_eq!(Workspace::from_key("i"), Some(Workspace::Intelligence));
+        assert_eq!(Workspace::Intelligence.section(), Workspace::Today.section());
     }
 
     #[test]

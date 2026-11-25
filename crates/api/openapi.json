@@ -1679,6 +1679,126 @@
         "x-roles": "see domain command"
       }
     },
+    "/v1/intel/signals": {
+      "get": {
+        "operationId": "intel_signals",
+        "description": "Lists visible signals newest first. Cross-company reads require current public clearance and only return reviewed content and public identifiers.",
+        "parameters": [
+          {"in":"query","name":"source","schema":{"type":"string"}},
+          {"in":"query","name":"kind","schema":{"type":"string"}},
+          {"in":"query","name":"state","schema":{"type":"string"}},
+          {"in":"query","name":"severity_min","schema":{"type":"string"}},
+          {"in":"query","name":"audience_at_most","schema":{"type":"string"}},
+          {"in":"query","name":"persona","schema":{"type":"string","format":"uuid"}},
+          {"in":"query","name":"project","schema":{"type":"string","format":"uuid"}},
+          {"in":"query","name":"subject","schema":{"type":"string"}},
+          {"in":"query","name":"since","schema":{"type":"string","format":"date-time"}},
+          {"in":"query","name":"q","schema":{"type":"string"}},
+          {"in":"query","name":"include_expired","schema":{"type":"boolean","default":false}},
+          {"in":"query","name":"limit","schema":{"type":"integer","minimum":1,"maximum":100,"default":50}},
+          {"in":"query","name":"cursor","schema":{"type":"string"}}
+        ],
+        "responses": {
+          "200": {"description":"IntelSignalPage with items and a nullable next_cursor"},
+          "403": {"description":"No matching intelligence grant"}
+        },
+        "security": [{"bearer":[]}]
+      },
+      "post": {
+        "operationId": "intel_ingest",
+        "description": "Ingests an authorized source run and its signals atomically. Only operators receive per-signal receipts; all other writers get only the delivery ID and accepted count. Replays are subject to current authorization.",
+        "parameters": [{"in":"header","name":"Idempotency-Key","schema":{"type":"string","maxLength":128}}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json":{"schema":{"type":"object","required":["source","run"],"properties":{
+            "source":{"type":"string"},
+            "run":{"type":"object","required":["run_id","status","finished_at"]},
+            "signals":{"type":"array","maxItems":100,"items":{"type":"object"}}
+          }}}}
+        },
+        "responses": {
+          "200": {"description":"SignalBatchOut tagged by mode: receipts or accepted"},
+          "403": {"description":"Caller may not write to this source"},
+          "409": {"description":"Idempotency key conflict or source tenant mismatch"},
+          "422": {"description":"Invalid batch"},
+          "429": {"description":"Daily source budget exceeded"}
+        },
+        "security": [{"bearer":[]}]
+      }
+    },
+    "/v1/intel/signals/{id}": {
+      "parameters": [{"in":"path","name":"id","required":true,"schema":{"type":"string","format":"uuid"}}],
+      "get": {
+        "operationId": "intel_signal",
+        "responses": {
+          "200": {"description":"IntelSignalDetail: revision history is operator-only; cross-company public reads omit private metadata and links"},
+          "403": {"description":"No matching intelligence grant"},
+          "404": {"description":"Signal not found or not visible"}
+        },
+        "security": [{"bearer":[]}]
+      }
+    },
+    "/v1/intel/signals/{id}/decision": {
+      "parameters": [{"in":"path","name":"id","required":true,"schema":{"type":"string","format":"uuid"}}],
+      "post": {
+        "operationId": "intel_decide",
+        "x-roles": "operator",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json":{"schema":{"type":"object","required":["action"],"properties":{
+            "action":{"enum":["acknowledge","dismiss","snooze","reopen"]},
+            "until":{"type":"string","format":"date-time"},
+            "note":{"type":"string","maxLength":4000}
+          }}}}
+        },
+        "responses": {
+          "200": {"description":"Updated IntelSignal"},
+          "403": {"description":"Operator required"},
+          "404": {"description":"Signal not found or not visible"},
+          "422": {"description":"Invalid decision"}
+        },
+        "security": [{"bearer":[]}]
+      }
+    },
+    "/v1/intel/signals/{id}/clearance": {
+      "parameters": [{"in":"path","name":"id","required":true,"schema":{"type":"string","format":"uuid"}}],
+      "post": {
+        "operationId": "intel_clear",
+        "x-roles": "operator",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json":{"schema":{"type":"object",
+            "required":["audience","revision","policy_version","source_default_audience","projection_sha256","rationale"],
+            "properties":{
+              "audience":{"enum":["operator_only","company_internal","persona_eligible","public_cleared"]},
+              "revision":{"type":"integer"},
+              "policy_version":{"type":"integer"},
+              "source_default_audience":{"enum":["operator_only","company_internal","persona_eligible","public_cleared"]},
+              "projection_sha256":{"type":"string"},
+              "rationale":{"type":"string","minLength":1,"maxLength":4000}
+            }
+          }}}
+        },
+        "responses": {
+          "200": {"description":"Updated IntelSignal"},
+          "403": {"description":"Operator required"},
+          "404": {"description":"Signal not found or not visible"},
+          "409": {"description":"Stale revision, projection digest, or source policy"},
+          "422": {"description":"Invalid clearance or owner-scoped signal"}
+        },
+        "security": [{"bearer":[]}]
+      }
+    },
+    "/v1/intel/sources": {
+      "get": {
+        "operationId": "intel_sources",
+        "responses": {
+          "200": {"description":"IntelSourceStatus array; error detail and watermark require monitoring authority"},
+          "403": {"description":"No matching intelligence grant"}
+        },
+        "security": [{"bearer":[]}]
+      }
+    },
     "/v1/news": {
       "get": {
         "operationId": "news_list",

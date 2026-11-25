@@ -71,6 +71,7 @@ pub struct Settings {
     pub principal_owners_config: Option<PathBuf>,
     pub mail_config: Option<PathBuf>,
     pub calendar_config: Option<PathBuf>,
+    pub intel_config: Option<PathBuf>,
     /// Raise `hub:summary-stale` when no daily summary has been written for
     /// this many hours; unset disables the rule.
     pub summary_stale_hours: Option<u32>,
@@ -124,6 +125,7 @@ impl Settings {
             principal_owners_config: env("HUB_PRINCIPAL_OWNERS_CONFIG").map(PathBuf::from),
             mail_config: env("HUB_MAIL_CONFIG").map(PathBuf::from),
             calendar_config: env("HUB_CALENDAR_CONFIG").map(PathBuf::from),
+            intel_config: env("HUB_INTEL_CONFIG").map(PathBuf::from),
             summary_stale_hours: match env("HUB_SUMMARY_STALE_HOURS") {
                 None => None,
                 Some(v) => Some(v.parse().with_context(|| format!("HUB_SUMMARY_STALE_HOURS must be a number of hours, got {v}"))?),
@@ -161,6 +163,7 @@ impl Settings {
             principal_owners_config: None,
             mail_config: None,
             calendar_config: None,
+            intel_config: None,
             summary_stale_hours: None,
             company_id: None,
             fleet_issues: None,
@@ -250,6 +253,8 @@ pub(crate) fn require_live_approvals(
 }
 
 pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
+    let intel: domain::intel::IntelConfig = load_runtime_json(s.intel_config.as_deref(), "intel")?;
+    intel.validate()?;
     let principal_owners = load_runtime_json(s.principal_owners_config.as_deref(), "principal owners")?;
     let mail_calendar = crate::mail_calendar::Runtime::new(
         load_runtime_json(s.mail_config.as_deref(), "mail")?,
@@ -402,6 +407,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         .context("HUB_COMPANY_ID (the Paperclip company id) is required")?;
 
     let config = HubConfig {
+        intel,
         public_url: s.public_url.trim_end_matches('/').to_string(),
         company_id,
         integrations: vec![

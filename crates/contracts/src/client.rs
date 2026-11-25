@@ -121,6 +121,28 @@ impl HubClient {
     pub async fn today(&self) -> Result<Today, ClientError> {
         self.get("/today").await
     }
+    pub async fn intel_ingest(&self, body: &SignalBatchIn, idempotency_key: Option<&str>) -> Result<SignalBatchOut, ClientError> {
+        let mut req = self.http.post(self.url("/intel/signals")).json(body);
+        if let Some(key) = idempotency_key {
+            req = req.header(IDEMPOTENCY_HEADER, key);
+        }
+        self.send(req).await
+    }
+    pub async fn intel_signals(&self, query: &IntelSignalQuery) -> Result<IntelSignalPage, ClientError> {
+        self.send(self.http.get(self.url("/intel/signals")).query(query)).await
+    }
+    pub async fn intel_signal(&self, id: Uuid) -> Result<IntelSignalDetail, ClientError> {
+        self.get(&format!("/intel/signals/{id}")).await
+    }
+    pub async fn intel_decide(&self, id: Uuid, body: &SignalDecisionIn) -> Result<IntelSignal, ClientError> {
+        self.post(&format!("/intel/signals/{id}/decision"), body).await
+    }
+    pub async fn intel_clear(&self, id: Uuid, body: &SignalClearanceIn) -> Result<IntelSignal, ClientError> {
+        self.post(&format!("/intel/signals/{id}/clearance"), body).await
+    }
+    pub async fn intel_sources(&self) -> Result<Vec<IntelSourceStatus>, ClientError> {
+        self.get("/intel/sources").await
+    }
     pub async fn news(&self) -> Result<Vec<NewsItem>, ClientError> {
         self.get("/news").await
     }

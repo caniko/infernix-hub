@@ -62,6 +62,9 @@ pub async fn serve(ctx: ClientContext, packs: Vec<Box<dyn Pack>>) -> anyhow::Res
 }
 
 /// The catalog in registration order, with its effects fixed here.
+#[path = "intel_mcp.rs"]
+mod intel_mcp;
+
 fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
     let hub = ctx.hub.clone();
     let mut routes = vec![
@@ -154,6 +157,7 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
         (Effect::Write, provider_select_account_tool(hub.clone())),
     ];
     routes.extend(mail_calendar_tools(hub));
+    routes.extend(intel_mcp::tools(ctx.hub.clone()));
     routes
 }
 
@@ -964,6 +968,10 @@ mod tests {
                 ("hub_mail_triage", Effect::Write),
                 ("hub_calendar_agenda", Effect::Read),
                 ("hub_mail_bi_generate_digest", Effect::Write),
+                ("hub_intel_signals", Effect::Read),
+                ("hub_intel_signal", Effect::Read),
+                ("hub_intel_sources", Effect::Read),
+                ("hub_intel_ingest", Effect::Write),
             ]
         );
         let mut names: Vec<&str> = actual.iter().map(|(name, _)| *name).collect();

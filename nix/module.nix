@@ -1044,6 +1044,12 @@ in {
       '';
     };
 
+    intel = mkOption {
+      type = types.attrsOf (pkgs.formats.json {}).type;
+      default = {};
+      description = "Intelligence source policies and principal grants. Rendered into the Nix store; do not include secrets.";
+    };
+
     packs = mkOption {
       type = types.attrsOf (types.submodule ({name, ...}: {
         options = {
@@ -1209,6 +1215,7 @@ in {
           // optionalAttrs (cfg.principalOwners != {}) {HUB_PRINCIPAL_OWNERS_CONFIG = toString (jsonFile "principal-owners" cfg.principalOwners);}
           // optionalAttrs mail.enable {HUB_MAIL_CONFIG = toString (jsonFile "mail" mailConfig);}
           // optionalAttrs calendar.enable {HUB_CALENDAR_CONFIG = toString (jsonFile "calendar" calendarConfig);}
+          // optionalAttrs (cfg.intel != {}) {HUB_INTEL_CONFIG = toString (jsonFile "intel" cfg.intel);}
           // optionalAttrs (cfg.database.urlFile == null) {DATABASE_URL = cfg.database.url;}
           // optionalAttrs cfg.migrations.enable {HUB_MIGRATE_ON_START = "0";}
           // optionalAttrs (cfg.integrations.assistant == "live" && llmUrl != null) {

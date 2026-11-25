@@ -266,7 +266,9 @@ async fn today_items(hub: &Hub, sql: &str) -> DResult<Vec<TodayItem>> {
 
 pub async fn today(hub: &Hub, actor: &Actor) -> DResult<Today> {
     actor.require(crate::ANY_READER)?;
-    system_today(hub).await
+    let mut today = system_today(hub).await?;
+    today.intelligence = crate::intel::today_for_actor(hub, actor).await?;
+    Ok(today)
 }
 
 /// The same read for the producer loop, which has no request and no role.
@@ -360,6 +362,7 @@ pub async fn system_today(hub: &Hub) -> DResult<Today> {
         )
         .await?,
         renewals: crate::renewals::today(hub).await?,
+        intelligence: Vec::new(),
     })
 }
 

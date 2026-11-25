@@ -70,6 +70,7 @@ fn App() -> Element {
         chat_persona: use_signal(Loaded::default),
         selected_content: use_signal(|| None),
         selected_news: use_signal(|| None),
+        selected_signal: use_signal(|| None),
         selected_persona: use_signal(|| None),
         selected_project: use_signal(|| None),
         projects_show_individual: use_signal(|| false),
@@ -198,7 +199,7 @@ fn App() -> Element {
                     dioxus.send('escape');
                     return;
                 }
-                if (!editing && !event.ctrlKey && !event.metaKey && !event.altKey && /^[0-9npu]$/.test(event.key.toLowerCase())) {
+                if (!editing && !event.ctrlKey && !event.metaKey && !event.altKey && /^[0-9inpu]$/.test(event.key.toLowerCase())) {
                     dioxus.send('ws:' + event.key.toLowerCase());
                 }
             });
@@ -417,6 +418,7 @@ fn App() -> Element {
                         Workspace::Providers => rsx! { workspaces::providers::ProvidersView {} },
                         Workspace::Today => rsx! { workspaces::today::TodayView {} },
                         Workspace::News => rsx! { workspaces::news::NewsView {} },
+                        Workspace::Intelligence => rsx! { workspaces::intelligence::IntelligenceView {} },
                         Workspace::Studio => rsx! { workspaces::studio::StudioView {} },
                         Workspace::Calendar => rsx! { workspaces::calendar::CalendarView {} },
                         Workspace::Mail => rsx! { workspaces::mail::MailView {} },
