@@ -195,6 +195,7 @@ pub enum AccountErrorKind {
     QuotaExhausted,
     UpstreamUnavailable,
     ProbeFailed,
+    QuotaProbeUnsupported,
     Other,
 }
 
@@ -209,6 +210,7 @@ impl AccountErrorKind {
             Self::QuotaExhausted => "quota_exhausted",
             Self::UpstreamUnavailable => "upstream_unavailable",
             Self::ProbeFailed => "probe_failed",
+            Self::QuotaProbeUnsupported => "quota_probe_unsupported",
             Self::Other => "other",
         }
     }
@@ -223,6 +225,7 @@ impl AccountErrorKind {
             "quota_exhausted" => Self::QuotaExhausted,
             "upstream_unavailable" => Self::UpstreamUnavailable,
             "probe_failed" => Self::ProbeFailed,
+            "quota_probe_unsupported" => Self::QuotaProbeUnsupported,
             _ => Self::Other,
         }
     }
@@ -237,6 +240,7 @@ impl AccountErrorKind {
             Self::QuotaExhausted => "Quota exhausted",
             Self::UpstreamUnavailable => "Upstream unavailable",
             Self::ProbeFailed => "Quota probe failed",
+            Self::QuotaProbeUnsupported => "Quota probe unsupported",
             Self::Other => "Provider error",
         }
     }
@@ -303,13 +307,14 @@ pub struct AccountError {
 
 impl AccountError {
     pub fn blocks_routing(&self, now: DateTime<Utc>) -> bool {
-        self.kind.is_blocking() || self.backoff_until.is_some_and(|until| until > now)
+        self.kind != AccountErrorKind::QuotaProbeUnsupported
+            && (self.kind.is_blocking() || self.backoff_until.is_some_and(|until| until > now))
     }
 
     /// A zero count is also valid for an immediate error from an older publisher.
     pub fn is_notification_worthy(&self) -> bool {
         match self.kind {
-            AccountErrorKind::QuotaExhausted => false,
+            AccountErrorKind::QuotaExhausted | AccountErrorKind::QuotaProbeUnsupported => false,
             AccountErrorKind::UpstreamUnavailable => self.consecutive_count >= 3,
             AccountErrorKind::ProbeFailed | AccountErrorKind::Other => self.consecutive_count >= 2,
             _ => true,

@@ -25,10 +25,13 @@ async fn provider_account_errors_survive_migration_and_resolve_independently_ove
         ..sqlx::migrate::Migrator::DEFAULT
     };
     before_17.run(&db).await.unwrap();
-    sqlx::query("insert into model_provider_instances (id, label, family, health) values ('test-proxy', 'Test Proxy', 'test', 'degraded')")
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "insert into model_provider_instances (id, label, family, mode, verification, health)
+         values ('test-proxy', 'Test Proxy', 'test', 'fixture', 'fixture_tested', 'degraded')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     sqlx::query("insert into model_accounts (provider_id, id, source_account_id, display_name) values ('test-proxy', 'primary', 'primary', 'Primary')")
         .execute(&db)
         .await
@@ -105,6 +108,31 @@ async fn provider_account_errors_survive_migration_and_resolve_independently_ove
     batch.accounts[1].last_error = Some(AccountError { kind: AccountErrorKind::QuotaExhausted, backoff_until: None, ..error.clone() });
     set_mask(false).await.unwrap().error_for_status().unwrap();
     post_batch(&batch).await.unwrap().error_for_status().unwrap();
+    let persisted: (String, String) =
+        sqlx::query_as("select mode, verification from model_provider_instances where id = 'test-proxy'").fetch_one(&db).await.unwrap();
+    assert_eq!(persisted, (contracts::AdapterMode::Live.as_str().into(), contracts::Verification::LiveVerified.as_str().into()));
+    let newer_fixture_at = at + Duration::seconds(1);
+    sqlx::query(
+        "insert into model_provider_instances (id, label, family, mode, verification, health, last_observed_at)
+         values ('newer-fixture', 'Newer Fixture', 'test', 'fixture', 'fixture_tested', 'healthy', $1)",
+    )
+    .bind(newer_fixture_at)
+    .execute(&db)
+    .await
+    .unwrap();
+    let older_live: ObservationBatch = serde_json::from_value(json!({
+        "provider_id":"newer-fixture", "provider_label":"Older Live", "provider_family":"test",
+        "source_host":"test", "source_user":"test", "collected_at":at, "health":"offline"
+    }))
+    .unwrap();
+    let operator = domain::providers::internal_operator("test");
+    domain::providers::ingest_observations(&hub, &operator, "newer-fixture", older_live).await.unwrap();
+    let persisted: (String, String, String, chrono::DateTime<Utc>) =
+        sqlx::query_as("select mode, verification, health, last_observed_at from model_provider_instances where id = 'newer-fixture'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(persisted, ("live".into(), "live_verified".into(), "healthy".into(), newer_fixture_at));
     let loaded = get_accounts().await;
     let primary = loaded.iter().find(|a| a.id == "primary").unwrap();
     assert_eq!(primary.last_error.as_ref(), Some(&error));

@@ -870,6 +870,11 @@ impl Proxy {
                 .get_mut(&account.id)
                 .filter(|c| !c.disabled && c.same_credential(account))
                 .ok_or_else(|| probe_error("credential changed before quota refresh"))?;
+            if let Some(error) = &current.quota_probe_policy_error
+                && error.backoff_until.is_some_and(|until| until > Utc::now())
+            {
+                return Err(Box::new(error.clone()));
+            }
             let generation = last_generation
                 .max(current.probe_generation)
                 .checked_add(1)
@@ -947,7 +952,8 @@ impl Proxy {
                 Lane::Go => {
                     let url = router::upstream(self, &account, &axum::http::Uri::from_static("/v1/usage"))
                         .ok_or_else(|| probe_error("invalid OpenCode Go usage endpoint"))?;
-                    let raw = self.oauth_usage_json(&mut account, |a| self.http.get(url.clone()).bearer_auth(&a.access)).await?;
+                    let request = self.http.get(url).bearer_auth(&account.access).timeout(Duration::from_secs(12));
+                    let raw = quota_response_json(&account, request.send().await).await?;
                     Ok((None, None, opencode::parse_opencode_go_usage(&raw, Utc::now()), vec![], None))
                 }
                 Lane::Google => {
@@ -976,6 +982,7 @@ impl Proxy {
             .ok_or_else(|| probe_error("quota refresh was superseded"))?;
         let error_is_current = current.error_generation == error_generation;
         let was_probe_failed = current.probe_failed;
+        let had_policy_error = current.quota_probe_policy_error.take().is_some();
         let project_changed = probed_project.is_some() && current.set_google_project(probed_project);
         let changed;
         let result = match result {
@@ -992,12 +999,19 @@ impl Proxy {
                 current.next_grant = next;
                 current.observed = Some(now);
                 current.probe_failed = false;
-                changed = error_is_current && current.clear_account_error();
+                changed = (error_is_current && current.clear_account_error()) || had_policy_error;
                 Ok(())
             }
             Err(e) => {
-                current.probe_failed = true;
-                changed = error_is_current && current.record_error_once(&e);
+                let unsupported = e.kind == AccountErrorKind::QuotaProbeUnsupported;
+                current.probe_failed = !unsupported;
+                if unsupported {
+                    // Inference success or failure cannot change organization policy for quota probes.
+                    current.quota_probe_policy_error = Some((*e).clone());
+                    changed = true;
+                } else {
+                    changed = (error_is_current && current.record_error_once(&e)) || had_policy_error;
+                }
                 if current.lane == Lane::Google {
                     let now = Utc::now();
                     current.windows.retain(|w| {
@@ -1016,9 +1030,10 @@ impl Proxy {
                 Err(e)
             }
         };
+        let probe_state_changed = was_probe_failed != current.probe_failed;
         state.pool.revision += i64::from(project_changed);
         drop(state);
-        if project_changed || changed || was_probe_failed != result.is_err() {
+        if project_changed || changed || probe_state_changed {
             self.notify_hub_sync();
         }
         if let Err(error) = &result {

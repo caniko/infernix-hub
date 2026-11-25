@@ -105,13 +105,15 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
     let caps_json = serde_json::to_value(&batch.capabilities).unwrap_or_else(|_| json!([]));
     let evs_json = serde_json::to_value(&batch.evidence_kinds).unwrap_or_else(|_| json!([]));
 
-    sqlx::query(
+    let provider_written = sqlx::query(
         "insert into model_provider_instances
             (id, label, family, mode, verification, router_id, health, status_message, capabilities, evidence_kinds, last_observed_at, updated_at)
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
          on conflict (id) do update set
             label = excluded.label,
             family = excluded.family,
+            mode = excluded.mode,
+            verification = excluded.verification,
             router_id = coalesce(excluded.router_id, model_provider_instances.router_id),
             health = excluded.health,
             status_message = excluded.status_message,
@@ -133,7 +135,19 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
     .bind(&evs_json)
     .bind(batch.collected_at)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if provider_written == 0 && mode == AdapterMode::Live {
+        // A newer fixture snapshot must not keep a live provider labelled as a fixture.
+        sqlx::query(
+            "update model_provider_instances set mode = $2, verification = $3, updated_at = now() where id = $1 and mode = 'fixture'",
+        )
+        .bind(provider_id)
+        .bind(mode.as_str())
+        .bind(verification.as_str())
+        .execute(&mut *tx)
+        .await?;
+    }
 
     let source_publisher = batch.source_publisher.as_deref().filter(|id| !id.trim().is_empty());
     let publisher = (pushed && mode != AdapterMode::Fixture).then_some((batch.source_host.as_str(), batch.source_user.as_str()));
@@ -2030,6 +2044,57 @@ fn stale_publisher_raises<'a>(
     })
 }
 
+const QUOTA_CRITICAL_PERCENT: f64 = 0.5;
+
+fn antigravity_bucket_scope(provider_id: &str, win: &QuotaWindow) -> Option<&'static str> {
+    if provider_id != "antigravity" {
+        return None;
+    }
+    // Summary and models-fallback observations use different labels and session keys for the same routing bucket.
+    ["gemini-argon", "gemini", "3p"]
+        .into_iter()
+        .find(|scope| win.window_key.strip_prefix(scope).is_some_and(|suffix| matches!(suffix, "-5h" | "-quota" | "-weekly")))
+}
+
+fn has_quota_fallback(provider_id: &str, accounts: &[ModelAccount], acct: &ModelAccount, win: &QuotaWindow, now: DateTime<Utc>) -> bool {
+    let bucket = antigravity_bucket_scope(provider_id, win);
+    let scope = bucket.or(win.scope_model.as_deref());
+    let active = |w: &QuotaWindow| w.resets_at.is_none_or(|reset| reset > now);
+    accounts.iter().any(|other| {
+        if !other.enabled
+            || other.weight == 0
+            || other.id == acct.id
+            || other.provider_id != acct.provider_id
+            || other.credential_fingerprint.as_ref().is_some_and(|fp| Some(fp) == acct.credential_fingerprint.as_ref())
+            || other.cooldown_until.is_some_and(|until| until > now)
+            || other.enrollment_state == EnrollmentState::Error
+            || other.last_error.as_ref().is_some_and(|error| error.blocks_routing(now))
+        {
+            return false;
+        }
+        let mut measured_capacity = false;
+        for w in other.windows.iter().filter(|w| active(w)) {
+            let other_bucket = antigravity_bucket_scope(provider_id, w);
+            let other_scope = other_bucket.or(w.scope_model.as_deref());
+            let exhausted = w.status == QuotaStatus::Rejected
+                || w.used_percent.is_some_and(|p| p >= 100.0)
+                || w.remaining_percent.is_some_and(|p| p <= 0.0);
+            if exhausted && w.kind != QuotaWindowKind::Spend && (other_scope.is_none() || other_scope == scope) {
+                return false;
+            }
+            let matching_window = w.window_key == win.window_key
+                || (bucket.is_some() && bucket == other_bucket && w.window_key.ends_with("-weekly") == win.window_key.ends_with("-weekly"));
+            measured_capacity |= other_scope == scope
+                && matching_window
+                && !exhausted
+                && !w.stale
+                && w.observation_state == QuotaObservationState::Measured
+                && w.remaining_percent.is_some_and(|p| p > 0.0);
+        }
+        measured_capacity
+    })
+}
+
 fn quota_raises(provider_id: &str, settings: &ProviderPanelSettings, accounts: &[ModelAccount], now: DateTime<Utc>) -> Vec<Raise> {
     let source = format!("providers:{provider_id}");
     let mut items = Vec::new();
@@ -2060,17 +2125,18 @@ fn quota_raises(provider_id: &str, settings: &ProviderPanelSettings, accounts: &
                     && win.observation_state == QuotaObservationState::Measured
                     && win.resets_at.is_none_or(|reset| reset > now)
                 {
-                    let entry = lowest.entry(&win.window_key).or_insert((win, remaining));
-                    if remaining < entry.1 {
-                        *entry = (win, remaining);
+                    let critical = remaining <= QUOTA_CRITICAL_PERCENT && !has_quota_fallback(provider_id, accounts, acct, win, now);
+                    let entry = lowest.entry(&win.window_key).or_insert((win, remaining, critical));
+                    if (critical && !entry.2) || (critical == entry.2 && remaining < entry.1) {
+                        *entry = (win, remaining, critical);
                     }
                 }
             }
-            for (win, remaining) in lowest.into_values() {
+            for (win, remaining, critical) in lowest.into_values() {
                 items.push(Raise {
                     source: source.clone(),
                     dedupe_key: provider_notification_key(provider_id, &format!("{}:{}:low", acct.id, win.window_key)),
-                    severity: if remaining <= 0.5 { Severity::Critical } else { Severity::Warning },
+                    severity: if critical { Severity::Critical } else { Severity::Warning },
                     title: format!("{provider_id} · {label} {} low ({remaining:.0}% left)", win.label),
                     body: match win.resets_at {
                         Some(r) => format!("Resets at {}", r.format("%Y-%m-%d %H:%M UTC")),
@@ -2315,6 +2381,53 @@ mod tests {
         let mut a = acct("primary", true, None, None, sample_window("quota", None, QuotaObservationState::NeverObserved));
         a.last_error = Some(account_error(AccountErrorKind::BillingRequired, 1));
         assert!(provider_health_raises(&provider, &settings, &[a], now).iter().all(|r| r.dedupe_key != "provider:test:health:error"));
+    }
+
+    #[test]
+    fn quota_alert_stays_warning_with_an_eligible_measured_pool_fallback() {
+        let now = Utc::now();
+        let settings = ProviderPanelSettings { notify_limit_hit: true, ..Default::default() };
+        let mut empty = sample_window("gemini-argon-5h", Some(100.0), QuotaObservationState::Measured);
+        empty.scope_model = Some("Gemini Argon".into());
+        let healthy = QuotaWindow {
+            window_key: "gemini-argon-quota".into(),
+            scope_model: Some("Gemini 4 Argon".into()),
+            used_percent: Some(5.0),
+            remaining_percent: Some(95.0),
+            ..empty.clone()
+        };
+        let primary = acct("google-primary", true, None, None, empty);
+        let mut fallback = acct("google-agam", true, None, None, healthy);
+        let severity = |fallback: &ModelAccount| {
+            quota_raises("antigravity", &settings, &[primary.clone(), fallback.clone()], now)
+                .into_iter()
+                .find(|r| r.dedupe_key.ends_with("google-primary:gemini-argon-5h:low"))
+                .unwrap()
+                .severity
+        };
+        assert_eq!(severity(&fallback), Severity::Warning);
+        fallback.enabled = false;
+        assert_eq!(severity(&fallback), Severity::Critical);
+        fallback.enabled = true;
+        fallback.cooldown_until = Some(now + Duration::hours(1));
+        assert_eq!(severity(&fallback), Severity::Critical);
+        fallback.cooldown_until = None;
+        fallback.windows[0].observation_state = QuotaObservationState::StaleLastGood;
+        assert_eq!(severity(&fallback), Severity::Critical);
+        fallback.windows[0].observation_state = QuotaObservationState::Measured;
+        fallback.windows[0].window_key = "gemini-quota".into();
+        assert_eq!(severity(&fallback), Severity::Critical);
+    }
+
+    #[test]
+    fn quota_alert_is_critical_when_the_pool_is_exhausted() {
+        let now = Utc::now();
+        let settings = ProviderPanelSettings { notify_limit_hit: true, ..Default::default() };
+        let empty = sample_window("gemini-5h", Some(100.0), QuotaObservationState::Measured);
+        let accounts = [acct("primary", true, None, None, empty.clone()), acct("backup", true, None, None, empty)];
+        let alerts = quota_raises("antigravity", &settings, &accounts, now);
+        assert_eq!(alerts.len(), 2);
+        assert!(alerts.iter().all(|r| r.severity == Severity::Critical));
     }
 
     #[test]

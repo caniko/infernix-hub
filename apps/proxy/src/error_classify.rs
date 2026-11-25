@@ -192,6 +192,16 @@ fn classify(
         .unwrap_or(if html || !raw.is_null() { "" } else { body });
     let message = redact_known_secrets(message, secrets);
     let lower = message.to_ascii_lowercase();
+    if lane == Lane::Claude
+        && source == QuotaProbe
+        && http == Some(403)
+        && lower.trim().trim_end_matches('.') == "oauth authentication is currently not allowed for this organization"
+    {
+        let mut result = local_error(QuotaProbeUnsupported, source, "Organization policy disallows OAuth quota probes.");
+        result.http_status = http;
+        result.backoff_until = Some(result.occurred_at + chrono::TimeDelta::hours(1));
+        return Some(result);
+    }
     let says = |phrases: &[&str]| phrases.iter().any(|p| lower.contains(p));
     let codes = || reasons.iter().copied().chain(code).chain(error_type).chain(rpc_status);
     let has = |known: &[&str]| codes().any(|code| known.iter().any(|s| code.eq_ignore_ascii_case(s)));

@@ -172,6 +172,7 @@ pub fn parse_meridian_quota_all(body: &Value, provider_id: &str, observed_at: Da
             let reason = meridian_reason(&profile["error"]).or_else(|| meridian_reason(&profile["failure"]["reason"]));
             let consecutive = profile["failure"]["consecutiveFailures"].as_u64();
             let unsupported = reason == Some("not_oauth");
+            let rate_limited = reason == Some("rate_limited");
             let last_good = profile.get("lastGood").filter(|v| v.is_object() && profile["fetchedAt"].is_null());
             let snapshot = last_good.unwrap_or(profile);
             let fetched_at = meridian_time(&snapshot["fetchedAt"]);
@@ -179,7 +180,7 @@ pub fn parse_meridian_quota_all(body: &Value, provider_id: &str, observed_at: Da
             account.last_observed_at = fetched_at;
             account.enrollment_state = if fetched_at.is_some() {
                 EnrollmentState::Verified
-            } else if reason.is_some() && !unsupported {
+            } else if reason.is_some() && !unsupported && !rate_limited {
                 EnrollmentState::Error
             } else {
                 EnrollmentState::Unobserved
@@ -187,7 +188,23 @@ pub fn parse_meridian_quota_all(body: &Value, provider_id: &str, observed_at: Da
             account.status_message = reason
                 .filter(|_| !unsupported)
                 .map(|reason| consecutive.map_or_else(|| reason.into(), |n| format!("{reason} ({n} consecutive failures)")));
-            account.status = AccountStatus::resolve(account.enabled, None, observed_at, false, account.status_message.is_some());
+            account.last_error_observed = rate_limited || (fetched_at.is_some() && !stale);
+            if rate_limited {
+                account.last_error = Some(AccountError {
+                    kind: AccountErrorKind::QuotaExhausted,
+                    source: AccountErrorSource::QuotaProbe,
+                    http_status: Some(429),
+                    provider_code: Some("rate_limited".into()),
+                    message: "Meridian quota endpoint was rate limited.".into(),
+                    action_hint: None,
+                    action_url: None,
+                    occurred_at: observed_at,
+                    consecutive_count: u32::try_from(consecutive.unwrap_or(1)).unwrap_or(u32::MAX),
+                    backoff_until: None,
+                });
+            }
+            account.status =
+                AccountStatus::resolve(account.enabled, None, observed_at, false, account.status_message.is_some() && !rate_limited);
             account.windows = rows(&snapshot["windows"])
                 .iter()
                 .filter_map(|raw| {

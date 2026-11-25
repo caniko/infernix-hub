@@ -5459,6 +5459,80 @@ async fn unchanged_oauth_reload_on_401_quarantines_and_fails_over() {
 }
 
 #[tokio::test]
+async fn quota_probe_go_401_keeps_the_original_error_without_oauth_renewal() {
+    let mock = serve(Router::new().route(
+        "/v1/usage",
+        get(|headers: HeaderMap| async move {
+            assert_eq!(router::bearer(&headers), Some("go-fixture"));
+            (StatusCode::UNAUTHORIZED, axum::Json(json!({"error":{"code":"invalid_api_key","message":"Invalid Go key."}})))
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    let mut accounts = pool::parse_credentials("go.json", &json!({"type":"opencode-go","api_key":"go-fixture"}), false).unwrap();
+    accounts[0].base = Some(mock.0.clone());
+    proxy.state.write().await.pool.insert(accounts);
+    let account = proxy.state.read().await.pool.accounts["go.json"].clone();
+    assert!(!account.api_key);
+    let error = proxy.refresh_usage(&account).await.unwrap_err();
+    assert_eq!((error.kind, error.source, error.http_status), (AccountErrorKind::AuthExpired, AccountErrorSource::QuotaProbe, Some(401)));
+    assert_eq!(error.provider_code.as_deref(), Some("invalid_api_key"));
+    assert_eq!(error.message, "Invalid Go key.");
+}
+
+#[tokio::test]
+async fn quota_probe_claude_org_policy_403_backs_off_without_blocking_inference() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock = serve(
+        Router::new()
+            .route(
+                "/api/oauth/usage",
+                get({
+                    let calls = calls.clone();
+                    move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::FORBIDDEN,
+                            axum::Json(json!({"type":"error","error":{"type":"permission_error",
+                        "message":"OAuth authentication is currently not allowed for this organization"}})),
+                        )
+                    }
+                }),
+            )
+            .route("/v1/messages", post(|| async { axum::Json(json!({"content":[]})) })),
+    )
+    .await;
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    proxy.state.write().await.pool.policy.strategy = FillFirst;
+    let account = proxy.state.read().await.pool.accounts["a.json"].clone();
+    let error = proxy.refresh_usage(&account).await.unwrap_err();
+    assert_eq!(error.kind.as_str(), "quota_probe_unsupported");
+    assert_eq!((error.source, error.http_status), (AccountErrorSource::QuotaProbe, Some(403)));
+    assert!(error.backoff_until.is_some_and(|until| until > Utc::now()));
+    assert!(!error.blocks_routing(Utc::now()));
+    assert!(proxy.state.read().await.pool.accounts["a.json"].eligible(Utc::now(), "claude-fixture"));
+    let server = serve(proxy.clone().app()).await;
+    let response = Http::new(&server)
+        .request("POST", "/v1/messages")
+        .bearer_auth("inference-fixture")
+        .json(&json!({"model":"claude-fixture","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(proxy.state.read().await.pool.accounts["a.json"].success, 1);
+    let batches = hub_sync::observations(&proxy, "host", "user").await;
+    let published = batches.iter().flat_map(|batch| &batch.accounts).find(|a| a.source_account_id == "a.json").unwrap();
+    assert_eq!(published.last_error.as_ref(), Some(error.as_ref()));
+    assert_eq!(proxy.refresh_usage(&account).await.unwrap_err(), error);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn quota_probe_401_with_unchanged_oauth_token_expires_claude_and_google_auth() {
     let mock = serve(
         Router::new()

@@ -83,6 +83,37 @@ fn meridian_preserves_last_good_and_distinguishes_unsupported_and_failed() {
 }
 
 #[test]
+fn meridian_rate_limit_is_a_quota_error_even_without_a_successful_probe() {
+    let accounts = parse_meridian_quota_all(
+        &json!({
+            "profiles": [
+                {"id":"first", "fetchedAt":null, "error":"rate_limited", "failure":{"consecutiveFailures":2}},
+                {"id":"cached", "fetchedAt":null, "failure":{"reason":"rate_limited"},
+                 "lastGood":{"fetchedAt":1700000000000_i64,"windows":[{"type":"five_hour","utilization":0.4}]}}
+            ]
+        }),
+        "claude",
+        now(),
+    );
+    let [first, cached] = &accounts[..] else { panic!("expected two profiles") };
+    assert_eq!(first.enrollment_state, EnrollmentState::Unobserved);
+    assert_ne!(first.status, AccountStatus::Error);
+    assert_eq!(first.last_observed_at, None);
+    assert_eq!(first.windows[0].observation_state, QuotaObservationState::ProbeFailed);
+    let error = first.last_error.as_ref().unwrap();
+    assert_eq!(
+        (error.kind, error.source, error.http_status),
+        (AccountErrorKind::QuotaExhausted, AccountErrorSource::QuotaProbe, Some(429))
+    );
+    assert_eq!(error.consecutive_count, 2);
+    assert!(!error.blocks_routing(now()));
+    assert_eq!(cached.enrollment_state, EnrollmentState::Verified);
+    assert_eq!(cached.last_observed_at, DateTime::from_timestamp_millis(1700000000000));
+    assert_eq!(cached.windows[0].observation_state, QuotaObservationState::StaleLastGood);
+    assert_eq!(cached.windows[0].used_percent, Some(40.0));
+}
+
+#[test]
 fn antigravity_merges_summary_and_filters_only_untouched_resets() {
     let reset = now() + TimeDelta::hours(5) + TimeDelta::seconds(60);
     let windows = parse_antigravity_summary(

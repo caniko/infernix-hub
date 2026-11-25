@@ -190,6 +190,7 @@ pub struct Account {
     pub scoped_cooldowns: BTreeMap<String, Cooldown>,
     pending_quota: Vec<PendingQuota>,
     pub last_error: Option<AccountError>,
+    pub quota_probe_policy_error: Option<AccountError>,
     pub error_generation: u64,
     pub source_fingerprint: Option<String>,
     pub windows: Vec<QuotaWindow>,
@@ -250,6 +251,9 @@ impl Account {
 
     pub(crate) fn replace_access(&mut self, access: String) {
         let old = std::mem::replace(&mut self.access, access);
+        if old != self.access {
+            self.quota_probe_policy_error = None;
+        }
         self.scrub_label(&[&old]);
     }
 
@@ -371,9 +375,11 @@ impl Account {
     }
 
     pub(crate) fn has_account_error(&self) -> bool {
-        self.last_error
-            .as_ref()
-            .map_or(self.probe_failed, |err| err.blocks_routing(Utc::now()) || err.kind == AccountErrorKind::ProbeFailed)
+        self.reported_error().map_or(self.probe_failed, |err| err.blocks_routing(Utc::now()) || err.kind == AccountErrorKind::ProbeFailed)
+    }
+
+    pub(crate) fn reported_error(&self) -> Option<&AccountError> {
+        self.last_error.as_ref().or(self.quota_probe_policy_error.as_ref())
     }
 
     pub fn eligible(&self, now: DateTime<Utc>, model: &str) -> bool {
@@ -497,7 +503,7 @@ impl Account {
             "type": self.provider, "label": crate::error_classify::safe_label(self), "disabled": self.disabled, "note": self.note, "priority": self.priority,
             "weight": self.weight, "status": if self.disabled { "disabled" } else if self.has_account_error() { "error" } else { "active" },
             "cooldown_until": self.cooldown_until(), "observed_at": self.observed, "last_used_at": self.last_used,
-            "last_error": self.last_error,
+            "last_error": self.reported_error(),
             "preferred": pool.preferred(self.lane) == Some(self.id.as_str()),
             "plan": self.plan.as_ref().map(|p| json!({"tier":p,"label":p,"multiplier":self.multiplier})),
         });
@@ -721,6 +727,7 @@ fn parse_credentials_for_lane(name: &str, raw: &Value, local: bool, known_lane: 
             models: models.clone(),
             cooldown: None,
             last_error: None,
+            quota_probe_policy_error: None,
             error_generation: 0,
             source_fingerprint: None,
             scoped_cooldowns: BTreeMap::new(),
@@ -905,6 +912,7 @@ impl Pool {
                     }
                     a.cooldown = old.cooldown;
                     a.last_error.clone_from(&old.last_error);
+                    a.quota_probe_policy_error.clone_from(&old.quota_probe_policy_error);
                     a.scoped_cooldowns.clone_from(&old.scoped_cooldowns);
                     a.pending_quota.clone_from(&old.pending_quota);
                     a.windows.clone_from(&old.windows);
