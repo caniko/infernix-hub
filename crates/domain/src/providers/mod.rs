@@ -417,12 +417,14 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
     }
 
     if let Some(routing) = &batch.routing_status {
-        // The native proxy publishes its complete pool with its routing view.
-        // Other collectors may send partial inventory and cannot define a pool.
-        let routed_account_ids = (routing.router_id.as_deref() == Some("fleetix-proxy")
+        // Only Antigravity uses the proxy pool as its quota source. Claude and
+        // OpenCode also use direct-login quota, even when their proxy pool is empty.
+        let routed_account_ids = (provider_id == "antigravity"
+            && routing.router_id.as_deref() == Some("fleetix-proxy")
             && source_publisher == Some("fleetix-agent-proxy")
             && batch.account_inventory_complete)
             .then(|| batch.accounts.iter().map(|a| a.id.as_str()).collect::<Vec<_>>());
+        let routed_accounts_collected_at = routed_account_ids.as_ref().map(|_| batch.collected_at);
         let clean_logs: Vec<ProxyLogEntry> = routing
             .recent_logs
             .iter()
@@ -437,8 +439,9 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
             .collect();
         sqlx::query(
             "insert into provider_routing_state
-                (provider_id, router_id, revision, runtime, policy, clients, lockouts, recent_logs, rolling_starter, routed_account_ids, updated_at)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+                (provider_id, router_id, revision, runtime, policy, clients, lockouts, recent_logs, rolling_starter,
+                 routed_account_ids, routed_accounts_collected_at, updated_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
              on conflict (provider_id) do update set
                 router_id = excluded.router_id,
                 revision = greatest(provider_routing_state.revision, excluded.revision),
@@ -448,7 +451,10 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
                 lockouts = excluded.lockouts,
                 recent_logs = excluded.recent_logs,
                 rolling_starter = excluded.rolling_starter,
-                routed_account_ids = coalesce(excluded.routed_account_ids, provider_routing_state.routed_account_ids),
+                routed_account_ids = case
+                    when excluded.routed_accounts_collected_at >= coalesce(provider_routing_state.routed_accounts_collected_at, '-infinity')
+                    then excluded.routed_account_ids else provider_routing_state.routed_account_ids end,
+                routed_accounts_collected_at = greatest(excluded.routed_accounts_collected_at, provider_routing_state.routed_accounts_collected_at),
                 updated_at = now()",
         )
         .bind(provider_id)
@@ -461,6 +467,7 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
         .bind(serde_json::to_value(&clean_logs).unwrap_or_else(|_| json!([])))
         .bind(serde_json::to_value(&routing.rolling_starter).unwrap_or_else(|_| json!({})))
         .bind(routed_account_ids)
+        .bind(routed_accounts_collected_at)
         .execute(&mut *tx)
         .await?;
     }

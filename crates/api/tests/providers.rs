@@ -911,9 +911,10 @@ async fn fixture_providers_and_activity_over_http() {
     let mut routing: Value = get("providers/antigravity/routing").send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     routing["router_id"] = json!("fleetix-proxy");
     routing["runtime"]["router_id"] = json!("fleetix-proxy");
+    let reported_at = chrono::Utc::now();
     let mut batch = json!({
         "provider_id": "antigravity", "provider_label": "Antigravity", "provider_family": "antigravity",
-        "source_host": "atlas", "source_user": "tester", "collected_at": chrono::Utc::now(),
+        "source_host": "atlas", "source_user": "tester", "collected_at": reported_at,
         "source_publisher": "fleetix-agent-proxy", "account_inventory_complete": true,
         "router_id": "fleetix-proxy", "routing_status": routing, "accounts": accounts,
     });
@@ -931,6 +932,14 @@ async fn fixture_providers_and_activity_over_http() {
     assert!(!quota.samples.is_empty());
     assert!(quota.samples.iter().all(|s| s.account_id.starts_with("antigravity:atlas:tester:")));
 
+    let mut delayed = batch.clone();
+    delayed["source_host"] = json!("other-host");
+    delayed["collected_at"] = json!(reported_at - chrono::Duration::seconds(1));
+    delayed["accounts"] = json!([]);
+    observe(&delayed).send().await.unwrap().error_for_status().unwrap();
+    let current: ProviderSummary = get(provider_path).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(current.account_count, 4, "an older complete report cannot replace membership");
+
     batch["accounts"] = json!([]);
     batch["account_inventory_complete"] = json!(false);
     observe(&batch).send().await.unwrap().error_for_status().unwrap();
@@ -938,9 +947,11 @@ async fn fixture_providers_and_activity_over_http() {
     assert_eq!(current.account_count, 4, "partial reports cannot set membership");
 
     batch["account_inventory_complete"] = json!(true);
+    batch["collected_at"] = json!(reported_at + chrono::Duration::seconds(1));
     observe(&batch).send().await.unwrap().error_for_status().unwrap();
     batch["router_id"] = json!("other-router");
     batch["routing_status"]["router_id"] = json!("other-router");
+    batch["accounts"] = json!([accounts[0]]);
     observe(&batch).send().await.unwrap().error_for_status().unwrap();
     let current: ProviderSummary = get(provider_path).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     assert_eq!(current.account_count, 0);
@@ -964,6 +975,26 @@ async fn fixture_providers_and_activity_over_http() {
         .unwrap();
     assert!(!historical.samples.is_empty());
     assert!(historical.samples.iter().all(|s| s.account_id == seeded.accounts[0].id));
+
+    let other_path = "providers/opencode";
+    let before: ProviderSummary = get(other_path).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert!(before.account_count > 0 && !before.pools.is_empty());
+    let mut routing: Value = get("providers/opencode/routing").send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    routing["router_id"] = json!("fleetix-proxy");
+    batch["provider_id"] = json!("opencode");
+    batch["provider_label"] = json!("OpenCode");
+    batch["provider_family"] = json!("opencode");
+    batch["router_id"] = json!("fleetix-proxy");
+    batch["accounts"] = json!([]);
+    batch["routing_status"] = routing;
+    post("providers/opencode/observations").json(&batch).send().await.unwrap().error_for_status().unwrap();
+    let after: ProviderSummary = get(other_path).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(after.account_count, before.account_count, "providers outside Antigravity keep existing quota sources");
+    assert!(after.routed_account_ids.is_none());
+    let quota: contracts::providers::ProviderQuotaReport =
+        get("providers/opencode/quota").send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(quota.accounts.len(), before.account_count);
+    assert!(!quota.samples.is_empty());
 
     server.abort();
     let _ = server.await;
