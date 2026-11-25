@@ -7,7 +7,7 @@ use fleetix_agent_proxy::{
     clients::{Client, register_t3code},
     config::{self, Config, DEFAULT_BIND, DEFAULT_URL},
     hub_sync, verify,
-    worker::WorkerOptions,
+    worker::{GoogleWorkerOptions, WorkerOptions},
 };
 use futures_util::FutureExt;
 use tokio::net::TcpListener;
@@ -50,6 +50,8 @@ enum Command {
         exclude_local_providers: Vec<Lane>,
         #[command(flatten)]
         worker: Box<WorkerOptions>,
+        #[command(flatten)]
+        google_worker: Box<GoogleWorkerOptions>,
     },
     RegisterT3code {
         #[arg(long, default_value = DEFAULT_URL)]
@@ -109,9 +111,11 @@ async fn main() -> Result<()> {
             discover_local,
             exclude_local_providers,
             worker,
+            google_worker,
         } => {
             let mut config = Config::new(bind, &state_dir(state)?, auth_dir, discover_local, client_key_file, management_key_file)?;
             let worker = worker.validate(&config)?;
+            let google_worker = google_worker.validate(&config, worker.as_ref())?;
             config.exclude_local_lanes = exclude_local_providers.into_iter().collect();
             if let Some(home) = t3code_home {
                 config.t3code_home = home;
@@ -121,6 +125,14 @@ async fn main() -> Result<()> {
                 None => env::var("HUB_TOKEN").ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()),
             };
             ensure!(hub_url.is_some() == hub_token.is_some(), "configure both HUB_URL and HUB_TOKEN (or --hub-token-file)");
+            if let Some(token) = hub_token.as_deref() {
+                if let Some(worker) = worker.as_ref() {
+                    worker.validate_hub_token(token)?;
+                }
+                if let Some(google_worker) = google_worker.as_ref() {
+                    google_worker.validate_hub_token(token)?;
+                }
+            }
             let hub = hub_url
                 .zip(hub_token)
                 .map(|(url, token)| Ok::<_, anyhow::Error>((config::origin(&url)?.to_string(), token)))
@@ -136,11 +148,19 @@ async fn main() -> Result<()> {
                 register_t3code(&config.t3code_home, SOURCE_ID, SOURCE_LABEL, &config.url, &config.management_key)?;
             }
             let addr = config.bind;
-            let proxy = Arc::new(Proxy::new(config)?.with_hub_sync_configured(hub.is_some()).with_worker_config(worker.as_ref()));
+            let proxy = Arc::new(
+                Proxy::new(config)?.with_hub_sync_configured(hub.is_some()).with_worker_configs(worker.as_ref(), google_worker.as_ref()),
+            );
             proxy.discover_local_commands().await;
             let worker = if let Some(worker) = worker {
                 worker.validate_pool(&proxy).await?;
                 Some(worker.bind().await?)
+            } else {
+                None
+            };
+            let google_worker = if let Some(google_worker) = google_worker {
+                google_worker.validate_pool(&proxy).await?;
+                Some(google_worker.bind().await?)
             } else {
                 None
             };
@@ -168,10 +188,20 @@ async fn main() -> Result<()> {
             };
             let shared = axum::serve(listener, proxy.clone().app().into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(shutdown.clone());
-            let result = if let Some(worker) = worker {
-                tokio::try_join!(std::future::IntoFuture::into_future(shared), worker.serve(proxy, shutdown)).map(|_| ())
-            } else {
-                shared.await
+            let result = match (worker, google_worker) {
+                (Some(worker), Some(google_worker)) => tokio::try_join!(
+                    std::future::IntoFuture::into_future(shared),
+                    worker.serve(proxy.clone(), shutdown.clone()),
+                    google_worker.serve(proxy, shutdown),
+                )
+                .map(|_| ()),
+                (Some(worker), None) => {
+                    tokio::try_join!(std::future::IntoFuture::into_future(shared), worker.serve(proxy, shutdown)).map(|_| ())
+                }
+                (None, Some(google_worker)) => {
+                    tokio::try_join!(std::future::IntoFuture::into_future(shared), google_worker.serve(proxy, shutdown)).map(|_| ())
+                }
+                (None, None) => shared.await,
             };
             quota.abort();
             if let Some(sync) = sync {
@@ -234,6 +264,30 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["proxy", "serve", "--worker-listen", "127.0.0.1:9000", "--worker-api-key", "fixture"]).is_err());
+
+        let google_cli = Cli::try_parse_from([
+            "proxy",
+            "serve",
+            "--google-worker-unix-socket",
+            "/tmp/worker-google.sock",
+            "--google-worker-allowed-models",
+            "gemini-4-neon-high,gemini-3.8-flash",
+        ])
+        .unwrap();
+        let Command::Serve { google_worker, .. } = google_cli.command else { panic!("expected serve command") };
+        assert_eq!(google_worker.google_worker_allowed_models, ["gemini-4-neon-high", "gemini-3.8-flash"]);
+        assert_eq!(google_worker.google_worker_unix_socket, Some(PathBuf::from("/tmp/worker-google.sock")));
+        assert!(
+            Cli::try_parse_from([
+                "proxy",
+                "serve",
+                "--google-worker-unix-socket",
+                "/tmp/worker-google.sock",
+                "--google-worker-listen",
+                "127.0.0.1:9001",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

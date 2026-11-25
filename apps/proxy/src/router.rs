@@ -34,6 +34,308 @@ use crate::{
 pub(crate) const REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024;
 pub(crate) const POOL_QUOTA_HEADER: &str = "x-fleetix-pool-quota";
 
+#[derive(Clone, Copy)]
+pub(crate) struct LocalPoolResponse;
+
+struct DeferredWireCompletion {
+    proxy: Arc<Proxy>,
+    account: Account,
+    exchange: Exchange,
+    status: StatusCode,
+    usage: Usage,
+    latency: i64,
+    request_at: DateTime<Utc>,
+    response: Option<Vec<u8>>,
+    response_size: usize,
+    failure: Option<(GoogleError, Usage, i64)>,
+    sse_failed: bool,
+    done_err: bool,
+}
+
+#[derive(Clone)]
+struct WorkerStreamContext {
+    proxy: Arc<Proxy>,
+    account: Account,
+    model: String,
+    headers: HeaderMap,
+    fallback: u64,
+    request_at: DateTime<Utc>,
+}
+
+struct WorkerStreamState {
+    context: WorkerStreamContext,
+    stream_error: bool,
+    wire_accounted: bool,
+    provider_error: Option<StatusCode>,
+    provider_error_classified: Option<AccountError>,
+    finalized: bool,
+    pending: Option<DeferredWireCompletion>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkerStreamOutcome(Arc<std::sync::Mutex<WorkerStreamState>>);
+
+impl WorkerStreamOutcome {
+    fn new(proxy: Arc<Proxy>, account: Account, model: String, headers: HeaderMap, fallback: u64, request_at: DateTime<Utc>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(WorkerStreamState {
+            context: WorkerStreamContext { proxy, account, model, headers, fallback, request_at },
+            stream_error: false,
+            wire_accounted: false,
+            provider_error: None,
+            provider_error_classified: None,
+            finalized: false,
+            pending: None,
+        })))
+    }
+
+    fn defer_completion(&self, completion: DeferredWireCompletion) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.finalized {
+            return;
+        }
+        state.pending = Some(completion);
+    }
+
+    async fn dispatch_transport_error(&self) {
+        let ctx = {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            // Mark stream_error before deduplication or any await so cancellation
+            // during transport error accounting never records `disconnected`.
+            state.stream_error = true;
+            if state.wire_accounted {
+                return;
+            }
+            state.wire_accounted = true;
+            state.context.clone()
+        };
+        let shared = self.0.clone();
+        let task = async move {
+            let error = local_error(AccountErrorKind::UpstreamUnavailable, AccountErrorSource::Stream, "upstream response stream broke");
+            result(&ctx.proxy, &ctx.account, &ctx.model, None, false, ctx.request_at, None).await;
+            ctx.proxy.report_account_error(&ctx.account, &error).await;
+            let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if state.provider_error_classified.is_none() {
+                state.provider_error_classified = Some(error);
+            }
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _ = runtime.spawn(task).await;
+        } else {
+            task.await;
+        }
+    }
+
+    pub(crate) async fn dispatch_provider_error(&self, status: StatusCode, raw: Value) {
+        let ctx = {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if state.provider_error.is_some() {
+                return;
+            }
+            state.provider_error = Some(status);
+            if state.wire_accounted {
+                return;
+            }
+            state.wire_accounted = true;
+            state.context.clone()
+        };
+        let shared = self.0.clone();
+        // Run provider-error accounting in a runtime-owned task before yielding
+        // the sanitized frame so an immediate disconnect never drops cooldowns.
+        let task = async move {
+            let raw_bytes = serde_json::to_vec(&raw).unwrap_or_default();
+            let classified = classify_upstream_http_error(
+                Lane::Google,
+                status,
+                &ctx.headers,
+                &raw_bytes,
+                AccountErrorSource::Stream,
+                &account_secrets(&ctx.account),
+            );
+            let now = Utc::now();
+            let reset = google_reset_hint(&raw, now).0;
+            let cooldown = classified
+                .as_ref()
+                .filter(|e| e.kind == AccountErrorKind::QuotaExhausted)
+                .map(|_| quota_deadline(quota_hint(Lane::Google, &ctx.headers, reset, now), ctx.fallback, now));
+            result(&ctx.proxy, &ctx.account, &ctx.model, cooldown, false, ctx.request_at, None).await;
+            if let Some(classified) = classified {
+                ctx.proxy.report_account_error(&ctx.account, &classified).await;
+                shared.lock().unwrap_or_else(|e| e.into_inner()).provider_error_classified = Some(classified);
+            }
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _ = runtime.spawn(task).await;
+        } else {
+            task.await;
+        }
+    }
+
+    pub(crate) async fn finish_ok(&self) {
+        let (pending, provider_error, provider_classified) = {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if state.finalized {
+                return;
+            }
+            state.finalized = true;
+            (state.pending.take(), state.provider_error, state.provider_error_classified.take())
+        };
+        let Some(mut completion) = pending else { return };
+        let task = async move {
+            let (final_status, outcome) = if let Some((error, _, _)) = completion.failure {
+                (error.status, error.outcome())
+            } else if completion.done_err || completion.sse_failed {
+                let status = provider_error.unwrap_or(completion.status);
+                let outcome = if status == StatusCode::TOO_MANY_REQUESTS { "rate_limited" } else { "stream_error" };
+                (status, outcome)
+            } else if let Some(err_status) = provider_error {
+                if let Some(classified) = &provider_classified {
+                    completion.exchange.attempt_error(classified);
+                }
+                let outcome = if err_status == StatusCode::TOO_MANY_REQUESTS { "rate_limited" } else { "stream_error" };
+                (err_status, outcome)
+            } else if completion.status.is_success() {
+                result(&completion.proxy, &completion.account, "", None, true, completion.request_at, None).await;
+                (completion.status, "success")
+            } else {
+                (completion.status, "http_error")
+            };
+            if let Some(last) = completion.exchange.attempts.last_mut() {
+                last.status_code = Some(i32::from(final_status.as_u16()));
+                last.outcome = outcome.into();
+            }
+            completion
+                .exchange
+                .finish(
+                    Some(final_status),
+                    outcome,
+                    completion.usage,
+                    Some(completion.latency),
+                    Some((completion.response, completion.response_size)),
+                )
+                .await;
+        };
+        // Transfer ownership to a runtime task before the first await so client
+        // cancellation during finalization never erases a completed exchange.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _ = runtime.spawn(task).await;
+        } else {
+            task.await;
+        }
+    }
+
+    pub(crate) async fn finish_stream_error(&self) {
+        let pending = {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.stream_error = true;
+            if state.finalized {
+                return;
+            }
+            let pending = state.pending.take();
+            if pending.is_some() {
+                state.finalized = true;
+            }
+            pending
+        };
+        let Some(mut completion) = pending else { return };
+        let task = async move {
+            if let Some(last) = completion.exchange.attempts.last_mut() {
+                last.status_code = Some(i32::from(StatusCode::BAD_GATEWAY.as_u16()));
+                last.outcome = "stream_error".into();
+            }
+            completion
+                .exchange
+                .finish(
+                    Some(StatusCode::BAD_GATEWAY),
+                    "stream_error",
+                    completion.usage,
+                    Some(completion.latency),
+                    Some((completion.response, completion.response_size)),
+                )
+                .await;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _ = runtime.spawn(task).await;
+        } else {
+            task.await;
+        }
+    }
+
+    fn early_drop_error(&self) -> (bool, Option<StatusCode>, Option<AccountError>) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (state.stream_error, state.provider_error, state.provider_error_classified.take())
+    }
+
+    pub(crate) fn into_guard(self) -> WorkerStreamGuard {
+        WorkerStreamGuard(self)
+    }
+
+    fn take_drop_state(&self) -> (bool, Option<StatusCode>, Option<AccountError>, Option<DeferredWireCompletion>) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.finalized {
+            return (state.stream_error, None, None, None);
+        }
+        state.finalized = true;
+        (state.stream_error, state.provider_error, state.provider_error_classified.take(), state.pending.take())
+    }
+}
+
+pub(crate) struct WorkerStreamGuard(WorkerStreamOutcome);
+
+impl WorkerStreamGuard {
+    pub(crate) async fn dispatch_provider_error(&self, status: StatusCode, raw: Value) {
+        self.0.dispatch_provider_error(status, raw).await;
+    }
+
+    pub(crate) async fn finish_ok(&self) {
+        self.0.finish_ok().await;
+    }
+
+    pub(crate) async fn finish_stream_error(&self) {
+        self.0.finish_stream_error().await;
+    }
+}
+
+impl Drop for WorkerStreamGuard {
+    fn drop(&mut self) {
+        let (worker_stream_error, provider_error, provider_classified, deferred) = self.0.take_drop_state();
+        if let Some(mut completion) = deferred
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                let (status, outcome) = if worker_stream_error {
+                    (Some(StatusCode::BAD_GATEWAY), "stream_error")
+                } else if let Some((error, _, _)) = completion.failure {
+                    (Some(error.status), error.outcome())
+                } else if let Some(err_status) = provider_error {
+                    if !completion.sse_failed
+                        && let Some(classified) = &provider_classified
+                    {
+                        completion.exchange.attempt_error(classified);
+                    }
+                    let outcome = if err_status == StatusCode::TOO_MANY_REQUESTS { "rate_limited" } else { "stream_error" };
+                    (Some(err_status), outcome)
+                } else {
+                    (None, "disconnected")
+                };
+                if let Some(last) = completion.exchange.attempts.last_mut() {
+                    if let Some(code) = status {
+                        last.status_code = Some(i32::from(code.as_u16()));
+                    }
+                    last.outcome = outcome.into();
+                }
+                completion.exchange.finish(status, outcome, completion.usage, Some(completion.latency), None).await;
+            });
+        }
+    }
+}
+
+pub(crate) fn is_sse_media_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|ct| ct.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream")))
+}
+
 pub(crate) fn routes() -> Router<Arc<Proxy>> {
     Router::new()
         .route("/v1/messages", post(forward))
@@ -57,7 +359,7 @@ fn parse_bearer(value: &HeaderValue) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then_some(secret).filter(|s| !s.is_empty())
 }
 
-fn lane_error(lane: Lane, status: StatusCode, message: &'static str) -> Response {
+pub(crate) fn lane_error(lane: Lane, status: StatusCode, message: &'static str) -> Response {
     if lane == Lane::Google {
         let rpc_status = match status {
             StatusCode::UNAUTHORIZED => "UNAUTHENTICATED",
@@ -121,15 +423,15 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
         _ if path.starts_with("/v1internal/") || path.starts_with("/v1internal:") || path.starts_with("/v1beta/") => Lane::Google,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    if let Some(worker_bearer) = proxy.worker_bearer.as_deref()
-        && parts
+    if proxy.worker_bearers.iter().any(|worker_bearer| {
+        parts
             .headers
             .get_all(header::AUTHORIZATION)
             .iter()
             .filter_map(parse_bearer)
             .chain(parts.headers.get_all("x-api-key").iter().filter_map(|value| value.to_str().ok()))
             .any(|token| matches_secret(token, worker_bearer))
-    {
+    }) {
         return lane_error(lane, StatusCode::UNAUTHORIZED, "invalid inference credentials");
     }
     let provided = bearer(&parts.headers);
@@ -209,7 +511,13 @@ pub(crate) async fn forward_authorized(
         .map(|m| if lane == Lane::Google { m.strip_prefix("models/").unwrap_or(m) } else { m })
         .filter(|s| bounded_identifier(s))
         .unwrap_or_default();
-    let accounts = AccountFilter { lane, model, required_project, subscriptions_only: worker_upstream.is_some() };
+    let accounts = AccountFilter {
+        lane,
+        model,
+        required_project,
+        subscriptions_only: worker_upstream.is_some(),
+        require_account_project: worker_upstream.is_some() && lane == Lane::Google && !projects.is_empty(),
+    };
     let effort = text(&raw, &["/reasoning/effort", "reasoning_effort", "/output_config/effort", "effort"])
         .filter(|s| bounded_identifier(s))
         .map(str::to_owned);
@@ -288,7 +596,7 @@ pub(crate) async fn forward_authorized(
             return Some(QuotaSnapshot::Ready(PoolQuota { reset, verified_reset: None, now }));
         }
         let live_deadline = |account: &Account| account.quota_limited_until(now, model);
-        let supported = |account: &Account| pool.supports(account, lane, model, required_project) && !account.quarantined(now);
+        let supported = |account: &Account| accounts.supports(pool, account) && !account.quarantined(now);
         let reset = pool
             .accounts
             .values()
@@ -302,7 +610,7 @@ pub(crate) async fn forward_authorized(
                 })
             })
             .min()?;
-        let verified_reset = pool.verified_google_reset_at(model, required_project, now);
+        let verified_reset = pool.verified_google_reset_at_for(&accounts, now);
         let pending = retained.iter_mut().enumerate().find_map(|(index, quota)| {
             let current = pool.accounts.get(&quota.account.id).filter(|a| a.same_credential(&quota.account) && supported(a))?;
             if live_deadline(current).or(quota.until)? > reset.max(verified_reset.unwrap_or(reset)) {
@@ -368,10 +676,10 @@ pub(crate) async fn forward_authorized(
         let incoming = async {
             let upstream_error = || inference_error("upstream request failed");
             let resolved = proxy.token_account(&account, false).await.map_err(|error| *error)?;
-            let usable = |account: &Account| {
-                accounts.allows(account) && required_project.is_none_or(|project| account.project.as_deref() == Some(project))
+            let usable = |pool: &Pool, account: &Account| {
+                accounts.allows_in(pool, account) && required_project.is_none_or(|project| account.project.as_deref() == Some(project))
             };
-            if !usable(&resolved) {
+            if !usable(&proxy.state.read().await.pool, &resolved) {
                 return Err(upstream_error());
             }
             account = resolved;
@@ -417,7 +725,7 @@ pub(crate) async fn forward_authorized(
                 && (reload_on_401 || (lane == Lane::Google && !account.api_key && account.refresh.is_some()))
             {
                 match proxy.token_account(&account, true).await {
-                    Ok(fresh) if !usable(&fresh) => return Err(upstream_error()),
+                    Ok(fresh) if !usable(&proxy.state.read().await.pool, &fresh) => return Err(upstream_error()),
                     Ok(fresh) if fresh.access != account.access => {
                         account = fresh;
                         res = build(&account).send().await.map_err(|_| upstream_error())?;
@@ -476,17 +784,56 @@ pub(crate) async fn forward_authorized(
         let google_stream = lane == Lane::Google && response.status() == StatusCode::OK && inspect_google(&headers);
         let mut prelude = GooglePrelude { first: [first, None], ..GooglePrelude::default() };
         if google_stream && let Some(first) = prelude.first[0].take() {
-            prelude = google_first(&mut response, first, sse).await;
+            if worker_upstream.is_some() && !sse {
+                let limit = if worker_upstream.is_some_and(|u| u.path() == crate::worker::GOOGLE_FETCH_AVAILABLE_MODELS) {
+                    crate::worker::GOOGLE_CATALOG_RESPONSE_LIMIT
+                } else {
+                    crate::worker::GOOGLE_JSON_RESPONSE_LIMIT
+                };
+                let body_deadline = tokio::time::Instant::now() + crate::worker::WORKER_BODY_READ_TIMEOUT;
+                prelude = google_worker_json_prelude(&mut response, first, limit, body_deadline).await;
+                if prelude.timed_out {
+                    let error =
+                        local_error(AccountErrorKind::UpstreamUnavailable, AccountErrorSource::Stream, "upstream response body timed out");
+                    exchange.attempt(&account, previous_session_account, started, began, Some(StatusCode::GATEWAY_TIMEOUT), "stream_error");
+                    exchange.attempt_error(&error);
+                    let task = {
+                        let proxy = proxy.clone();
+                        let account = account.clone();
+                        let model = model.to_owned();
+                        let error = error.clone();
+                        async move {
+                            result(&proxy, &account, &model, None, false, started, None).await;
+                            proxy.report_account_error(&account, &error).await;
+                        }
+                    };
+                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                        let _ = runtime.spawn(task).await;
+                    } else {
+                        task.await;
+                    }
+                    exchange
+                        .finish(Some(StatusCode::GATEWAY_TIMEOUT), "stream_error", prelude.usage, Some(millis(began.elapsed())), None)
+                        .await;
+                    return lane_error(lane, StatusCode::GATEWAY_TIMEOUT, "upstream response timed out");
+                }
+            } else {
+                prelude = google_first(&mut response, first, sse, worker_upstream.is_some() && lane == Lane::Google).await;
+            }
         }
         let mut status = prelude.error.as_ref().map_or_else(|| response.status(), |(error, _)| error.status);
         let received_at = Utc::now();
         let oauth_unavailable = refresh_error.as_ref().is_some_and(|e| e.kind == AccountErrorKind::UpstreamUnavailable);
         let mut pending_quota_body = None;
+        let mut worker_pending_handle: Option<tokio::task::JoinHandle<Result<Cooldown, Box<AccountError>>>> = None;
         let mut quota_reader = None;
         let mut quota_body_verified = None;
         let mut header_reset = None;
         let mut body_reset = None;
         let mut classified = refresh_error;
+        let mut worker_http_error_accounted = false;
+        let mut worker_settled_cooldown = None;
+        let mut response = Some(response);
         if let Some((error, raw)) = prelude.error.as_ref() {
             classified = error.classify(raw, &account, AccountErrorSource::Inference);
             // Auth rejection can be retried before output. Other blocking SSE events
@@ -494,57 +841,145 @@ pub(crate) async fn forward_authorized(
             if sse && classified.as_ref().is_some_and(|e| e.kind.is_blocking() && e.kind != AccountErrorKind::AuthExpired) {
                 prelude.error = None;
                 classified = None;
-                status = response.status();
+                status = response.as_ref().unwrap().status();
             }
         } else if !status.is_success() {
             let google_quota = lane == Lane::Google && status == StatusCode::TOO_MANY_REQUESTS;
             header_reset = header_cooldown(lane, &headers, received_at);
-            if google_quota {
-                let unverified_until =
-                    header_reset.is_none().then(|| quota_deadline(None, policy.failover_cooldown_secs, received_at).until);
-                quota_reader = begin_google_quota_read(&proxy, &account, model, header_reset, unverified_until, received_at).await;
-            }
             let diagnostic_deadline =
                 if google_quota && header_reset.is_none() { deadline } else { error_prefix_deadline(lane, status, &headers, deadline) };
-            let mut prefix = ErrorPrefix::default();
-            prefix.read(&mut response, diagnostic_deadline, google_quota).await;
-            let diagnostic = prefix.diagnostic();
-            if classified.is_none() && (status != StatusCode::FORBIDDEN || prefix.complete || !diagnostic.is_empty()) {
-                classified = classify_upstream_http_error(
-                    lane,
-                    status,
-                    &headers,
-                    diagnostic,
-                    AccountErrorSource::Inference,
-                    &account_secrets(&account),
-                );
-            }
-            if google_quota {
-                let (reset, verified) = prefix.quota_evidence(Utc::now());
-                body_reset = reset;
-                quota_body_verified = Some(verified);
-                if !prefix.finished() && classified.as_ref().is_some_and(|e| e.kind == AccountErrorKind::QuotaExhausted) {
-                    pending_quota_body = header_reset.map(|until| (until, std::mem::take(&mut prefix)));
+            if worker_upstream.is_some() && lane == Lane::Google {
+                // Move the non-2xx worker response into a runtime-owned task before
+                // begin_google_quota_read so client cancellation during a stalled 429
+                // still settles both the failure count and routing cooldown (including
+                // any pending body continuation).
+                let mut owned_response = response.take().unwrap();
+                let task = {
+                    let proxy = proxy.clone();
+                    let account = account.clone();
+                    let model = model.to_owned();
+                    let headers = headers.clone();
+                    let fallback = policy.failover_cooldown_secs;
+                    let mut classified = classified.take();
+                    async move {
+                        let quota_reader = if google_quota {
+                            let unverified_until = header_reset.is_none().then(|| quota_deadline(None, fallback, received_at).until);
+                            begin_google_quota_read(&proxy, &account, &model, header_reset, unverified_until, received_at).await
+                        } else {
+                            None
+                        };
+                        let mut prefix = ErrorPrefix::default();
+                        prefix.read(&mut owned_response, diagnostic_deadline, google_quota).await;
+                        let diagnostic = prefix.diagnostic();
+                        if classified.is_none() && (status != StatusCode::FORBIDDEN || prefix.complete || !diagnostic.is_empty()) {
+                            classified = classify_upstream_http_error(
+                                lane,
+                                status,
+                                &headers,
+                                diagnostic,
+                                AccountErrorSource::Inference,
+                                &account_secrets(&account),
+                            );
+                        }
+                        let mut body_reset = None;
+                        let mut quota_body_verified = None;
+                        let mut pending_quota_body = None;
+                        if google_quota {
+                            let (reset, verified) = prefix.quota_evidence(Utc::now());
+                            body_reset = reset;
+                            quota_body_verified = Some(verified);
+                            if !prefix.finished() && classified.as_ref().is_some_and(|e| e.kind == AccountErrorKind::QuotaExhausted) {
+                                pending_quota_body = header_reset.map(|until| (until, std::mem::take(&mut prefix)));
+                            }
+                        }
+                        let limited = classified.as_ref().is_some_and(|e| e.kind == AccountErrorKind::QuotaExhausted);
+                        let cooldown = limited.then(|| {
+                            let hint = merge_quota_hints(lane, &headers, header_reset, body_reset);
+                            let mut cooldown = quota_deadline(hint, fallback, Utc::now());
+                            cooldown.verified_reset &= quota_body_verified.unwrap_or(true);
+                            cooldown
+                        });
+                        if let Some(error) = classified.as_ref() {
+                            let settled = cooldown.filter(|_| pending_quota_body.is_none());
+                            let body_read = quota_reader.as_ref().zip(quota_body_verified);
+                            result(&proxy, &account, &model, settled, false, started, body_read).await;
+                            proxy.report_account_error(&account, error).await;
+                        }
+                        let (owned_response, pending_handle) = if let Some((header_until, mut body)) = pending_quota_body {
+                            let handle = tokio::spawn(async move {
+                                body.read(&mut owned_response, deadline, true).await;
+                                body.settle_google_quota(&proxy, &account, &model, &headers, header_until, quota_reader).await
+                            });
+                            (None, Some(handle))
+                        } else {
+                            if !limited && let Some(reader) = quota_reader.as_ref() {
+                                discard_google_quota_read(&proxy, &account, reader).await;
+                            }
+                            (Some(owned_response), None)
+                        };
+                        (owned_response, prefix, classified, body_reset, quota_body_verified, cooldown, pending_handle)
+                    }
+                };
+                let (owned_response, prefix, cls, br, qbv, cd, pending_handle) =
+                    if let Ok(runtime) = tokio::runtime::Handle::try_current() { runtime.spawn(task).await.unwrap() } else { task.await };
+                response = owned_response;
+                classified = cls;
+                body_reset = br;
+                quota_body_verified = qbv;
+                worker_settled_cooldown = cd;
+                worker_pending_handle = pending_handle;
+                worker_http_error_accounted = true;
+                prelude.first = prefix.chunks;
+                prelude.stream_error = prefix.error;
+            } else {
+                if google_quota {
+                    let unverified_until =
+                        header_reset.is_none().then(|| quota_deadline(None, policy.failover_cooldown_secs, received_at).until);
+                    quota_reader = begin_google_quota_read(&proxy, &account, model, header_reset, unverified_until, received_at).await;
                 }
+                let mut prefix = ErrorPrefix::default();
+                prefix.read(response.as_mut().unwrap(), diagnostic_deadline, google_quota).await;
+                let diagnostic = prefix.diagnostic();
+                if classified.is_none() && (status != StatusCode::FORBIDDEN || prefix.complete || !diagnostic.is_empty()) {
+                    classified = classify_upstream_http_error(
+                        lane,
+                        status,
+                        &headers,
+                        diagnostic,
+                        AccountErrorSource::Inference,
+                        &account_secrets(&account),
+                    );
+                }
+                if google_quota {
+                    let (reset, verified) = prefix.quota_evidence(Utc::now());
+                    body_reset = reset;
+                    quota_body_verified = Some(verified);
+                    if !prefix.finished() && classified.as_ref().is_some_and(|e| e.kind == AccountErrorKind::QuotaExhausted) {
+                        pending_quota_body = header_reset.map(|until| (until, std::mem::take(&mut prefix)));
+                    }
+                }
+                prelude.first = prefix.chunks;
+                prelude.stream_error = prefix.error;
             }
-            prelude.first = prefix.chunks;
-            prelude.stream_error = prefix.error;
         }
+        let mut response = response;
         let mut limited = classified.as_ref().is_some_and(|e| e.kind == AccountErrorKind::QuotaExhausted);
         let decoded_quota_reset = prelude
             .error
             .as_ref()
             .filter(|_| limited)
             .map(|(error, _)| quota_hint(lane, &headers, error.reset, received_at).map_or(received_at, |hint| hint.until));
-        let cooldown = limited.then(|| {
-            if let Some((error, _)) = &prelude.error {
-                header_reset = header_cooldown(lane, &headers, received_at);
-                body_reset = error.reset;
-            }
-            let hint = merge_quota_hints(lane, &headers, header_reset, body_reset);
-            let mut cooldown = quota_deadline(hint, policy.failover_cooldown_secs, Utc::now());
-            cooldown.verified_reset &= quota_body_verified.unwrap_or(true);
-            cooldown
+        let cooldown = worker_settled_cooldown.or_else(|| {
+            limited.then(|| {
+                if let Some((error, _)) = &prelude.error {
+                    header_reset = header_cooldown(lane, &headers, received_at);
+                    body_reset = error.reset;
+                }
+                let hint = merge_quota_hints(lane, &headers, header_reset, body_reset);
+                let mut cooldown = quota_deadline(hint, policy.failover_cooldown_secs, Utc::now());
+                cooldown.verified_reset &= quota_body_verified.unwrap_or(true);
+                cooldown
+            })
         });
         let mut quota_until = cooldown.filter(|_| lane == Lane::Google).map(|cooldown| cooldown.until);
         let failover = classified.as_ref().is_some_and(|e| {
@@ -568,10 +1003,36 @@ pub(crate) async fn forward_authorized(
         );
         if let Some(error) = classified.as_ref() {
             exchange.attempt_error(error);
-            let settled = cooldown.filter(|_| pending_quota_body.is_none());
-            let body_read = quota_reader.as_ref().zip(quota_body_verified);
-            result(&proxy, &account, model, settled, false, started, body_read).await;
-            proxy.report_account_error(&account, error).await;
+            if !worker_http_error_accounted {
+                let settled = cooldown.filter(|_| pending_quota_body.is_none());
+                let body_read = quota_reader.as_ref().zip(quota_body_verified);
+                if worker_upstream.is_some() && lane == Lane::Google {
+                    // Commit prelude failure/cooldown in a runtime-owned task so client
+                    // cancellation while awaiting the proxy state lock cannot drop it.
+                    let owned_reader = quota_reader.take();
+                    let task = {
+                        let proxy = proxy.clone();
+                        let account = account.clone();
+                        let model = model.to_owned();
+                        let error = error.clone();
+                        async move {
+                            result(&proxy, &account, &model, settled, false, started, owned_reader.as_ref().zip(quota_body_verified)).await;
+                            proxy.report_account_error(&account, &error).await;
+                            owned_reader
+                        }
+                    };
+                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                        if let Ok(reader) = runtime.spawn(task).await {
+                            quota_reader = reader;
+                        }
+                    } else {
+                        quota_reader = task.await;
+                    }
+                } else {
+                    result(&proxy, &account, model, settled, false, started, body_read).await;
+                    proxy.report_account_error(&account, error).await;
+                }
+            }
         }
         if pending_quota_body.is_none() {
             if !limited && let Some(reader) = quota_reader.as_ref() {
@@ -596,18 +1057,23 @@ pub(crate) async fn forward_authorized(
             };
             if has_next {
                 last_decoded_quota_reset = decoded_quota_reset.or(last_decoded_quota_reset);
-                let reader = pending_quota_body.map(|(header_until, mut body)| {
-                    let proxy = proxy.clone();
-                    let model = model.to_owned();
-                    let account = account.clone();
-                    tokio::spawn(async move {
-                        body.read(&mut response, deadline, true).await;
-                        body.settle_google_quota(&proxy, &account, &model, &headers, header_until, quota_reader)
-                            .await
-                            .ok()
-                            .map(|cooldown| cooldown.until)
-                    })
-                });
+                let reader = worker_pending_handle
+                    .map(|handle| tokio::spawn(async move { handle.await.ok().and_then(|res| res.ok()).map(|cooldown| cooldown.until) }))
+                    .or_else(|| {
+                        pending_quota_body.map(|(header_until, mut body)| {
+                            let proxy = proxy.clone();
+                            let model = model.to_owned();
+                            let account = account.clone();
+                            let mut response = response.take().unwrap();
+                            tokio::spawn(async move {
+                                body.read(&mut response, deadline, true).await;
+                                body.settle_google_quota(&proxy, &account, &model, &headers, header_until, quota_reader)
+                                    .await
+                                    .ok()
+                                    .map(|cooldown| cooldown.until)
+                            })
+                        })
+                    });
                 if let Some(until) = quota_until {
                     retained_quota.push(RetainedQuota { account, until: Some(until), reader });
                 }
@@ -615,8 +1081,20 @@ pub(crate) async fn forward_authorized(
                 proxy.log("warn", "upstream request failed over").await;
                 continue;
             }
-            if let Some((header_until, mut body)) = pending_quota_body {
-                body.read(&mut response, deadline, true).await;
+            if let Some(handle) = worker_pending_handle {
+                if let Ok(settled) = handle.await {
+                    match settled {
+                        Ok(cooldown) => quota_until = Some(cooldown.until),
+                        Err(error) => {
+                            limited = false;
+                            quota_until = None;
+                            exchange.attempt_error(&error);
+                            classified = Some(*error);
+                        }
+                    }
+                }
+            } else if let Some((header_until, mut body)) = pending_quota_body {
+                body.read(response.as_mut().unwrap(), deadline, true).await;
                 match body.settle_google_quota(&proxy, &account, model, &headers, header_until, quota_reader).await {
                     Ok(cooldown) => quota_until = Some(cooldown.until),
                     Err(error) => {
@@ -671,36 +1149,62 @@ pub(crate) async fn forward_authorized(
                 .await;
             return (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response();
         }
-        if status.is_success() {
+        if worker_upstream.is_some() && lane == Lane::Google && !status.is_success() {
+            exchange.finish(Some(status), "http_error", prelude.usage, Some(millis(began.elapsed())), None).await;
+            return lane_error(lane, status, "upstream inference failed");
+        }
+        let worker_stream_outcome = (worker_upstream.is_some() && lane == Lane::Google && status.is_success()).then(|| {
+            WorkerStreamOutcome::new(
+                proxy.clone(),
+                account.clone(),
+                exchange.model.clone(),
+                headers.clone(),
+                policy.failover_cooldown_secs,
+                started,
+            )
+        });
+        let mut guard = RecordOnDrop(Some(exchange), None, worker_stream_outcome.clone());
+        if prelude.stream_error.is_some()
+            && let Some(outcome) = worker_stream_outcome.as_ref()
+        {
+            // Guard already owns `exchange`; dispatch prelude-observed transport error
+            // before awaiting the affinity lock so cancellation loses neither accounting
+            // nor the exchange record.
+            outcome.dispatch_transport_error().await;
+        }
+        if status.is_success()
+            && let Some(ex) = guard.0.as_ref()
+        {
             let mut state = proxy.state.write().await;
-            if let Some(key) = &exchange.affinity_key {
+            if let Some(key) = &ex.affinity_key {
                 let current = state.pool.bound(lane, key);
                 // Do not overwrite a conversation moved while this request was in flight.
-                let shared_key_binding =
-                    accounts.subscriptions_only && current.and_then(|id| state.pool.accounts.get(id)).is_some_and(|a| !accounts.allows(a));
+                let shared_key_binding = accounts.subscriptions_only
+                    && current.and_then(|id| state.pool.accounts.get(id)).is_some_and(|a| !accounts.allows_in(&state.pool, a));
                 if !shared_key_binding && (current.is_none() || current == moved_from.as_deref() || current == Some(&account.id)) {
                     state.pool.bind(lane, key, &account.id);
-                    if let (Some(session), Some(parent)) = (&exchange.session, &exchange.parent) {
+                    if let (Some(session), Some(parent)) = (&ex.session, &ex.parent) {
                         state.pool.link(lane, session, parent);
                     }
                 }
             }
         }
-        if let Some(capture) = &mut exchange.capture {
+        if let Some(capture) = guard.0.as_mut().and_then(|ex| ex.capture.as_mut()) {
             capture.response_type = if sse { "text/event-stream" } else { "application/json" }.into();
         }
         let state = Wire {
             proxy: proxy.clone(),
-            guard: RecordOnDrop(Some(exchange), None),
+            guard,
             account,
             status,
             started: began,
-            upstream: response,
+            upstream: response.unwrap(),
             first: prelude.first,
             stream_error: prelude.stream_error,
             flush_google_prefix: prelude.flush_prefix,
             upstream_done: false,
             sse,
+            strict_sse_eof: worker_upstream.is_some() && lane == Lane::Google,
             google: (google_stream && !sse && status.is_success()).then(|| GoogleFrames::new(false)),
             google_sse: google_stream && sse && status.is_success(),
             fallback: policy.failover_cooldown_secs,
@@ -716,6 +1220,9 @@ pub(crate) async fn forward_authorized(
             allow_usage_refresh: worker_upstream.is_none(),
         };
         let mut response = Response::new(Body::from_stream(stream::try_unfold(state, Wire::next)));
+        if let Some(outcome) = worker_stream_outcome {
+            response.extensions_mut().insert(outcome);
+        }
         *response.status_mut() = status;
         let connection = connection_headers(&headers);
         for (key, value) in &headers {
@@ -838,6 +1345,7 @@ fn pool_limit(lane: Lane, model: &str, PoolQuota { reset, verified_reset, now }:
         })
     };
     let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(payload)).into_response();
+    response.extensions_mut().insert(LocalPoolResponse);
     let headers = response.headers_mut();
     headers.insert("x-should-retry", header::HeaderValue::from_static("false"));
     if lane == Lane::Google
@@ -946,7 +1454,7 @@ pub(crate) async fn run_window_start(
         } else {
             let sse = is_sse(response.headers());
             let error = match crate::bounded_body(response, 256 * 1024).await {
-                Ok(body) if sse => SseObserver::frame(&body, &mut usage, account),
+                Ok(body) if sse => SseObserver::frame(&body, &mut usage, account).0,
                 Ok(body) => {
                     if let Ok(raw) = serde_json::from_slice(&body) {
                         usage.observe(&raw, account.lane);
@@ -1093,6 +1601,10 @@ fn google_affinity_hint(raw: &Value, model: &str, cache: Option<&str>) -> Option
 pub(crate) struct ProjectFields(Vec<(Range<usize>, String)>);
 
 impl ProjectFields {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Find project aliases in wire order and reject duplicate routing fields before
     /// consulting `Value`, which only keeps the last value for a repeated key.
     pub(crate) fn scan(body: &[u8]) -> Option<Self> {
@@ -1581,7 +2093,7 @@ fn google_reset_hint(raw: &Value, now: DateTime<Utc>) -> (Option<Cooldown>, bool
         if let Value::Array(items) = raw {
             return items.iter().filter_map(|item| collect(item, now, verified)).reduce(Cooldown::merge);
         }
-        let error = raw.get("error")?;
+        let error = raw.get("error").or_else(|| raw.pointer("/response/error"))?;
         // An item may omit its status in a 429 body, but an explicit non-quota error cannot attest a quota reset.
         if !error.get("code").is_none_or(|code| matches!(code.as_u64(), Some(8 | 429)))
             || !error.get("status").is_none_or(|status| matches!(status.as_str(), Some("RESOURCE_EXHAUSTED" | "QUOTA_EXHAUSTED")))
@@ -1851,6 +2363,17 @@ struct GoogleError {
 }
 
 impl GoogleError {
+    fn from_worker_object(raw: &Value) -> Option<(Self, &Value)> {
+        if let Some(found) = Self::from_frame(raw) {
+            return Some(found);
+        }
+        let nested = raw.pointer("/response/error")?.as_object()?;
+        let synthetic = json!({ "error": nested });
+        let (mut error, _) = Self::from_frame(&synthetic)?;
+        error.reset = google_reset_hint(raw, Utc::now()).0;
+        Some((error, raw))
+    }
+
     fn from_frame(raw: &Value) -> Option<(Self, &Value)> {
         if let Value::Array(items) = raw {
             return items.iter().find_map(Self::from_frame);
@@ -1902,10 +2425,8 @@ impl GoogleError {
             &account_secrets(account),
         )?;
         // A generic in-band 403 can be specific to the requested resource.
-        if classified.kind == AccountErrorKind::PermissionDenied
-            && !raw.pointer("/error/details").is_some_and(Value::is_array)
-            && source == AccountErrorSource::Inference
-        {
+        let has_details = raw.pointer("/error/details").or_else(|| raw.pointer("/response/error/details")).is_some_and(Value::is_array);
+        if classified.kind == AccountErrorKind::PermissionDenied && !has_details && source == AccountErrorSource::Inference {
             return None;
         }
         classified.source = source;
@@ -2149,9 +2670,158 @@ struct GooglePrelude {
     usage: Usage,
     stream_error: Option<reqwest::Error>,
     flush_prefix: bool,
+    timed_out: bool,
 }
 
-async fn google_first(response: &mut reqwest::Response, first: Bytes, sse: bool) -> GooglePrelude {
+enum DecodedSseEvent {
+    Empty,
+    Json(Value),
+    Invalid,
+}
+
+fn decode_sse_event_json(event_bytes: &[u8]) -> DecodedSseEvent {
+    let mut rest = event_bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(event_bytes);
+    let mut data_lines = Vec::new();
+    while !rest.is_empty() {
+        let (len, end) = sse_line_break(rest).unwrap_or((rest.len(), rest.len()));
+        let Ok(line) = std::str::from_utf8(&rest[..len]) else {
+            return DecodedSseEvent::Invalid;
+        };
+        rest = &rest[end..];
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, rest)) => (field, rest.strip_prefix(' ').unwrap_or(rest)),
+            None => (line, ""),
+        };
+        if field == "data" {
+            data_lines.push(value);
+        }
+    }
+    if data_lines.is_empty() {
+        return DecodedSseEvent::Empty;
+    }
+    match serde_json::from_str::<Value>(&data_lines.join("\n")) {
+        Ok(value) => DecodedSseEvent::Json(value),
+        Err(_) => DecodedSseEvent::Invalid,
+    }
+}
+
+async fn google_worker_json_prelude(
+    response: &mut reqwest::Response,
+    first: Bytes,
+    limit: usize,
+    deadline: tokio::time::Instant,
+) -> GooglePrelude {
+    let mut buf = first.to_vec();
+    let mut prelude = GooglePrelude::default();
+    let mut eof = false;
+    while buf.len() <= limit {
+        match tokio::time::timeout_at(deadline, response.chunk()).await {
+            Ok(Ok(Some(bytes))) => {
+                if buf.len().saturating_add(bytes.len()) > limit {
+                    prelude.first = [Some(buf.into()), Some(bytes)];
+                    return prelude;
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            Ok(Ok(None)) => {
+                eof = true;
+                break;
+            }
+            Ok(Err(err)) => {
+                prelude.stream_error = Some(err);
+                break;
+            }
+            Err(_) => {
+                prelude.timed_out = true;
+                break;
+            }
+        }
+    }
+    if eof
+        && let Ok(raw) = serde_json::from_slice::<Value>(&buf)
+        && raw.is_object()
+    {
+        prelude.usage.observe(&raw, Lane::Google);
+        if let Some((error, err_raw)) = GoogleError::from_worker_object(&raw) {
+            prelude.error = Some((error, err_raw.clone()));
+        }
+    }
+    if !buf.is_empty() {
+        prelude.first = [Some(buf.into()), None];
+    }
+    prelude
+}
+
+async fn google_first(response: &mut reqwest::Response, first: Bytes, sse: bool, strict_sse_eof: bool) -> GooglePrelude {
+    if sse && strict_sse_eof {
+        let mut frames = SseFrames::default();
+        let mut received = first.len();
+        frames.push(first);
+        let mut prefix = Vec::new();
+        let mut eof = false;
+        let mut prelude = GooglePrelude::default();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if received > GOOGLE_FRAME_LIMIT || tokio::time::Instant::now() >= deadline {
+                prelude.flush_prefix = true;
+                break;
+            }
+            if let Some((event_bytes, complete)) = frames.take(false, true) {
+                prefix.extend_from_slice(&event_bytes);
+                if complete {
+                    match decode_sse_event_json(&event_bytes) {
+                        DecodedSseEvent::Empty => {}
+                        // Stop at the first malformed data event so the worker sanitizer
+                        // handles it with 502 instead of scanning past to a later error.
+                        DecodedSseEvent::Invalid => break,
+                        DecodedSseEvent::Json(raw) => match crate::worker::classify_google_worker_envelope(&raw) {
+                            crate::worker::GoogleWorkerEnvelopeKind::Invalid => break,
+                            crate::worker::GoogleWorkerEnvelopeKind::ProviderError => {
+                                if let Some((error, err_raw)) = GoogleError::from_worker_object(&raw) {
+                                    prelude.error = Some((error, err_raw.clone()));
+                                }
+                                break;
+                            }
+                            crate::worker::GoogleWorkerEnvelopeKind::Data => {
+                                prelude.usage.observe(&raw, Lane::Google);
+                                if google_has_output(&raw) {
+                                    break;
+                                }
+                            }
+                        },
+                    }
+                }
+            } else if eof {
+                break;
+            } else if received == GOOGLE_FRAME_LIMIT {
+                prelude.flush_prefix = true;
+                break;
+            } else {
+                match tokio::time::timeout_at(deadline, response.chunk()).await {
+                    Ok(Ok(Some(bytes))) => {
+                        received = received.saturating_add(bytes.len());
+                        frames.push(bytes);
+                    }
+                    Ok(Ok(None)) => eof = true,
+                    Ok(Err(err)) => {
+                        prelude.stream_error = Some(err);
+                        break;
+                    }
+                    Err(_) => {
+                        prelude.flush_prefix = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let mut tail = std::mem::take(&mut frames.frame);
+        tail.extend_from_slice(&frames.pending);
+        prelude.first = [(!prefix.is_empty()).then(|| prefix.into()), (!tail.is_empty()).then(|| tail.into())];
+        return prelude;
+    }
     let mut frames = GoogleFrames::new(sse);
     let mut received = first.len();
     frames.push(first);
@@ -2218,6 +2888,7 @@ struct Wire {
     flush_google_prefix: bool,
     upstream_done: bool,
     sse: bool,
+    strict_sse_eof: bool,
     google: Option<GoogleFrames>,
     google_sse: bool,
     fallback: u64,
@@ -2248,7 +2919,9 @@ impl Wire {
                 return Ok(Some(GoogleFrame { bytes, json: None }));
             } else if let Some(err) = self.stream_error.take() {
                 // Let the downstream dispatcher flush the buffered prefix before it aborts the body.
-                tokio::task::yield_now().await;
+                if self.guard.2.is_none() {
+                    tokio::task::yield_now().await;
+                }
                 return Err(err);
             } else if self.upstream_done {
                 return Ok(None);
@@ -2276,6 +2949,11 @@ impl Wire {
     async fn google_frame(&mut self, mut frame: GoogleFrame) -> Bytes {
         if let Some((span, mut raw)) = frame.json.take() {
             self.usage.observe(&raw, Lane::Google);
+            // Google worker responses defer all provider-error classification and
+            // runtime-owned accounting to WorkerStreamOutcome so nothing is lost on drop.
+            if self.guard.2.is_some() {
+                return frame.bytes;
+            }
             if let Some((error, detail)) = GoogleError::from_frame(&raw)
                 && let Some(exchange) = &mut self.guard.0
             {
@@ -2301,7 +2979,7 @@ impl Wire {
                     extend_quota(&self.proxy, &self.account, &exchange.model, until).await;
                 }
                 if cooldown.is_some() {
-                    if first_error {
+                    if first_error && self.allow_usage_refresh {
                         self.proxy.schedule_usage_refresh(self.account.id.clone()).await;
                     }
                     normalize_google_quota(&mut raw, &exchange.model, now);
@@ -2318,9 +2996,11 @@ impl Wire {
         frame.bytes
     }
 
-    async fn record_stream_error(&mut self, error: AccountError) {
+    async fn record_stream_error(&mut self, error: AccountError, reset_hint: Option<Cooldown>) {
         self.sse_failed = true;
-        let limited = (error.kind == AccountErrorKind::QuotaExhausted).then(|| quota_deadline(None, self.fallback, Utc::now()));
+        let now = Utc::now();
+        let limited = (error.kind == AccountErrorKind::QuotaExhausted)
+            .then(|| quota_deadline(quota_hint(self.account.lane, self.upstream.headers(), reset_hint, now), self.fallback, now));
         if let Some(exchange) = &mut self.guard.0 {
             exchange.attempt_error(&error);
             if let Some(last) = exchange.attempts.last_mut() {
@@ -2340,7 +3020,9 @@ impl Wire {
             Ok(Some(chunk))
         } else if let Some(err) = self.stream_error.take() {
             // Let the downstream dispatcher flush the buffered prefix before it aborts the body.
-            tokio::task::yield_now().await;
+            if self.guard.2.is_none() {
+                tokio::task::yield_now().await;
+            }
             Err(err)
         } else {
             self.upstream.chunk().await
@@ -2352,19 +3034,26 @@ impl Wire {
             return Ok(None);
         }
         loop {
-            let (frame, error) = match self.sse_frames.take(self.sse_eof) {
+            let (frame, error, reset_hint) = match self.sse_frames.take(self.sse_eof, self.strict_sse_eof) {
                 Some((frame, true)) => {
-                    let error = SseObserver::frame(&frame, &mut self.usage, &self.account);
-                    if self.google_sse && !error.as_ref().is_some_and(|e| e.kind.is_blocking()) {
-                        let mut lines = GoogleFrames::new(true);
-                        lines.push(frame.clone());
-                        let mut rewritten = Vec::new();
-                        while let Some(line) = lines.next(true) {
-                            rewritten.extend_from_slice(&self.google_frame(line).await);
+                    if self.guard.2.is_some() {
+                        if let DecodedSseEvent::Json(raw) = decode_sse_event_json(&frame) {
+                            self.usage.observe(&raw, self.account.lane);
                         }
-                        (rewritten.into(), error.filter(|_| self.guard.1.is_none()))
+                        (frame, None, None)
                     } else {
-                        (frame, error)
+                        let (error, reset_hint) = SseObserver::frame(&frame, &mut self.usage, &self.account);
+                        if self.google_sse && !error.as_ref().is_some_and(|e| e.kind.is_blocking()) {
+                            let mut lines = GoogleFrames::new(true);
+                            lines.push(frame.clone());
+                            let mut rewritten = Vec::new();
+                            while let Some(line) = lines.next(true) {
+                                rewritten.extend_from_slice(&self.google_frame(line).await);
+                            }
+                            (rewritten.into(), error.filter(|_| self.guard.1.is_none()), reset_hint)
+                        } else {
+                            (frame, error, reset_hint)
+                        }
                     }
                 }
                 Some((bytes, false)) => return Ok(Some(bytes)),
@@ -2382,7 +3071,7 @@ impl Wire {
                 let kind = error.kind;
                 let terminal = kind.is_blocking();
                 if self.status.is_success() && (!self.sse_failed || terminal) {
-                    self.record_stream_error(error).await;
+                    self.record_stream_error(error, reset_hint).await;
                 }
                 if terminal {
                     self.sse_terminal = true;
@@ -2433,18 +3122,44 @@ impl Wire {
                 {
                     self.usage.observe(&raw, self.account.lane);
                 }
-                if self.status.is_success() && self.guard.1.is_none() {
-                    if done.is_err() && !self.sse_failed {
-                        self.record_stream_error(local_error(
-                            AccountErrorKind::UpstreamUnavailable,
-                            AccountErrorSource::Stream,
-                            "upstream response stream broke",
-                        ))
+                if self.status.is_success() && self.guard.1.is_none() && done.is_err() && !self.sse_failed {
+                    if let Some(worker_outcome) = self.guard.2.as_ref() {
+                        worker_outcome.dispatch_transport_error().await;
+                    } else {
+                        self.record_stream_error(
+                            local_error(
+                                AccountErrorKind::UpstreamUnavailable,
+                                AccountErrorSource::Stream,
+                                "upstream response stream broke",
+                            ),
+                            None,
+                        )
                         .await;
                     }
-                    if !self.sse_failed {
-                        result(&self.proxy, &self.account, "", None, true, self.request_at, None).await;
-                    }
+                }
+                if let Some(worker_outcome) = self.guard.2.clone()
+                    && let Some(exchange) = self.guard.0.take()
+                {
+                    let response =
+                        if self.response_size <= CAPTURE_BYTES { transformed_response(&self.capture_buf, self.sse) } else { None };
+                    worker_outcome.defer_completion(DeferredWireCompletion {
+                        proxy: self.proxy.clone(),
+                        account: self.account.clone(),
+                        exchange,
+                        status: self.status,
+                        usage: self.usage,
+                        latency: millis(self.started.elapsed()),
+                        request_at: self.request_at,
+                        response,
+                        response_size: self.response_size,
+                        failure: self.guard.1.take(),
+                        sse_failed: self.sse_failed,
+                        done_err: done.is_err(),
+                    });
+                    return done.map(|_| None);
+                }
+                if self.status.is_success() && self.guard.1.is_none() && !self.sse_failed {
+                    result(&self.proxy, &self.account, "", None, true, self.request_at, None).await;
                 }
                 if let Some(mut exchange) = self.guard.0.take() {
                     let outcome = if let Some((error, _, _)) = self.guard.1 {
@@ -2518,7 +3233,7 @@ impl SseFrames {
     }
 
     // The bool indicates a complete frame eligible for inspection, not raw passthrough bytes.
-    fn take(&mut self, eof: bool) -> Option<(Bytes, bool)> {
+    fn take(&mut self, eof: bool, strict_eof: bool) -> Option<(Bytes, bool)> {
         const MAX_EVENT_BYTES: usize = 1024 * 1024;
         if !self.pending.is_empty() && std::mem::take(&mut self.after_cr) && self.pending[0] == b'\n' {
             return Some((self.pending.split_to(1), false));
@@ -2562,7 +3277,7 @@ impl SseFrames {
         if forwarded > 0 {
             Some((self.pending.split_to(forwarded), false))
         } else {
-            (eof && !self.frame.is_empty()).then(|| (std::mem::take(&mut self.frame).into(), true))
+            (eof && !self.frame.is_empty()).then(|| (std::mem::take(&mut self.frame).into(), !strict_eof))
         }
     }
 }
@@ -2574,24 +3289,30 @@ struct SseObserver {
 }
 
 impl SseObserver {
-    fn frame(frame: &[u8], usage: &mut Usage, account: &Account) -> Option<AccountError> {
+    fn frame(frame: &[u8], usage: &mut Usage, account: &Account) -> (Option<AccountError>, Option<Cooldown>) {
         let mut observer = Self::default();
         let mut rest = frame.strip_prefix(b"\xef\xbb\xbf").unwrap_or(frame);
         let mut first_error = None;
+        let mut reset_hint = None;
         while !rest.is_empty() {
             let (len, end) = sse_line_break(rest).unwrap_or((rest.len(), rest.len()));
-            if let Some(error) = observer.observe(&rest[..len], usage, account) {
+            let (error, hint) = observer.observe(&rest[..len], usage, account);
+            if hint.is_some() {
+                reset_hint = reset_hint.or(hint);
+            }
+            if let Some(error) = error {
                 if error.kind.is_blocking() {
-                    return Some(error);
+                    return (Some(error), reset_hint);
                 }
                 first_error.get_or_insert(error);
             }
             rest = &rest[end..];
         }
-        observer.flush(usage, account).or(first_error)
+        let (flushed, hint) = observer.flush(usage, account);
+        (flushed.or(first_error), reset_hint.or(hint))
     }
 
-    fn observe(&mut self, line: &[u8], usage: &mut Usage, account: &Account) -> Option<AccountError> {
+    fn observe(&mut self, line: &[u8], usage: &mut Usage, account: &Account) -> (Option<AccountError>, Option<Cooldown>) {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
@@ -2608,35 +3329,66 @@ impl SseObserver {
             self.data.push(b'\n');
             if let Ok(raw) = serde_json::from_slice::<Value>(data) {
                 usage.observe(&raw, account.lane);
+                let hint = (account.lane == Lane::Google).then(|| google_reset_hint(&raw, Utc::now()).0).flatten();
                 if let Some(error) = classify_sse_error(account.lane, &self.event, data, &account_secrets(account)) {
-                    return Some(error);
+                    return (Some(error), hint);
                 }
             }
         }
-        None
+        (None, None)
     }
 
-    fn flush(&mut self, usage: &mut Usage, account: &Account) -> Option<AccountError> {
+    fn flush(&mut self, usage: &mut Usage, account: &Account) -> (Option<AccountError>, Option<Cooldown>) {
+        let mut hint = None;
         if let Ok(raw) = serde_json::from_slice::<Value>(&self.data) {
             usage.observe(&raw, account.lane);
+            if account.lane == Lane::Google {
+                hint = google_reset_hint(&raw, Utc::now()).0;
+            }
         }
         let error = classify_sse_error(account.lane, &self.event, &self.data, &account_secrets(account));
         self.event.clear();
         self.data.clear();
-        error
+        (error, hint)
     }
 }
 
-struct RecordOnDrop(Option<Exchange>, Option<(GoogleError, Usage, i64)>);
+struct RecordOnDrop(Option<Exchange>, Option<(GoogleError, Usage, i64)>, Option<WorkerStreamOutcome>);
 impl Drop for RecordOnDrop {
     fn drop(&mut self) {
-        if let Some(mut exchange) = self.0.take()
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
+        // Only inspect worker drop state if this guard still owns the exchange;
+        // after normal EOF transfer to deferred completion, leave provider_error_classified
+        // intact for finish_ok().
+        let Some(mut exchange) = self.0.take() else {
+            return;
+        };
+        let (worker_stream_error, provider_status, provider_classified) =
+            self.2.as_ref().map_or((false, None, None), WorkerStreamOutcome::early_drop_error);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let failure = self.1;
             runtime.spawn(async move {
+                if worker_stream_error {
+                    if let Some(last) = exchange.attempts.last_mut() {
+                        last.status_code = Some(i32::from(StatusCode::BAD_GATEWAY.as_u16()));
+                        last.outcome = "stream_error".into();
+                    }
+                    exchange.finish(Some(StatusCode::BAD_GATEWAY), "stream_error", Usage::default(), None, None).await;
+                    return;
+                }
                 if let Some((error, usage, latency)) = failure {
                     exchange.finish(Some(error.status), error.outcome(), usage, Some(latency), None).await;
+                    return;
+                }
+                if let Some(err_status) = provider_status {
+                    if let Some(classified) = &provider_classified {
+                        exchange.attempt_error(classified);
+                    }
+                    let outcome = if err_status == StatusCode::TOO_MANY_REQUESTS { "rate_limited" } else { "stream_error" };
+                    if let Some(last) = exchange.attempts.last_mut() {
+                        last.status_code = Some(i32::from(err_status.as_u16()));
+                        last.outcome = outcome.into();
+                    }
+                    exchange.finish(Some(err_status), outcome, Usage::default(), None, None).await;
                     return;
                 }
                 let mut status = None;

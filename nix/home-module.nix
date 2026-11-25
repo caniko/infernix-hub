@@ -63,13 +63,36 @@
   };
   proxyCfg = cfg.agentProxy;
   workerCfg = proxyCfg.workerListener;
+  googleWorkerCfg = proxyCfg.googleWorkerListener;
   # The socket's leading %t is the only intentional systemd specifier.
-  workerSocketArg = let
-    escaped = escapeSystemdExecArgs [workerCfg.unixSocket];
+  escapeSocketArg = socket: let
+    escaped = escapeSystemdExecArgs [socket];
   in
     if lib.hasPrefix ''"%%t/'' escaped
     then ''"%t/${lib.removePrefix ''"%%t/'' escaped}''
     else escaped;
+  workerSocketArg = escapeSocketArg workerCfg.unixSocket;
+  googleWorkerSocketArg = escapeSocketArg googleWorkerCfg.unixSocket;
+  isCanonicalSocketPath = socket: let
+    parts = lib.splitString "/" socket;
+    tail = builtins.tail parts;
+  in
+    tail != [] && lib.all (part: part != "" && part != "." && part != "..") tail;
+  userUid =
+    if (args ? osConfig) && (args.osConfig.users.users.${config.home.username}.uid or null) != null
+    then toString args.osConfig.users.users.${config.home.username}.uid
+    else null;
+  resolveSocketPath = socket:
+    if userUid != null && lib.hasPrefix "%t/" socket
+    then "/run/user/${userUid}/${lib.removePrefix "%t/" socket}"
+    else socket;
+  mixedRuntimePrefix = a: b:
+    (lib.hasPrefix "%t/" a && lib.hasPrefix "/run/user/" b)
+    || (lib.hasPrefix "/run/user/" a && lib.hasPrefix "%t/" b);
+  workerSocketsCollide = a: b:
+    if userUid != null
+    then resolveSocketPath a == resolveSocketPath b
+    else a == b || mixedRuntimePrefix a b;
   localProxy = cfg.enable && proxyCfg.enable && hasProxy;
   collectorCfg = cfg.collector;
   hasDeclarativeT3UsageSources =
@@ -259,9 +282,30 @@ in {
           type = types.listOf (types.addCheck (types.strMatching "[A-Za-z0-9._:/-]+") (model: let
             lower = lib.toLower model;
           in
-            !(lib.hasInfix "claude" lower || lib.hasInfix "anthropic" lower)));
+            builtins.stringLength model
+            <= 192
+            && !(lib.hasInfix "claude" lower || lib.hasInfix "anthropic" lower)));
           default = [];
           description = "Exact Codex model names permitted on the worker socket; required when enabled.";
+        };
+      };
+      googleWorkerListener = {
+        enable = lib.mkEnableOption "the OAuth-only Google/Antigravity worker socket";
+        unixSocket = lib.mkOption {
+          type = types.strMatching "(%t|/run)/[A-Za-z0-9._/-]+";
+          default = "%t/fleetix-agent-proxy/worker-google.sock";
+          description = "Private Unix socket for scoped Google/Antigravity workers under %t or /run, with no parent traversal.";
+        };
+        allowedModels = lib.mkOption {
+          type = types.listOf (types.addCheck (types.strMatching "[A-Za-z0-9._:/-]+") (model: let
+            lower = lib.toLower model;
+          in
+            builtins.stringLength model
+            <= 192
+            && lib.hasPrefix "gemini-" lower
+            && !(lib.hasInfix "claude" lower || lib.hasInfix "anthropic" lower || lib.hasInfix "gpt" lower || lib.hasInfix "openai" lower)));
+          default = [];
+          description = "Exact Gemini model names permitted on the Google worker socket; required when enabled.";
         };
       };
       discoverLocal = lib.mkOption {
@@ -323,12 +367,24 @@ in {
           message = "Fleetix Agent Proxy local and external modes are mutually exclusive.";
         }
         {
-          assertion = !(lib.elem ".." (lib.splitString "/" workerCfg.unixSocket));
-          message = "Fleetix Agent Proxy worker socket must not contain '..' path components.";
+          assertion = isCanonicalSocketPath workerCfg.unixSocket;
+          message = "Fleetix Agent Proxy worker socket must be a canonical path without empty, '.' or '..' components.";
         }
         {
           assertion = !workerCfg.enable || workerCfg.allowedModels != [];
           message = "Fleetix Agent Proxy worker listener requires a non-empty model allowlist.";
+        }
+        {
+          assertion = isCanonicalSocketPath googleWorkerCfg.unixSocket;
+          message = "Fleetix Agent Proxy Google worker socket must be a canonical path without empty, '.' or '..' components.";
+        }
+        {
+          assertion = !googleWorkerCfg.enable || googleWorkerCfg.allowedModels != [];
+          message = "Fleetix Agent Proxy Google worker listener requires a non-empty model allowlist.";
+        }
+        {
+          assertion = !(workerCfg.enable && googleWorkerCfg.enable && workerSocketsCollide workerCfg.unixSocket googleWorkerCfg.unixSocket);
+          message = "Fleetix Agent Proxy Codex and Google worker sockets must use distinct paths (and cannot mix %t/ with /run/user/ when UID is unavailable).";
         }
       ];
     }
@@ -391,6 +447,10 @@ in {
                 + lib.optionalString workerCfg.enable (
                   " \"--worker-unix-socket\" ${workerSocketArg} "
                   + escapeSystemdExecArgs (map (model: "--worker-allowed-models=${model}") workerCfg.allowedModels)
+                )
+                + lib.optionalString googleWorkerCfg.enable (
+                  " \"--google-worker-unix-socket\" ${googleWorkerSocketArg} "
+                  + escapeSystemdExecArgs (map (model: "--google-worker-allowed-models=${model}") googleWorkerCfg.allowedModels)
                 );
               Restart = "on-failure";
               RestartSec = 5;

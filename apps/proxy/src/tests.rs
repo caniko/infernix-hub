@@ -1,7 +1,11 @@
 use super::*;
 use crate::{
     pool::AccountFilter,
-    worker::{CODEX_RESPONSES, WorkerOptions},
+    worker::{
+        CODEX_RESPONSES, GOOGLE_COUNT_TOKENS, GOOGLE_FETCH_ADMIN_CONTROLS, GOOGLE_FETCH_AVAILABLE_MODELS, GOOGLE_FETCH_USER_INFO,
+        GOOGLE_GENERATE_CONTENT, GOOGLE_LIST_EXPERIMENTS, GOOGLE_LOAD_CODE_ASSIST, GOOGLE_RETRIEVE_QUOTA_SUMMARY,
+        GOOGLE_STREAM_GENERATE_CONTENT, GoogleWorkerOptions, WorkerOptions,
+    },
 };
 use axum::{
     body::{Body, Bytes},
@@ -941,6 +945,1775 @@ async fn scoped_worker_startup_rejects_invalid_configuration() {
         .unwrap(),
     );
     assert!(worker.validate_pool(&proxy).await.is_err());
+}
+
+#[tokio::test]
+async fn scoped_google_worker_uses_only_google_oauth_accounts_and_rewrites_project() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = Scratch::new();
+    let shared_calls = Arc::new(AtomicUsize::new(0));
+    let shared = serve(Router::new().fallback({
+        let shared_calls = shared_calls.clone();
+        move || async move {
+            shared_calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }))
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen_queries = Arc::new(tokio::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let mock = serve(Router::new().fallback({
+        let calls = calls.clone();
+        let seen_queries = seen_queries.clone();
+        move |uri: axum::http::Uri, headers: HeaderMap, body: axum::body::Bytes| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            seen_queries.lock().await.push(uri.query().map(str::to_owned));
+            assert_eq!(headers["authorization"], "Bearer upstream-google-oauth");
+            assert!(!headers.contains_key("x-goog-api-key"));
+            assert!(!headers.contains_key("x-api-key"));
+            let raw: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(raw["project"], "real-upstream-project");
+            assert_eq!(raw["model"], "gemini-4-neon-high");
+            match raw["request"]["contents"][0]["parts"][0]["text"].as_str() {
+                Some("fail") => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                Some("quota") => {
+                    (StatusCode::TOO_MANY_REQUESTS, r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota exceeded"}}"#)
+                        .into_response()
+                }
+                _ => (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"OK\"}]}}]}}\n\n",
+                )
+                    .into_response(),
+            }
+        }
+    }))
+    .await;
+    let config = fixture_config(&dir, &shared);
+    let worker = GoogleWorkerOptions {
+        google_worker_unix_socket: Some(dir.join("worker-google.sock")),
+        google_worker_allowed_models: vec!["gemini-4-neon-high".into()],
+        ..Default::default()
+    }
+    .validate(&config, None)
+    .unwrap()
+    .unwrap()
+    .with_test_upstream(mock.0.clone());
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    {
+        let mut state = proxy.state.write().await;
+        // API-key Google account and ambiguous opaque token without refresh/ya29 must never be used.
+        state.pool.insert(
+            pool::parse_credentials(
+                "google-key.json",
+                &json!({"type":"api_key","family":"google","api_key":"AIzaSyFixtureKey000000000000"}),
+                false,
+            )
+            .unwrap(),
+        );
+        state.pool.insert(
+            pool::parse_credentials("google-aiza.json", &json!({"type":"antigravity","access_token":"AIzaSyDisguisedKey000000000"}), false)
+                .unwrap(),
+        );
+        state.pool.insert(
+            pool::parse_credentials("google-opaque.json", &json!({"type":"antigravity","access_token":"opaque-no-refresh"}), false)
+                .unwrap(),
+        );
+        state.pool.policy.api_key_order = contracts::providers::ApiKeyOrder::KeysFirst;
+        state.pool.policy.preferred_account_id = Some("google-key.json".into());
+    }
+    let server = serve(worker.app(proxy.clone())).await;
+    let http = Http::new(&server);
+    let post = |text: &str| {
+        http.request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+            .bearer_auth("worker-placeholder")
+            .header("content-type", "application/json")
+            .json(&json!({
+                "model": "gemini-4-neon-high",
+                "project": "worker-project",
+                "request": {"contents": [{"role": "user", "parts": [{"text": text}]}]},
+                "requestId": "agent/test/1",
+                "requestType": "agent",
+                "userAgent": "antigravity",
+            }))
+    };
+    assert_eq!(post("empty").send().await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials(
+            "google-oauth.json",
+            &json!({
+                "type": "antigravity",
+                "access_token": "upstream-google-oauth",
+                "refresh_token": "1//fixture-google-refresh",
+                "project_id": "real-upstream-project",
+                "base_url": shared.0.as_str(),
+            }),
+            false,
+        )
+        .unwrap(),
+    );
+    let ok = post("allow").send().await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert!(ok.text().await.unwrap().contains("\"text\":\"OK\""));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(shared_calls.load(Ordering::SeqCst), 0, "account base_url override must be ignored");
+    assert_eq!(seen_queries.lock().await.as_slice(), &[Some("alt=sse".to_owned())]);
+
+    {
+        let mut state = proxy.state.write().await;
+        state.pool.policy.preferred_account_id = None;
+        state.pool.policy.switch_on_server_error = true;
+    }
+    assert_eq!(post("fail").send().await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "must not fail over to API-key Google account");
+    assert_eq!(post("quota").send().await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(shared_calls.load(Ordering::SeqCst), 0);
+    assert!(proxy.state.read().await.usage_refreshes.is_empty(), "no ad-hoc probe may be scheduled");
+}
+
+#[tokio::test]
+async fn scoped_google_worker_synthesizes_metadata_and_filters_available_models() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = Scratch::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock = serve(Router::new().fallback({
+        let calls = calls.clone();
+        move |uri: axum::http::Uri, body: axum::body::Bytes| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(uri.path(), GOOGLE_FETCH_AVAILABLE_MODELS);
+            let raw: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(raw["project"], "real-upstream-project");
+            axum::Json(json!({
+                "models": {
+                    "gemini-4-neon-high": {"displayName": "Gemini 4 Neon High", "model": "MODEL_PLACEHOLDER_M37"},
+                    "gemini-4-argon-high": {"displayName": "Gemini 4 Argon High"},
+                    "claude-opus-5-5-max": {"displayName": "Claude Opus"},
+                    "gpt-6.2-astra": {"displayName": "GPT Astra"}
+                },
+                "defaultAgentModelId": "claude-opus-5-5-max",
+                "agentModelSorts": [
+                    {
+                        "displayName": "Recommended",
+                        "groups": [
+                            {"modelIds": ["claude-opus-5-5-max", "gemini-4-neon-high", "gemini-4-argon-high"]},
+                            {"modelIds": ["claude-opus-5-5-max"]}
+                        ]
+                    },
+                    {
+                        "displayName": "Other",
+                        "groups": [{"modelIds": ["gpt-6.2-astra"]}]
+                    }
+                ],
+                "commandModelIds": ["claude-opus-5-5-max", "gemini-4-neon-high"],
+                "operatorEmail": "private@example.test"
+            }))
+        }
+    }))
+    .await;
+    let config = fixture_config(&dir, &mock);
+    let worker = GoogleWorkerOptions {
+        google_worker_unix_socket: Some(dir.join("worker-google.sock")),
+        google_worker_allowed_models: vec!["gemini-4-neon-high".into()],
+        ..Default::default()
+    }
+    .validate(&config, None)
+    .unwrap()
+    .unwrap()
+    .with_test_upstream(mock.0.clone());
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials(
+            "google-oauth.json",
+            &json!({
+                "type": "antigravity",
+                "access_token": "upstream-google-oauth",
+                "refresh_token": "1//fixture-google-refresh",
+                "project_id": "real-upstream-project",
+            }),
+            false,
+        )
+        .unwrap(),
+    );
+    let server = serve(worker.app(proxy)).await;
+    let http = Http::new(&server);
+
+    let load: Value = http
+        .request("POST", GOOGLE_LOAD_CODE_ASSIST)
+        .json(&json!({"metadata": {"ideType": "ANTIGRAVITY"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(load["cloudaicompanionProject"], "worker-project");
+    for path in [GOOGLE_FETCH_USER_INFO, GOOGLE_FETCH_ADMIN_CONTROLS, GOOGLE_LIST_EXPERIMENTS, GOOGLE_RETRIEVE_QUOTA_SUMMARY] {
+        let res = http.request("POST", path).json(&json!({"project": "worker-project"})).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.json::<Value>().await.unwrap(), json!({}));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "synthetic metadata endpoints must never contact upstream");
+
+    let catalog: Value = http
+        .request("POST", GOOGLE_FETCH_AVAILABLE_MODELS)
+        .json(&json!({"project": "worker-project"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(catalog["models"].as_object().unwrap().keys().collect::<Vec<_>>(), vec!["gemini-4-neon-high"]);
+    assert_eq!(catalog["defaultAgentModelId"], "gemini-4-neon-high");
+    assert_eq!(catalog["agentModelSorts"], json!([{"displayName": "Recommended", "groups": [{"modelIds": ["gemini-4-neon-high"]}]}]));
+    assert_eq!(catalog["commandModelIds"], json!(["gemini-4-neon-high"]));
+    assert!(catalog.get("operatorEmail").is_none());
+}
+
+#[tokio::test]
+async fn scoped_google_worker_enforces_routes_queries_headers_models_and_strict_json() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = Scratch::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock = serve(Router::new().fallback({
+        let calls = calls.clone();
+        move || async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            axum::Json(json!({"totalTokens": 7}))
+        }
+    }))
+    .await;
+    let config = fixture_config(&dir, &mock);
+    let worker = GoogleWorkerOptions {
+        google_worker_unix_socket: Some(dir.join("worker-google.sock")),
+        google_worker_allowed_models: vec!["gemini-4-neon-high".into()],
+        ..Default::default()
+    }
+    .validate(&config, None)
+    .unwrap()
+    .unwrap()
+    .with_test_upstream(mock.0.clone());
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials(
+            "google-oauth.json",
+            &json!({
+                "type": "antigravity",
+                "access_token": "upstream-google-oauth",
+                "refresh_token": "1//fixture-google-refresh",
+                "project_id": "real-upstream-project",
+            }),
+            false,
+        )
+        .unwrap(),
+    );
+    let server = serve(worker.app(proxy)).await;
+    let http = Http::new(&server);
+
+    for (method, path) in [
+        ("POST", "/v1/messages"),
+        ("POST", "/v1/responses"),
+        ("POST", "/v1/chat/completions"),
+        ("POST", CODEX_RESPONSES),
+        ("GET", "/v0/management/status"),
+        ("GET", "/v8/management/status"),
+        ("POST", "/v1beta/models/gemini-4-neon-high:generateContent"),
+        ("POST", "/v1internal:onboardUser"),
+        ("POST", "/v1internal:deleteInstance"),
+        ("POST", "/v1internal:writeTrajectoryAcls"),
+        ("GET", GOOGLE_FETCH_AVAILABLE_MODELS),
+        ("POST", &format!("{GOOGLE_GENERATE_CONTENT}?alt=sse")),
+        ("POST", &format!("{GOOGLE_COUNT_TOKENS}?alt=sse")),
+        ("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=json")),
+        ("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse&key=x")),
+    ] {
+        let res =
+            http.request(method, path).json(&json!({"model": "gemini-4-neon-high", "request": {"contents": []}})).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "expected 403 for {method} {path}");
+    }
+
+    for (path, raw_body) in [
+        (GOOGLE_STREAM_GENERATE_CONTENT, r#"{"model":"claude-opus-5-5-max","request":{"contents":[]}}"#),
+        (GOOGLE_STREAM_GENERATE_CONTENT, r#"{"model":"gemini-4-argon-high","request":{"contents":[]}}"#),
+        (GOOGLE_STREAM_GENERATE_CONTENT, r#"{"model":"gemini-4-neon-high","request":{"model":"claude-opus-5-5-max","contents":[]}}"#),
+        (
+            GOOGLE_STREAM_GENERATE_CONTENT,
+            r#"{"model":"gemini-4-neon-high","request":{"cachedContent":"projects/other/cachedContents/c","contents":[]}}"#,
+        ),
+        (GOOGLE_STREAM_GENERATE_CONTENT, r#"{"model":"gemini-4-neon-high","request":{"contents":[]},"unknown":1}"#),
+        (GOOGLE_STREAM_GENERATE_CONTENT, r#"{"model":"gemini-4-neon-high","model":"gemini-4-neon-high","request":{"contents":[]}}"#),
+        (GOOGLE_STREAM_GENERATE_CONTENT, r#"{"model":"gemini-4-neon-high","request":{"$serde_json::private::Number":"1"}}"#),
+        (GOOGLE_COUNT_TOKENS, r#"{"model":"gemini-4-neon-high","request":{"model":"models/claude-opus-5-5-max","contents":[]}}"#),
+        (GOOGLE_COUNT_TOKENS, r#"{"request":{"model":"models/gemini-4-argon-high","contents":[]}}"#),
+    ] {
+        let res = http.request("POST", path).header("content-type", "application/json").body(raw_body).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "expected 403 for {path} body {raw_body}");
+    }
+
+    // Disallowed header must be rejected.
+    let bad_hdr = http
+        .request("POST", GOOGLE_GENERATE_CONTENT)
+        .header("x-cpa-purpose", "canary")
+        .json(&json!({"model": "gemini-4-neon-high", "request": {"contents": []}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_hdr.status(), StatusCode::FORBIDDEN);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    // Valid countTokens with models/ prefix passes.
+    let ok = http
+        .request("POST", GOOGLE_COUNT_TOKENS)
+        .json(&json!({"request": {"model": "models/gemini-4-neon-high", "contents": []}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn scoped_google_worker_validation_and_tcp_bearer_isolation() {
+    let dir = Scratch::new();
+    let mock = serve(Router::new()).await;
+    let config = fixture_config(&dir, &mock);
+    let codex_key = dir.join("codex-key");
+    let google_key = dir.join("google-key");
+    let codex_bearer = "codex-worker-bearer-fixture-000001";
+    let google_bearer = "google-worker-bearer-fixture-000001";
+    config::write_private(&codex_key, format!("{codex_bearer}\n").as_bytes(), true).unwrap();
+    config::write_private(&google_key, format!("{google_bearer}\n").as_bytes(), true).unwrap();
+
+    let codex = WorkerOptions {
+        worker_unix_socket: Some(dir.join("worker.sock")),
+        worker_api_key_file: Some(codex_key.clone()),
+        worker_allowed_models: vec!["gpt-6.2-sol".into()],
+        ..Default::default()
+    }
+    .validate(&config)
+    .unwrap()
+    .unwrap();
+
+    // Colliding socket path or key must fail.
+    assert!(
+        GoogleWorkerOptions {
+            google_worker_unix_socket: Some(dir.join("worker.sock")),
+            google_worker_allowed_models: vec!["gemini-4-neon-high".into()],
+            ..Default::default()
+        }
+        .validate(&config, Some(&codex))
+        .is_err()
+    );
+    assert!(
+        GoogleWorkerOptions {
+            google_worker_listen: Some("127.0.0.1:0".parse().unwrap()),
+            google_worker_api_key_file: Some(codex_key),
+            google_worker_allowed_models: vec!["gemini-4-neon-high".into()],
+            ..Default::default()
+        }
+        .validate(&config, Some(&codex))
+        .is_err()
+    );
+    // Disallowed model names must fail.
+    for models in [&[][..], &["gpt-6.2-sol"], &["claude-opus-5-5"], &["gemini-claude-sneak"], &["gemini-gpt-sneak"]] {
+        assert!(
+            GoogleWorkerOptions {
+                google_worker_unix_socket: Some(dir.join("worker-google.sock")),
+                google_worker_allowed_models: models.iter().map(|s| (*s).into()).collect(),
+                ..Default::default()
+            }
+            .validate(&config, Some(&codex))
+            .is_err()
+        );
+    }
+
+    let google = GoogleWorkerOptions {
+        google_worker_listen: Some("127.0.0.1:0".parse().unwrap()),
+        google_worker_api_key_file: Some(google_key),
+        google_worker_allowed_models: vec!["gemini-4-neon-high".into()],
+        ..Default::default()
+    }
+    .validate(&config, Some(&codex))
+    .unwrap()
+    .unwrap();
+
+    let proxy = Arc::new(Proxy::new(config).unwrap().with_worker_configs(Some(&codex), Some(&google)));
+    let shared_server = serve(proxy.clone().app()).await;
+    let bound = google.bind().await.unwrap();
+    let google_addr = bound.test_tcp_addr();
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let task = tokio::spawn({
+        let shutdown = shutdown.clone();
+        let proxy = proxy.clone();
+        async move {
+            bound.serve(proxy, shutdown.notified_owned()).await.unwrap();
+        }
+    });
+    let google_url = reqwest::Url::parse(&format!("http://{google_addr}")).unwrap();
+    let raw_http = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    // Google TCP bearer must be rejected on shared listener and required on Google worker listener.
+    let shared_res = Http::new(&shared_server)
+        .request("POST", GOOGLE_LOAD_CODE_ASSIST)
+        .bearer_auth(google_bearer)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shared_res.status(), StatusCode::UNAUTHORIZED);
+
+    let unauth = raw_http.post(google_url.join(GOOGLE_LOAD_CODE_ASSIST).unwrap()).json(&json!({})).send().await.unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let authed =
+        raw_http.post(google_url.join(GOOGLE_LOAD_CODE_ASSIST).unwrap()).bearer_auth(google_bearer).json(&json!({})).send().await.unwrap();
+    assert_eq!(authed.status(), StatusCode::OK);
+    shutdown.notify_one();
+    task.await.unwrap();
+
+    // Hub token must not equal either worker bearer.
+    assert!(codex.validate_hub_token(codex_bearer).is_err());
+    assert!(codex.validate_hub_token("distinct-hub-token-fixture-000001").is_ok());
+    let google_again = GoogleWorkerOptions {
+        google_worker_listen: Some("127.0.0.1:0".parse().unwrap()),
+        google_worker_api_key_file: Some(dir.join("google-key")),
+        google_worker_allowed_models: vec!["gemini-4-neon-high".into()],
+        ..Default::default()
+    }
+    .validate(&fixture_config(&dir, &mock), Some(&codex))
+    .unwrap()
+    .unwrap();
+    assert!(google_again.validate_hub_token(google_bearer).is_err());
+    assert!(google_again.validate_hub_token("distinct-hub-token-fixture-000001").is_ok());
+}
+
+#[tokio::test]
+async fn scoped_google_worker_hardening_regressions() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // P1-1: Contradictory boolean api_key: true + refresh_token is rejected at ingestion;
+    // boolean api_key: true + ya29.* is marked api_key=true and excluded from selection & reset witnesses.
+    assert!(
+        pool::parse_credentials(
+            "contradictory.json",
+            &json!({"type":"antigravity","api_key":true,"access_token":"ya29.fixture","refresh_token":"1//fixture"}),
+            false,
+        )
+        .is_err()
+    );
+    let marked_api = pool::parse_credentials(
+        "bool-api.json",
+        &json!({"type":"antigravity","api_key":true,"access_token":"ya29.fixture","project_id":"proj-api"}),
+        false,
+    )
+    .unwrap();
+    assert!(marked_api[0].api_key);
+
+    let dir = Scratch::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<(String, Value)>::new()));
+    let mock = serve(Router::new().fallback({
+        let calls = calls.clone();
+        let seen_bodies = seen_bodies.clone();
+        move |uri: axum::http::Uri, body: axum::body::Bytes| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let raw: Value = serde_json::from_slice(&body).unwrap();
+            seen_bodies.lock().await.push((uri.path().to_owned(), raw.clone()));
+            match uri.path() {
+                GOOGLE_FETCH_AVAILABLE_MODELS => axum::Json(json!({
+                    "models": {
+                        "gemini-4-neon-high": {
+                            "displayName": "Gemini 4 Neon High",
+                            "model": "MODEL_PLACEHOLDER_M37",
+                            "quotaInfo": {"remainingFraction": 0.42, "resetTime": "2030-01-01T00:00:00Z"},
+                            "weeklyQuotaInfo": {"remainingFraction": 0.77},
+                            "internalOperatorNote": "secret-note"
+                        }
+                    },
+                    "defaultAgentModelId": "gemini-4-neon-high",
+                    "agentModelSorts": [{
+                        "displayName": "Recommended",
+                        "secretSortMeta": "strip-me",
+                        "groups": [{"modelIds": ["gemini-4-neon-high"], "secretGroupMeta": "strip-me"}]
+                    }]
+                }))
+                .into_response(),
+                GOOGLE_COUNT_TOKENS => axum::Json(json!({
+                    "totalTokens": 42,
+                    "remainingCredits": 9999,
+                    "secretField": "strip-me"
+                }))
+                .into_response(),
+                GOOGLE_GENERATE_CONTENT => match raw["request"]["contents"][0]["parts"][0]["text"].as_str() {
+                    Some("upstream-error") => (
+                        StatusCode::BAD_REQUEST,
+                        [("x-goog-debug", "operator-project-123"), ("x-ratelimit-remaining", "5")],
+                        r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"project operator-project-123 failed"}}"#,
+                    )
+                        .into_response(),
+                    _ => (
+                        StatusCode::OK,
+                        [("x-goog-debug", "strip-header"), ("x-ratelimit-remaining", "5")],
+                        axum::Json(json!({
+                            "response": {
+                                "candidates": [{"content": {"role": "model", "parts": [{"text": "clean"}]}}],
+                                "usageMetadata": {"totalTokenCount": 9},
+                                "secretInner": "strip-me"
+                            },
+                            "consumedCredits": 12,
+                            "remainingCredits": 888,
+                            "traceOperator": "operator@example.test"
+                        })),
+                    )
+                        .into_response(),
+                },
+                GOOGLE_STREAM_GENERATE_CONTENT => {
+                    let text = raw["request"]["contents"][0]["parts"][0]["text"].as_str().unwrap_or("");
+                    if text == "late-quota" {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream"), ("x-ratelimit-remaining", "0")],
+                            concat!(
+                                "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"part1\"}]}}]},\"consumedCredits\":5}\n\n",
+                                "data: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"quota exceeded for operator-project-123\"}}\n\n"
+                            ),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream"), ("x-goog-debug", "strip-me")],
+                            "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]}}]},\"consumedCredits\":3,\"remainingCredits\":97}\n\n",
+                        )
+                            .into_response()
+                    }
+                }
+                _ => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+    }))
+    .await;
+
+    let config = fixture_config(&dir, &mock);
+    let worker = GoogleWorkerOptions {
+        google_worker_unix_socket: Some(dir.join("worker-google.sock")),
+        google_worker_allowed_models: vec!["gemini-4-neon-high".into()],
+        ..Default::default()
+    }
+    .validate(&config, None)
+    .unwrap()
+    .unwrap()
+    .with_test_upstream(mock.0.clone());
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    {
+        let mut state = proxy.state.write().await;
+        // Bool api_key=true account + OAuth account WITHOUT a trusted project must both be ineligible for project-bound calls.
+        state.pool.insert(marked_api);
+        state.pool.insert(
+            pool::parse_credentials(
+                "oauth-no-project.json",
+                &json!({"type":"antigravity","access_token":"ya29.no-proj","refresh_token":"1//no-proj"}),
+                false,
+            )
+            .unwrap(),
+        );
+        // Put verified cooldown on api_key account and verify subscriptions_only reset witness ignores it.
+        let now = Utc::now();
+        let reset = now + TimeDelta::minutes(10);
+        state
+            .pool
+            .accounts
+            .get_mut("bool-api.json")
+            .unwrap()
+            .scoped_cooldowns
+            .insert("gemini".into(), pool::Cooldown { until: reset, verified_reset: true });
+        let filter = pool::AccountFilter {
+            lane: Lane::Google,
+            model: "gemini-4-neon-high",
+            required_project: None,
+            subscriptions_only: true,
+            require_account_project: true,
+        };
+        assert_eq!(state.pool.verified_google_reset_at_for(&filter, now), None);
+    }
+
+    let server = serve(worker.app(proxy.clone())).await;
+    let http = Http::new(&server);
+
+    // P1-3: Caller-supplied project must never reach upstream when no OAuth account has a trusted project.
+    let no_proj = http
+        .request("POST", GOOGLE_GENERATE_CONTENT)
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "project": "attacker-project",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_proj.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    // Now add an OAuth account with a trusted project.
+    proxy.state.write().await.pool.insert(
+        pool::parse_credentials(
+            "oauth-trusted.json",
+            &json!({
+                "type": "antigravity",
+                "access_token": "ya29.trusted",
+                "refresh_token": "1//trusted",
+                "project_id": "trusted-gcp-project"
+            }),
+            false,
+        )
+        .unwrap(),
+    );
+
+    // P1-2 & P1-3: routingConfig, modelSelectionConfig, x-goog-request-params, unknown request keys, deep JSON all rejected (403).
+    assert_eq!(
+        http.request("POST", GOOGLE_GENERATE_CONTENT)
+            .header("x-goog-request-params", "project=attacker")
+            .json(&json!({"model": "gemini-4-neon-high", "request": {"contents": []}}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for bad_req in [
+        json!({"model": "gemini-4-neon-high", "request": {"contents": [], "generationConfig": {"routingConfig": {"autoMode": {}}}}}),
+        json!({"model": "gemini-4-neon-high", "request": {"contents": [], "generationConfig": {"modelSelectionConfig": {"featureSelectionPreference": "QUALITY"}}}}),
+        json!({"model": "gemini-4-neon-high", "request": {"contents": [], "generation_config": {"routing_config": {}}}}),
+        json!({"model": "gemini-4-neon-high", "request": {"contents": [], "unknownNestedField": true}}),
+    ] {
+        assert_eq!(
+            http.request("POST", GOOGLE_GENERATE_CONTENT).json(&bad_req).send().await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "expected 403 for {bad_req}"
+        );
+    }
+    // P2-3: Excessive nesting depth rejected fast.
+    let mut deep = String::from(r#"{"model":"gemini-4-neon-high","request":{"contents":"#);
+    for _ in 0..70 {
+        deep.push('[');
+    }
+    for _ in 0..70 {
+        deep.push(']');
+    }
+    deep.push_str("}}");
+    assert_eq!(
+        http.request("POST", GOOGLE_GENERATE_CONTENT).header("content-type", "application/json").body(deep).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    // P1-4: fetchAvailableModels strips quotaInfo, weeklyQuotaInfo, and unknown fields inside allowed model/sort/group entries.
+    let catalog: Value = http
+        .request("POST", GOOGLE_FETCH_AVAILABLE_MODELS)
+        .json(&json!({"project": "attacker-project"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = &catalog["models"]["gemini-4-neon-high"];
+    assert_eq!(entry["displayName"], "Gemini 4 Neon High");
+    assert!(entry.get("quotaInfo").is_none());
+    assert!(entry.get("weeklyQuotaInfo").is_none());
+    assert!(entry.get("internalOperatorNote").is_none());
+    assert!(catalog["agentModelSorts"][0].get("secretSortMeta").is_none());
+    assert!(catalog["agentModelSorts"][0]["groups"][0].get("secretGroupMeta").is_none());
+
+    // P1-2: countTokens with outer-only model rewrites to canonical request.model="models/..." and omits project.
+    let count: Value = http
+        .request("POST", GOOGLE_COUNT_TOKENS)
+        .json(&json!({"model": "gemini-4-neon-high", "project": "attacker-project", "request": {"contents": []}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(count, json!({"totalTokens": 42}));
+    {
+        let bodies = seen_bodies.lock().await;
+        let (path, sent) = bodies.last().unwrap();
+        assert_eq!(path, GOOGLE_COUNT_TOKENS);
+        assert!(sent.get("project").is_none());
+        assert!(sent.get("model").is_none());
+        assert_eq!(sent["request"]["model"], "models/gemini-4-neon-high");
+    }
+
+    // P1-5: 2xx JSON response strips account credits, unknown fields, and upstream headers.
+    let gen_ok = http
+        .request("POST", GOOGLE_GENERATE_CONTENT)
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "project": "attacker-project",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "ok"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gen_ok.status(), StatusCode::OK);
+    assert!(gen_ok.headers().get("x-goog-debug").is_none());
+    assert!(gen_ok.headers().get("x-ratelimit-remaining").is_none());
+    let gen_json: Value = gen_ok.json().await.unwrap();
+    assert_eq!(gen_json["response"]["candidates"][0]["content"]["parts"][0]["text"], "clean");
+    assert!(gen_json.get("consumedCredits").is_none());
+    assert!(gen_json.get("remainingCredits").is_none());
+    assert!(gen_json.get("traceOperator").is_none());
+    assert!(gen_json["response"].get("secretInner").is_none());
+
+    // P1-5: Upstream error body/headers are replaced by locally synthesized Google RPC error.
+    let gen_err = http
+        .request("POST", GOOGLE_GENERATE_CONTENT)
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "upstream-error"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gen_err.status(), StatusCode::BAD_REQUEST);
+    assert!(gen_err.headers().get("x-goog-debug").is_none());
+    assert!(gen_err.headers().get("x-ratelimit-remaining").is_none());
+    let err_text = gen_err.text().await.unwrap();
+    assert!(!err_text.contains("operator-project-123"));
+
+    // P1-5 + P2-1: SSE strips account credits + diagnostics AND in-stream quota error after first frame schedules zero usage refreshes.
+    let sse = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "late-quota"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse.status(), StatusCode::OK);
+    assert!(sse.headers().get("x-ratelimit-remaining").is_none());
+    let sse_text = sse.text().await.unwrap();
+    assert!(sse_text.contains("\"text\":\"part1\""));
+    assert!(!sse_text.contains("consumedCredits"));
+    assert!(!sse_text.contains("operator-project-123"));
+    assert!(sse_text.contains("RESOURCE_EXHAUSTED"));
+    assert!(proxy.state.read().await.usage_refreshes.is_empty(), "in-stream worker quota error must not trigger usage refresh");
+}
+
+#[tokio::test]
+async fn scoped_google_worker_round2_hardening_regressions() {
+    let dir = Scratch::new();
+    let mock = serve(Router::new().fallback(|uri: axum::http::Uri, body: axum::body::Bytes| async move {
+        let raw: Value = serde_json::from_slice(&body).unwrap();
+        match uri.path() {
+            GOOGLE_FETCH_AVAILABLE_MODELS => axum::Json(json!({
+                "models": {
+                    "gemini-4-neon-high": {
+                        "displayName": {"nested": "bad-type"},
+                        "model": "MODEL_PLACEHOLDER_M37",
+                        "supportsThinking": "not-a-bool",
+                        "maxTokens": 3000000000_u64,
+                        "maxOutputTokens": 65536,
+                        "supportedMimeTypes": {"image/png": true, "application/pdf": false, "bad/mime": "yes"},
+                        "supportedThinkingLevels": ["high", 42, {"bad": true}]
+                    }
+                },
+                "defaultAgentModelId": "gemini-4-neon-high"
+            }))
+            .into_response(),
+            GOOGLE_COUNT_TOKENS => match raw["request"]["contents"][0]["parts"][0]["text"].as_str() {
+                Some("nested-error") => (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    axum::Json(json!({"response":{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"secret count quota detail"}}})),
+                )
+                    .into_response(),
+                _ => (StatusCode::OK, [("content-type", "application/json")], "{not-valid-json").into_response(),
+            },
+            GOOGLE_GENERATE_CONTENT => match raw["request"]["contents"][0]["parts"][0]["text"].as_str() {
+                Some("diag-200") => axum::Json(json!({
+                    "response": {
+                        "candidates": [{
+                            "content": {"role": "model", "parts": [{"text": "hello", "extraPartDiag": "strip"}]},
+                            "finishReason": "STOP",
+                            "finishMessage": "provider internal diag operator-project",
+                            "index": 0
+                        }],
+                        "promptFeedback": {
+                            "blockReason": "OTHER",
+                            "blockReasonMessage": "provider block diag"
+                        },
+                        "usageMetadata": {
+                            "promptTokenCount": 3,
+                            "candidatesTokenCount": 1,
+                            "totalTokenCount": 4,
+                            "providerInternalCost": 999
+                        },
+                        "modelVersion": "gemini-4-neon",
+                        "traceId": "trace-secret-123",
+                        "responseId": "resp-secret-456"
+                    }
+                }))
+                .into_response(),
+                Some("bad-400") => (
+                    StatusCode::BAD_REQUEST,
+                    [("retry-after", "99")],
+                    r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"raw upstream detail"}}"#,
+                )
+                    .into_response(),
+                Some("nested-rpc8-json") => (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    axum::Json(json!({"response":{"error":{"code":8,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"150s"}]}}})),
+                )
+                    .into_response(),
+                _ => StatusCode::OK.into_response(),
+            },
+            GOOGLE_STREAM_GENERATE_CONTENT => match raw["request"]["contents"][0]["parts"][0]["text"].as_str() {
+                Some("json-array") => (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    axum::Json(json!([
+                        {
+                            "response": {
+                                "candidates": [{"content": {"role": "model", "parts": [{"text": "chunk-1"}]}, "finishMessage": "strip"}],
+                                "traceId": "strip-trace"
+                            },
+                            "consumedCredits": 2
+                        },
+                        {
+                            "response": {
+                                "candidates": [{"content": {"role": "model", "parts": [{"text": "chunk-2"}]}}]
+                            },
+                            "remainingCredits": 50
+                        }
+                    ])),
+                )
+                    .into_response(),
+                Some("cr-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "\u{feff}: keepalive\n\rdata: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"cr-ok\"}]},\"finishMessage\":\"strip\"}],\"traceId\":\"strip\"}}\r\r",
+                )
+                    .into_response(),
+                Some("empty-data-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data:\n\n",
+                )
+                    .into_response(),
+                Some("bare-data-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data\n\n",
+                )
+                    .into_response(),
+                Some("trailing-malformed-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok-first\"}]}}]}}\n\ndata: {broken-final",
+                )
+                    .into_response(),
+                Some("open-cr-sse") => {
+                    let first = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(Bytes::from_static(
+                            b"data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"live-cr\"}]}}]}}\r\r",
+                        ))
+                    });
+                    let stream = futures_util::StreamExt::chain(first, futures_util::stream::pending());
+                    (StatusCode::OK, [("content-type", "text/event-stream")], Body::from_stream(stream)).into_response()
+                }
+                Some("response-error-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data: {\"response\":{\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"secret upstream billing detail\",\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"180s\"}]}}}\n\n",
+                )
+                    .into_response(),
+                Some("unterminated-429-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"uncommitted 429\"}}",
+                )
+                    .into_response(),
+                Some("multiline-invalid-429-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\"}}\ndata: {trailing-garbage\n\n",
+                )
+                    .into_response(),
+                Some("nested-rpc8-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data: {\"response\":{\"error\":{\"code\":8,\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"240s\"}]}}}\n\n",
+                )
+                    .into_response(),
+                Some("invalid-then-429-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data: {broken-first\n\ndata: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\"}}\n\n",
+                )
+                    .into_response(),
+                Some("null-then-429-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data: null\n\ndata: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\"}}\n\n",
+                )
+                    .into_response(),
+                Some("oversized-error-sse") => {
+                    let padding = "x".repeat(1_200_000);
+                    let payload = format!(
+                        "data: {{\"error\":{{\"code\":503,\"status\":\"UNAVAILABLE\",\"message\":\"{padding}\"}}}}\n\n"
+                    );
+                    (StatusCode::OK, [("content-type", "text/event-stream")], payload).into_response()
+                }
+                Some("truncated-valid-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"danger_tool\",\"args\":{}}}]}}]}}",
+                )
+                    .into_response(),
+                Some("malformed-sse") => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"before-bad\"}]}}]}}\n\ndata: {not-valid-json\n\n",
+                )
+                    .into_response(),
+                _ => StatusCode::OK.into_response(),
+            },
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }))
+    .await;
+
+    let config = fixture_config(&dir, &mock);
+    let worker = GoogleWorkerOptions {
+        google_worker_unix_socket: Some(dir.join("worker-google.sock")),
+        google_worker_allowed_models: vec!["gemini-4-neon-high".into()],
+        ..Default::default()
+    }
+    .validate(&config, None)
+    .unwrap()
+    .unwrap()
+    .with_test_upstream(mock.0.clone());
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+
+    // Round-2 P1-1: Same-refresh rediscovery with api_key: true and wrapped OpenCode auth with outer api_key: true.
+    {
+        let mut state = proxy.state.write().await;
+        // Enroll a valid provenance Google OAuth account, then attempt same-refresh rediscovery marked api_key: true.
+        pool::add_provenance_google(
+            &mut state.pool,
+            "work",
+            json!({
+                "access_token": "ya29.orig",
+                "refresh_token": "1//same-refresh",
+                "project_id": "trusted-project",
+                "expires_at": "2035-01-01T00:00:00Z"
+            }),
+        );
+        let original_id = state.pool.accounts.keys().next().unwrap().clone();
+        // Contradictory same-refresh with api_key: true must be rejected without mutating access_token.
+        pool::add_provenance_google(
+            &mut state.pool,
+            "work",
+            json!({
+                "api_key": true,
+                "access_token": "ya29.injected-api",
+                "refresh_token": "1//same-refresh",
+                "project_id": "trusted-project",
+                "expires_at": "2035-01-01T00:00:00Z"
+            }),
+        );
+        assert_eq!(state.pool.accounts[&original_id].access, "ya29.orig");
+        assert!(!state.pool.accounts[&original_id].api_key);
+
+        // Wrapped OpenCode entry with outer api_key: true / type: api_key must NOT enter OAuth pool.
+        let mut fresh_pool = pool::Pool::default();
+        pool::add_opencode(
+            &mut fresh_pool,
+            &json!({
+                "antigravity": {
+                    "api_key": true,
+                    "auth": {"access_token": "ya29.wrapped", "project_id": "proj-wrapped"}
+                }
+            }),
+            &Default::default(),
+        );
+        let wrapped = fresh_pool.accounts.values().next().unwrap();
+        assert!(wrapped.api_key, "outer api_key: true must survive unwrapping nested auth");
+        let filter = pool::AccountFilter {
+            lane: Lane::Google,
+            model: "gemini-4-neon-high",
+            required_project: None,
+            subscriptions_only: true,
+            require_account_project: true,
+        };
+        assert!(!filter.allows(wrapped));
+        let now = Utc::now();
+        let wrapped_id = wrapped.id.clone();
+        fresh_pool
+            .accounts
+            .get_mut(&wrapped_id)
+            .unwrap()
+            .scoped_cooldowns
+            .insert("gemini".into(), pool::Cooldown { until: now + TimeDelta::minutes(5), verified_reset: true });
+        assert_eq!(fresh_pool.verified_google_reset_at_for(&filter, now), None);
+
+        // Round-3 P1-1: Provenance record whose SOLE API-key marker is `provider: "api_key"`
+        // must keep api_key=true even after `provider` is stripped during enrollment.
+        let mut prov_pool = pool::Pool::default();
+        pool::add_provenance_google(
+            &mut prov_pool,
+            "provider-api",
+            json!({"provider": "api_key", "access_token": "ya29.prov-api", "project_id": "proj-api"}),
+        );
+        let prov_acc = prov_pool.accounts.values().next().unwrap();
+        assert!(prov_acc.api_key);
+        assert!(!filter.allows(prov_acc));
+
+        // Round-4 P1: Lane-valued `type` must NOT mask `provider: "api_key"`.
+        let mut masked_pool = pool::Pool::default();
+        pool::add_provenance_google(
+            &mut masked_pool,
+            "masked-provider-api",
+            json!({"type": "google", "provider": "api_key", "access_token": "ya29.masked-api", "project_id": "proj-api"}),
+        );
+        let masked_acc = masked_pool.accounts.values().next().unwrap();
+        assert!(masked_acc.api_key);
+        assert!(!filter.allows(masked_acc));
+        let mut masked_oc = pool::Pool::default();
+        pool::add_opencode(
+            &mut masked_oc,
+            &json!({
+                "antigravity": {
+                    "type": "google",
+                    "provider": "api_key",
+                    "auth": {"access_token": "ya29.masked-oc", "project_id": "proj-oc"}
+                }
+            }),
+            &Default::default(),
+        );
+        let masked_oc_acc = masked_oc.accounts.values().next().unwrap();
+        assert!(masked_oc_acc.api_key);
+        assert!(!filter.allows(masked_oc_acc));
+
+        // Round-5 P1-1: Nested `tokens` object carrying API-key markers must never qualify as Google OAuth.
+        let nested_api = pool::parse_credentials(
+            "nested-api.json",
+            &json!({"type": "google", "project_id": "proj-nested", "tokens": {"api_key": true, "access_token": "ya29.nested-api"}}),
+            false,
+        )
+        .unwrap();
+        assert!(nested_api[0].api_key);
+        assert!(!filter.allows(&nested_api[0]));
+        assert!(
+            pool::parse_credentials(
+                "nested-contradictory.json",
+                &json!({"type": "google", "tokens": {"provider": "api_key", "access_token": "ya29.bad", "refresh_token": "1//r"}}),
+                false,
+            )
+            .is_err()
+        );
+
+        // Round-5 P1-2: Duplicate Google credentials must be discovery-order independent.
+        let mut order_oauth_first = pool::Pool::default();
+        pool::add_provenance_google(
+            &mut order_oauth_first,
+            "dup-oauth",
+            json!({"access_token": "ya29.shared-dup", "project_id": "proj-dup", "expires_at": "2035-01-01T00:00:00Z"}),
+        );
+        pool::add_provenance_google(
+            &mut order_oauth_first,
+            "dup-api",
+            json!({"api_key": true, "access_token": "ya29.shared-dup", "project_id": "proj-dup"}),
+        );
+        assert!(order_oauth_first.pick_for(&filter, (None, None), &[], now).is_none());
+        for acc in order_oauth_first.accounts.values_mut() {
+            acc.scoped_cooldowns.insert("gemini".into(), pool::Cooldown { until: now + TimeDelta::minutes(5), verified_reset: true });
+        }
+        assert_eq!(order_oauth_first.verified_google_reset_at_for(&filter, now), None);
+
+        let mut order_api_first = pool::Pool::default();
+        pool::add_provenance_google(
+            &mut order_api_first,
+            "dup-api",
+            json!({"api_key": true, "access_token": "ya29.shared-dup", "project_id": "proj-dup"}),
+        );
+        pool::add_provenance_google(
+            &mut order_api_first,
+            "dup-oauth",
+            json!({"access_token": "ya29.shared-dup", "project_id": "proj-dup", "expires_at": "2035-01-01T00:00:00Z"}),
+        );
+        assert!(order_api_first.pick_for(&filter, (None, None), &[], now).is_none());
+        assert_eq!(order_api_first.verified_google_reset_at_for(&filter, now), None);
+
+        // Round-3 P1-1: Wrapped OpenCode auth with outer `key` or outer string `api_key`
+        // must never be suppressed by an inner OAuth-shaped token or same-name field.
+        let mut oc_pool = pool::Pool::default();
+        pool::add_opencode(
+            &mut oc_pool,
+            &json!({
+                "antigravity": {
+                    "key": "outer-key-marker",
+                    "auth": {"access_token": "ya29.inner", "project_id": "proj-oc"}
+                }
+            }),
+            &Default::default(),
+        );
+        let oc_acc = oc_pool.accounts.values().next().unwrap();
+        assert!(oc_acc.api_key);
+        assert!(!filter.allows(oc_acc));
+        let mut oc_contradictory = pool::Pool::default();
+        pool::add_opencode(
+            &mut oc_contradictory,
+            &json!({
+                "antigravity": {
+                    "api_key": "outer-string-key",
+                    "auth": {"api_key": false, "access_token": "ya29.inner", "refresh_token": "1//inner"}
+                }
+            }),
+            &Default::default(),
+        );
+        assert!(oc_contradictory.accounts.is_empty());
+    }
+
+    let server = serve(worker.app(proxy.clone())).await;
+    let http = Http::new(&server);
+
+    // Round-2 P2-1: Malformed field types dropped from catalog.
+    let catalog: Value = http.request("POST", GOOGLE_FETCH_AVAILABLE_MODELS).json(&json!({})).send().await.unwrap().json().await.unwrap();
+    let model = &catalog["models"]["gemini-4-neon-high"];
+    assert!(model.get("displayName").is_none());
+    assert!(model.get("supportsThinking").is_none());
+    assert!(model.get("maxTokens").is_none());
+    assert_eq!(model["model"], "MODEL_PLACEHOLDER_M37");
+    assert_eq!(model["maxOutputTokens"], 65536);
+    assert_eq!(model["supportedMimeTypes"], json!({"image/png": true, "application/pdf": false}));
+    assert_eq!(model["supportedThinkingLevels"], json!(["high"]));
+
+    // Round-2 P1-5: traceId, responseId, finishMessage, blockReasonMessage, and unknown usage/part fields stripped.
+    let diag: Value = http
+        .request("POST", GOOGLE_GENERATE_CONTENT)
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "diag-200"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = &diag["response"];
+    assert!(resp.get("traceId").is_none());
+    assert!(resp.get("responseId").is_none());
+    assert_eq!(resp["candidates"][0]["content"]["parts"][0], json!({"text": "hello"}));
+    assert_eq!(resp["candidates"][0]["finishReason"], "STOP");
+    assert!(resp["candidates"][0].get("finishMessage").is_none());
+    assert_eq!(resp["promptFeedback"], json!({"blockReason": "OTHER"}));
+    assert_eq!(resp["usageMetadata"], json!({"promptTokenCount": 3, "candidatesTokenCount": 1, "totalTokenCount": 4}));
+
+    // Round-2 P2-2: No-query streamGenerateContent returning JSON array succeeds and sanitizes every item.
+    let array_resp = http
+        .request("POST", GOOGLE_STREAM_GENERATE_CONTENT)
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "json-array"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(array_resp.status(), StatusCode::OK);
+    let array_json: Value = array_resp.json().await.unwrap();
+    let items = array_json.as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["response"]["candidates"][0]["content"]["parts"][0]["text"], "chunk-1");
+    assert!(items[0].get("consumedCredits").is_none());
+    assert!(items[0]["response"].get("traceId").is_none());
+    assert!(items[0]["response"]["candidates"][0].get("finishMessage").is_none());
+    assert_eq!(items[1]["response"]["candidates"][0]["content"]["parts"][0]["text"], "chunk-2");
+
+    // Round-2 P2-3: CR-only SSE framing works and comment-only frames are skipped.
+    let cr = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "cr-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(cr.contains("\"text\":\"cr-ok\""));
+    assert!(!cr.contains("strip"));
+
+    // Round-2 P2-3: Malformed SSE data event emits a local error frame instead of silent EOF.
+    let bad_sse = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "malformed-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(bad_sse.contains("\"text\":\"before-bad\""));
+    assert!(bad_sse.contains("\"code\":502"));
+    assert!(bad_sse.contains("upstream stream invalid"));
+    // Round-3 P2: Malformed SSE stream is finalized as stream_error (not disconnected).
+    tokio::task::yield_now().await;
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(last) = proxy.state.read().await.activity.back()
+                && last.outcome == "stream_error"
+            {
+                assert_eq!(last.status_code, Some(502));
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "expected stream_error activity outcome");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // Round-3 P2-3: Empty `data:` line is invalid JSON, not silently skipped.
+    let empty_sse = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "empty-data-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(empty_sse.contains("\"code\":502"));
+
+    // Round-4 P2: Bare `data` line without colon takes the same invalid-JSON path as `data:`.
+    let bare_sse = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "bare-data-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(bare_sse.contains("\"code\":502"));
+
+    // Round-4 P2: Final malformed event without blank-line terminator produces 502/stream_error and zero account.success increment.
+    let (acc_id, success_before, activity_before) = {
+        let state = proxy.state.read().await;
+        let (id, acc) = state.pool.accounts.iter().next().unwrap();
+        (id.clone(), acc.success, state.activity.len())
+    };
+    let trailing_bad = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "trailing-malformed-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(trailing_bad.contains("\"code\":502"));
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = proxy.state.read().await;
+            if state.activity.len() == activity_before + 1 {
+                let last = state.activity.back().unwrap();
+                assert_eq!(last.outcome, "stream_error");
+                assert_eq!(last.status_code, Some(502));
+                assert_eq!(state.pool.accounts[&acc_id].success, success_before, "malformed final SSE event must not increment success");
+                break;
+            }
+            drop(state);
+            assert!(tokio::time::Instant::now() < deadline, "expected trailing malformed SSE activity record");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // Round-4 P2: CR-terminated event is delivered immediately while upstream stream remains open.
+    let mut open_cr = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "open-cr-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(open_cr.status(), StatusCode::OK);
+    let first_chunk = tokio::time::timeout(Duration::from_secs(2), open_cr.chunk()).await.unwrap().unwrap().unwrap();
+    assert!(std::str::from_utf8(&first_chunk).unwrap().contains("\"text\":\"live-cr\""));
+    drop(open_cr);
+
+    // Round-5 P2: Rejected JSON response (invalid countTokens payload) records stream_error/502 and zero account.success increment.
+    let (acc_id, success_before) = {
+        let state = proxy.state.read().await;
+        let (id, acc) = state.pool.accounts.iter().next().unwrap();
+        (id.clone(), acc.success)
+    };
+    let bad_count = http
+        .request("POST", GOOGLE_COUNT_TOKENS)
+        .json(&json!({"model": "gemini-4-neon-high", "request": {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_count.status(), StatusCode::BAD_GATEWAY);
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "stream_error");
+        assert_eq!(last.status_code, Some(502));
+        assert_eq!(state.pool.accounts[&acc_id].success, success_before);
+    }
+
+    // Round-5 P2: Uncommitted valid SSE event at EOF (missing blank-line delimiter) is never dispatched.
+    let truncated_sse = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "truncated-valid-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!truncated_sse.contains("danger_tool"), "uncommitted SSE event must not be dispatched at EOF");
+    assert!(truncated_sse.contains("\"code\":502"));
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "stream_error");
+        assert_eq!(last.status_code, Some(502));
+        assert_eq!(state.pool.accounts[&acc_id].success, success_before);
+    }
+
+    // Round-5 P2: Oversized (>1 MiB) SSE error event is sanitized and recorded as stream_error (not success).
+    let oversized_err = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "oversized-error-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(oversized_err.contains("\"code\":503"));
+    assert!(!oversized_err.contains("xxxxxxxx"));
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "stream_error");
+        assert_eq!(last.status_code, Some(503));
+        assert_eq!(state.pool.accounts[&acc_id].success, success_before);
+    }
+
+    // Round-5 P2: Nested `response.error` SSE envelope is sanitized, preserves provider reset delay, and records rate_limited.
+    let resp_err = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "response-error-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(resp_err.contains("\"code\":429"));
+    assert!(!resp_err.contains("secret upstream billing detail"));
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "rate_limited");
+        assert_eq!(last.status_code, Some(429));
+        assert_eq!(state.pool.accounts[&acc_id].success, success_before);
+        let cd = state.pool.accounts[&acc_id].scoped_cooldowns.get("gemini").expect("expected provider reset cooldown");
+        assert!(cd.until > Utc::now() + TimeDelta::seconds(120), "nested response.error must preserve 180s RetryInfo reset delay");
+    }
+    // Clear the cooldown set by response-error-sse before subsequent tests.
+    proxy.state.write().await.pool.accounts.get_mut(&acc_id).unwrap().scoped_cooldowns.clear();
+
+    // Round-6 P1: Unterminated 429 SSE event at EOF must NOT cool the account and must record 502/stream_error.
+    let unterm_429 = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "unterminated-429-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(unterm_429.contains("\"code\":502"));
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "stream_error");
+        assert_eq!(last.status_code, Some(502));
+        assert!(state.pool.accounts[&acc_id].scoped_cooldowns.is_empty(), "uncommitted 429 SSE must not cool account");
+        assert_eq!(state.pool.accounts[&acc_id].success, success_before);
+    }
+
+    // Round-7 P2: Multi-line SSE event whose first line is a 429 object but joined payload is invalid JSON
+    // must NOT cool/failover and must record 502/stream_error.
+    let multi_bad = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "multiline-invalid-429-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(multi_bad.contains("\"code\":502"));
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "stream_error");
+        assert_eq!(last.status_code, Some(502));
+        assert!(state.pool.accounts[&acc_id].scoped_cooldowns.is_empty(), "invalid joined SSE payload must not cool account");
+        assert_eq!(state.pool.accounts[&acc_id].success, success_before);
+    }
+
+    // Round-7 P2: Nested response.error with numeric RPC code 8 and no status string preserves 240s RetryInfo reset delay.
+    let rpc8 = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "nested-rpc8-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(rpc8.contains("\"code\":429"));
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "rate_limited");
+        assert_eq!(last.status_code, Some(429));
+        let cd = state.pool.accounts[&acc_id].scoped_cooldowns.get("gemini").expect("expected RPC code 8 cooldown");
+        assert!(cd.until > Utc::now() + TimeDelta::seconds(180), "RPC code 8 without status must preserve 240s RetryInfo delay");
+    }
+    proxy.state.write().await.pool.accounts.get_mut(&acc_id).unwrap().scoped_cooldowns.clear();
+
+    // Round-7 P1: Managed API-key row inserted BEFORE OAuth row under another ID keeps conflict even if API-key row is removed.
+    {
+        let mut insert_pool = pool::Pool::default();
+        insert_pool.insert(
+            pool::parse_credentials(
+                "managed-key.json",
+                &json!({"type": "google", "api_key": true, "access_token": "ya29.rot-dup", "project_id": "proj-rot"}),
+                false,
+            )
+            .unwrap(),
+        );
+        insert_pool.insert(
+            pool::parse_credentials(
+                "managed-oauth.json",
+                &json!({"type": "google", "access_token": "ya29.rot-dup", "project_id": "proj-rot"}),
+                false,
+            )
+            .unwrap(),
+        );
+        insert_pool.accounts.remove("managed-key.json");
+        let filter = pool::AccountFilter {
+            lane: Lane::Google,
+            model: "gemini-4-neon-high",
+            required_project: None,
+            subscriptions_only: true,
+            require_account_project: true,
+        };
+        assert!(insert_pool.pick_for(&filter, (None, None), &[], Utc::now()).is_none());
+
+        // Round-8 P1-1: Reverse order (OAuth with refresh first, API key second) also records OAuth refresh fingerprint.
+        let mut rev_pool = pool::Pool::default();
+        rev_pool.insert(
+            pool::parse_credentials(
+                "rev-oauth.json",
+                &json!({"type": "google", "access_token": "ya29.rev-dup", "refresh_token": "1//rev-refresh", "project_id": "proj-rev"}),
+                false,
+            )
+            .unwrap(),
+        );
+        rev_pool.insert(
+            pool::parse_credentials(
+                "rev-key.json",
+                &json!({"type": "google", "api_key": true, "access_token": "ya29.rev-dup", "project_id": "proj-rev"}),
+                false,
+            )
+            .unwrap(),
+        );
+        rev_pool.accounts.remove("rev-key.json");
+        rev_pool.accounts.get_mut("rev-oauth.json").unwrap().access = "ya29.rotated-new".into();
+        assert!(rev_pool.pick_for(&filter, (None, None), &[], Utc::now()).is_none());
+
+        // Round-8 P1-2: OpenCode entry with outer string api_key records outer key digest even when inner token differs.
+        let mut outer_oc_pool = pool::Pool::default();
+        pool::add_opencode(
+            &mut outer_oc_pool,
+            &json!({"antigravity": {"api_key": "ya29.outer-key", "auth": {"access_token": "ya29.inner-tok", "project_id": "proj-oc"}}}),
+            &Default::default(),
+        );
+        let disk_matching_outer = pool::parse_credentials(
+            "disk-outer.json",
+            &json!({"type": "google", "access_token": "ya29.outer-key", "project_id": "proj-oc"}),
+            false,
+        )
+        .unwrap();
+        assert!(outer_oc_pool.is_api_key_conflicted(&disk_matching_outer[0]));
+
+        // Round-9 P1-1: OpenCode entry with outer object `api_key` wrapper and `keys[]` records nested key digests.
+        let mut group_oc_pool = pool::Pool::default();
+        pool::add_opencode(
+            &mut group_oc_pool,
+            &json!({"antigravity": {"api_key": {"keys": ["ya29.group-key"]}, "auth": {"access_token": "ya29.inner-tok", "project_id": "proj-oc"}}}),
+            &Default::default(),
+        );
+        let disk_matching_group = pool::parse_credentials(
+            "disk-group.json",
+            &json!({"type": "google", "access_token": "ya29.group-key", "project_id": "proj-oc"}),
+            false,
+        )
+        .unwrap();
+        assert!(group_oc_pool.is_api_key_conflicted(&disk_matching_group[0]));
+
+        // Round-10 P1-1: Outer OpenCode `keys[]` array marks inner `auth` as API-key material.
+        let mut keys_oc_pool = pool::Pool::default();
+        pool::add_opencode(
+            &mut keys_oc_pool,
+            &json!({"antigravity": {"keys": ["ya29.other-key"], "auth": {"access_token": "ya29.inner-oauth-shaped", "project_id": "proj-oc"}}}),
+            &Default::default(),
+        );
+        let keys_acc = keys_oc_pool.accounts.values().next().unwrap();
+        assert!(keys_acc.api_key, "outer keys[] group must classify inner auth as api_key");
+
+        // Round-10 P1-2: Merging a rejected OpenCode API-key digest onto a live pool with an existing
+        // OAuth account also persists that OAuth account's refresh fingerprint across access rotation.
+        let mut prop_pool = pool::Pool::default();
+        prop_pool.insert(
+            pool::parse_credentials(
+                "prop-oauth.json",
+                &json!({"type": "google", "access_token": "ya29.prop-old", "refresh_token": "1//prop-refresh", "project_id": "proj-prop"}),
+                false,
+            )
+            .unwrap(),
+        );
+        let mut rejected_oc = pool::Pool::default();
+        pool::add_opencode(
+            &mut rejected_oc,
+            &json!({"antigravity": {"api_key": true, "auth": {"access_token": "ya29.prop-old", "refresh_token": "1//contradictory"}}}),
+            &Default::default(),
+        );
+        prop_pool.merge_api_key_conflict_fps(&rejected_oc.collect_api_key_conflict_fps());
+        prop_pool.accounts.get_mut("prop-oauth.json").unwrap().access = "ya29.prop-rotated".into();
+        assert!(prop_pool.pick_for(&filter, (None, None), &[], Utc::now()).is_none());
+
+        // Round-11 P1: Fixed-point conflict propagation covers transitive shared-refresh aliases.
+        let mut trans_pool = pool::Pool::default();
+        trans_pool.insert(
+            pool::parse_credentials(
+                "trans-a.json",
+                &json!({"type": "google", "access_token": "ya29.trans-a", "refresh_token": "1//trans-shared", "project_id": "proj-t"}),
+                false,
+            )
+            .unwrap(),
+        );
+        trans_pool.insert(
+            pool::parse_credentials(
+                "trans-b.json",
+                &json!({"type": "google", "access_token": "ya29.trans-b", "refresh_token": "1//trans-shared", "project_id": "proj-t"}),
+                false,
+            )
+            .unwrap(),
+        );
+        trans_pool.insert(
+            pool::parse_credentials(
+                "trans-b-copy.json",
+                &json!({"type": "google", "access_token": "ya29.trans-b", "project_id": "proj-t"}),
+                false,
+            )
+            .unwrap(),
+        );
+        trans_pool.insert(
+            pool::parse_credentials(
+                "trans-api.json",
+                &json!({"type": "google", "api_key": true, "access_token": "ya29.trans-a", "project_id": "proj-t"}),
+                false,
+            )
+            .unwrap(),
+        );
+        assert!(trans_pool.pick_for(&filter, (None, None), &[], Utc::now()).is_none());
+    }
+
+    // Round-9 P2: `data: null` (invalid envelope) followed by 429 stops at the first event with 502 and zero cooldown.
+    let null_then_429 = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "null-then-429-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(null_then_429.contains("\"code\":502"));
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "stream_error");
+        assert_eq!(last.status_code, Some(502));
+        assert!(state.pool.accounts[&acc_id].scoped_cooldowns.is_empty());
+    }
+
+    // Round-8 P2: Prelude stops on first malformed SSE event without scanning past to a later 429.
+    let inv_then_429 = http
+        .request("POST", &format!("{GOOGLE_STREAM_GENERATE_CONTENT}?alt=sse"))
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "invalid-then-429-sse"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(inv_then_429.contains("\"code\":502"));
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "stream_error");
+        assert_eq!(last.status_code, Some(502));
+        assert!(state.pool.accounts[&acc_id].scoped_cooldowns.is_empty());
+    }
+
+    // Round-8 P2: Non-streaming generateContent returning standalone nested response.error returns HTTP 429 (not 200) and records error.
+    let json_rpc8 = http
+        .request("POST", GOOGLE_GENERATE_CONTENT)
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "nested-rpc8-json"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(json_rpc8.status(), StatusCode::TOO_MANY_REQUESTS);
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "rate_limited");
+        assert_eq!(last.status_code, Some(429));
+        assert!(
+            last.attempts.last().is_some_and(|a| a.error_message.is_some()),
+            "classified attempt error must be preserved on normal completion"
+        );
+    }
+    proxy.state.write().await.pool.accounts.get_mut(&acc_id).unwrap().scoped_cooldowns.clear();
+
+    // Round-6 P2: countTokens returning 200 with nested response.error returns mapped 429 and records rate_limited (not success).
+    let count_err = http
+        .request("POST", GOOGLE_COUNT_TOKENS)
+        .json(&json!({"model": "gemini-4-neon-high", "request": {"contents": [{"role": "user", "parts": [{"text": "nested-error"}]}]}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(count_err.status(), StatusCode::TOO_MANY_REQUESTS);
+    let count_err_text = count_err.text().await.unwrap();
+    assert!(!count_err_text.contains("secret count quota detail"));
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "rate_limited");
+        assert_eq!(last.status_code, Some(429));
+        assert_eq!(state.pool.accounts[&acc_id].success, success_before);
+    }
+    proxy.state.write().await.pool.accounts.get_mut(&acc_id).unwrap().scoped_cooldowns.clear();
+
+    // Round-2 P2-6: Ordinary upstream 400 is recorded as http_error (not disconnected) and strips upstream Retry-After.
+    let err400 = http
+        .request("POST", GOOGLE_GENERATE_CONTENT)
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "bad-400"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(err400.status(), StatusCode::BAD_REQUEST);
+    assert!(err400.headers().get("retry-after").is_none(), "upstream retry-after must be stripped");
+    {
+        let state = proxy.state.read().await;
+        let last = state.activity.back().unwrap();
+        assert_eq!(last.outcome, "http_error");
+        assert_eq!(last.status_code, Some(400));
+    }
+
+    // Round-2 P2-5: Locally synthesized pool 429 without verified witness still preserves local Retry-After.
+    {
+        let mut state = proxy.state.write().await;
+        let id = state.pool.accounts.keys().next().unwrap().clone();
+        state
+            .pool
+            .accounts
+            .get_mut(&id)
+            .unwrap()
+            .scoped_cooldowns
+            .insert("gemini".into(), pool::Cooldown { until: Utc::now() + TimeDelta::seconds(45), verified_reset: false });
+    }
+    let local_429 = http
+        .request("POST", GOOGLE_GENERATE_CONTENT)
+        .json(&json!({
+            "model": "gemini-4-neon-high",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "diag-200"}]}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(local_429.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(local_429.headers().get(crate::router::POOL_QUOTA_HEADER).is_none());
+    assert!(local_429.headers().get("retry-after").is_some(), "local pool backoff retry-after must be preserved");
 }
 
 struct Http<'a>(&'a Server, reqwest::Client);
