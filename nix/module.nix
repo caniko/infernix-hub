@@ -1178,7 +1178,7 @@ in {
         requires = optional cfg.database.createLocally "postgresql.service";
         partOf = optional cfg.database.createLocally "postgresql.service";
         onFailure = cfg.systemd.onFailure;
-        unitConfig.StartLimitIntervalSec = 0;
+        unitConfig.StartLimitIntervalSec = lib.mkDefault 0;
         environment =
           {
             HUB_BIND = cfg.bind;

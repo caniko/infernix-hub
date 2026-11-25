@@ -20,7 +20,7 @@ pub use mail_calendar::*;
 /// Generic AI model provider, multi-account, quota, activity, routing and export contracts.
 pub mod providers;
 
-/// The Fleetix operations snapshot with Canix's expected-offline extension.
+/// The Fleetix operations snapshot with Canix's additive extensions.
 pub mod fleet {
     use std::collections::BTreeMap;
 
@@ -36,6 +36,10 @@ pub mod fleet {
         /// Host names confirmed offline by the producer, not all intermittent hosts.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub expected_offline_hosts: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pending_post_switch_actions: Option<Vec<PostSwitchSummary>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub post_switch_error: Option<String>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pub host_warnings: BTreeMap<String, Vec<String>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -44,34 +48,47 @@ pub mod fleet {
         pub probe_coverage: BTreeMap<String, ProbeCoverage>,
     }
 
+    /// Snapshot-safe projection: no command arguments or raw errors.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PostSwitchSummary {
+        pub id: String,
+        pub host: String,
+        pub kind: String,
+        pub description: String,
+        pub min_commit: Option<String>,
+        pub attempts: u32,
+        pub has_error: bool,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct OfflineHostSnapshot {
         pub name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         pub last_seen: Option<DateTime<Utc>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         pub last_health: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         pub last_failures: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         pub last_warnings: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         pub last_revision: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         pub offline_since: Option<DateTime<Utc>>,
     }
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct ProbeCoverage {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         pub inspected_users: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         pub user_bus_errors: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         pub sections_ok: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         pub sections_failed: Vec<String>,
     }
 
@@ -84,24 +101,63 @@ pub mod fleet {
     }
 
     #[test]
-    fn fleet_extensions_round_trip_and_are_omitted_for_legacy_snapshots() {
-        let mut wire = serde_json::json!({"schemaVersion": 1, "generatedAt": "2026-11-25T00:00:00Z", "hosts": [], "monitoring": {}});
-        let old: FleetStatus = serde_json::from_value(wire.clone()).unwrap();
-        let encoded = serde_json::to_value(&old).unwrap();
-        for key in ["hostWarnings", "offlineHosts", "probeCoverage"] {
-            assert!(encoded.get(key).is_none());
+    fn legacy_fleet_snapshots_omit_missing_extensions() {
+        let wire = serde_json::json!({"schemaVersion": 1, "generatedAt": "2026-11-25T00:00:00Z", "hosts": [], "monitoring": {}});
+        let status: FleetStatus = serde_json::from_value(wire).unwrap();
+        let encoded = serde_json::to_value(&status).unwrap();
+        for key in ["expectedOfflineHosts", "pendingPostSwitchActions", "postSwitchError", "hostWarnings", "offlineHosts", "probeCoverage"]
+        {
+            assert!(encoded.get(key).is_none(), "{key}");
         }
-        assert_eq!(serde_json::from_value::<FleetStatus>(encoded).unwrap(), old);
+        assert_eq!(serde_json::from_value::<FleetStatus>(encoded).unwrap(), status);
+    }
 
-        wire["hostWarnings"] = serde_json::json!({"nomad": ["drift"]});
-        wire["offlineHosts"] = serde_json::json!([{"name": "nomad", "lastSeen": "2026-11-24T00:00:00Z", "lastFailures": ["disk"]}]);
-        wire["probeCoverage"] = serde_json::json!({"nomad": {"inspectedUsers": ["can"], "sectionsFailed": ["systemd"]}});
-        let new: FleetStatus = serde_json::from_value(wire.clone()).unwrap();
-        let encoded = serde_json::to_value(&new).unwrap();
-        for key in ["hostWarnings", "offlineHosts", "probeCoverage"] {
-            assert_eq!(encoded[key], wire[key]);
-        }
-        assert_eq!(serde_json::from_value::<FleetStatus>(encoded).unwrap(), new);
+    #[test]
+    fn full_canix_fleet_snapshot_round_trips_without_drops() {
+        let wire = serde_json::json!({
+            "schemaVersion": SCHEMA_VERSION,
+            "generatedAt": "2026-11-25T12:34:56.123456789+00:00",
+            "targetRevision": "0123abc",
+            "hosts": [{
+                "name": "node-alpha", "health": "degraded", "revision": "0123abc", "system": "/nix/store/node-alpha",
+                "failures": ["forgejo: inactive"], "checkedAt": "2026-11-25T12:33:00+00:00"
+            }],
+            "monitoring": {
+                "error": null, "monitored": 12,
+                "alerts": [{"key": "core_forgejo", "name": "forgejo", "group": "core",
+                            "since": "2026-11-25T11:22:00Z", "detail": ["[STATUS] == 200"]}]
+            },
+            "pendingOps": [{"id": "op-1", "host": "node-alpha", "title": "Restart Forgejo", "reason": "unit is down",
+                            "requestedBy": "nightly", "created": "2026-11-25T12:10:00+00:00"}],
+            "nightly": {
+                "startedAt": "2026-11-25T02:00:00Z", "finishedAt": null, "revision": "0123abc", "commit": "deadbee",
+                "error": null, "hosts": [{"host": "node-beta", "outcome": "switched", "detail": "health check passed"}]
+            },
+            "expectedOfflineHosts": ["node-gamma", "node-delta"],
+            // Exercise both optional keys even though Canix emits one or the other.
+            "pendingPostSwitchActions": [
+                {"id": "action-1", "host": "node-alpha", "kind": "service-restart", "description": "Restart Forgejo",
+                 "minCommit": "deadbee", "attempts": 2, "hasError": true},
+                {"id": "action-2", "host": "node-alpha", "kind": "notification", "description": "Report switch",
+                 "minCommit": null, "attempts": 0, "hasError": false}
+            ],
+            "postSwitchError": "could not read queue; see `canix host post-switch list` for details",
+            "hostWarnings": {"node-alpha": ["user probe incomplete"]},
+            "offlineHosts": [
+                {"name": "node-gamma", "lastSeen": "2026-11-16T10:00:00.123Z", "lastHealth": "degraded",
+                 "lastFailures": ["disk"], "lastWarnings": ["drift"], "lastRevision": "4567def",
+                 "offlineSince": "2026-11-17T10:00:00Z"},
+                {"name": "node-delta", "lastSeen": null, "lastHealth": null, "lastFailures": [],
+                 "lastWarnings": [], "lastRevision": null, "offlineSince": null}
+            ],
+            "probeCoverage": {
+                "node-alpha": {"inspectedUsers": ["can"], "userBusErrors": ["skipped dejana 1001 non-root"],
+                          "sectionsOk": ["system"], "sectionsFailed": ["users"]},
+                "node-beta": {"inspectedUsers": ["can"], "userBusErrors": [], "sectionsOk": ["users"], "sectionsFailed": []}
+            }
+        });
+        let status: FleetStatus = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(status).unwrap(), wire);
     }
 }
 

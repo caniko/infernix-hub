@@ -777,7 +777,7 @@ pub fn fleet_raises(status: &FleetStatus, now: DateTime<Utc>) -> Vec<Raise> {
                 details.push(format!("Failed sections:\n{}", sorted_lines(&coverage.sections_failed)));
             }
             if !coverage.user_bus_errors.is_empty() {
-                details.push(format!("User bus errors:\n{}", sorted_lines(&coverage.user_bus_errors)));
+                details.push(format!("User unit probe issues:\n{}", sorted_lines(&coverage.user_bus_errors)));
             }
             push(Severity::Warning, format!("fleet:probe:{host}"), format!("Host {host} probe incomplete"), details.join("\n\n"));
         }
@@ -1369,7 +1369,7 @@ mod tests {
                 {"name": "boundary", "lastSeen": "2026-11-18T12:00:00Z"}
             ],
             "hostWarnings": {"nomad": ["zed", "disk", "zed"]},
-            "probeCoverage": {"nomad": {"userBusErrors": ["can: no bus"], "sectionsFailed": ["users"]}},
+            "probeCoverage": {"nomad": {"userBusErrors": ["skipped dejana 1001 non-root", "can: no bus"], "sectionsFailed": ["users"]}},
             "nightly": {"startedAt": "2026-11-25T07:59:59Z"},
             "monitoring": {"error": "missing credentials"}
         }))
@@ -1378,11 +1378,21 @@ mod tests {
         let raises = fleet_raises(&status, now);
         let find = |key: &str| raises.iter().find(|r| r.dedupe_key == format!("fleet:{key}")).unwrap();
         assert!(find("host:nomad").body.starts_with("service\nssd\nLast seen: "));
-        assert!(find("offline:nomad").body.contains("2026-11-17T12:00:00"));
+        let offline = find("offline:nomad");
+        assert_eq!(offline.title, "Host nomad offline for over 7 days");
+        assert_eq!(offline.body, "Offline since: 2026-11-17T12:00:00+00:00");
+        let later = fleet_raises(&status, now + Duration::days(3));
+        let later_offline = later.iter().find(|r| r.dedupe_key == "fleet:offline:nomad").unwrap();
+        assert_eq!((&offline.title, &offline.body, offline.severity), (&later_offline.title, &later_offline.body, later_offline.severity));
         assert!(raises.iter().all(|r| r.dedupe_key != "fleet:offline:boundary"));
+        let later_boundary = later.iter().find(|r| r.dedupe_key == "fleet:offline:boundary").unwrap();
+        assert_eq!(later_boundary.body, "Last seen: 2026-11-18T12:00:00+00:00");
         assert_eq!((find("warn:nomad").severity, find("warn:nomad").body.as_str()), (Severity::Info, "disk\nzed"));
-        assert!(find("probe:nomad").body.contains("users"));
-        assert!(find("probe:nomad").body.contains("can: no bus"));
+        assert_eq!(find("probe:nomad").severity, Severity::Warning);
+        assert_eq!(
+            find("probe:nomad").body,
+            "Failed sections:\nusers\n\nUser unit probe issues:\ncan: no bus\nskipped dejana 1001 non-root"
+        );
         assert!(find("nightly:stalled").body.contains("2026-11-25T07:59:59Z"));
         assert_eq!(find("monitoring").severity, Severity::Critical);
         let keep = fleet_keep_keys(&status);
