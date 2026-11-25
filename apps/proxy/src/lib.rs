@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 pub struct Proxy {
     config: Config,
-    worker_bearer: Option<String>,
+    worker_bearers: Vec<String>,
     hub_sync_configured: bool,
     pub(crate) source_host: String,
     pub(crate) source_user: String,
@@ -135,7 +135,7 @@ impl Proxy {
         .build()?;
         Ok(Self {
             config,
-            worker_bearer: None,
+            worker_bearers: Vec::new(),
             hub_sync_configured: false,
             source_host,
             source_user,
@@ -165,8 +165,17 @@ impl Proxy {
         self
     }
 
-    pub fn with_worker_config(mut self, worker: Option<&worker::WorkerConfig>) -> Self {
-        self.worker_bearer = worker.and_then(worker::WorkerConfig::bearer).map(str::to_owned);
+    pub fn with_worker_config(self, worker: Option<&worker::WorkerConfig>) -> Self {
+        self.with_worker_configs(worker, None)
+    }
+
+    pub fn with_worker_configs(mut self, codex: Option<&worker::WorkerConfig>, google: Option<&worker::GoogleWorkerConfig>) -> Self {
+        self.worker_bearers = codex
+            .and_then(worker::WorkerConfig::bearer)
+            .into_iter()
+            .chain(google.and_then(worker::GoogleWorkerConfig::bearer))
+            .map(str::to_owned)
+            .collect();
         self
     }
 
@@ -581,22 +590,39 @@ impl Proxy {
                     && (current.lane != Lane::Codex || codex_reload_matches(&current, next))
                     && next.organization.as_ref().zip(current.organization.as_ref()).is_none_or(|(x, y)| x == y)
             };
-            let mut updated =
-                if current.local { Pool::reload_local(&self.config, &current) } else { Pool::reload_file(&self.config, &current) }
-                    .filter(usable);
+            let mut discovered_conflicts = Vec::new();
+            let mut updated = if current.local {
+                let (reloaded, conflicts) = Pool::reload_local_with_conflicts(&self.config, &current);
+                discovered_conflicts.extend(conflicts);
+                reloaded
+            } else {
+                Pool::reload_file(&self.config, &current)
+            }
+            .filter(usable);
             if current.local
                 && self.config.discover_local
                 && !self.config.exclude_local_lanes.contains(&current.lane)
-                && updated.as_ref().is_none_or(|next| next.access == current.access)
                 && let Some(raw) = read_local_opencode_auth().await
             {
-                // Some OpenCode installs store OAuth only in their database.
+                // Always inspect OpenCode auth for newly discovered API-key conflicts,
+                // even when a disk credential already changed its access token.
                 let mut found = Pool::default();
                 pool::add_opencode(&mut found, &raw, &self.config.exclude_local_lanes);
-                updated = found.accounts.remove(&current.id).filter(usable).or(updated);
+                discovered_conflicts.extend(found.collect_api_key_conflict_fps());
+                if updated.as_ref().is_none_or(|next| next.access == current.access) {
+                    updated = found
+                        .accounts
+                        .get(&current.id)
+                        .filter(|next| !found.is_api_key_conflicted(next) && usable(next))
+                        .cloned()
+                        .or(updated);
+                }
             }
-            let updated = updated.ok_or_else(|| auth_error("no usable credential found on reload"))?;
             let mut state = self.state.write().await;
+            state.pool.merge_api_key_conflict_fps(&discovered_conflicts);
+            let updated = updated
+                .filter(|next| !state.pool.is_api_key_conflicted(next))
+                .ok_or_else(|| auth_error("no usable credential found on reload"))?;
             let entry =
                 state.pool.accounts.get_mut(&a.id).filter(|entry| entry.same_secret(&current) && !entry.disabled).ok_or_else(superseded)?;
             if !entry.same_secret(&updated) && entry.error_generation == current.error_generation {

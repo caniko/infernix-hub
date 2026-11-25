@@ -222,6 +222,15 @@ impl Account {
                 }))
     }
 
+    fn is_google_oauth(&self) -> bool {
+        self.lane == Lane::Google
+            && !self.api_key
+            && !self.access.starts_with("AIza")
+            && (self.refresh.as_deref().is_some_and(|token| {
+                !token.is_empty() && token.len() <= 32_768 && !token.starts_with("AIza") && token.bytes().all(|b| b.is_ascii_graphic())
+            }) || (!self.access.is_empty() && self.access.starts_with("ya29.")))
+    }
+
     pub(crate) fn current_secrets(&self) -> [&str; 3] {
         [&self.access, self.refresh.as_deref().unwrap_or_default(), self.google_secret.as_deref().unwrap_or_default()]
     }
@@ -282,6 +291,33 @@ impl Account {
     fn shares_discovery_token(&self, other: &Self) -> bool {
         self.lane == other.lane
             && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
+    }
+
+    fn shares_credential_fingerprint(&self, other: &Self) -> bool {
+        if self.lane != other.lane {
+            return false;
+        }
+        let fps = self.credential_fingerprints();
+        other.credential_fingerprints().iter().any(|fp| fps.contains(fp))
+    }
+
+    fn credential_fingerprints(&self) -> Vec<[u8; 32]> {
+        let mut fps = Vec::with_capacity(3);
+        if !self.access.is_empty() {
+            fps.push(Sha256::digest(&self.access).into());
+        }
+        if let Some(fp) = self.provenance_token_fp
+            && !fps.contains(&fp)
+        {
+            fps.push(fp);
+        }
+        if let Some(refresh) = self.refresh.as_deref().filter(|r| !r.is_empty()) {
+            let fp: [u8; 32] = Sha256::digest(refresh).into();
+            if !fps.contains(&fp) {
+                fps.push(fp);
+            }
+        }
+        fps
     }
 
     fn discard_discovered_access(&mut self) {
@@ -600,10 +636,19 @@ pub fn parse_credentials(name: &str, raw: &Value, local: bool) -> Result<Vec<Acc
 }
 
 fn parse_credentials_for_lane(name: &str, raw: &Value, local: bool, known_lane: Option<Lane>) -> Result<Vec<Account>> {
+    parse_credentials_with_options(name, raw, local, known_lane, false)
+}
+
+fn parse_credentials_with_options(
+    name: &str,
+    raw: &Value,
+    local: bool,
+    known_lane: Option<Lane>,
+    force_api_key: bool,
+) -> Result<Vec<Account>> {
     ensure!(filename(name) && raw.is_object(), "invalid credential name or JSON object");
-    let kind = text(raw, &["type", "provider"]).unwrap_or_default();
     let api_key_wrapper = raw.get("api_key").filter(|v| v.is_object());
-    let forced_api_key = api_key_wrapper.is_some();
+    let forced_api_key = force_api_key || api_key_wrapper.is_some();
     let group = api_key_wrapper.unwrap_or(raw);
     let lane = known_lane
         .or_else(|| text(raw, &["family", "provider", "type"]).and_then(Lane::parse))
@@ -633,20 +678,27 @@ fn parse_credentials_for_lane(name: &str, raw: &Value, local: bool, known_lane: 
             "credential has no usable access or refresh token"
         );
         ensure!(access.len() <= 32_768 && access.bytes().all(|b| b.is_ascii_graphic()), "invalid credential token");
-        let auth_types = [raw, entry].into_iter().flat_map(|value| {
-            ["type", "auth_type", "auth_mode"].into_iter().filter_map(|field| text(value, &[field]).map(str::to_ascii_lowercase))
-        });
-        let api_key = lane != Lane::Go
-            && (forced_api_key
-                || key.is_some()
-                || is_group
-                || matches!(kind, "api_key" | "api-key")
-                || (lane == Lane::Codex
-                    && (access.starts_with("sk-")
-                        || auth_types.clone().any(|kind| matches!(kind.as_str(), "api" | "apikey" | "api_key" | "api-key")))));
+        let (raw_api, raw_oauth) = record_api_key_evidence(raw, lane);
+        let (entry_api, entry_oauth) = record_api_key_evidence(entry, lane);
+        let explicit_oauth = raw_oauth || entry_oauth;
+        let marker_api_key = raw_api || entry_api;
+        let bool_api_key =
+            [raw, entry].into_iter().any(|value| value["api_key"].as_bool() == Some(true) || value["api-key"].as_bool() == Some(true));
+        ensure!(
+            api_key_wrapper.is_some() || !(bool_api_key || force_api_key || marker_api_key) || (refresh.is_none() && !explicit_oauth),
+            "contradictory api_key and OAuth credential fields"
+        );
+        let api_key = lane != Lane::Go && (forced_api_key || bool_api_key || marker_api_key || key.is_some() || is_group);
         let codex_oauth_explicit = lane == Lane::Codex
             && !api_key
-            && auth_types.into_iter().any(|kind| matches!(kind.as_str(), "oauth" | "oauth2" | "chatgpt" | "chatgptauthtokens"));
+            && [raw, entry]
+                .into_iter()
+                .flat_map(|value| {
+                    ["type", "provider", "auth_type", "auth_mode"]
+                        .into_iter()
+                        .filter_map(|field| text(value, &[field]).map(str::to_ascii_lowercase))
+                })
+                .any(|kind| matches!(kind.as_str(), "oauth" | "oauth2" | "chatgpt" | "chatgptauthtokens"));
         let access_claims = jwt_claims(access);
         let id_token = text(entry, &["id_token", "/tokens/id_token"]);
         let claims = id_token.map(jwt_claims).unwrap_or_else(|| access_claims.clone());
@@ -793,19 +845,31 @@ pub(crate) struct AccountFilter<'a> {
     pub model: &'a str,
     pub required_project: Option<&'a str>,
     pub subscriptions_only: bool,
+    pub require_account_project: bool,
 }
 
 impl<'a> AccountFilter<'a> {
     pub(crate) fn shared(lane: Lane, model: &'a str, required_project: Option<&'a str>) -> Self {
-        Self { lane, model, required_project, subscriptions_only: false }
+        Self { lane, model, required_project, subscriptions_only: false, require_account_project: false }
     }
 
     pub(crate) fn allows(&self, account: &Account) -> bool {
-        account.lane == self.lane && (!self.subscriptions_only || account.is_codex_oauth())
+        account.lane == self.lane
+            && (!self.require_account_project || account.project.as_deref().is_some_and(|project| !project.trim().is_empty()))
+            && (!self.subscriptions_only
+                || match self.lane {
+                    Lane::Codex => account.is_codex_oauth(),
+                    Lane::Google => account.is_google_oauth(),
+                    _ => false,
+                })
+    }
+
+    pub(crate) fn allows_in(&self, pool: &Pool, account: &Account) -> bool {
+        self.allows(account) && (!self.subscriptions_only || !pool.is_api_key_conflicted(account))
     }
 
     pub(crate) fn supports(&self, pool: &Pool, account: &Account) -> bool {
-        self.allows(account) && pool.supports(account, self.lane, self.model, self.required_project)
+        self.allows_in(pool, account) && pool.supports(account, self.lane, self.model, self.required_project)
     }
 }
 
@@ -820,9 +884,82 @@ pub struct Pool {
     pub source_user: String,
     affinity: HashMap<Session, (String, Instant)>,
     parents: HashMap<Session, String>,
+    api_key_conflicts: BTreeSet<(Lane, [u8; 32])>,
 }
 
 impl Pool {
+    pub(crate) fn record_api_key_conflict(&mut self, account: &Account) {
+        let mut changed = false;
+        for fp in account.credential_fingerprints() {
+            changed |= self.api_key_conflicts.insert((account.lane, fp));
+        }
+        if changed {
+            self.revision += 1;
+        }
+    }
+
+    pub(crate) fn collect_api_key_conflict_fps(&self) -> Vec<(Lane, [u8; 32])> {
+        let mut out: BTreeSet<(Lane, [u8; 32])> = self.api_key_conflicts.clone();
+        for account in self.accounts.values().filter(|a| a.api_key) {
+            for fp in account.credential_fingerprints() {
+                out.insert((account.lane, fp));
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    pub(crate) fn merge_api_key_conflict_fps(&mut self, fps: &[(Lane, [u8; 32])]) {
+        let mut changed = false;
+        for entry in fps {
+            changed |= self.api_key_conflicts.insert(*entry);
+        }
+        if changed {
+            self.revision += 1;
+        }
+        self.propagate_api_key_conflicts();
+    }
+
+    fn propagate_api_key_conflicts(&mut self) {
+        // Propagate lane-scoped fingerprints to a fixed point so transitive aliases
+        // (e.g., A shares access with API key -> shared refresh -> B's access) are
+        // all persisted regardless of discovery or insertion order.
+        loop {
+            let mut added = false;
+            let fps_to_add: Vec<(Lane, [u8; 32])> = self
+                .accounts
+                .values()
+                .filter(|acc| {
+                    acc.credential_fingerprints().iter().any(|fp| self.api_key_conflicts.contains(&(acc.lane, *fp)))
+                        || (acc.api_key
+                            && self
+                                .accounts
+                                .values()
+                                .any(|other| other.id != acc.id && !other.api_key && other.shares_credential_fingerprint(acc)))
+                })
+                .flat_map(|acc| acc.credential_fingerprints().into_iter().map(move |fp| (acc.lane, fp)))
+                .collect();
+            for entry in fps_to_add {
+                added |= self.api_key_conflicts.insert(entry);
+            }
+            if !added {
+                break;
+            }
+            self.revision += 1;
+        }
+    }
+
+    pub(crate) fn is_api_key_conflicted(&self, account: &Account) -> bool {
+        let fps = account.credential_fingerprints();
+        if fps.iter().any(|fp| self.api_key_conflicts.contains(&(account.lane, *fp))) {
+            return true;
+        }
+        self.accounts.values().any(|other| {
+            other.id != account.id
+                && other.lane == account.lane
+                && other.api_key
+                && (other.shares_discovery_token(account) || other.credential_fingerprints().iter().any(|fp| fps.contains(fp)))
+        })
+    }
     pub fn set_source(&mut self, host: String, user: String) {
         self.source_host = host;
         self.source_user = user;
@@ -856,18 +993,25 @@ impl Pool {
         Ok(pool)
     }
 
+    #[cfg(test)]
     pub fn reload_local(config: &Config, account: &Account) -> Option<Account> {
+        Self::reload_local_with_conflicts(config, account).0
+    }
+
+    pub(crate) fn reload_local_with_conflicts(config: &Config, account: &Account) -> (Option<Account>, Vec<(Lane, [u8; 32])>) {
         if config.exclude_local_lanes.contains(&account.lane) {
-            return None;
+            return (None, Vec::new());
         }
         let mut found = Self::default();
         match account.lane {
             Lane::Claude => discover_claude(config, &mut found),
             Lane::Codex => discover_codex(config, &mut found),
-            _ => return None,
+            _ => return (None, Vec::new()),
         }
         discover_opencode(config, &mut found);
-        found.accounts.remove(&account.id)
+        let conflicts = found.collect_api_key_conflict_fps();
+        let reloaded = found.accounts.get(&account.id).filter(|a| !found.is_api_key_conflicted(a)).cloned();
+        (reloaded, conflicts)
     }
 
     pub fn reload_file(config: &Config, account: &Account) -> Option<Account> {
@@ -881,6 +1025,22 @@ impl Pool {
     pub fn insert(&mut self, accounts: Vec<Account>) {
         for mut a in accounts {
             a.pending_quota.clear();
+            // Record BOTH rows' fingerprints symmetrically whenever an API-key row and an
+            // OAuth row share any lane-scoped credential fingerprint (including saved
+            // provenance_token_fp after access refresh), regardless of order or ID match.
+            let conflicted_others: Vec<Account> = self
+                .accounts
+                .values()
+                .filter(|other| other.api_key != a.api_key && other.shares_credential_fingerprint(&a))
+                .cloned()
+                .collect();
+            if !conflicted_others.is_empty() || a.credential_fingerprints().iter().any(|fp| self.api_key_conflicts.contains(&(a.lane, *fp)))
+            {
+                for other in &conflicted_others {
+                    self.record_api_key_conflict(other);
+                }
+                self.record_api_key_conflict(&a);
+            }
             if let Some(old) = self.accounts.get_mut(&a.id) {
                 a.redacted_labels.extend(std::mem::take(&mut old.redacted_labels));
                 // Scrub before preserving any live credentials on an unchanged reload.
@@ -935,6 +1095,7 @@ impl Pool {
             }
             self.accounts.insert(a.id.clone(), a);
         }
+        self.propagate_api_key_conflicts();
     }
 
     pub fn find(&self, id: &str) -> Option<&Account> {
@@ -962,9 +1123,20 @@ impl Pool {
         &'a self,
         lane: Lane,
         model: &'a str,
-        required_project: Option<&str>,
+        required_project: Option<&'a str>,
         now: DateTime<Utc>,
     ) -> Option<ModelEligibility<'a>> {
+        self.evaluate_model_eligibility_for(&AccountFilter::shared(lane, model, required_project), now)
+    }
+
+    pub(crate) fn evaluate_model_eligibility_for<'a>(
+        &'a self,
+        filter: &AccountFilter<'a>,
+        now: DateTime<Utc>,
+    ) -> Option<ModelEligibility<'a>> {
+        let lane = filter.lane;
+        let model = filter.model;
+        let required_project = filter.required_project;
         if !bounded_identifier(model) {
             return None;
         }
@@ -980,7 +1152,9 @@ impl Pool {
         };
         for account in self.accounts.values().filter(|a| a.lane == lane) {
             let mut reasons = Vec::new();
-            if let Some(reason) = self.support_exclusion(account, model, required_project) {
+            if !filter.allows_in(self, account) {
+                reasons.push("subscriptions_only");
+            } else if let Some(reason) = self.support_exclusion(account, model, required_project) {
                 reasons.push(reason);
             } else {
                 evaluation.supported_accounts += 1;
@@ -1031,13 +1205,18 @@ impl Pool {
         Some(evaluation)
     }
 
+    #[cfg(test)]
     pub(crate) fn verified_google_reset_at(
         &self,
         model: &str,
         required_project: Option<&str>,
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
-        self.evaluate_model_eligibility(Lane::Google, model, required_project, now)?.verified_next_reset_at
+        self.verified_google_reset_at_for(&AccountFilter::shared(Lane::Google, model, required_project), now)
+    }
+
+    pub(crate) fn verified_google_reset_at_for(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.evaluate_model_eligibility_for(filter, now)?.verified_next_reset_at
     }
 
     pub fn next_reset(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
@@ -1099,7 +1278,8 @@ impl Pool {
             options.retain(|a| a.api_key == keys_first);
         }
         let bound = |session| {
-            self.bound(lane, session).filter(|id| !filter.subscriptions_only || self.accounts.get(*id).is_some_and(|a| filter.allows(a)))
+            self.bound(lane, session)
+                .filter(|id| !filter.subscriptions_only || self.accounts.get(*id).is_some_and(|a| filter.allows_in(self, a)))
         };
         let sticky = session.and_then(bound).or_else(|| parent.and_then(bound));
         if let Some(a) = sticky.and_then(|id| options.iter().find(|a| a.id == id)) {
@@ -1264,24 +1444,48 @@ fn local_credential_name(lane: Lane, label: &str) -> String {
 }
 
 fn add(pool: &mut Pool, lane: Lane, label: &str, raw: Value) {
+    add_with_api_key(pool, lane, label, raw, false);
+}
+
+fn add_with_api_key(pool: &mut Pool, lane: Lane, label: &str, raw: Value, force_api_key: bool) {
     let name = local_credential_name(lane, label);
-    if let Ok(found) = parse_credentials_for_lane(&name, &raw, true, Some(lane)) {
+    if let Ok(found) = parse_credentials_with_options(&name, &raw, true, Some(lane), force_api_key) {
         let cutoff = Utc::now() + chrono::TimeDelta::seconds(30);
+        let mut api_key_conflicts = Vec::new();
         let found = found
             .into_iter()
             .filter_map(|mut a| {
                 if !a.api_key && matches!(a.lane, Lane::Claude | Lane::Codex) && a.expires.is_some_and(|e| e <= cutoff) {
                     return None;
                 }
+                let conflicted_existing: Vec<Account> = pool
+                    .accounts
+                    .values()
+                    .filter(|old| old.api_key != a.api_key && old.shares_credential_fingerprint(&a))
+                    .cloned()
+                    .collect();
+                if !conflicted_existing.is_empty() {
+                    for old in conflicted_existing {
+                        api_key_conflicts.push(old);
+                    }
+                    api_key_conflicts.push(a.clone());
+                }
                 let mut duplicates = pool.accounts.values_mut().filter(|old| old.id != a.id && old.shares_discovery_token(&a)).peekable();
                 if duplicates.peek().is_none() {
                     return Some(a);
                 }
-                if a.lane != Lane::Google || a.api_key {
+                if a.api_key {
+                    // Retain API-key classification on the shared token identity regardless of discovery order.
+                    api_key_conflicts.push(a);
+                    return None;
+                }
+                if a.lane != Lane::Google {
                     return None;
                 }
                 if let Some(survivor) = duplicates.find(|old| old.compatible_refresh(&a)) {
-                    if !survivor.api_key && survivor.refresh.is_none() && a.refresh.is_some() {
+                    if survivor.api_key {
+                        api_key_conflicts.push(a);
+                    } else if survivor.refresh.is_none() && a.refresh.is_some() {
                         merge_google_duplicate(survivor, a, false, false);
                         pool.revision += 1;
                     }
@@ -1291,6 +1495,9 @@ fn add(pool: &mut Pool, lane: Lane, label: &str, raw: Value) {
                 Some(a)
             })
             .collect();
+        for conflicted in &api_key_conflicts {
+            pool.record_api_key_conflict(conflicted);
+        }
         pool.insert(found);
     }
 }
@@ -1342,10 +1549,22 @@ fn merge_google_duplicate(survivor: &mut Account, replacement: Account, explicit
     survivor.scrub_label(&[]);
 }
 
+fn classify_google_provenance_api_key(raw: &Value) -> Result<bool> {
+    ensure!(raw.is_object(), "invalid provenance Google credential object");
+    let (is_api_key, explicit_oauth) = record_api_key_evidence(raw, Lane::Google);
+    ensure!(!is_api_key || !explicit_oauth, "contradictory api_key and OAuth credential fields");
+    Ok(is_api_key)
+}
+
 pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value) {
+    // Validate the original record before rewriting wrapper metadata so explicit API-key
+    // markers or contradictory fields cannot be masked during enrollment or rediscovery.
+    let Ok(candidate_api_key) = classify_google_provenance_api_key(&raw) else { return };
     let Some(fields) = raw.as_object_mut() else { return };
     fields.entry("label").or_insert_with(|| json!(label));
-    fields.insert("type".into(), json!(Lane::Google.name()));
+    if !candidate_api_key {
+        fields.insert("type".into(), json!(Lane::Google.name()));
+    }
     fields.remove("provider");
     fields.remove("family");
     let refresh = text(&raw, &["refresh_token", "refreshToken", "refresh"]).map(str::to_owned);
@@ -1355,13 +1574,19 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
     let email = text(&raw, &["email"]).map(str::to_owned);
     let enrolled = pool.accounts.values().find(|a| a.provenance_enrollment.as_deref() == Some(label));
     let existing = enrolled.or_else(|| {
+        if candidate_api_key {
+            return None;
+        }
         let refresh = refresh.as_ref()?;
-        pool.accounts.values().find(|a| a.lane == Lane::Google && a.refresh.as_ref() == Some(refresh))
+        pool.accounts.values().find(|a| a.lane == Lane::Google && !a.api_key && a.refresh.as_ref() == Some(refresh))
     });
     if let Some(existing) = existing {
         let mut id = existing.id.clone();
-        if enrolled.is_some() && (existing.refresh != refresh || refresh.is_none()) {
-            let Ok(mut replacements) = parse_credentials(&existing.name, &raw, true) else { return };
+        if enrolled.is_some() && (existing.refresh != refresh || refresh.is_none() || existing.api_key != candidate_api_key) {
+            let Ok(mut replacements) = parse_credentials_with_options(&existing.name, &raw, true, Some(Lane::Google), candidate_api_key)
+            else {
+                return;
+            };
             let Some(mut replacement) = replacements.pop().filter(|a| a.id == existing.id) else { return };
             // An access-only reread of the same token must not erase an enriched refresh token.
             if (replacement.refresh.is_some() && existing.refresh != replacement.refresh)
@@ -1369,28 +1594,46 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
                 || existing.api_key != replacement.api_key
                 || existing.base != replacement.base
             {
+                let conflicted_existing: Vec<Account> = pool
+                    .accounts
+                    .values()
+                    .filter(|other| other.api_key != replacement.api_key && other.shares_credential_fingerprint(&replacement))
+                    .cloned()
+                    .collect();
                 let duplicate = pool.accounts.values().find(|other| other.id != id && other.shares_discovery_token(&replacement));
+                let survivor_id = duplicate.filter(|other| other.compatible_refresh(&replacement)).map(|other| other.id.clone());
+                let has_duplicate = duplicate.is_some();
+                let enrollment = existing.provenance_enrollment.clone();
+                let next_probe_gen = existing.probe_generation.saturating_add(1);
+                if !conflicted_existing.is_empty() {
+                    for other in &conflicted_existing {
+                        pool.record_api_key_conflict(other);
+                    }
+                    pool.record_api_key_conflict(&replacement);
+                }
                 pool.revision += 1;
-                if let Some(survivor) = duplicate.filter(|other| other.compatible_refresh(&replacement)) {
+                if let Some(duplicate_id) = survivor_id {
                     // Keep the account that already holds the credential and its route evidence.
-                    let duplicate_id = survivor.id.clone();
                     pool.accounts.remove(&id);
                     id = duplicate_id;
                     if let Some(survivor) = pool.accounts.get_mut(&id) {
                         merge_google_duplicate(survivor, replacement, client.is_some(), secret.is_some());
                     }
                 } else {
-                    if duplicate.is_some() {
+                    if has_duplicate {
                         replacement.discard_discovered_access();
                     }
-                    replacement.provenance_enrollment = existing.provenance_enrollment.clone();
-                    replacement.probe_generation = existing.probe_generation.saturating_add(1);
+                    replacement.provenance_enrollment = enrollment;
+                    replacement.probe_generation = next_probe_gen;
                     pool.insert(vec![replacement]);
                     return;
                 }
             }
         }
         let Some(existing) = pool.accounts.get_mut(&id) else { return };
+        if existing.api_key || candidate_api_key {
+            return;
+        }
         let relabel = existing.local
             && existing.provenance_enrollment.as_deref().is_none_or(|enrollment| enrollment == label)
             && existing.label != label
@@ -1453,11 +1696,26 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
             existing.error_generation = existing.error_generation.saturating_add(1);
         }
         pool.revision += i64::from(relabel || enriched || project_changed || rotated);
-        if rotated && let Some(rotated_account) = pool.accounts.get(&id) {
+        if rotated && let Some(rotated_account) = pool.accounts.get(&id).cloned() {
+            let conflicted: Vec<Account> = pool
+                .accounts
+                .values()
+                .filter(|other| {
+                    other.id != id && other.api_key != rotated_account.api_key && other.shares_credential_fingerprint(&rotated_account)
+                })
+                .cloned()
+                .collect();
+            if !conflicted.is_empty() {
+                for other in &conflicted {
+                    pool.record_api_key_conflict(other);
+                }
+                pool.record_api_key_conflict(&rotated_account);
+            }
+            pool.propagate_api_key_conflicts();
             let duplicate =
                 pool.accounts.values().find(|other| other.id != id && other.lane == Lane::Google && other.access == rotated_account.access);
             if let Some(other) = duplicate {
-                if other.compatible_refresh(rotated_account) {
+                if other.compatible_refresh(&rotated_account) {
                     let duplicate_id = other.id.clone();
                     if let Some(replacement) = pool.accounts.remove(&id)
                         && let Some(survivor) = pool.accounts.get_mut(&duplicate_id)
@@ -1472,10 +1730,11 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
                 }
             }
         }
+        pool.propagate_api_key_conflicts();
         return;
     }
     let source = format!("provenance:{label}");
-    add(pool, Lane::Google, &source, raw);
+    add_with_api_key(pool, Lane::Google, &source, raw, candidate_api_key);
     if let Some(account) = pool.accounts.get_mut(&local_credential_name(Lane::Google, &source)) {
         account.provenance_enrollment = Some(label.to_owned());
         if !account.access.is_empty() {
@@ -1484,13 +1743,121 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
     }
 }
 
+fn object_api_key_evidence(record: &Value, lane: Lane) -> (bool, bool) {
+    let api_wrapper = record.get("api_key").is_some_and(Value::is_object) || record.get("api-key").is_some_and(Value::is_object);
+    let has_keys_array = record.get("keys").is_some_and(Value::is_array);
+    let bool_api = record["api_key"].as_bool() == Some(true) || record["api-key"].as_bool() == Some(true);
+    let key = record.as_str().or_else(|| text(record, &["api_key", "api-key", "key", "OPENAI_API_KEY"]));
+    let access = key.or_else(|| text(record, &["access_token", "accessToken", "access", "token"])).unwrap_or_default();
+    let refresh = text(record, &["refresh_token", "refreshToken", "refresh"]);
+    // Inspect every type/provider/auth marker independently so field order never hides an API-key marker.
+    let markers: Vec<String> = ["type", "provider", "auth_type", "auth_mode"]
+        .into_iter()
+        .filter_map(|field| record.get(field).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_ascii_lowercase))
+        .collect();
+    let explicit_oauth =
+        refresh.is_some() || markers.iter().any(|kind| matches!(kind.as_str(), "oauth" | "oauth2" | "chatgpt" | "chatgptauthtokens"));
+    let is_api_key = lane != Lane::Go
+        && (api_wrapper
+            || has_keys_array
+            || bool_api
+            || key.is_some()
+            || markers.iter().any(|kind| matches!(kind.as_str(), "api" | "apikey" | "api_key" | "api-key"))
+            || (lane == Lane::Codex && access.starts_with("sk-"))
+            || (lane == Lane::Google && access.starts_with("AIza")));
+    (is_api_key, explicit_oauth)
+}
+
+fn record_api_key_evidence(record: &Value, lane: Lane) -> (bool, bool) {
+    let mut is_api_key = false;
+    let mut explicit_oauth = false;
+    for candidate in [Some(record), record.get("tokens"), record.get("claudeAiOauth")].into_iter().flatten() {
+        let (api, oauth) = object_api_key_evidence(candidate, lane);
+        is_api_key |= api;
+        explicit_oauth |= oauth;
+    }
+    (is_api_key, explicit_oauth)
+}
+
+fn collect_api_key_token_fps(value: &Value, lane: Lane, force_api_key: bool, depth: usize, out: &mut Vec<(Lane, [u8; 32])>) {
+    if lane == Lane::Go || depth > 4 {
+        return;
+    }
+    let mut push_token = |token: &str| {
+        if !token.is_empty() && token.len() <= 32_768 && token.bytes().all(|b| b.is_ascii_graphic()) {
+            out.push((lane, Sha256::digest(token).into()));
+        }
+    };
+    if let Some(s) = value.as_str().filter(|s| !s.trim().is_empty()) {
+        push_token(s);
+        return;
+    }
+    let Some(obj) = value.as_object() else {
+        return;
+    };
+    for field in ["api_key", "api-key", "key", "OPENAI_API_KEY"] {
+        if let Some(val) = obj.get(field).and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+            push_token(val);
+        }
+    }
+    let (is_api, _) = object_api_key_evidence(value, lane);
+    let treat_as_api = force_api_key || is_api;
+    if treat_as_api {
+        for field in ["access_token", "accessToken", "access", "token", "refresh_token", "refreshToken", "refresh"] {
+            if let Some(val) = obj.get(field).and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                push_token(val);
+            }
+        }
+    }
+    for nested_key in ["tokens", "claudeAiOauth"] {
+        if let Some(nested) = obj.get(nested_key) {
+            collect_api_key_token_fps(nested, lane, treat_as_api, depth + 1, out);
+        }
+    }
+    for wrapper_key in ["api_key", "api-key"] {
+        if let Some(wrapper) = obj.get(wrapper_key).filter(|v| v.is_object()) {
+            collect_api_key_token_fps(wrapper, lane, true, depth + 1, out);
+        }
+    }
+    if let Some(keys) = obj.get("keys").and_then(Value::as_array) {
+        for item in keys {
+            collect_api_key_token_fps(item, lane, true, depth + 1, out);
+        }
+    }
+}
+
+fn extract_api_key_token_fps(record: &Value, lane: Lane, force_api_key: bool) -> Vec<(Lane, [u8; 32])> {
+    let mut fps = Vec::new();
+    collect_api_key_token_fps(record, lane, force_api_key, 0, &mut fps);
+    fps
+}
+
 pub(crate) fn add_opencode(pool: &mut Pool, raw: &Value, excluded: &BTreeSet<Lane>) {
     let rows = raw.get("credentials").unwrap_or(raw);
     let object = rows.as_object().into_iter().flatten().map(|(name, row)| (name.as_str(), row));
     let list = rows.as_array().into_iter().flatten().filter_map(|row| Some((text(row, &["provider", "providerID", "id"])?, row)));
     for (name, entry) in object.chain(list) {
         if let Some(lane) = Lane::parse(name).filter(|lane| !excluded.contains(lane)) {
-            add(pool, lane, name, entry.get("auth").unwrap_or(entry).clone());
+            if let Some(auth) = entry.get("auth") {
+                // Classify outer and inner records independently before unwrapping so
+                // neither layer can mask API-key markers or contradictory OAuth fields.
+                let (outer_api, outer_oauth) = record_api_key_evidence(entry, lane);
+                let (inner_api, inner_oauth) = record_api_key_evidence(auth, lane);
+                let force_api_key = outer_api || inner_api;
+                // Preserve every explicit API-key digest from both outer and inner layers
+                // before unwrapping or rejecting the row.
+                let mut explicit_fps = extract_api_key_token_fps(entry, lane, force_api_key);
+                explicit_fps.extend(extract_api_key_token_fps(auth, lane, force_api_key));
+                pool.merge_api_key_conflict_fps(&explicit_fps);
+                if force_api_key && (outer_oauth || inner_oauth) {
+                    continue;
+                }
+                add_with_api_key(pool, lane, name, auth.clone(), force_api_key);
+            } else {
+                let explicit_fps = extract_api_key_token_fps(entry, lane, false);
+                pool.merge_api_key_conflict_fps(&explicit_fps);
+                add(pool, lane, name, entry.clone());
+            }
         }
     }
 }
