@@ -391,7 +391,7 @@ async fn readyz(State(s): State<AppState>) -> (StatusCode, Json<Value>) {
         Json(serde_json::json!({
             "status": if ready { "ok" } else { "degraded" },
             "database": database.map_or_else(|error| error, |()| "ok"),
-            "worker": worker.unwrap_or_else(|_| "unhealthy").to_string(),
+            "worker": worker.unwrap_or("unhealthy").to_string(),
             "syncFailures": failures,
         })),
     )

@@ -174,6 +174,9 @@ async fn enqueue_create(
     Ok(())
 }
 
+/// Episode id, notification id, dedupe key, title, synced body, severity, body hash, generations.
+type DeadFleetCreate = (Uuid, Uuid, String, String, String, String, String, i64);
+
 /// A healthy routing probe can revive rejected creates. Without a recovery
 /// transition, only retry rows that were rejected under a different route.
 pub async fn rearm_permanent_dead_fleet_creates(hub: &Hub, force_all: bool) -> DResult<usize> {
@@ -181,7 +184,7 @@ pub async fn rearm_permanent_dead_fleet_creates(hub: &Hub, force_all: bool) -> D
     let mut tx = hub.db.begin().await?;
     lock_writers(&mut tx).await?;
     // Keys encode the generation; sort by length first to order g10 after g9.
-    let dead: Vec<(Uuid, Uuid, String, String, String, String, String, i64)> = sqlx::query_as(
+    let dead: Vec<DeadFleetCreate> = sqlx::query_as(
         "select e.id, e.notification_id, e.dedupe_key, n.title, e.last_synced_body,
                 e.last_synced_severity, e.last_synced_body_hash, latest.generations
            from fleet_issue_episodes e join notifications n on n.id = e.notification_id
