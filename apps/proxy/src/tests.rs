@@ -6888,3 +6888,51 @@ async fn t3code_algorithmic_verification_suite_passes() {
     assert!(report.passed, "verify-t3code suite failed:\n{}", report.format_human());
     assert_eq!(report.total_count, 9);
 }
+
+#[test]
+fn ssl_cert_file_loader_accepts_pem_bundle_and_fails_closed() {
+    const TEST_CA_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIDITCCAgmgAwIBAgIUTv5/JBwoKAlxeI3tqpcD3gcgQ54wDQYJKoZIhvcNAQEL
+BQAwIDEeMBwGA1UEAwwVcHJveHktdGVzdC1jYS5pbnZhbGlkMB4XDTI2MTEyNDIz
+NTYzMVoXDTM2MTEyMTIzNTYzMVowIDEeMBwGA1UEAwwVcHJveHktdGVzdC1jYS5p
+bnZhbGlkMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtoZStMjVMYcF
+UfK9mWwZXJ46DLQZyc1I2E7AGa9hTHIAMurwWLuYdJ2Dj7gBNDRQonXnykEJK/tt
+HJES5YAKgKMX7RnRqKVBSIE1yjrUmS6xUFwqFWkTEuN746JTprabKY5Fsy5aTlxs
+llT6xfQiDE8mR9aciUrl80fCoujIUVtiFqcK92bPbnmbVRwIS/QYsI+8etnE5V1B
+QHxOqNwEZCqnsZzuUfPQmU+qJJ+NxG3AK1Keu1f8tRV5CrBgcRkjaWbUl7ko68ry
+tpvIs7uCB3ufN9DQxvKFnPvVewWnDPcxgHAFZf/pH16/DVR7Bfs3q6sWkTuA0Tk8
+/UstfWDgAQIDAQABo1MwUTAdBgNVHQ4EFgQU+TBHItLF8USh+dIyCpIVN+t/1Bww
+HwYDVR0jBBgwFoAU+TBHItLF8USh+dIyCpIVN+t/1BwwDwYDVR0TAQH/BAUwAwEB
+/zANBgkqhkiG9w0BAQsFAAOCAQEAT9uL7AnikQ1TMc46KJvqpCWXZtFZdvqeLpY2
+L1jAUqgyGiFdrjvDvlgLLbkomgzJ4XNX0u0wIYxxAqXN73AylU2H4DkKQ1htPy2R
+BHf8He66vDD+bMe0kyuTizSQRN1sMAAaQrWWQrxLfCHaUpeZbj36tefTYXtmwoL8
+QzwTJbiulOlSWgZdaSa0MW29Our/8W5vzIOqhaoZS/UadY6x5E3JRIm089eV9dum
+TRw38jv6f5x9snvhpU5iqdPhVQ4qlqInaecoAi+umWw3FJwQNKKRjdfjhIf/0iAY
+fUzIU8/LOvSpg1rgVwKzTzwyTGAuI0Ch8RiMsNoOOoO/6dXeoA==
+-----END CERTIFICATE-----
+";
+    let dir = std::env::temp_dir().join(format!("fleetix-proxy-ssl-cert-file-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let valid = dir.join("ca.pem");
+    fs::write(&valid, TEST_CA_PEM).unwrap();
+    let client = crate::with_root_certificates_from_path(reqwest::Client::builder(), &valid).expect("valid PEM bundle should load").build();
+    assert!(client.is_ok(), "client with valid extra CA should build");
+
+    let empty = dir.join("empty.pem");
+    fs::write(&empty, "# comment only\n").unwrap();
+    assert!(crate::with_root_certificates_from_path(reqwest::Client::builder(), &empty).is_err());
+
+    let invalid = dir.join("invalid.pem");
+    fs::write(&invalid, "-----BEGIN CERTIFICATE-----\nnot-valid-base64!\n-----END CERTIFICATE-----\n").unwrap();
+    assert!(crate::with_root_certificates_from_path(reqwest::Client::builder(), &invalid).is_err());
+
+    let missing = dir.join("missing.pem");
+    assert!(crate::with_root_certificates_from_path(reqwest::Client::builder(), &missing).is_err());
+
+    let nix_sentinel = Path::new("/no-cert-file.crt");
+    if !nix_sentinel.exists() {
+        assert!(crate::with_root_certificates_from_path(reqwest::Client::builder(), nix_sentinel).is_ok());
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
