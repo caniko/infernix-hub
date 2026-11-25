@@ -22,6 +22,9 @@ pub mod providers;
 
 /// The Fleetix operations snapshot with Canix's expected-offline extension.
 pub mod fleet {
+    use std::collections::BTreeMap;
+
+    use chrono::{DateTime, Utc};
     pub use fleetix::status::*;
     use serde::{Deserialize, Serialize};
 
@@ -33,6 +36,43 @@ pub mod fleet {
         /// Host names confirmed offline by the producer, not all intermittent hosts.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub expected_offline_hosts: Vec<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub host_warnings: BTreeMap<String, Vec<String>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub offline_hosts: Vec<OfflineHostSnapshot>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub probe_coverage: BTreeMap<String, ProbeCoverage>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OfflineHostSnapshot {
+        pub name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_seen: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_health: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub last_failures: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub last_warnings: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_revision: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub offline_since: Option<DateTime<Utc>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ProbeCoverage {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub inspected_users: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub user_bus_errors: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub sections_ok: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub sections_failed: Vec<String>,
     }
 
     impl std::ops::Deref for FleetStatus {
@@ -41,6 +81,27 @@ pub mod fleet {
         fn deref(&self) -> &Self::Target {
             &self.snapshot
         }
+    }
+
+    #[test]
+    fn fleet_extensions_round_trip_and_are_omitted_for_legacy_snapshots() {
+        let mut wire = serde_json::json!({"schemaVersion": 1, "generatedAt": "2026-11-25T00:00:00Z", "hosts": [], "monitoring": {}});
+        let old: FleetStatus = serde_json::from_value(wire.clone()).unwrap();
+        let encoded = serde_json::to_value(&old).unwrap();
+        for key in ["hostWarnings", "offlineHosts", "probeCoverage"] {
+            assert!(encoded.get(key).is_none());
+        }
+        assert_eq!(serde_json::from_value::<FleetStatus>(encoded).unwrap(), old);
+
+        wire["hostWarnings"] = serde_json::json!({"nomad": ["drift"]});
+        wire["offlineHosts"] = serde_json::json!([{"name": "nomad", "lastSeen": "2026-11-24T00:00:00Z", "lastFailures": ["disk"]}]);
+        wire["probeCoverage"] = serde_json::json!({"nomad": {"inspectedUsers": ["can"], "sectionsFailed": ["systemd"]}});
+        let new: FleetStatus = serde_json::from_value(wire.clone()).unwrap();
+        let encoded = serde_json::to_value(&new).unwrap();
+        for key in ["hostWarnings", "offlineHosts", "probeCoverage"] {
+            assert_eq!(encoded[key], wire[key]);
+        }
+        assert_eq!(serde_json::from_value::<FleetStatus>(encoded).unwrap(), new);
     }
 }
 
@@ -267,6 +328,47 @@ pub struct SystemStatus {
     /// are configured or the producer loop is not running here.
     #[serde(default)]
     pub feeds: Vec<FeedState>,
+    #[serde(default, rename = "syncFailures", alias = "sync_failures", skip_serializing_if = "Vec::is_empty")]
+    pub sync_failures: Vec<SyncFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncFailure {
+    pub source: String,
+    #[serde(alias = "consecutive_failures")]
+    pub consecutive_failures: u32,
+    #[serde(alias = "last_error")]
+    pub last_error: Option<String>,
+    #[serde(alias = "last_ok_at")]
+    pub last_ok_at: Option<DateTime<Utc>>,
+    #[serde(alias = "last_error_at")]
+    pub last_error_at: Option<DateTime<Utc>>,
+}
+
+#[test]
+fn system_status_sync_failures_round_trip() {
+    let mut wire = serde_json::json!({
+        "api_version": "v1", "fixture_mode": false, "production_paused": false,
+        "principal": {"id": Uuid::nil(), "name": "system", "role": "operator"}, "integrations": []
+    });
+    let old: SystemStatus = serde_json::from_value(wire.clone()).unwrap();
+    assert!(old.sync_failures.is_empty());
+    assert!(serde_json::to_value(old).unwrap().get("syncFailures").is_none());
+    wire["sync_failures"] = serde_json::json!([{
+        "source": "fleet", "consecutive_failures": 2, "last_error": "timeout",
+        "last_ok_at": null, "last_error_at": "2026-11-25T00:00:00Z"
+    }]);
+    let status: SystemStatus = serde_json::from_value(wire.clone()).unwrap();
+    let encoded = serde_json::to_value(&status).unwrap();
+    assert_eq!(
+        encoded["syncFailures"],
+        serde_json::json!([{
+            "source": "fleet", "consecutiveFailures": 2, "lastError": "timeout",
+            "lastOkAt": null, "lastErrorAt": "2026-11-25T00:00:00Z"
+        }])
+    );
+    assert_eq!(serde_json::from_value::<SystemStatus>(encoded).unwrap(), status);
 }
 
 /// One status feed as the last poll saw it. Failing checks themselves are

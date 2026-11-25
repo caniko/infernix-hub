@@ -164,7 +164,12 @@
     if cfg.database.urlFile != null
     then
       pkgs.writeShellScript "${name}-db-url" ''
-        export DATABASE_URL="$(cat ${toString cfg.database.urlFile})"
+        DATABASE_URL="$(${pkgs.coreutils}/bin/cat -- ${lib.escapeShellArg (toString cfg.database.urlFile)})" || exit 78
+        if [[ -z "$DATABASE_URL" ]]; then
+          echo "fleetix-hub: database.urlFile is empty" >&2
+          exit 78
+        fi
+        export DATABASE_URL
         exec ${exe} "$@"
       ''
     else exe;
@@ -173,6 +178,27 @@
   # migrations are core and always run the upstream binary.
   launcher = mkLauncher "fleetix-hub-serve" cfg.executable;
   coreLauncher = mkLauncher "fleetix-hubd" coreExecutable;
+  migrationLauncher = pkgs.writeShellScript "fleetix-hub-migrate" ''
+    for attempt in 1 2 3; do
+      # Keep stdout separate so only the daemon's top-level SQLx error can
+      # trigger a retry. SQLx already waits on TCP refusal until pool timeout.
+      status=0
+      { error="$(${coreLauncher} "$@" 2>&1 >&3)"; } 3>&1 || status=$?
+      [[ -z "$error" ]] || printf '%s\n' "$error" >&2
+      if (( status != 1 || attempt == 3 )); then
+        exit "$status"
+      fi
+      case "''${error%%$'\n'*}" in
+        "Error: pool timed out while waiting for an open connection" | \
+        "Error: error communicating with database: Connection refused (os error 111)" | \
+        "Error: error communicating with database: No such file or directory (os error 2)")
+          echo "fleetix-hub: PostgreSQL not ready; retrying migration command" >&2
+          ${pkgs.coreutils}/bin/sleep 2
+          ;;
+        *) exit "$status" ;;
+      esac
+    done
+  '';
 
   # --- packs --------------------------------------------------------------
   enabledPacks = lib.filterAttrs (_: pack: pack.enable) cfg.packs;
@@ -371,6 +397,12 @@ in {
 
   options.services.fleetix-hub = {
     enable = mkEnableOption "fleetix-hub content operations hub";
+
+    systemd.onFailure = mkOption {
+      type = types.listOf types.str;
+      default = [];
+      description = "Systemd units to start when the hub or its migration gate enters the failed state.";
+    };
 
     principalOwners = mkOption {
       type = types.attrsOf types.str;
@@ -1138,11 +1170,15 @@ in {
         description = "fleetix-hub API and integration worker";
         wantedBy = ["multi-user.target"];
         after =
-          ["network-online.target" "postgresql.service"]
+          ["network-online.target"]
+          ++ optional cfg.database.createLocally "postgresql.service"
           ++ integrationUnits
           ++ passiveUnits;
         wants = ["network-online.target"] ++ integrationUnits;
         requires = optional cfg.database.createLocally "postgresql.service";
+        partOf = optional cfg.database.createLocally "postgresql.service";
+        onFailure = cfg.systemd.onFailure;
+        unitConfig.StartLimitIntervalSec = 0;
         environment =
           {
             HUB_BIND = cfg.bind;
@@ -1244,23 +1280,26 @@ in {
           ]));
     })
 
-    # Schema ownership belongs to harbor-db; the runtime unit starts only
-    # after the migration and its read-only check.
-    {
-      services.harbor-db.projects.fleetix-hub = mkIf cfg.migrations.enable {
+    # Keep harbor-db's hard migration gate. A dependency-job failure does
+    # not trigger the hub's Restart= or OnFailure=.
+    (mkIf cfg.migrations.enable {
+      systemd.services = {
+        harbor-db-fleetix-hub.onFailure = cfg.systemd.onFailure;
+        # Reuse harbor-db's successful-migration activation helper when the
+        # local database starts, even if the hub has no active job to restart.
+        harbor-db-fleetix-hub-activate.wantedBy = optional cfg.database.createLocally "postgresql.service";
+      };
+
+      services.harbor-db.projects.fleetix-hub = {
         enable = true;
         description = "fleetix-hub database migrations";
-        runner =
-          if cfg.database.urlFile != null
-          then {
-            command = "${coreLauncher} migrate";
-            checkCommand = "${coreLauncher} migrate --check";
-          }
-          else {
-            executable = coreExecutable;
-            args = ["migrate"];
-            checkArgs = ["migrate" "--check"];
-          };
+        runner = {
+          executable = "${migrationLauncher}";
+          args = ["migrate"];
+          checkArgs = ["migrate" "--check"];
+        };
+        after = optional (!cfg.database.createLocally) "network-online.target";
+        wants = optional (!cfg.database.createLocally) "network-online.target";
         user = migrationUser;
         group = migrationGroup;
         environment =
@@ -1282,6 +1321,6 @@ in {
           }
           // optionalAttrs (cfg.database.urlFile == null) {databaseUrl = cfg.database.url;};
       };
-    }
+    })
   ]);
 }

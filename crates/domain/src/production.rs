@@ -1326,10 +1326,10 @@ pub async fn reconcile_pipeline_deadlines(hub: &Hub) -> DResult<()> {
 /// sweep.
 pub async fn reconcile_pipelines(hub: &Hub) -> DResult<()> {
     reconcile_pipeline_deadlines(hub).await?;
-    follow_open_runs(hub).await
+    reconcile_pipeline_runs(hub).await
 }
 
-async fn follow_open_runs(hub: &Hub) -> DResult<()> {
+pub async fn reconcile_pipeline_runs(hub: &Hub) -> DResult<()> {
     let open: Vec<(Uuid, Uuid, String, Value)> = sqlx::query_as(&format!(
         "with picked as ({}) select p.id, g.id, w.pipeline_id, p.raw from picked p
          join generation_requests g on g.id = p.generation_request_id join workflows w on w.id = g.workflow_id",
@@ -1639,7 +1639,7 @@ pub async fn reconcile_procedures(hub: &Hub) -> DResult<()> {
         };
         set_attempt(hub, id, state, json!({})).await?;
     }
-    follow_open_runs(hub).await
+    Ok(())
 }
 
 /// Copy one engine output into durable storage. Idempotent per output.

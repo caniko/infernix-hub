@@ -32,7 +32,7 @@ enum Cmd {
     },
     /// Run the worker only.
     Worker,
-    /// Apply migrations and exit; `--check` only reports (exit 1 if pending).
+    /// Apply migrations and exit; `--check` only reports (exit 1 if not current).
     Migrate {
         #[arg(long)]
         check: bool,
@@ -94,11 +94,10 @@ async fn run() -> anyhow::Result<()> {
             let bundled = domain::MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0);
             println!("database head {head}, bundled head {bundled}, applied {applied:?}");
             if check {
-                let pending = domain::pending_migrations(&db).await?;
-                if !pending.is_empty() {
-                    eprintln!("pending migrations: {pending:?}");
-                    std::process::exit(1);
-                }
+                let status = domain::migration_status(&db).await?;
+                // Do not wrap in the startup error: `--check` exits 1, not 78.
+                anyhow::ensure!(status.ahead.is_empty(), "{}", bootstrap::SchemaAhead(status.ahead));
+                anyhow::ensure!(status.pending.is_empty(), "pending migrations: {:?}", status.pending);
                 println!("schema current");
             } else {
                 println!("migrations applied");
@@ -144,7 +143,7 @@ async fn run() -> anyhow::Result<()> {
             let comfy = fx.comfy.clone().context("fixture comfy")?;
             comfy.spawn_runner(Duration::from_millis(700));
             fx.windmill.as_ref().context("fixture windmill")?.connect(&s.public_url, "dev-procedure-token");
-            tokio::spawn(worker::run(state.hub.clone(), Duration::from_millis(700)));
+            fleetix_hubd::spawn_worker(&state.hub, Duration::from_millis(700));
             let url = s.public_url.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(500)).await;

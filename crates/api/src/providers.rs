@@ -303,10 +303,12 @@ pub async fn run_loop(hub: Hub) {
             poll_provider(&hub, &system_actor, id, provider.as_ref(), failures.entry(id).or_default()).await;
         }
         retention_counter = retention_counter.wrapping_add(1);
-        if retention_counter.is_multiple_of(15)
-            && let Err(error) = domain::providers::capture::enforce_retention(&hub).await
-        {
-            tracing::warn!(%error, "provider capture retention failed");
+        if retention_counter.is_multiple_of(15) {
+            crate::record_notification_sync(
+                &hub,
+                "provider-retention",
+                domain::providers::capture::enforce_retention(&hub).await.map(|_| 0),
+            );
         }
     }
 }
@@ -322,13 +324,16 @@ async fn poll_provider(hub: &Hub, actor: &Actor, id: &str, provider: &dyn domain
     };
     if let Some(raises) = poller_raises(id, streak, result.as_ref().err()) {
         let source = poller_source(id);
-        if let Err(error) = notifications::sync(hub, &source, raises).await {
-            tracing::warn!(provider = %id, %error, "provider poller notification sync failed");
-        }
+        crate::record_notification_sync(hub, &source, notifications::sync(hub, &source, raises).await);
     }
-    if let Err(error) = result {
-        let detail = sanitize_provider_error(&error.to_string());
-        tracing::warn!(provider = %id, %detail, consecutive_failures = *streak, "provider poll failed");
+    let source = format!("provider-poll:{id}");
+    match result {
+        Ok(()) => hub.record_sync_ok(&source),
+        Err(error) => {
+            let detail = sanitize_provider_error(&error.to_string());
+            hub.record_sync_error(&source, &detail);
+            tracing::error!(provider = %id, %detail, consecutive_failures = *streak, "provider poll failed");
+        }
     }
 }
 
@@ -436,6 +441,7 @@ mod tests {
         for expected in 1..=2 {
             poll_provider(hub, &actor, "audit-poller", &bad, &mut streak).await;
             assert_eq!(streak, expected);
+            assert!(hub.sync_failures().iter().any(|f| f.consecutive_failures == expected));
         }
         assert!(open().await.unwrap());
         poll_provider(hub, &actor, "audit-poller", &noop, &mut streak).await;
@@ -444,6 +450,14 @@ mod tests {
         poll_provider(hub, &actor, "audit-poller", &good, &mut streak).await;
         assert!(!open().await.unwrap());
         assert_eq!(streak, 0);
+        assert!(hub.sync_failures().is_empty());
+        sqlx::query("alter table notifications rename to broken_notifications").execute(&hub.db).await.unwrap();
+        poll_provider(hub, &actor, "audit-poller", &bad, &mut streak).await;
+        poll_provider(hub, &actor, "audit-poller", &bad, &mut streak).await;
+        assert!(hub.sync_failures().iter().any(|f| f.source == "providers-poller:audit-poller"));
+        sqlx::query("alter table broken_notifications rename to notifications").execute(&hub.db).await.unwrap();
+        poll_provider(hub, &actor, "audit-poller", &good, &mut streak).await;
+        assert!(hub.sync_failures().is_empty());
         let publishers: i64 = sqlx::query_scalar("select count(*) from model_provider_publishers where provider_id = 'audit-poller'")
             .fetch_one(&hub.db)
             .await

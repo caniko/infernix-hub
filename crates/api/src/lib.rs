@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path as FsPath;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -13,8 +14,10 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::Utc;
 use contracts::*;
-use domain::{Actor, DomainError, Hub};
+use domain::ports::PortError;
+use domain::{Actor, DomainError, Hub, notifications};
 use plugin::{Pack, ServerContext, ServerHost, valid_pack_id, validate_packs};
 use serde::Deserialize;
 use serde_json::Value;
@@ -25,7 +28,7 @@ pub mod feeds;
 
 /// Exit status for a server startup failure, including errors wrapped in context.
 pub fn exit_code(error: &anyhow::Error) -> i32 {
-    if error.downcast_ref::<bootstrap::PendingMigrations>().is_some() { 78 } else { 1 }
+    if error.is::<bootstrap::PendingMigrations>() || error.is::<bootstrap::SchemaAhead>() { 78 } else { 1 }
 }
 pub mod mcp;
 pub mod plugin;
@@ -225,7 +228,8 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
     Router::new()
         .nest("/v1", v1)
         .route("/openapi.json", get(openapi))
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .layer(tower_http::trace::TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<Body>| {
             let cid = req.headers().get(CORRELATION_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
             tracing::info_span!("http", method = %req.method(), path = %req.uri().path(), correlation_id = %cid)
@@ -322,7 +326,7 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
         }
         tokio::spawn(feeds::run(state.hub.clone(), feeds));
         tokio::spawn(providers::run_loop(state.hub.clone()));
-        tokio::spawn(worker::run(state.hub.clone(), Duration::from_secs(2)));
+        spawn_worker(&state.hub, Duration::from_secs(2));
         tokio::spawn(notify_loop(state.hub.clone(), state.fleet_status_file.clone(), state.secret_inventory_file.clone()));
     }
     let listener = tokio::net::TcpListener::bind(&settings.bind).await.with_context(|| format!("binding {}", settings.bind))?;
@@ -333,6 +337,57 @@ pub async fn run(settings: bootstrap::Settings, packs: Vec<Box<dyn Pack>>) -> an
         })
         .await?;
     Ok(())
+}
+
+pub fn spawn_worker(hub: &Hub, every: Duration) {
+    hub.mark_worker_started();
+    hub.worker_enabled.store(true, Ordering::Release);
+    tokio::spawn(worker::run(hub.clone(), every));
+}
+
+async fn database_health(hub: &Hub) -> Result<(), &'static str> {
+    match tokio::time::timeout(Duration::from_secs(2), domain::sqlx::query("select 1").execute(&hub.db)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) => Err("unavailable"),
+        Err(_) => Err("timed out"),
+    }
+}
+
+fn worker_health(hub: &Hub) -> Result<&'static str, String> {
+    if !hub.worker_enabled.load(Ordering::Acquire) {
+        return Ok("disabled");
+    }
+    hub.worker_health(Utc::now(), Duration::from_secs(180)).map(|()| "ok")
+}
+
+async fn healthz(State(s): State<AppState>) -> (StatusCode, String) {
+    if let Err(error) = database_health(&s.hub).await {
+        return (StatusCode::SERVICE_UNAVAILABLE, format!("database {error}"));
+    }
+    match worker_health(&s.hub) {
+        Ok(_) => (StatusCode::OK, "ok".into()),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error),
+    }
+}
+
+async fn readyz(State(s): State<AppState>) -> (StatusCode, Json<Value>) {
+    let database = database_health(&s.hub).await;
+    let worker = worker_health(&s.hub);
+    let mut failures = s.hub.sync_failures();
+    let ready = database.is_ok() && worker.is_ok() && failures.iter().all(|failure| failure.consecutive_failures < 3);
+    // This route is unauthenticated. Full diagnostics are on /v1/status.
+    for failure in &mut failures {
+        failure.last_error = Some("sync failed".into());
+    }
+    (
+        if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE },
+        Json(serde_json::json!({
+            "status": if ready { "ok" } else { "degraded" },
+            "database": database.map_or_else(|error| error, |()| "ok"),
+            "worker": worker.unwrap_or_else(|_| "unhealthy").to_string(),
+            "syncFailures": failures,
+        })),
+    )
 }
 
 /// Producers ride one in-process loop next to the worker: no scheduler, no
@@ -356,37 +411,30 @@ pub async fn notify_pass(
 ) {
     let today = async {
         let today = domain::content::system_today(hub).await?;
-        domain::notifications::today_with_stalled(hub, &today).await
+        notifications::today_with_stalled(hub, &today).await
     }
     .await;
     match today {
         Ok(raises) => notify_sync(hub, "today", raises).await,
-        Err(error) => tracing::warn!(%error, "notifications: today source skipped"),
+        Err(error) => record_notification_sync(hub, "today", Err(error)),
     }
-    if let Err(error) = domain::notifications::sync_member_renewals(hub).await {
-        tracing::warn!(%error, "notifications: member renewals source skipped");
-    }
-    if let Err(error) = domain::providers::reconcile_quota_notifications(hub).await {
-        tracing::warn!(%error, "notifications: provider quota reconciliation skipped");
-    }
-    let fleet = match fleet_status_file {
-        Some(path) => Some(read_fleet_status(Some(path)).await),
-        None => None,
-    };
+    record_notification_sync(hub, "renewals", notifications::sync_member_renewals(hub).await.map(|()| 0));
+    let fleet = if let Some(path) = fleet_status_file { Some(read_fleet_status(Some(path)).await) } else { None };
     if let Some(Ok(status)) = &fleet
         && let Ok(mut offline) = hub.expected_offline_hosts.write()
     {
-        offline.clone_from(&status.expected_offline_hosts);
+        *offline = status.expected_offline_hosts.iter().chain(status.offline_hosts.iter().map(|host| &host.name)).cloned().collect();
+        offline.sort_unstable();
+        offline.dedup();
     }
-    if let Err(error) = domain::providers::reconcile_provider_health_notifications(hub).await {
-        tracing::warn!(%error, "notifications: provider health reconciliation skipped");
-    }
+    record_notification_sync(hub, "provider-quota", domain::providers::reconcile_quota_notifications(hub).await.map(|_| 0));
+    record_notification_sync(hub, "provider-health", domain::providers::reconcile_provider_health_notifications(hub).await.map(|_| 0));
     if let Some(fleet) = fleet {
-        let raises = match fleet {
-            Ok(status) => domain::notifications::fleet_raises(&status, chrono::Utc::now()),
-            Err(error) => vec![domain::notifications::fleet_unreadable(&error.to_string())],
+        let (raises, keep) = match fleet {
+            Ok(status) => (notifications::fleet_raises(&status, Utc::now()), notifications::fleet_keep_keys(&status)),
+            Err(error) => (vec![notifications::fleet_unreadable(&error.to_string())], notifications::fleet_unreadable_keep_prefixes()),
         };
-        notify_sync(hub, "fleet", raises).await;
+        notify_sync_keeping(hub, "fleet", raises, &keep).await;
     }
     if let Some(path) = secret_inventory_file {
         match read_secret_inventory(Some(path)).await {
@@ -414,36 +462,64 @@ pub async fn notify_pass(
                     Ok(())
                 }
                 .await;
-                if let Err(error) = result {
-                    tracing::warn!(%error, "notifications: secret source skipped");
-                }
+                record_notification_sync(hub, "secrets", result.map(|()| 0));
             }
             Err(error) => {
                 let raise = secret_inventory_stale(format!("{}: {}: {error}", path.display(), secret_error_code(&error)));
-                if let Err(error) = domain::notifications::raise(hub, &raise).await {
-                    tracing::warn!(%error, "notifications: secret inventory stale raise failed");
-                }
+                record_notification_sync(hub, "secrets", notifications::raise(hub, &raise).await.map(usize::from));
             }
         }
     }
-    match domain::notifications::sync_summary_staleness(hub, summary_stale_hours).await {
-        Ok(0) => {}
-        Ok(changed) => tracing::debug!(source = "hub", changed, "notifications: producer pass"),
-        Err(error) => tracing::warn!(%error, "notifications: hub source skipped"),
-    }
-    if let Err(error) = domain::notifications::expire_snoozes(hub).await {
-        tracing::warn!(%error, "notifications: snooze expiry failed");
-    }
-    if let Err(error) = domain::notifications::prune(hub).await {
-        tracing::warn!(%error, "notifications: prune failed");
+    record_notification_sync(hub, "hub", notifications::sync_summary_staleness(hub, summary_stale_hours).await);
+    record_notification_sync(hub, "snooze-expiry", notifications::expire_snoozes(hub).await);
+    record_notification_sync(hub, "notification-prune", notifications::prune(hub).await.map(|pruned| pruned as usize));
+    if let Some(fi) = &hub.config.fleet_issues {
+        let result = match hub.paperclip.verify_routing(&fi.company_id, fi.project_id.as_deref(), fi.assignee_agent_id.as_deref()).await {
+            Ok(()) => {
+                let recovered = async {
+                    let resolved = notifications::clear_paperclip_routing_error(hub).await?;
+                    let rearmed = notifications::rearm_permanent_dead_fleet_creates(hub, resolved > 0).await?;
+                    Ok(resolved + rearmed)
+                }
+                .await;
+                Some(recovered)
+            }
+            Err(PortError::Rejected { status, message }) if (400..500).contains(&status) && status != 429 => {
+                let detail = format!("Paperclip routing rejected ({status}): {message}");
+                tracing::error!("{detail}");
+                Some(notifications::report_paperclip_routing_error(hub, &detail).await.map(|()| 0))
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not verify Paperclip routing");
+                None
+            }
+        };
+        if let Some(result) = result {
+            record_notification_sync(hub, "paperclip", result);
+        }
     }
 }
 
-async fn notify_sync(hub: &Hub, source: &str, raises: Vec<domain::notifications::Raise>) {
-    match domain::notifications::sync(hub, source, raises).await {
-        Ok(0) => {}
-        Ok(changed) => tracing::debug!(source, changed, "notifications: producer pass"),
-        Err(error) => tracing::warn!(%error, source, "notifications: producer pass failed"),
+async fn notify_sync(hub: &Hub, source: &str, raises: Vec<notifications::Raise>) {
+    notify_sync_keeping(hub, source, raises, &[]).await;
+}
+
+async fn notify_sync_keeping(hub: &Hub, source: &str, raises: Vec<notifications::Raise>, keep: &[String]) {
+    record_notification_sync(hub, source, notifications::sync_keeping(hub, source, raises, keep).await);
+}
+
+fn record_notification_sync(hub: &Hub, source: &str, result: domain::DResult<usize>) {
+    match result {
+        Ok(changed) => {
+            hub.record_sync_ok(source);
+            if changed > 0 {
+                tracing::debug!(source, changed, "notifications: producer pass");
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, source, "notifications: producer pass failed");
+            hub.record_sync_error(source, error);
+        }
     }
 }
 
@@ -562,9 +638,16 @@ fn fleet_error(error: FleetStatusError, correlation_id: Option<String>) -> ApiEr
 }
 
 /// The hub never collects fleet data itself.
-async fn fleet_status(State(s): State<AppState>, Caller(a): Caller) -> R<contracts::fleet::FleetStatus> {
+async fn fleet_status(State(s): State<AppState>, Caller(a): Caller) -> Result<impl IntoResponse, ApiErr> {
     a.require(&[Role::Operator, Role::Agent, Role::Procedure, Role::Ingest]).map_err(err(&a))?;
-    read_fleet_status(s.fleet_status_file.as_deref()).await.map(Json).map_err(|e| fleet_error(e, a.correlation_id.clone()))
+    let status = read_fleet_status(s.fleet_status_file.as_deref()).await.map_err(|e| fleet_error(e, a.correlation_id.clone()))?;
+    let (stale, age) = notifications::fleet_snapshot_stale(&status, Utc::now());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-fleet-status-stale", HeaderValue::from_static(if stale { "true" } else { "false" }));
+    if let Some(seconds) = age {
+        headers.insert("x-fleet-status-age-seconds", HeaderValue::from(seconds));
+    }
+    Ok((headers, Json(status)))
 }
 
 pub async fn read_secret_inventory(path: Option<&FsPath>) -> Result<contracts::SecretInventory, FleetStatusError> {

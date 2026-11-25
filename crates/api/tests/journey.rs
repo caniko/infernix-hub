@@ -41,6 +41,10 @@ async fn fresh_db() -> Option<String> {
 }
 
 async fn start(db_url: &str, assets: &std::path::Path) -> H {
+    start_with(db_url, assets, |_| {}).await
+}
+
+async fn start_with(db_url: &str, assets: &std::path::Path, configure: impl FnOnce(&mut Settings)) -> H {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let mut s = Settings::fixture(db_url, &addr);
@@ -48,6 +52,7 @@ async fn start(db_url: &str, assets: &std::path::Path) -> H {
     s.asset_dir = assets.to_path_buf();
     s.registry_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../registry").into();
     s.seed_file = Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../registry/hub.fixture.json").into());
+    configure(&mut s);
     let (state, fx) = bootstrap::build(&s).await.unwrap();
     for (name, role, token) in
         [("operator", Role::Operator, "op"), ("agent", Role::Agent, "ag"), ("windmill", Role::Procedure, "pr"), ("n8n", Role::Ingest, "in")]
@@ -1385,8 +1390,114 @@ fn openapi_lists_every_route() {
     let src = include_str!("../src/lib.rs");
     for line in src.lines().filter(|l| l.trim_start().starts_with(".route(\"")) {
         let path = line.split('"').nth(1).unwrap();
-        let full = if path.starts_with("/openapi") || path == "/healthz" { path.to_string() } else { format!("/v1{path}") };
+        let full =
+            if path.starts_with("/openapi") || matches!(path, "/healthz" | "/readyz") { path.to_string() } else { format!("/v1{path}") };
         assert!(doc["paths"].get(&full).is_some(), "openapi.json misses {full}");
+    }
+}
+
+#[tokio::test]
+async fn health_and_readiness_check_database_worker_and_sync_failures() {
+    let Some(h) = harness().await else { return };
+    let http = reqwest::Client::new();
+    let health = || http.get(format!("{}/healthz", h.url)).send();
+    let ready = || http.get(format!("{}/readyz", h.url)).send();
+    let response = health().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "ok");
+    let response = ready().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        json!({
+            "status": "ok", "database": "ok", "worker": "disabled", "syncFailures": []
+        })
+    );
+
+    h.hub.worker_enabled.store(true, std::sync::atomic::Ordering::Release);
+    h.hub.mark_worker_started();
+    assert_eq!(ready().await.unwrap().json::<serde_json::Value>().await.unwrap()["worker"], "ok");
+    *h.hub.worker_started_at.write().unwrap() = Some(Utc::now() - chrono::Duration::seconds(61));
+    assert_eq!(health().await.unwrap().status(), 200);
+    assert_eq!(ready().await.unwrap().status(), 200);
+    *h.hub.worker_started_at.write().unwrap() = Some(Utc::now() - chrono::Duration::seconds(181));
+    let response = health().await.unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(response.text().await.unwrap().contains("worker stalled"));
+    assert_eq!(ready().await.unwrap().status(), 503);
+    h.hub.record_worker_tick();
+    assert_eq!(ready().await.unwrap().status(), 200);
+
+    // Break the producers without breaking the database health query or the status API.
+    domain::sqlx::query("alter table notifications rename to broken_notifications").execute(&h.hub.db).await.unwrap();
+    for expected in 1..=3 {
+        fleetix_hubd::notify_pass(&h.hub, None, None, None).await;
+        let response = ready().await.unwrap();
+        assert_eq!(response.status(), if expected < 3 { 200 } else { 503 });
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        let failures = body["syncFailures"].as_array().unwrap();
+        let failure = failures.iter().find(|f| f["source"] == "today").unwrap();
+        assert_eq!(failure["consecutiveFailures"], expected);
+        assert_eq!(failure["lastError"], "sync failed", "unauthenticated readiness must not expose errors");
+        let status: serde_json::Value = h.op.get("/status").await.unwrap();
+        let today = status["syncFailures"].as_array().unwrap().iter().find(|f| f["source"] == "today").unwrap();
+        assert_eq!(today["consecutiveFailures"], expected);
+        assert!(today["lastError"].as_str().unwrap().contains("notifications"));
+        assert!(today["lastErrorAt"].is_string());
+        for field in ["lastErrorAt", "lastOkAt"] {
+            assert_eq!(failure.get(field), today.get(field));
+            assert!(today.get(field).is_some());
+        }
+        for source in ["snooze-expiry", "notification-prune"] {
+            let maintenance = failures.iter().find(|f| f["source"] == source).unwrap();
+            assert_eq!(maintenance["consecutiveFailures"], expected, "{source}");
+        }
+    }
+    assert_eq!(health().await.unwrap().status(), 200);
+    domain::sqlx::query("alter table broken_notifications rename to notifications").execute(&h.hub.db).await.unwrap();
+    fleetix_hubd::notify_pass(&h.hub, None, None, None).await;
+    let response = ready().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json::<serde_json::Value>().await.unwrap()["syncFailures"], json!([]));
+    assert!(h.op.get::<SystemStatus>("/status").await.unwrap().sync_failures.is_empty());
+
+    h.hub.db.close().await;
+    let response = health().await.unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(response.text().await.unwrap().contains("database"));
+    let response = ready().await.unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.json::<serde_json::Value>().await.unwrap()["database"], "unavailable");
+}
+
+#[tokio::test]
+async fn future_migration_refuses_serve_and_migrate_check() {
+    let Some(h) = harness().await else { return };
+    let run = |args: &[&str], migrate_on_start: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_fleetix-hubd"))
+            .args(args)
+            .env("DATABASE_URL", &h.db_url)
+            .env("HUB_MIGRATE_ON_START", migrate_on_start)
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["migrate", "--check"], "0").status.success());
+    let applied: i64 = domain::sqlx::query_scalar("select max(version) from _sqlx_migrations").fetch_one(&h.hub.db).await.unwrap();
+    let ahead = applied + 1;
+    domain::sqlx::query(
+        "insert into _sqlx_migrations (version, description, success, checksum, execution_time)
+         values ($1, 'future migration', true, ''::bytea, 0)",
+    )
+    .bind(ahead)
+    .execute(&h.hub.db)
+    .await
+    .unwrap();
+    assert_eq!(domain::migration_status(&h.hub.db).await.unwrap().ahead, vec![ahead]);
+    for (args, code, migrate) in [(&["serve"][..], 78, "0"), (&["serve"][..], 78, "1"), (&["migrate", "--check"][..], 1, "0")] {
+        let output = run(args, migrate);
+        assert_eq!(output.status.code(), Some(code), "{output:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("ahead of this binary") && error.contains(&format!("[{ahead}]")), "{error}");
     }
 }
 
@@ -4228,6 +4339,14 @@ async fn status_feed_checks_resolve_on_recovery_and_hold_through_errors() {
     assert!(find(&rows, "monitor:syndb:backup.clickhouse").unwrap().resolved_at.is_some());
     assert!(find(&rows, "monitor:syndb:feed").unwrap().resolved_at.is_some());
 
+    for (table, renamed) in [("notifications", "broken_notifications"), ("broken_notifications", "notifications")] {
+        domain::sqlx::query(&format!("alter table {table} rename to {renamed}")).execute(&h.hub.db).await.unwrap();
+        let result = fleetix_hubd::feeds::sync(&h.hub, &Default::default()).await;
+        let failed = renamed == "broken_notifications";
+        assert_eq!(result.is_err(), failed);
+        assert_eq!(h.hub.sync_failures().iter().any(|f| f.source == "monitor"), failed);
+    }
+
     // The source is reserved: no API caller can fake it.
     assert!(h.op.raise_notification(&notification_in("monitor:syndb:x", "fake")).await.is_err());
 }
@@ -4549,90 +4668,424 @@ async fn member_renewal_producer_rejects_legacy_key_collision() {
     assert_eq!(title, "old");
 }
 
-#[tokio::test]
-async fn fleet_degradations_file_one_paperclip_issue_per_condition_and_day() {
-    let Some(h) = harness().await else { return };
-    let route = domain::FleetIssues {
-        company_id: "ops-co".into(),
-        project_id: Some("ops-project".into()),
-        assignee_agent_id: Some("ops-agent".into()),
-    };
-    let mut hub = h.hub.clone();
-    hub.config = Arc::new(domain::HubConfig { fleet_issues: Some(route), ..(*h.hub.config).clone() });
-    let raise = |key: &str, body: &str| domain::notifications::Raise {
-        source: "fleet".into(),
-        dedupe_key: key.into(),
-        severity: Severity::Warning,
-        title: format!("{key} degraded"),
-        body: body.into(),
-        subject_type: None,
-        subject_id: None,
-        url: None,
-    };
-    let issues = |hub: domain::Hub| async move {
-        domain::sqlx::query_as::<_, (serde_json::Value, String)>(
-            "select payload, state from outbox where topic = 'paperclip.create_issue' and idempotency_key like 'fleetix-hub:fleet:%' order by created_at",
-        )
-        .fetch_all(&hub.db)
-        .await
-        .unwrap()
-    };
-    async fn sync(hub: &domain::Hub, raises: Vec<domain::notifications::Raise>) -> domain::DResult<usize> {
-        domain::notifications::sync(hub, "fleet", raises).await
+async fn fleet_harness() -> Option<H> {
+    let db = fresh_db().await?;
+    let assets = std::env::temp_dir().join(format!("ihub-test-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&assets).await.unwrap();
+    Some(
+        start_with(&db, &assets, |s| {
+            s.fleet_status_file = Some(assets.join("fleet.json"));
+            s.fleet_issues = Some(domain::FleetIssues {
+                company_id: "ops-co".into(),
+                project_id: Some("ops-project".into()),
+                assignee_agent_id: Some("ops-agent".into()),
+            });
+        })
+        .await,
+    )
+}
+
+fn fleet_snapshot() -> serde_json::Value {
+    json!({"schemaVersion": 1, "generatedAt": Utc::now(), "hosts": [], "monitoring": {}})
+}
+
+fn fleet_host(name: &str, health: &str, failures: &[&str]) -> serde_json::Value {
+    json!({"name": name, "health": health, "failures": failures, "checkedAt": Utc::now()})
+}
+
+impl H {
+    async fn write_fleet(&self, snapshot: &serde_json::Value) {
+        tokio::fs::write(self.assets.join("fleet.json"), snapshot.to_string()).await.unwrap();
     }
 
-    // Unrouted files nothing; a condition already open when routing starts files
-    // once, and edits, flaps and passes the same day file no second issue. A
-    // pending op is an approval, not a degradation.
-    sync(&h.hub, vec![raise("fleet:host:edge", "first")]).await.unwrap();
-    assert!(issues(hub.clone()).await.is_empty());
-    sync(&hub, vec![raise("fleet:host:edge", "pg-backup-health failed")]).await.unwrap();
-    sync(&hub, vec![raise("fleet:host:edge", "edited")]).await.unwrap();
-    sync(&hub, vec![]).await.unwrap();
-    sync(&hub, vec![raise("fleet:host:edge", "flapped"), raise("fleet:op:op-1", "approve")]).await.unwrap();
-    let rows = issues(hub.clone()).await;
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    let payload = &rows[0].0;
-    assert_eq!(payload["company_id"], "ops-co");
-    assert_eq!(payload["project_id"], "ops-project");
-    assert_eq!(payload["assignee_agent_id"], "ops-agent");
-    assert_eq!(payload["title"], "Fleet: fleet:host:edge");
-    assert!(payload["description"].as_str().unwrap().starts_with("fleet:host:edge degraded\n\npg-backup-health failed"));
-    assert!(payload["origin_key"].as_str().unwrap().starts_with("fleetix-hub:fleet:fleet:host:edge:"));
+    async fn notify_fleet(&self) {
+        fleetix_hubd::notify_pass(&self.hub, Some(&self.assets.join("fleet.json")), None, None).await;
+    }
 
-    // Another condition files its own, with producer titles: two alerts share a
-    // display name and two nightly runs share theirs. Other sources and unrouted
-    // hubs file none.
-    let titled = |key: &str, title: &str| domain::notifications::Raise { title: title.into(), ..raise(key, "x") };
-    sync(
-        &hub,
-        vec![
-            raise("fleet:host:edge", "flapped"),
-            titled("fleet:alert:internal_forgejo", "Alert: forgejo"),
-            titled("fleet:alert:public_forgejo", "Alert: forgejo"),
-            titled("fleet:nightly:2026-11-18t02:00:00z", "Nightly update failed"),
-            titled("fleet:nightly:2026-11-19t02:00:00z", "Nightly update failed"),
-        ],
-    )
-    .await
-    .unwrap();
-    domain::notifications::sync(
-        &hub,
-        "monitor",
-        vec![domain::notifications::Raise { source: "monitor".into(), ..raise("monitor:x", "fail") }],
-    )
-    .await
-    .unwrap();
-    sync(&h.hub, vec![raise("fleet:host:edge", "flapped"), raise("fleet:host:nomad", "x")]).await.unwrap();
-    let rows = issues(hub.clone()).await;
-    assert_eq!(rows.len(), 4, "{rows:?}");
-    let titles = |title: &str| rows.iter().filter(|(p, _)| p["title"] == title).count();
-    // Same-named alerts stay apart; every nightly run is one condition.
-    assert_eq!(titles("Fleet: fleet:alert:internal_forgejo"), 1);
-    assert_eq!(titles("Fleet: fleet:alert:public_forgejo"), 1);
-    assert_eq!(titles("Fleet: fleet:nightly"), 1);
+    async fn notification(&self, key: &str) -> Notification {
+        self.op
+            .notifications(None, 0, true)
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|n| n.dedupe_key == key)
+            .unwrap_or_else(|| panic!("missing notification {key}"))
+    }
+}
 
-    // The worker delivers them through the Paperclip port.
+#[tokio::test]
+async fn fleet_snapshot_to_paperclip_episode_recovers_and_refiles_on_recurrence() {
+    let Some(h) = fleet_harness().await else { return };
+    let board = h.fx.paperclip.as_ref().unwrap();
+    let key = "fleet:host:edge";
+    let mut snapshot = fleet_snapshot();
+    snapshot["hosts"] = json!([fleet_host("edge", "degraded", &["disk", "service"])]);
+    h.write_fleet(&snapshot).await;
+    h.notify_fleet().await;
+    assert!(h.notification(key).await.url.is_none());
     h.tick().await;
-    assert!(issues(hub).await.iter().all(|(_, state)| state == "delivered"));
+    let first = board.issue("fixture-issue-1").unwrap();
+    let first_request = board.issue_requests().pop().unwrap();
+    assert_eq!(first_request.company_id, "ops-co");
+    assert_eq!(first_request.project_id.as_deref(), Some("ops-project"));
+    assert_eq!(first_request.assignee_agent_id.as_deref(), Some("ops-agent"));
+    assert_eq!(first.priority.as_deref(), Some("high"));
+    let note = h.notification(key).await;
+    assert_eq!(note.url, first.reference.url);
+
+    snapshot["hosts"] = json!([fleet_host("edge", "unreachable", &["service", "network", "power"])]);
+    h.write_fleet(&snapshot).await;
+    for _ in 0..2 {
+        h.notify_fleet().await;
+        h.tick().await;
+    }
+    assert_eq!(board.issue_requests().len(), 1);
+    let comments = board.issue_comments();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].issue_id, first.reference.id);
+    assert!(comments[0].body.contains("**Added:**\n- network\n- power"));
+    assert!(comments[0].body.contains("**Removed:**\n- disk"));
+    assert!(comments[0].body.ends_with("network\npower\nservice"));
+    assert_eq!(board.issue(first.reference.id.as_str()).unwrap().priority.as_deref(), Some("critical"));
+    assert_eq!(h.notification(key).await.url, first.reference.url);
+
+    // Neither a missing snapshot nor an expected offline host proves recovery.
+    tokio::fs::remove_file(h.assets.join("fleet.json")).await.unwrap();
+    h.notify_fleet().await;
+    assert!(h.notification(key).await.resolved_at.is_none());
+    assert!(h.notification("fleet:stale").await.resolved_at.is_none());
+    snapshot["hosts"] = json!([]);
+    snapshot["expectedOfflineHosts"] = json!(["laptop", "spare"]);
+    snapshot["offlineHosts"] = json!([{"name": "edge"}, {"name": "spare"}]);
+    h.write_fleet(&snapshot).await;
+    h.notify_fleet().await;
+    assert_eq!(*h.hub.expected_offline_hosts.read().unwrap(), ["edge", "laptop", "spare"]);
+    assert!(h.notification(key).await.resolved_at.is_none());
+    assert!(h.notification("fleet:stale").await.resolved_at.is_some());
+    h.tick().await;
+    assert_eq!(board.issue(first.reference.id.as_str()).unwrap().status, "backlog");
+
+    snapshot["hosts"] = json!([fleet_host("edge", "healthy", &[])]);
+    h.write_fleet(&snapshot).await;
+    h.notify_fleet().await;
+    assert!(h.notification(key).await.resolved_at.is_some());
+    h.tick().await;
+    assert_eq!(board.issue(first.reference.id.as_str()).unwrap().status, "done");
+    assert!(board.issue_updates().iter().any(|u| {
+        u.issue_id == first.reference.id
+            && u.status.as_deref() == Some("done")
+            && u.comment.as_deref().is_some_and(|text| text.contains("Fleet condition cleared"))
+    }));
+
+    snapshot = fleet_snapshot();
+    snapshot["hosts"] = json!([fleet_host("edge", "degraded", &["disk", "service"])]);
+    h.write_fleet(&snapshot).await;
+    h.notify_fleet().await;
+    let reopened = h.notification(key).await;
+    assert_eq!(reopened.id, note.id);
+    assert!(reopened.url.is_none() && reopened.resolved_at.is_none());
+    h.tick().await;
+    let requests = board.issue_requests();
+    let recurrence = requests.iter().filter(|r| r.title.starts_with("Fleet: fleet:host:edge")).collect::<Vec<_>>();
+    assert_eq!(recurrence.len(), 2);
+    assert_ne!(recurrence[0].origin_key, recurrence[1].origin_key);
+    assert_ne!(recurrence[0].title, recurrence[1].title);
+    let new_issue = board.issue(&format!("fixture-issue-{}", requests.len())).unwrap();
+    assert_ne!(new_issue.reference.url, first.reference.url);
+    assert_eq!(h.notification(key).await.url, new_issue.reference.url);
+}
+
+#[tokio::test]
+async fn fleet_pass_maps_snapshot_signals_to_notification_severity_and_paperclip_priority() {
+    let Some(h) = fleet_harness().await else { return };
+    let board = h.fx.paperclip.as_ref().unwrap();
+    let now = Utc::now();
+    let mut snapshot = fleet_snapshot();
+    snapshot["generatedAt"] = json!(now - chrono::Duration::minutes(30));
+    snapshot["hosts"] = json!([fleet_host("down", "unreachable", &[]), fleet_host("edge", "degraded", &[])]);
+    snapshot["monitoring"] = json!({
+        "error": "monitor read failed",
+        "alerts": [
+            {"key": "api", "name": "API", "group": "test", "detail": ["first"]},
+            {"key": "api", "name": "API", "group": "test", "detail": ["second"]}
+        ]
+    });
+    snapshot["offlineHosts"] = json!([{"name": "laptop", "offlineSince": now - chrono::Duration::days(8)}]);
+    snapshot["hostWarnings"] = json!({"edge": ["configuration drift"]});
+    snapshot["probeCoverage"] = json!({"edge": {"sectionsFailed": ["systemd"], "userBusErrors": ["no user bus"]}});
+    snapshot["nightly"] = json!({"startedAt": now - chrono::Duration::hours(5)});
+    h.write_fleet(&snapshot).await;
+    h.notify_fleet().await;
+    h.tick().await;
+    let requests = board.issue_requests();
+    for (key, severity, priority) in [
+        ("host:down", Severity::Critical, Some("critical")),
+        ("host:edge", Severity::Warning, Some("high")),
+        ("stale", Severity::Critical, Some("high")),
+        ("monitoring", Severity::Critical, Some("high")),
+        ("alert:api", Severity::Warning, Some("high")),
+        ("offline:laptop", Severity::Warning, Some("medium")),
+        ("probe:edge", Severity::Warning, Some("medium")),
+        ("nightly:stalled", Severity::Warning, Some("medium")),
+        ("warn:edge", Severity::Info, None),
+    ] {
+        let note = h.notification(&format!("fleet:{key}")).await;
+        assert_eq!(note.severity, severity, "{key}");
+        assert_eq!(note.url.is_some(), priority.is_some(), "{key}");
+        let title = format!("Fleet: fleet:{key}");
+        let matching: Vec<_> = requests.iter().filter(|r| r.title == title).collect();
+        assert_eq!(matching.len(), usize::from(priority.is_some()), "{key}");
+        assert_eq!(matching.first().and_then(|r| r.priority.as_deref()), priority, "{key}");
+    }
+    assert_eq!(requests.len(), 8);
+    assert!(h.hub.sync_failures().is_empty(), "duplicate alert keys must not abort the pass");
+    let alert = h.notification("fleet:alert:api").await;
+    assert!(alert.body.contains("first") && alert.body.contains("second"));
+    let probe = h.notification("fleet:probe:edge").await;
+    assert!(probe.body.contains("systemd") && probe.body.contains("no user bus"));
+    assert_eq!(h.notification("fleet:warn:edge").await.body, "configuration drift");
+
+    snapshot["probeCoverage"] = json!({});
+    snapshot["offlineHosts"] = json!([{"name": "edge"}]);
+    snapshot["monitoring"]["alerts"][0]["detail"] = json!(["first", "first"]);
+    h.write_fleet(&snapshot).await;
+    h.notify_fleet().await;
+    h.tick().await;
+    assert!(h.notification("fleet:probe:edge").await.open, "an offline host has not recovered its probes");
+    assert_eq!(h.notification("fleet:alert:api").await.seq, alert.seq, "duplicate detail must not change evidence");
+    assert!(!board.issue_comments().iter().any(|comment| comment.body.contains("Alert: API")));
+
+    snapshot["nightly"]["finishedAt"] = json!(now);
+    snapshot["nightly"]["error"] = json!("update failed");
+    h.write_fleet(&snapshot).await;
+    h.notify_fleet().await;
+    h.tick().await;
+    assert!(h.notification("fleet:nightly:stalled").await.resolved_at.is_some());
+    let failed =
+        h.op.notifications(None, 0, false).await.unwrap().items.into_iter().find(|n| n.dedupe_key.starts_with("fleet:nightly:")).unwrap();
+    assert_eq!(failed.severity, Severity::Warning);
+    assert!(failed.url.is_some());
+    let request = board.issue_requests().pop().unwrap();
+    assert_eq!(request.title, "Fleet: fleet:nightly");
+    assert_eq!(request.priority.as_deref(), Some("medium"));
+}
+
+#[tokio::test]
+async fn exhausted_fleet_create_is_rearmed_by_the_next_notify_pass() {
+    let Some(h) = fleet_harness().await else { return };
+    let board = h.fx.paperclip.as_ref().unwrap();
+    let mut snapshot = fleet_snapshot();
+    snapshot["hosts"] = json!([fleet_host("edge", "degraded", &["disk"])]);
+    h.write_fleet(&snapshot).await;
+    h.notify_fleet().await;
+    let (id, origin): (Uuid, String) = domain::sqlx::query_as(
+        "update outbox set attempts = $1 where topic = 'paperclip.create_issue' returning id, payload->>'origin_key'",
+    )
+    .bind(domain::outbox::MAX_ATTEMPTS - 1)
+    .fetch_one(&h.hub.db)
+    .await
+    .unwrap();
+    board.unreachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    h.tick().await;
+    let state: String = domain::sqlx::query_scalar("select state from outbox where id = $1").bind(id).fetch_one(&h.hub.db).await.unwrap();
+    assert_eq!(state, "dead");
+    board.unreachable.store(false, std::sync::atomic::Ordering::SeqCst);
+    h.notify_fleet().await;
+    h.tick().await;
+    let requests = board.issue_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].origin_key, origin, "retry a possibly committed remote create with the same idempotency key");
+    assert!(h.notification("fleet:host:edge").await.url.is_some());
+    let rows: Vec<String> = domain::sqlx::query_scalar("select state from outbox where topic = 'paperclip.create_issue' order by state")
+        .fetch_all(&h.hub.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, ["dead", "delivered"]);
+}
+
+#[tokio::test]
+async fn paperclip_routing_probe_and_worker_rejections_raise_an_operator_notification() {
+    let Some(h) = fleet_harness().await else { return };
+    let board = h.fx.paperclip.as_ref().unwrap();
+    let mut snapshot = fleet_snapshot();
+    h.write_fleet(&snapshot).await;
+    let routing = "paperclip:routing:error";
+    let delivery = "paperclip:delivery:error";
+    let reject = |message: &str| board.set_routing_error(Some(domain::ports::PortError::Rejected { status: 403, message: message.into() }));
+    reject("routing probe denied");
+    h.notify_fleet().await;
+    let note = h.notification(routing).await;
+    assert_eq!(note.severity, Severity::Critical);
+    assert!(note.resolved_at.is_none() && note.body.contains("routing probe denied"));
+
+    for (operation, health, failure, topic) in [
+        ("comment", "degraded", "new evidence", "paperclip.comment_issue"),
+        ("close", "healthy", "", "paperclip.update_issue"),
+        ("create", "degraded", "recurrence", "paperclip.create_issue"),
+    ] {
+        board.set_routing_error(None);
+        if operation == "comment" {
+            snapshot["hosts"] = json!([fleet_host("edge", "degraded", &["initial"])]);
+            h.write_fleet(&snapshot).await;
+            h.notify_fleet().await;
+            h.tick().await;
+            assert!(h.notification("fleet:host:edge").await.url.is_some());
+        }
+        snapshot["hosts"] = json!([fleet_host("edge", health, &[failure])]);
+        h.write_fleet(&snapshot).await;
+        h.notify_fleet().await;
+        assert!(h.notification(routing).await.resolved_at.is_some(), "routing probe must clear the alert");
+        let message = format!("{operation} denied");
+        reject(&message);
+        // No producer pass: only worker delivery can raise the notification.
+        h.tick().await;
+        let note = h.notification(delivery).await;
+        assert!(note.resolved_at.is_none() && note.body.contains(&format!("403: {message}")), "{note:?}");
+        assert!(h.notification(routing).await.resolved_at.is_some(), "worker failure is not a routing probe failure");
+        let state: String = domain::sqlx::query_scalar("select state from outbox where topic = $1 and last_error like $2")
+            .bind(topic)
+            .bind(format!("%{message}"))
+            .fetch_one(&h.hub.db)
+            .await
+            .unwrap();
+        assert_eq!(state, "dead");
+    }
+
+    board.set_routing_error(None);
+    h.notify_fleet().await;
+    h.tick().await;
+    assert!(h.notification(delivery).await.open, "a healthy probe did not deliver the rejected create");
+    assert!(h.notification("fleet:host:edge").await.url.is_none(), "unchanged routing does not re-arm a permanent failure");
+
+    reject("configured route unavailable");
+    h.notify_fleet().await;
+    assert!(h.notification(routing).await.open && h.notification(delivery).await.open);
+    board.set_routing_error(None);
+    h.notify_fleet().await;
+    assert!(!h.notification(routing).await.open);
+    assert!(h.notification(delivery).await.open, "routing recovered, delivery is still due");
+    h.tick().await;
+    assert!(h.notification("fleet:host:edge").await.url.is_some(), "routing recovery re-arms the dead create");
+    assert!(!h.notification(delivery).await.open);
+    assert_eq!(board.issue_updates().len(), 0, "a permanent 4xx close is not re-armed");
+
+    snapshot["hosts"] = json!([fleet_host("edge", "degraded", &["more evidence"])]);
+    h.write_fleet(&snapshot).await;
+    reject("probe denied again");
+    h.notify_fleet().await;
+    board.set_routing_error(None);
+    h.tick().await;
+    assert_eq!(board.issue_comments().len(), 1);
+    assert!(h.notification(routing).await.open, "successful delivery must not clear an outstanding probe error");
+}
+
+#[tokio::test]
+async fn fleet_mutations_retry_ambiguous_writes_and_rearm_exhausted_recovery() {
+    use domain::{outbox, ports::PortError};
+
+    let Some(h) = fleet_harness().await else { return };
+    let board = h.fx.paperclip.as_ref().unwrap();
+    let mut snapshot = fleet_snapshot();
+    snapshot["hosts"] = json!([fleet_host("edge", "degraded", &["disk"])]);
+    h.write_fleet(&snapshot).await;
+    h.notify_fleet().await;
+    h.tick().await;
+
+    for (topic, health, attempts) in
+        [(outbox::PAPERCLIP_COMMENT_ISSUE, "degraded", 0), (outbox::PAPERCLIP_UPDATE_ISSUE, "healthy", outbox::MAX_ATTEMPTS - 2)]
+    {
+        snapshot["hosts"] = json!([fleet_host("edge", health, &["network"])]);
+        h.write_fleet(&snapshot).await;
+        h.notify_fleet().await;
+        let id: Uuid = domain::sqlx::query_scalar("update outbox set attempts = $1 where topic = $2 returning id")
+            .bind(attempts)
+            .bind(topic)
+            .fetch_one(&h.hub.db)
+            .await
+            .unwrap();
+        let state = || domain::sqlx::query_scalar::<_, String>("select state from outbox where id = $1").bind(id).fetch_one(&h.hub.db);
+        board.set_routing_error(Some(PortError::Ambiguous("HTTP 502 on a write".into())));
+        h.tick().await;
+        assert_eq!(state().await.unwrap(), "pending", "{topic}");
+        h.notify_fleet().await;
+        let count =
+            || domain::sqlx::query_scalar::<_, i64>("select count(*) from outbox where topic = $1").bind(topic).fetch_one(&h.hub.db);
+        assert_eq!(count().await.unwrap(), 1, "don't replace a pending row");
+        h.release_look_outbox().await;
+        if topic == outbox::PAPERCLIP_COMMENT_ISSUE {
+            board.set_routing_error(None);
+            h.tick().await;
+            assert_eq!(state().await.unwrap(), "delivered");
+            assert_eq!(board.issue_comments()[0].client_request_id, Some(id.to_string()));
+        } else {
+            h.tick().await;
+            assert_eq!(state().await.unwrap(), "dead");
+            domain::sqlx::query(
+                "update notifications set resolved_at = now() - interval '31 days', read_at = now() where dedupe_key = 'fleet:host:edge'",
+            )
+            .execute(&h.hub.db)
+            .await
+            .unwrap();
+            assert_eq!(domain::notifications::prune(&h.hub).await.unwrap(), 0, "keep a recovery outstanding past retention");
+            board.set_routing_error(None);
+            for _ in 0..2 {
+                h.notify_fleet().await;
+                h.tick().await;
+            }
+            let rearmed: Uuid =
+                domain::sqlx::query_scalar("select id from outbox where idempotency_key like '%:resolve:g1' and state = 'delivered'")
+                    .fetch_one(&h.hub.db)
+                    .await
+                    .unwrap();
+            assert_eq!(count().await.unwrap(), 2);
+            assert_eq!(board.issue("fixture-issue-1").unwrap().status, "done");
+            assert_eq!(board.issue_updates()[0].comment_client_request_id, Some(rearmed.to_string()));
+        }
+    }
+    assert_eq!(board.issue_comments().len(), 2, "one evidence comment and one recovery comment");
+}
+
+#[tokio::test]
+async fn fleet_create_skips_recovered_episode_and_worker_reports_progress() {
+    let Some(h) = fleet_harness().await else { return };
+    let board = h.fx.paperclip.as_ref().unwrap();
+    let mut snapshot = fleet_snapshot();
+    snapshot["hosts"] = json!([fleet_host("edge", "degraded", &["disk"])]);
+    h.write_fleet(&snapshot).await;
+    h.notify_fleet().await;
+    h.write_fleet(&fleet_snapshot()).await;
+    h.notify_fleet().await;
+
+    *h.hub.worker_last_tick.write().unwrap() = None;
+    assert_eq!(worker::drain_outbox(&h.hub).await.unwrap(), 1);
+    assert!(h.hub.worker_last_tick.read().unwrap().is_some());
+    assert!(board.issue_requests().is_empty(), "a stale create must not wake an agent");
+    *h.hub.worker_last_tick.write().unwrap() = None;
+    worker::reconcile(&h.hub).await.unwrap();
+    assert!(h.hub.worker_last_tick.read().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn fleet_status_headers_report_snapshot_age_and_staleness() {
+    let Some(h) = fleet_harness().await else { return };
+    let http = reqwest::Client::new();
+    for (age, stale) in [(Some(5), "false"), (Some(1800), "true"), (None, "true")] {
+        let mut snapshot = fleet_snapshot();
+        let generated = age.map(|secs| Utc::now() - chrono::Duration::seconds(secs));
+        snapshot["generatedAt"] = json!(generated.map(|t| t.to_rfc3339()).unwrap_or_else(|| "unknown".into()));
+        h.write_fleet(&snapshot).await;
+        let response = http.get(format!("{}/v1/fleet/status", h.url)).bearer_auth("op").send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["x-fleet-status-stale"], stale);
+        let header = response.headers().get("x-fleet-status-age-seconds");
+        match (generated, age) {
+            (Some(generated), Some(age)) => {
+                let reported: i64 = header.unwrap().to_str().unwrap().parse().unwrap();
+                assert!((age..=Utc::now().signed_duration_since(generated).num_seconds()).contains(&reported));
+            }
+            _ => assert!(header.is_none()),
+        }
+        assert_eq!(response.json::<serde_json::Value>().await.unwrap()["generatedAt"], snapshot["generatedAt"]);
+    }
 }

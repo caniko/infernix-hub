@@ -21,6 +21,18 @@
       system.stateVersion = config.system.nixos.release;
       networking.hostName = "evalhost";
       services.fleetix-hub.enable = true;
+      # Drive the real migration launcher without building the Rust daemon or
+      # connecting to a database.
+      services.fleetix-hub.package = pkgs.writeShellScriptBin "fleetix-hubd" ''
+        set -eu
+        [[ "$*" == "migrate --check" ]]
+        echo attempt >> attempts
+        if [[ "$TEST_MODE" == recover && $(wc -l < attempts) == 2 ]]; then
+          exit 0
+        fi
+        echo "$TEST_ERROR" >&2
+        exit "$TEST_STATUS"
+      '';
     })
   ];
 
@@ -94,6 +106,22 @@
   fixtureHub = fixture.config.systemd.services.fleetix-hub;
   fixtureMigration = fixture.config.systemd.services."harbor-db-fleetix-hub";
   fixtureCheck = fixture.config.systemd.services."harbor-db-fleetix-hub-check";
+  fixtureActivation = fixture.config.systemd.services.harbor-db-fleetix-hub-activate;
+
+  external = database:
+    (fixture.extendModules {
+      modules = [
+        {
+          services.fleetix-hub = {
+            database = {createLocally = false;} // database;
+            systemd.onFailure = ["hub-alert.service"];
+          };
+        }
+      ];
+    }).config.systemd.services;
+  externalUrl = "postgresql://db.example.invalid/fleetix-hub";
+  remote = external {url = externalUrl;};
+  secret = external {urlFile = "/run/agenix/hub-db-url";};
 
   liveHub = live.config.systemd.services.fleetix-hub;
   # ComfyUI enabled but the hub on its fixture: an on-demand ComfyUI must not
@@ -120,12 +148,34 @@ in {
   assert fixture.config.services.harbor-db.projects."fleetix-hub".enable;
   assert lib.elem "fleetix-hub.service" fixtureMigration.requiredBy;
   assert lib.elem "fleetix-hub.service" fixtureMigration.before;
+  assert lib.elem "postgresql-setup.service" fixtureMigration.requires;
+  assert lib.elem "postgresql.service" fixtureHub.partOf;
+  assert lib.elem "postgresql.service" fixtureActivation.wantedBy;
+  assert lib.elem "harbor-db-fleetix-hub.service" fixtureActivation.requires;
+  assert !(fixtureHub.unitConfig ? StartLimitBurst);
+  assert fixtureHub.unitConfig.StartLimitIntervalSec == 0;
+  assert fixtureHub.serviceConfig.Restart == "on-failure";
+  assert fixtureHub.serviceConfig.RestartSec == 5;
+  assert fixtureHub.serviceConfig.RestartPreventExitStatus == 78;
+  assert fixtureHub.onFailure == [];
+  assert fixtureMigration.serviceConfig.Type == "oneshot";
+  assert !(fixtureMigration.serviceConfig ? Restart);
+  assert fixtureCheck.serviceConfig.Type == "oneshot";
+  assert remote.fleetix-hub.partOf == [];
+  assert !(lib.elem "postgresql.service" remote.harbor-db-fleetix-hub-activate.wantedBy);
+  assert lib.elem "network-online.target" remote.harbor-db-fleetix-hub.after;
+  assert lib.elem "network-online.target" remote.harbor-db-fleetix-hub.wants;
+  assert remote.harbor-db-fleetix-hub.environment.DATABASE_URL == externalUrl;
+  assert !(secret.harbor-db-fleetix-hub.environment ? DATABASE_URL);
+  assert remote.fleetix-hub.onFailure == ["hub-alert.service"];
+  assert remote.harbor-db-fleetix-hub.onFailure == ["hub-alert.service"];
   assert lib.elem "--check" fixture.config.services.harbor-db.projects."fleetix-hub".runner.checkArgs;
   assert fixture.config.services.postgresql.enable;
   assert lib.any (db: db == "fleetix-hub") fixture.config.services.postgresql.ensureDatabases;
     pkgs.runCommand "fleetix-hub-module-eval-fixture" {
       nativeBuildInputs = [pkgs.jq];
       hubEnv = builtins.toJSON fixtureHub.environment;
+      migrationLauncher = fixture.config.services.harbor-db.projects.fleetix-hub.runner.executable;
     } ''
       set -eu
       printf "%s" "$hubEnv" > env.json
@@ -137,6 +187,21 @@ in {
       manifest=$(sed -n 's/.*--manifest //p' ${fixtureCheck.serviceConfig.ExecStart})
       test -f "$manifest"
       grep -F '"migrate","--check"' "$manifest"
+
+      transient="Error: error communicating with database: No such file or directory (os error 2)"
+      TEST_MODE=recover TEST_ERROR="$transient" TEST_STATUS=1 "$migrationLauncher" migrate --check
+      test "$(wc -l < attempts)" -eq 2
+
+      expect_failure() {
+        : > attempts
+        local status=0
+        TEST_MODE=fail TEST_ERROR="$1" TEST_STATUS="$2" "$migrationLauncher" migrate --check || status=$?
+        test "$status" -eq "$2"
+        test "$(wc -l < attempts)" -eq "$3"
+      }
+      expect_failure "$transient" 1 3
+      expect_failure "$transient" 78 1
+      expect_failure "Error: schema mismatch" 1 1
       touch $out
     '';
 

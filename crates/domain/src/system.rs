@@ -1,10 +1,69 @@
 //! Principals, status, production pause and accounts.
 
-use contracts::{Account, PauseIn, Principal, Role, SystemStatus};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use contracts::{Account, PauseIn, Principal, Role, SyncFailure, SystemStatus};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{Actor, DResult, Hub, OPERATOR, audit, decode, hash};
+
+impl Hub {
+    pub fn mark_worker_started(&self) {
+        *self.worker_started_at.write().unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
+    }
+
+    pub fn record_worker_tick(&self) {
+        *self.worker_last_tick.write().unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
+    }
+
+    pub fn worker_health(&self, now: DateTime<Utc>, max_stall: Duration) -> Result<(), String> {
+        if !self.worker_enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let started = *self.worker_started_at.read().unwrap_or_else(|e| e.into_inner());
+        let tick = *self.worker_last_tick.read().unwrap_or_else(|e| e.into_inner());
+        let latest = started.max(tick).ok_or_else(|| "worker has not started".to_string())?;
+        if now.signed_duration_since(latest).to_std().is_ok_and(|age| age > max_stall) {
+            return Err(format!("worker stalled; last activity at {}", latest.to_rfc3339()));
+        }
+        Ok(())
+    }
+
+    pub fn record_sync_ok(&self, source: &str) {
+        let mut sources = self.sync_health.write().unwrap_or_else(|e| e.into_inner());
+        let health = sources.entry(source.to_owned()).or_default();
+        health.consecutive_failures = 0;
+        health.last_ok_at = Some(Utc::now());
+    }
+
+    pub fn record_sync_error(&self, source: &str, err: impl ToString) {
+        let err = err.to_string();
+        let mut sources = self.sync_health.write().unwrap_or_else(|e| e.into_inner());
+        let health = sources.entry(source.to_owned()).or_default();
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        health.last_error = Some(err);
+        health.last_error_at = Some(Utc::now());
+    }
+
+    pub fn sync_failures(&self) -> Vec<SyncFailure> {
+        self.sync_health
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, health)| health.consecutive_failures > 0)
+            .map(|(source, health)| SyncFailure {
+                source: source.clone(),
+                consecutive_failures: health.consecutive_failures,
+                last_error: health.last_error.clone(),
+                last_ok_at: health.last_ok_at,
+                last_error_at: health.last_error_at,
+            })
+            .collect()
+    }
+}
 
 /// Resolve a bearer token to its principal. Only token hashes are stored.
 pub async fn authenticate(hub: &Hub, token: &str) -> DResult<Option<Principal>> {
@@ -53,6 +112,7 @@ pub async fn status(hub: &Hub, actor: &Actor) -> DResult<SystemStatus> {
         principal: actor.principal.clone(),
         integrations: hub.config.integrations.clone(),
         feeds: hub.feeds.read().map(|f| f.clone()).unwrap_or_default(),
+        sync_failures: hub.sync_failures(),
     })
 }
 
@@ -102,4 +162,31 @@ pub async fn accounts(hub: &Hub, actor: &Actor) -> DResult<Vec<Account>> {
     .fetch_all(&hub.db)
     .await?;
     decode(rows)
+}
+
+#[tokio::test]
+async fn worker_heartbeat_and_sync_failures_are_shared_across_hub_clones() {
+    let db = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://localhost/test").unwrap();
+    let hub = crate::mail_calendar_tests::test_hub(db, Default::default());
+    let worker = hub.clone();
+    let window = Duration::from_secs(30);
+    assert!(hub.worker_health(Utc::now(), window).is_ok());
+    hub.worker_enabled.store(true, Ordering::Release);
+    assert!(hub.worker_health(Utc::now(), window).is_err());
+    worker.mark_worker_started();
+    assert!(hub.worker_health(Utc::now(), window).is_ok());
+    let later = Utc::now() + chrono::Duration::seconds(31);
+    assert!(hub.worker_health(later, window).is_err());
+    worker.record_worker_tick();
+    assert!(hub.worker_health(Utc::now(), window).is_ok());
+
+    hub.record_sync_ok("fleet");
+    worker.record_sync_error("fleet", "first");
+    worker.record_sync_error("fleet", "second");
+    let failures = hub.sync_failures();
+    assert_eq!(failures[0].consecutive_failures, 2);
+    assert_eq!(failures[0].last_error.as_deref(), Some("second"));
+    assert!(failures[0].last_ok_at <= failures[0].last_error_at);
+    hub.record_sync_ok("fleet");
+    assert!(worker.sync_failures().is_empty());
 }

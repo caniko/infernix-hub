@@ -4,8 +4,10 @@
 //! transaction.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, RwLock};
 
+use chrono::{DateTime, Utc};
 use contracts::{Principal, Role};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -138,6 +140,18 @@ pub struct Hub {
     pub expected_offline_hosts: Arc<std::sync::RwLock<Vec<String>>>,
     /// Status feed states the producer loop last saw, for `/v1/status`.
     pub feeds: Arc<std::sync::RwLock<Vec<contracts::FeedState>>>,
+    pub worker_enabled: Arc<AtomicBool>,
+    pub worker_started_at: Arc<RwLock<Option<DateTime<Utc>>>>,
+    pub worker_last_tick: Arc<RwLock<Option<DateTime<Utc>>>>,
+    pub sync_health: Arc<RwLock<BTreeMap<String, SyncSourceHealth>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SyncSourceHealth {
+    pub consecutive_failures: u32,
+    pub last_error: Option<String>,
+    pub last_ok_at: Option<DateTime<Utc>>,
+    pub last_error_at: Option<DateTime<Utc>>,
 }
 
 /// The authenticated caller plus the request's correlation id.
@@ -267,10 +281,27 @@ pub async fn history(db: &PgPool, subject_type: &str, subject_id: &str) -> DResu
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MigrationStatus {
+    pub pending: Vec<i64>,
+    pub ahead: Vec<i64>,
+}
+
+pub async fn migration_status(db: &PgPool) -> DResult<MigrationStatus> {
+    Ok(compare_migrations(&applied_migrations(db).await?))
+}
+
+fn compare_migrations(applied: &[i64]) -> MigrationStatus {
+    let bundled: Vec<_> = MIGRATOR.iter().map(|m| m.version).collect();
+    MigrationStatus {
+        pending: bundled.iter().copied().filter(|v| !applied.contains(v)).collect(),
+        ahead: applied.iter().copied().filter(|v| !bundled.contains(v)).collect(),
+    }
+}
+
 /// Embedded migrations not yet applied successfully (all of them on an empty database).
 pub async fn pending_migrations(db: &PgPool) -> DResult<Vec<i64>> {
-    let applied = applied_migrations(db).await?;
-    Ok(MIGRATOR.iter().map(|m| m.version).filter(|v| !applied.contains(v)).collect())
+    Ok(migration_status(db).await?.pending)
 }
 
 pub async fn applied_migrations(db: &PgPool) -> DResult<Vec<i64>> {
@@ -286,6 +317,14 @@ pub async fn applied_migrations(db: &PgPool) -> DResult<Vec<i64>> {
 #[cfg(test)]
 mod owner_tests {
     use super::*;
+
+    #[test]
+    fn distinguishes_missing_and_unknown_migrations() {
+        let mut applied: Vec<_> = MIGRATOR.iter().map(|m| m.version).collect();
+        let missing = applied.pop().unwrap();
+        applied.push(missing + 1);
+        assert_eq!(compare_migrations(&applied), MigrationStatus { pending: vec![missing], ahead: vec![missing + 1] });
+    }
 
     #[test]
     fn owner_mapping_is_fail_closed_when_configured_even_for_procedures() {

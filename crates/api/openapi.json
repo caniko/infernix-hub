@@ -30,6 +30,29 @@
         "type": "object"
       },
       "CanonCommentIn": {"description": "See hub_contracts::CanonCommentIn", "type": "object"},
+      "Readiness": {
+        "type": "object",
+        "required": ["status", "database", "worker", "syncFailures"],
+        "properties": {
+          "status": { "enum": ["ok", "degraded"] },
+          "database": { "enum": ["ok", "unavailable", "timed out"] },
+          "worker": { "enum": ["ok", "disabled", "unhealthy"] },
+          "syncFailures": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["source", "consecutiveFailures"],
+              "properties": {
+                "source": { "type": "string" },
+                "consecutiveFailures": { "type": "integer", "minimum": 1 },
+                "lastError": { "type": "string", "description": "Redacted; see the authenticated status endpoint for details." },
+                "lastOkAt": { "type": ["string", "null"], "format": "date-time" },
+                "lastErrorAt": { "type": ["string", "null"], "format": "date-time" }
+              }
+            }
+          }
+        }
+      },
       "CanonDraftIn": {"description": "See hub_contracts::CanonDraftIn", "type": "object"},
       "IndividualProfile": {"description": "See hub_contracts::IndividualProfile", "type": "object"},
       "CanonDecisionIn": {
@@ -218,7 +241,24 @@
       },
       "SystemStatus": {
         "description": "See hub_contracts::SystemStatus",
-        "type": "object"
+        "type": "object",
+        "properties": {
+          "syncFailures": {
+            "description": "Active producer sync failures, with diagnostics. Omitted when no producer is failing.",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["source", "consecutiveFailures"],
+              "properties": {
+                "source": { "type": "string" },
+                "consecutiveFailures": { "type": "integer", "minimum": 1 },
+                "lastError": { "type": ["string", "null"] },
+                "lastOkAt": { "type": ["string", "null"], "format": "date-time" },
+                "lastErrorAt": { "type": ["string", "null"], "format": "date-time" }
+              }
+            }
+          }
+        }
       },
       "Today": {
         "description": "See hub_contracts::Today",
@@ -272,9 +312,29 @@
     "/healthz": {
       "get": {
         "operationId": "healthz",
+        "security": [],
         "responses": {
           "200": {
-            "description": "ok (unauthenticated)"
+            "description": "Database and worker are healthy; returns plain text ok"
+          },
+          "503": {
+            "description": "Database unavailable or worker unhealthy; returns plain text"
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "readyz",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Database and worker are healthy and no source has three consecutive sync failures",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Readiness" } } }
+          },
+          "503": {
+            "description": "Database or worker unhealthy, or a source has at least three consecutive sync failures",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Readiness" } } }
           }
         }
       }
@@ -1052,6 +1112,10 @@
         "operationId": "fleet_status",
         "responses": {
           "200": {
+            "headers": {
+              "X-Fleet-Status-Stale": { "schema": { "type": "boolean" } },
+              "X-Fleet-Status-Age-Seconds": { "description": "Omitted when snapshot age cannot be trusted", "schema": { "type": "integer" } }
+            },
             "content": {
               "application/json": {
                 "schema": {

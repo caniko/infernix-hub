@@ -67,25 +67,22 @@ fn user(name: &str) -> Actor {
 }
 
 // Same opt-in convention as the repository's PostgreSQL journey tests.
-#[tokio::test]
-async fn mail_calendar_postgres() {
-    let Ok(url) = std::env::var("HUB_TEST_DATABASE_URL") else {
-        eprintln!("HUB_TEST_DATABASE_URL unset; skipping DB-backed test");
-        return;
-    };
+pub(crate) async fn test_database() -> Option<(PgPool, PgPool, String)> {
+    let url = std::env::var("HUB_TEST_DATABASE_URL").ok()?;
     let opts = PgConnectOptions::from_str(&url).unwrap();
     let admin = PgPool::connect_with(opts.clone()).await.unwrap();
-    let database = format!("hub_mail_calendar_{}", Uuid::new_v4().simple());
+    let database = format!("hub_test_{}", Uuid::new_v4().simple());
     sqlx::query(&format!("create database {database}")).execute(&admin).await.unwrap();
     let db = PgPool::connect_with(opts.database(&database)).await.unwrap();
     MIGRATOR.run(&db).await.unwrap();
+    Some((db, admin, database))
+}
+
+pub(crate) fn test_hub(db: PgPool, config: HubConfig) -> Hub {
     let unused = Arc::new(Unused);
-    let hub = Hub {
-        db: db.clone(),
-        config: Arc::new(HubConfig {
-            principal_owners: BTreeMap::from([("alice-login".into(), "alice".into()), ("bob-login".into(), "bob".into())]),
-            ..Default::default()
-        }),
+    Hub {
+        db,
+        config: Arc::new(config),
         paperclip: unused.clone(),
         windmill: unused.clone(),
         comfy: unused.clone(),
@@ -101,7 +98,26 @@ async fn mail_calendar_postgres() {
         notified: Default::default(),
         expected_offline_hosts: Default::default(),
         feeds: Default::default(),
+        worker_enabled: Default::default(),
+        worker_started_at: Default::default(),
+        worker_last_tick: Default::default(),
+        sync_health: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn mail_calendar_postgres() {
+    let Some((db, admin, database)) = test_database().await else {
+        eprintln!("HUB_TEST_DATABASE_URL unset; skipping DB-backed test");
+        return;
     };
+    let hub = test_hub(
+        db.clone(),
+        HubConfig {
+            principal_owners: BTreeMap::from([("alice-login".into(), "alice".into()), ("bob-login".into(), "bob".into())]),
+            ..Default::default()
+        },
+    );
     let system = Actor::system();
     let (alice, bob) = (user("alice-login"), user("bob-login"));
     let account = hub

@@ -215,7 +215,8 @@ fn quota_matching_uses_bucket_keys_before_display_names() {
 pub(super) struct Scratch(PathBuf);
 impl Scratch {
     pub(super) fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("proxy-test-{}", Uuid::new_v4()));
+        // Leave room for nested Unix socket names under a checkout-local TMPDIR.
+        let path = std::env::temp_dir().join(Uuid::new_v4().simple().to_string());
         config::private_dir(&path).unwrap();
         Self(path)
     }

@@ -49,6 +49,31 @@ pub struct IssueRequest {
     /// Paperclip agent assigned to start the work (the Showrunner).
     #[serde(default)]
     pub assignee_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueCommentRequest {
+    pub issue_id: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "clientRequestId")]
+    pub client_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueUpdateRequest {
+    pub issue_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "commentClientRequestId")]
+    pub comment_client_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reopen: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +115,15 @@ pub struct ApprovalView {
 #[async_trait]
 pub trait Paperclip: Send + Sync {
     async fn create_issue(&self, req: &IssueRequest) -> PortResult<ForeignRef>;
+    async fn comment_issue(&self, _req: &IssueCommentRequest) -> PortResult<ForeignRef> {
+        Err(PortError::Unsupported("Paperclip issue comments are unavailable".into()))
+    }
+    async fn update_issue(&self, _req: &IssueUpdateRequest) -> PortResult<ForeignRef> {
+        Err(PortError::Unsupported("Paperclip issue updates are unavailable".into()))
+    }
+    async fn verify_routing(&self, _company_id: &str, _project_id: Option<&str>, _assignee_agent_id: Option<&str>) -> PortResult<()> {
+        Ok(())
+    }
     async fn create_approval(&self, req: &ApprovalRequest) -> PortResult<ForeignRef>;
     async fn get_approval(&self, id: &str) -> PortResult<ApprovalView>;
 }

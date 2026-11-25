@@ -13,7 +13,10 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use domain::ports::{ApprovalRequest, ApprovalStatus, ApprovalView, ForeignRef, IssueRequest, Paperclip, PortError, PortResult};
+use domain::ports::{
+    ApprovalRequest, ApprovalStatus, ApprovalView, ForeignRef, IssueCommentRequest, IssueRequest, IssueUpdateRequest, Paperclip, PortError,
+    PortResult,
+};
 use serde_json::{Value, json};
 
 use super::{read_json, transport_error, trim_base};
@@ -57,6 +60,37 @@ impl PaperclipClient {
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         rb.bearer_auth(&self.config.api_key)
     }
+
+    async fn issue_write(&self, request: reqwest::RequestBuilder, body: &Value, operation: &str) -> PortResult<(ForeignRef, Value)> {
+        let resp = self.auth(request).json(body).send().await.map_err(|e| transport_error(e, true))?;
+        let value = read_json(resp, false, true).await?;
+        let id = payload_str(&value, "id")
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| PortError::Ambiguous(format!("paperclip {operation} response has no id")))?;
+        Ok((ForeignRef { id, url: payload_str(&value, "url") }, value))
+    }
+
+    async fn routing_resource(&self, collection: &str, id: &str) -> PortResult<Value> {
+        let url = self.url(&format!("/api/{collection}/{id}"));
+        let resp = self.auth(self.http.get(url)).send().await.map_err(|e| transport_error(e, false))?;
+        read_json(resp, false, false).await.map_err(|err| match err {
+            PortError::Rejected { status, message } => {
+                PortError::Rejected { status, message: format!("Paperclip {collection}/{id}: {message}") }
+            }
+            other => other,
+        })
+    }
+}
+
+fn safe_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn validate_id(id: &str, field: &str) -> PortResult<()> {
+    if !safe_id(id) {
+        return Err(PortError::Rejected { status: 400, message: format!("Invalid Paperclip {field}") });
+    }
+    Ok(())
 }
 
 /// Map Paperclip's approval lifecycle
@@ -98,23 +132,59 @@ fn issue_body(req: &IssueRequest) -> Value {
     if let Some(agent) = &req.assignee_agent_id {
         body["assigneeAgentId"] = json!(agent);
     }
+    if let Some(priority) = &req.priority {
+        body["priority"] = json!(priority);
+    }
     body
 }
 
 #[async_trait]
 impl Paperclip for PaperclipClient {
     async fn create_issue(&self, req: &IssueRequest) -> PortResult<ForeignRef> {
+        validate_id(&req.company_id, "company ID")?;
         let url = self.url(&format!("/api/companies/{}/issues", req.company_id));
-        let body = issue_body(req);
-        let resp = self.auth(self.http.post(url)).json(&body).send().await.map_err(|e| transport_error(e, true))?;
-        let value = read_json(resp, false, true).await?;
-        let id = value
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| PortError::Ambiguous("paperclip create issue response has no id".into()))?
-            .to_string();
-        let url = value.get("url").and_then(Value::as_str).map(str::to_string);
-        Ok(ForeignRef { id, url })
+        let (mut issue, value) = self.issue_write(self.http.post(url), &issue_body(req), "create issue").await?;
+        if issue.url.is_none() {
+            issue.url = value["identifier"].as_str().filter(|id| safe_id(id)).map(|id| self.url(&format!("/issues/{id}")));
+        }
+        Ok(issue)
+    }
+
+    async fn comment_issue(&self, req: &IssueCommentRequest) -> PortResult<ForeignRef> {
+        validate_id(&req.issue_id, "issue ID")?;
+        let url = self.url(&format!("/api/issues/{}/comments", req.issue_id));
+        let mut body = json!(req);
+        body.as_object_mut().expect("issue comment serializes to an object").remove("issue_id");
+        self.issue_write(self.http.post(url), &body, "comment").await.map(|(r, _)| r)
+    }
+
+    async fn update_issue(&self, req: &IssueUpdateRequest) -> PortResult<ForeignRef> {
+        validate_id(&req.issue_id, "issue ID")?;
+        let url = self.url(&format!("/api/issues/{}", req.issue_id));
+        let mut body = json!(req);
+        body.as_object_mut().expect("issue update serializes to an object").remove("issue_id");
+        self.issue_write(self.http.patch(url), &body, "update issue").await.map(|(r, _)| r)
+    }
+
+    async fn verify_routing(&self, company_id: &str, project_id: Option<&str>, assignee_agent_id: Option<&str>) -> PortResult<()> {
+        validate_id(company_id, "company ID")?;
+        for (collection, id) in [("projects", project_id), ("agents", assignee_agent_id)] {
+            if let Some(id) = id {
+                validate_id(id, collection)?;
+            }
+        }
+        self.routing_resource("companies", company_id).await?;
+        for (collection, id) in [("projects", project_id), ("agents", assignee_agent_id)] {
+            if let Some(id) = id
+                && self.routing_resource(collection, id).await?["companyId"].as_str() != Some(company_id)
+            {
+                return Err(PortError::Rejected {
+                    status: 400,
+                    message: format!("Paperclip {collection}/{id} does not belong to company {company_id}"),
+                });
+            }
+        }
+        Ok(())
     }
 
     async fn create_approval(&self, req: &ApprovalRequest) -> PortResult<ForeignRef> {
@@ -176,6 +246,8 @@ impl Paperclip for PaperclipClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
 
     fn config() -> PaperclipConfig {
         PaperclipConfig::new("http://127.0.0.1:3117/", "board-secret-key")
@@ -203,15 +275,154 @@ mod tests {
             origin_key: "fleetix-hub:content:1".into(),
             project_id: None,
             assignee_agent_id: None,
+            priority: None,
         };
         let body = issue_body(&req);
         assert_eq!(body["idempotencyKey"], "fleetix-hub:content:1");
         assert!(body.get("projectId").is_none() && body.get("assigneeAgentId").is_none(), "unset ids are not sent");
+        assert!(body.get("priority").is_none());
         req.project_id = Some("project_studio_content".into());
         req.assignee_agent_id = Some("agent_studio_showrunner".into());
+        req.priority = Some("critical".into());
         let body = issue_body(&req);
         assert_eq!(body["projectId"], "project_studio_content");
         assert_eq!(body["assigneeAgentId"], "agent_studio_showrunner");
+        assert_eq!(body["priority"], "critical");
+    }
+
+    async fn server(calls: Vec<(&'static str, Value, u16, Value)>) -> (PaperclipClient, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = PaperclipConfig::new(format!("http://{}", listener.local_addr().unwrap()), "fixture-key");
+        let client = PaperclipClient::new(reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap(), cfg);
+        let server = tokio::spawn(async move {
+            for (target, expected, status, response) in calls {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(stream);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert_eq!(line, format!("{target} HTTP/1.1\r\n"));
+                let (mut len, mut auth) = (0, false);
+                loop {
+                    line.clear();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            len = value.trim().parse().unwrap();
+                        } else if name.eq_ignore_ascii_case("authorization") {
+                            auth = value.trim() == "Bearer fixture-key";
+                        }
+                    }
+                }
+                assert!(auth);
+                let mut body = vec![0; len];
+                socket.read_exact(&mut body).await.unwrap();
+                if expected.is_null() {
+                    assert!(body.is_empty());
+                } else {
+                    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), expected);
+                }
+                let response = response.to_string();
+                let wire = format!(
+                    "HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+                socket.get_mut().write_all(wire.as_bytes()).await.unwrap();
+            }
+        });
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn issue_calls_send_priority_comments_and_recovery_patch() {
+        let comment_id = "11111111-1111-4111-8111-111111111111";
+        let update_id = "22222222-2222-4222-8222-222222222222";
+        let (client, server) = server(vec![
+            (
+                "POST /api/companies/ops/issues",
+                json!({"title":"Broken","description":"disk","idempotencyKey":"ep","priority":"high"}),
+                201,
+                json!({"id":"issue", "identifier":"OPS-42"}),
+            ),
+            (
+                "POST /api/companies/ops/issues",
+                json!({"title":"Broken","description":"disk","idempotencyKey":"ep","priority":"high"}),
+                201,
+                json!({"id":"issue"}),
+            ),
+            ("POST /api/issues/issue/comments", json!({"body":"Added: GPU","clientRequestId":comment_id}), 201, json!({"id":"comment"})),
+            (
+                "PATCH /api/issues/issue",
+                json!({"status":"done","priority":"medium","comment":"Recovered","commentClientRequestId":update_id,"reopen":false}),
+                200,
+                json!({"id":"issue"}),
+            ),
+            ("PATCH /api/issues/issue", json!({"priority":"low"}), 200, json!({"id":"issue"})),
+        ])
+        .await;
+        let req = IssueRequest {
+            company_id: "ops".into(),
+            title: "Broken".into(),
+            description: "disk".into(),
+            origin_key: "ep".into(),
+            project_id: None,
+            assignee_agent_id: None,
+            priority: Some("high".into()),
+        };
+        let issue = client.create_issue(&req).await.unwrap();
+        assert_eq!(issue.url, Some(client.url("/issues/OPS-42")));
+        assert_eq!(client.create_issue(&req).await.unwrap().url, None);
+        let comment = client
+            .comment_issue(&IssueCommentRequest {
+                issue_id: issue.id.clone(),
+                body: "Added: GPU".into(),
+                client_request_id: Some(comment_id.into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(comment.id, "comment");
+        let updated = client
+            .update_issue(&IssueUpdateRequest {
+                issue_id: issue.id,
+                status: Some("done".into()),
+                priority: Some("medium".into()),
+                comment: Some("Recovered".into()),
+                comment_client_request_id: Some(update_id.into()),
+                reopen: Some(false),
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.id, "issue");
+        let priority = serde_json::from_value(json!({"issue_id": updated.id, "priority": "low"})).unwrap();
+        client.update_issue(&priority).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn routing_checks_ownership_and_rejects_invalid_or_missing_ids() {
+        let (client, server) = server(vec![
+            ("GET /api/companies/ops", Value::Null, 200, json!({"id":"ops"})),
+            ("GET /api/projects/project", Value::Null, 200, json!({"companyId":"ops"})),
+            ("GET /api/agents/agent", Value::Null, 200, json!({"companyId":"ops"})),
+            ("GET /api/companies/missing", Value::Null, 404, json!({"error":"not found"})),
+            ("GET /api/companies/ops", Value::Null, 200, json!({"id":"ops"})),
+            ("GET /api/projects/other", Value::Null, 200, json!({"companyId":"studio"})),
+            ("GET /api/companies/ops", Value::Null, 200, json!({"id":"ops"})),
+            ("GET /api/agents/other", Value::Null, 200, json!({"companyId":"studio"})),
+        ])
+        .await;
+        assert!(matches!(client.verify_routing("ops", Some("../project"), None).await, Err(PortError::Rejected { status: 400, .. })));
+        client.verify_routing("ops", Some("project"), Some("agent")).await.unwrap();
+        assert!(matches!(client.verify_routing("missing", None, None).await, Err(PortError::Rejected { status: 404, .. })));
+        for (project, agent) in [(Some("other"), None), (None, Some("other"))] {
+            assert!(matches!(
+                client.verify_routing("ops", project, agent).await,
+                Err(PortError::Rejected {status: 400, message}) if message.contains("does not belong to company ops")
+            ));
+        }
+        server.await.unwrap();
     }
 
     #[test]

@@ -6,12 +6,10 @@
 use std::time::Duration;
 
 use domain::outbox::Delivery;
-use domain::ports::{ApprovalRequest, GenerationJob, IssueRequest, PortError, PublicationTimer};
-use domain::{DResult, Hub, engagement, outbox, production, release};
+use domain::ports::{ApprovalRequest, GenerationJob, IssueCommentRequest, IssueRequest, IssueUpdateRequest, PortError, PublicationTimer};
+use domain::{DResult, Hub, engagement, notifications, outbox, production, release};
 use serde_json::Value;
 use uuid::Uuid;
-
-const MAX_ATTEMPTS: i32 = 12;
 
 fn classify(e: PortError, ambiguous_retry_safe: bool) -> Delivery {
     match e {
@@ -25,6 +23,33 @@ fn classify(e: PortError, ambiguous_retry_safe: bool) -> Delivery {
 
 fn uuid_field(payload: &Value, field: &str) -> Option<Uuid> {
     payload[field].as_str().and_then(|s| Uuid::parse_str(s).ok())
+}
+
+fn permanent_issue_error(error: &PortError) -> Option<String> {
+    match error {
+        PortError::Rejected { status, message } if (400..500).contains(status) && *status != 429 => {
+            Some(format!("{}{status}: {message}", outbox::PERMANENT_4XX_PREFIX))
+        }
+        _ => None,
+    }
+}
+
+async fn issue_error(hub: &Hub, error: PortError) -> Delivery {
+    if let Some(detail) = permanent_issue_error(&error) {
+        if let Err(err) = notifications::report_paperclip_delivery_error(hub, &detail).await {
+            tracing::error!(error = %err, "could not record Paperclip delivery error");
+        }
+        Delivery::Dead(detail)
+    } else {
+        classify(error, true)
+    }
+}
+
+async fn issue_delivered(hub: &Hub) -> Delivery {
+    if let Err(error) = notifications::clear_paperclip_delivery_error(hub).await {
+        tracing::error!(%error, "could not clear Paperclip delivery error");
+    }
+    Delivery::Done
 }
 
 /// A pipeline submission row the outbox dead-letters can never be delivered
@@ -44,8 +69,12 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
     let p = &row.payload;
     match row.topic.as_str() {
         outbox::PAPERCLIP_CREATE_ISSUE => {
-            // Fleet issues link nothing back: Paperclip's idempotency key is the link.
-            let link = match (uuid_field(p, "content_item_id"), uuid_field(p, "canon_revision_id"), uuid_field(p, "notification_id")) {
+            let notification_id = uuid_field(p, "notification_id");
+            let episode_id = uuid_field(p, "episode_id");
+            if !p["episode_id"].is_null() && (episode_id.is_none() || notification_id.is_none()) {
+                return Delivery::Dead("bad payload".into());
+            }
+            let link = match (uuid_field(p, "content_item_id"), uuid_field(p, "canon_revision_id"), notification_id) {
                 (Some(id), None, None) => {
                     Some((id, "update content_items set paperclip_issue_id = $2, paperclip_issue_url = $3 where id = $1"))
                 }
@@ -63,19 +92,66 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
                 // Frozen when the brief was created (delegated producer only).
                 project_id: p["project_id"].as_str().map(String::from),
                 assignee_agent_id: p["assignee_agent_id"].as_str().map(String::from),
+                priority: p["priority"].as_str().map(String::from),
             };
+            if let Some(id) = episode_id {
+                match domain::sqlx::query_scalar::<_, bool>("select state = 'resolved' from fleet_issue_episodes where id = $1")
+                    .bind(id)
+                    .fetch_optional(&hub.db)
+                    .await
+                {
+                    Ok(Some(true)) => return Delivery::Done,
+                    Ok(_) => {}
+                    Err(e) => return Delivery::Retry(e.to_string()),
+                }
+            }
             // Retrying is safe: adapters dedupe on origin_key.
-            match hub.paperclip.create_issue(&req).await {
-                Ok(issue) => match link {
-                    None => Delivery::Done,
-                    Some((id, query)) => {
-                        match domain::sqlx::query(query).bind(id).bind(&issue.id).bind(&issue.url).execute(&hub.db).await {
-                            Ok(_) => Delivery::Done,
-                            Err(e) => Delivery::Retry(e.to_string()),
+            let issue = match hub.paperclip.create_issue(&req).await {
+                Ok(issue) => issue,
+                Err(e) => return issue_error(hub, e).await,
+            };
+            issue_delivered(hub).await;
+            match (link, episode_id.zip(notification_id)) {
+                (None, Some((episode_id, notification_id))) => {
+                    match notifications::record_fleet_episode_issue(&hub.db, episode_id, notification_id, &issue.id, issue.url.as_deref())
+                        .await
+                    {
+                        Ok(()) => {
+                            hub.notified.notify_waiters();
+                            Delivery::Done
                         }
+                        Err(e) => Delivery::Retry(e.to_string()),
                     }
-                },
-                Err(e) => classify(e, true),
+                }
+                (None, None) => Delivery::Done,
+                (Some((id, query)), _) => {
+                    match domain::sqlx::query(query).bind(id).bind(&issue.id).bind(&issue.url).execute(&hub.db).await {
+                        Ok(_) => Delivery::Done,
+                        Err(e) => Delivery::Retry(e.to_string()),
+                    }
+                }
+            }
+        }
+        outbox::PAPERCLIP_COMMENT_ISSUE => {
+            let mut req: IssueCommentRequest = match serde_json::from_value(p.clone()) {
+                Ok(req) => req,
+                Err(e) => return Delivery::Dead(format!("bad payload: {e}")),
+            };
+            req.client_request_id = Some(row.id.to_string());
+            match hub.paperclip.comment_issue(&req).await {
+                Ok(_) => issue_delivered(hub).await,
+                Err(e) => issue_error(hub, e).await,
+            }
+        }
+        outbox::PAPERCLIP_UPDATE_ISSUE => {
+            let mut req: IssueUpdateRequest = match serde_json::from_value(p.clone()) {
+                Ok(req) => req,
+                Err(e) => return Delivery::Dead(format!("bad payload: {e}")),
+            };
+            req.comment_client_request_id = req.comment.as_ref().map(|_| row.id.to_string());
+            match hub.paperclip.update_issue(&req).await {
+                Ok(_) => issue_delivered(hub).await,
+                Err(e) => issue_error(hub, e).await,
             }
         }
         outbox::PAPERCLIP_CREATE_APPROVAL => {
@@ -175,6 +251,22 @@ async fn deliver(hub: &Hub, row: &outbox::OutboxRow) -> Delivery {
     }
 }
 
+async fn record_failure(tx: &mut domain::sqlx::PgConnection, row: &outbox::OutboxRow, error: &str, permanent: bool) -> DResult<bool> {
+    let dead = outbox::fail(tx, row.id, error, permanent).await?;
+    if dead {
+        dead_letter_pipeline(tx, row, error).await?;
+    }
+    Ok(dead)
+}
+
+fn log_failure(error: &str, attempts: i32, dead: bool) {
+    if dead {
+        tracing::error!(%error, attempts, "outbox item dead-lettered");
+    } else {
+        tracing::warn!(%error, attempts, "outbox delivery will retry");
+    }
+}
+
 /// Deliver due outbox rows, one row per transaction.
 // ponytail: the row lock is held across the remote call; fine for one worker
 // and small batches, switch to a lease column if delivery gets slow. A crash
@@ -200,12 +292,17 @@ pub async fn drain_outbox(hub: &Hub) -> DResult<usize> {
             && let Some((done, why)) = production::dispatch_blocker(hub, gen_id).await?
         {
             tracing::info!(%why, "generation command not sent");
-            if done {
-                outbox::mark_delivered(&mut tx, row.id).await?
+            let dead = if done {
+                outbox::mark_delivered(&mut tx, row.id).await?;
+                None
             } else {
-                outbox::mark_failed(&mut tx, row.id, &why, false, MAX_ATTEMPTS).await?
-            }
+                Some(record_failure(&mut tx, &row, &why, true).await?)
+            };
             tx.commit().await?;
+            hub.record_worker_tick();
+            if let Some(dead) = dead {
+                log_failure(&why, row.attempts + 1, dead);
+            }
             n += 1;
             continue;
         }
@@ -223,30 +320,30 @@ pub async fn drain_outbox(hub: &Hub) -> DResult<usize> {
                 .await?;
             }
             tx.commit().await?;
+            hub.record_worker_tick();
             n += 1;
             continue;
         }
-        match deliver(hub, &row).await {
-            Delivery::Done => outbox::mark_delivered(&mut tx, row.id).await?,
-            Delivery::Retry(e) => {
-                tracing::warn!(error = %e, attempts = row.attempts, "outbox delivery will retry");
-                outbox::mark_failed(&mut tx, row.id, &e, true, MAX_ATTEMPTS).await?;
-                // This delivery spent the last retry: the row is dead now.
-                if row.attempts + 1 >= MAX_ATTEMPTS {
-                    dead_letter_pipeline(&mut tx, &row, &e).await?;
-                }
+        let delivery = deliver(hub, &row).await;
+        let failure = match &delivery {
+            Delivery::Retry(e) | Delivery::Dead(e) => {
+                Some((e, record_failure(&mut tx, &row, e, matches!(delivery, Delivery::Dead(_))).await?))
+            }
+            Delivery::Done => {
+                outbox::mark_delivered(&mut tx, row.id).await?;
+                None
             }
             Delivery::Defer(wait) => {
                 tracing::info!(secs = wait.as_secs(), "outbox delivery deferred by its handler");
                 outbox::defer(&mut tx, row.id, wait.as_secs() as i64, "deferred by topic handler").await?;
+                None
             }
-            Delivery::Dead(e) => {
-                tracing::error!(error = %e, "outbox delivery dead-lettered");
-                outbox::mark_failed(&mut tx, row.id, &e, false, MAX_ATTEMPTS).await?;
-                dead_letter_pipeline(&mut tx, &row, &e).await?;
-            }
-        }
+        };
         tx.commit().await?;
+        hub.record_worker_tick();
+        if let Some((error, dead)) = failure {
+            log_failure(error, row.attempts + 1, dead);
+        }
         n += 1;
     }
 }
@@ -256,28 +353,40 @@ pub async fn reconcile(hub: &Hub) -> DResult<()> {
     // Local repairs first: pipeline deadlines and stranded generations never
     // wait behind a remote read.
     production::reconcile_pipeline_deadlines(hub).await?;
+    hub.record_worker_tick();
     for p in production::open_prompts(hub).await? {
         if let Err(e) = production::reconcile_prompt(hub, &p).await {
             tracing::warn!(prompt_id = %p.prompt_id, error = %e, "prompt reconcile failed");
         }
+        hub.record_worker_tick();
     }
+    hub.record_worker_tick();
     for (release_id, approval_id) in release::releases_in_review(hub).await? {
         match hub.paperclip.get_approval(&approval_id).await {
             Ok(view) => release::apply_approval(hub, release_id, &view).await?,
             Err(e) => tracing::warn!(%approval_id, error = %e, "approval read failed"),
         }
+        hub.record_worker_tick();
     }
+    hub.record_worker_tick();
     for (intent, account, key) in release::intents_to_reconcile(hub).await? {
         release::reconcile_intent(hub, intent, &account, &key).await?;
+        hub.record_worker_tick();
     }
+    hub.record_worker_tick();
     engagement::reconcile_replies(hub).await?;
-    // Procedure and pipeline polls read a bounded random batch (20 each, 5 s per
-    // call), so one stalled backend cannot hold the pass for long.
-    production::reconcile_procedures(hub).await
+    hub.record_worker_tick();
+    // Each bounded poll batch (20 at up to 5 s per read) gets its own heartbeat.
+    production::reconcile_procedures(hub).await?;
+    hub.record_worker_tick();
+    production::reconcile_pipeline_runs(hub).await?;
+    hub.record_worker_tick();
+    Ok(())
 }
 
 /// Outbox + reconcile, for tests and the `dev` loop.
 pub async fn tick(hub: &Hub) -> DResult<()> {
+    hub.record_worker_tick();
     drain_outbox(hub).await?;
     reconcile(hub).await
 }
@@ -287,6 +396,7 @@ pub async fn tick(hub: &Hub) -> DResult<()> {
 /// `capabilities.on_demand` (socket-activated, idle-exits) only gets a
 /// job-scoped subscription while one of its prompts is open.
 pub async fn run(hub: Hub, every: Duration) {
+    hub.mark_worker_started();
     let engines: Vec<(String, String, bool)> =
         domain::sqlx::query_as("select id, base_url, coalesce(capabilities ->> 'on_demand', 'false') = 'true' from engine_instances")
             .fetch_all(&hub.db)
@@ -392,6 +502,22 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn distinguishes_permanent_issue_errors_from_retryable_and_ambiguous_writes() {
+        for status in [400, 401, 403, 404, 422, 499] {
+            let error = PortError::Rejected { status, message: "routing".into() };
+            assert_eq!(permanent_issue_error(&error), Some(format!("permanent 4xx: {status}: routing")));
+        }
+        for status in [429, 500, 503] {
+            let error = PortError::Rejected { status, message: "wait".into() };
+            assert!(permanent_issue_error(&error).is_none());
+            assert!(matches!(classify(error, false), Delivery::Retry(_)));
+        }
+        let ambiguous = PortError::Ambiguous("timeout".into());
+        assert!(matches!(classify(ambiguous.clone(), false), Delivery::Dead(_)));
+        assert!(matches!(classify(ambiguous, true), Delivery::Retry(_)));
+    }
 
     /// The bug this guards: aborting the listener left its separately spawned
     /// subscription blocked on the socket forever.

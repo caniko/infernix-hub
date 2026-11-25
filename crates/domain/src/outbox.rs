@@ -11,14 +11,25 @@ use uuid::Uuid;
 use crate::{Actor, DResult, Hub};
 
 pub const PAPERCLIP_CREATE_ISSUE: &str = "paperclip.create_issue";
+pub const PAPERCLIP_COMMENT_ISSUE: &str = "paperclip.comment_issue";
+pub const PAPERCLIP_UPDATE_ISSUE: &str = "paperclip.update_issue";
 pub const PAPERCLIP_CREATE_APPROVAL: &str = "paperclip.create_approval";
 pub const WINDMILL_RUN_GENERATION: &str = "windmill.run_generation";
 pub const WINDMILL_SCHEDULE_PUBLICATION: &str = "windmill.schedule_publication";
 pub const PUBLISHER_SEND_REPLY: &str = "publisher.send_reply";
+pub const MAX_ATTEMPTS: i32 = 12;
+pub const PERMANENT_4XX_PREFIX: &str = "permanent 4xx: ";
 
 /// Core topics the worker handles itself; packs may not override them.
-pub const CORE_TOPICS: &[&str] =
-    &[PAPERCLIP_CREATE_ISSUE, PAPERCLIP_CREATE_APPROVAL, WINDMILL_RUN_GENERATION, WINDMILL_SCHEDULE_PUBLICATION, PUBLISHER_SEND_REPLY];
+pub const CORE_TOPICS: &[&str] = &[
+    PAPERCLIP_CREATE_ISSUE,
+    PAPERCLIP_COMMENT_ISSUE,
+    PAPERCLIP_UPDATE_ISSUE,
+    PAPERCLIP_CREATE_APPROVAL,
+    WINDMILL_RUN_GENERATION,
+    WINDMILL_SCHEDULE_PUBLICATION,
+    PUBLISHER_SEND_REPLY,
+];
 
 /// What to do with a claimed row after a delivery attempt.
 #[derive(Debug, Clone, PartialEq)]
@@ -94,21 +105,21 @@ pub async fn mark_delivered(tx: &mut sqlx::PgConnection, id: Uuid) -> DResult<()
     Ok(())
 }
 
-/// Back off exponentially (capped at 10 min); dead-letter after `max_attempts`.
-pub async fn mark_failed(tx: &mut sqlx::PgConnection, id: Uuid, error: &str, retryable: bool, max_attempts: i32) -> DResult<()> {
-    sqlx::query(
+/// Back off exponentially (capped at 10 min). Returns whether the claim transitioned to dead.
+pub async fn fail(tx: &mut sqlx::PgConnection, id: Uuid, error: &str, permanent: bool) -> DResult<bool> {
+    let dead = sqlx::query_scalar(
         "update outbox set attempts = attempts + 1, last_error = $2,
-           state = case when not $3 or attempts + 1 >= $4 then 'dead' else 'pending' end,
+           state = case when $3 or attempts + 1 >= $4 then 'dead' else 'pending' end,
            next_attempt_at = now() + least(interval '10 minutes', interval '2 seconds' * power(2, attempts))
-         where id = $1",
+         where id = $1 and state = 'pending' returning state = 'dead'",
     )
     .bind(id)
     .bind(error)
-    .bind(retryable)
-    .bind(max_attempts)
-    .execute(tx)
+    .bind(permanent)
+    .bind(MAX_ATTEMPTS)
+    .fetch_optional(tx)
     .await?;
-    Ok(())
+    Ok(dead.unwrap_or(false))
 }
 
 /// Postpone a delivery without spending a retry (e.g. waiting for GPU

@@ -43,6 +43,17 @@ impl std::fmt::Display for PendingMigrations {
 
 impl std::error::Error for PendingMigrations {}
 
+#[derive(Debug)]
+pub struct SchemaAhead(pub Vec<i64>);
+
+impl std::fmt::Display for SchemaAhead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "database schema is ahead of this binary; unknown applied migrations: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for SchemaAhead {}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub database_url: String,
@@ -269,14 +280,17 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         .context("connecting to PostgreSQL")?;
     // Under harbor-db the runtime role cannot run DDL: migrations are a
     // separate unit and the server refuses to start against a stale schema.
+    let migrations = domain::migration_status(&db).await?;
+    if !migrations.ahead.is_empty() {
+        return Err(SchemaAhead(migrations.ahead).into());
+    }
     if env("HUB_MIGRATE_ON_START").as_deref() == Some("0") {
-        let pending = domain::pending_migrations(&db).await?;
-        if !pending.is_empty() {
+        if !migrations.pending.is_empty() {
             let applied = domain::applied_migrations(&db).await?;
             return Err(PendingMigrations {
                 database_head: applied.last().copied().unwrap_or(0),
                 bundled_head: domain::MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0),
-                pending,
+                pending: migrations.pending,
             }
             .into());
         }
@@ -495,6 +509,10 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
         notified: Arc::new(tokio::sync::Notify::new()),
         expected_offline_hosts: Default::default(),
         feeds: Default::default(),
+        worker_enabled: Default::default(),
+        worker_started_at: Default::default(),
+        worker_last_tick: Default::default(),
+        sync_health: Default::default(),
     };
     if let Some(seed) = &seed {
         apply_seed(&hub, seed, &hub.config.company_id).await?;
@@ -750,6 +768,13 @@ mod tests {
         assert_eq!(error.to_string(), "database at 2, binary bundles 8; pending [3, 4, 8]; run `fleetix-hubd migrate` first");
         assert_eq!(crate::exit_code(&anyhow::Error::new(error).context("startup")), 78);
         assert_eq!(crate::exit_code(&anyhow::anyhow!("other error")), 1);
+    }
+
+    #[test]
+    fn schema_ahead_names_the_unknown_versions_and_maps_to_config_exit() {
+        let error = SchemaAhead(vec![21, 22]);
+        assert_eq!(error.to_string(), "database schema is ahead of this binary; unknown applied migrations: [21, 22]");
+        assert_eq!(crate::exit_code(&anyhow::Error::new(error).context("startup")), 78);
     }
 
     fn channel(name: &'static str) -> Arc<dyn ports::Publisher> {

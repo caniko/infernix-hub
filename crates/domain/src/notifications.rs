@@ -7,7 +7,9 @@
 //! resolving the rows a source no longer reports. `seq` is the long-poll cursor,
 //! so every change here wakes the waiters after its transaction commits.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use std::collections::{BTreeMap, BTreeSet};
+
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use contracts::fleet::{FleetStatus, Health, NightlyOutcome};
 use contracts::{
     AckNotificationsIn, Notification, NotificationPage, RaiseNotificationIn, Role, Severity, SnoozeNotificationIn, SyncNotificationsIn,
@@ -17,6 +19,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{Actor, DResult, DomainError, Hub, audit, decode, decode_one, invalid};
+
+mod fleet_issues;
+pub use fleet_issues::{rearm_permanent_dead_fleet_creates, record_fleet_episode_issue};
 
 #[cfg(test)]
 #[test]
@@ -90,8 +95,8 @@ fn secret_custodian_requires_a_member_principal() {
 
 /// Producer keys belong to the loop; an HTTP caller that could write them would
 /// fake a source's state, and the next pass would resolve it away.
-const RESERVED_SOURCES: &[&str] = &["today", "fleet", "hub", "secrets", "monitor"];
-const RESERVED_PREFIXES: &[&str] = &["today:", "fleet:", "hub:", "secrets:", "monitor:", "provider:"];
+const RESERVED_SOURCES: &[&str] = &["today", "fleet", "hub", "secrets", "monitor", "paperclip"];
+const RESERVED_PREFIXES: &[&str] = &["today:", "fleet:", "hub:", "secrets:", "monitor:", "provider:", "paperclip:"];
 
 fn reserved_source(source: &str) -> bool {
     RESERVED_SOURCES.contains(&source) || ["providers:", "providers-health:", "providers-poller:"].iter().any(|p| source.starts_with(p))
@@ -220,7 +225,9 @@ async fn upsert(
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, case when $12 then now() end)
          on conflict (company_id, dedupe_key) do update set
            severity = excluded.severity, title = excluded.title, body = excluded.body,
-           subject_type = excluded.subject_type, subject_id = excluded.subject_id, url = excluded.url,
+            subject_type = excluded.subject_type, subject_id = excluded.subject_id,
+            url = case when excluded.source = 'fleet' and notifications.resolved_at is null
+                       then coalesce(excluded.url, notifications.url) else excluded.url end,
            (read_at, seq) = (
                select case when preserve_ack then notifications.read_at end,
                       case when preserve_ack then notifications.seq else nextval('notifications_seq') end
@@ -278,42 +285,57 @@ pub async fn sync(hub: &Hub, source: &str, current: Vec<Raise>) -> DResult<usize
     sync_owned(hub, None, source, current, &[]).await
 }
 
-/// `sync`, except that unmentioned rows whose key starts with one of `keep` are
-/// left as they are: a status feed that cannot be read must not resolve (or
-/// churn) the checks it last reported.
+/// `sync`, except for unmentioned keys in `keep`. Entries ending in `:` are
+/// prefixes, all others are exact keys.
 pub async fn sync_keeping(hub: &Hub, source: &str, current: Vec<Raise>, keep: &[String]) -> DResult<usize> {
     sync_owned(hub, None, source, current, keep).await
 }
 
 async fn sync_owned(hub: &Hub, owner: Option<&str>, source: &str, current: Vec<Raise>, keep: &[String]) -> DResult<usize> {
+    if current.iter().any(|raise| raise.source != source) {
+        return Err(invalid("invalid_source", "notification must belong to the syncing source"));
+    }
+    let current = merge_same_key(current);
+    let route = hub.config.fleet_issues.as_ref().filter(|_| source == "fleet");
     let mut tx = hub.db.begin().await?;
     lock_writers(&mut tx).await?;
     let mut changed = 0;
     for raise in &current {
-        if raise.source != source {
-            return Err(invalid("invalid_source", "notification must belong to the syncing source"));
-        }
         changed += upsert(&mut tx, &hub.config, owner, raise, false).await?;
-        // Degradations only: a pending op is an approval for the operator.
-        if hub.config.fleet_issues.is_some() && source == "fleet" && !raise.dedupe_key.starts_with("fleet:op:") {
-            file_fleet_issue(&mut tx, hub, raise).await?;
+    }
+    if let Some(route) = route {
+        // When several failed nightly runs arrive in one pass, only the last
+        // run represents their shared episode. Keep each notification row.
+        let conditions: BTreeMap<_, _> = current.iter().map(|r| (fleet_issues::condition(&r.dedupe_key), r)).collect();
+        for raise in conditions.into_values() {
+            changed += fleet_issues::reconcile_fleet_episode(&mut tx, &hub.config.company_id, route, raise).await?;
         }
     }
     let keys: Vec<&str> = current.iter().map(|r| r.dedupe_key.as_str()).collect();
-    changed += sqlx::query(
+    let resolved: Vec<(Uuid, String, String)> = sqlx::query_as(
         "update notifications
          set resolved_at = now(), seq = nextval('notifications_seq'), updated_at = now()
          where company_id = $1 and source = $2 and resolved_at is null and dedupe_key <> all($3) and owner is not distinct from $4
-           and not exists (select 1 from unnest($5::text[]) p where starts_with(dedupe_key, p))",
+           and not exists (select 1 from unnest($5::text[]) p
+                           where case when right(p, 1) = ':' then starts_with(dedupe_key, p) else dedupe_key = p end)
+         returning id, dedupe_key, title",
     )
     .bind(&hub.config.company_id)
     .bind(source)
     .bind(&keys)
     .bind(owner)
     .bind(keep)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected() as usize;
+    .fetch_all(&mut *tx)
+    .await?;
+    changed += resolved.len();
+    if route.is_some() {
+        for (id, key, title) in resolved {
+            fleet_issues::resolve(&mut tx, id, &key, &title).await?;
+        }
+    }
+    if source == "fleet" {
+        fleet_issues::rearm_dead_recoveries(&mut tx, &hub.config.company_id).await?;
+    }
     tx.commit().await?;
     if changed > 0 {
         hub.notified.notify_waiters();
@@ -321,52 +343,41 @@ async fn sync_owned(hub: &Hub, owner: Option<&str>, source: &str, current: Vec<R
     Ok(changed)
 }
 
-/// Every fleet condition the producer reports is filed with Paperclip for an
-/// agent to fix, in the transaction that records it. The key holds one issue
-/// per condition per UTC day, so a flapping host cannot flood the board, and a
-/// condition still present tomorrow files again. Paperclip folds a create into
-/// an open issue with the same title created in the last 48 h, so a multi-day
-/// outage opens a new issue about every other day.
-// ponytail: one issue per episode needs an episode-start column; add it if the
-// every-other-day issues of long outages become noise.
-async fn file_fleet_issue(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, hub: &Hub, raise: &Raise) -> DResult<()> {
-    let Some(route) = &hub.config.fleet_issues else { return Ok(()) };
-    // Nightly keys carry the run time; every nightly is one condition.
-    let condition = if raise.dedupe_key.starts_with("fleet:nightly:") { "fleet:nightly" } else { raise.dedupe_key.as_str() };
-    let day = Utc::now().date_naive();
-    let key = format!("fleetix-hub:fleet:{condition}:{day}");
-    // Runs every pass: a plain read, unlike enqueue's upsert, never waits on the
-    // worker's row lock while it delivers under the notification writer lock.
-    let filed: bool =
-        sqlx::query_scalar("select exists(select 1 from outbox where idempotency_key = $1)").bind(&key).fetch_one(&mut **tx).await?;
-    if filed {
-        return Ok(());
-    }
-    let notification_id: Uuid = sqlx::query_scalar("select id from notifications where company_id = $1 and dedupe_key = $2")
-        .bind(&hub.config.company_id)
-        .bind(&raise.dedupe_key)
-        .fetch_one(&mut **tx)
-        .await?;
-    let description = format!(
-        "{}\n\n{}\n\nDetected by Fleetix Hub (notification `{}`, {day}). Diagnose from evidence, state the earliest causal failure and land the fix; the Board activates it.",
-        raise.title, raise.body, raise.dedupe_key
-    );
-    // The title is the condition alone, so only this condition's own open issue
-    // absorbs a create, whatever its current state ("degraded", "unreachable").
-    let title = format!("Fleet: {condition}");
-    crate::outbox::enqueue(
-        tx,
-        &Actor::system(),
-        crate::outbox::PAPERCLIP_CREATE_ISSUE,
-        &key,
-        json!({
-            "notification_id": notification_id, "company_id": route.company_id, "title": title,
-            "description": description, "origin_key": key,
-            "project_id": route.project_id, "assignee_agent_id": route.assignee_agent_id,
-        }),
+const PAPERCLIP_ROUTING_ERROR: &str = "paperclip:routing:error";
+const PAPERCLIP_DELIVERY_ERROR: &str = "paperclip:delivery:error";
+
+async fn report_paperclip_error(hub: &Hub, key: &str, title: &str, detail: &str) -> DResult<()> {
+    raise(
+        hub,
+        &Raise {
+            source: "paperclip".into(),
+            dedupe_key: key.into(),
+            severity: Severity::Critical,
+            title: title.into(),
+            body: detail.into(),
+            subject_type: None,
+            subject_id: None,
+            url: None,
+        },
     )
     .await?;
     Ok(())
+}
+
+pub async fn report_paperclip_routing_error(hub: &Hub, detail: &str) -> DResult<()> {
+    report_paperclip_error(hub, PAPERCLIP_ROUTING_ERROR, "Paperclip routing error", detail).await
+}
+
+pub async fn report_paperclip_delivery_error(hub: &Hub, detail: &str) -> DResult<()> {
+    report_paperclip_error(hub, PAPERCLIP_DELIVERY_ERROR, "Paperclip delivery error", detail).await
+}
+
+pub async fn clear_paperclip_routing_error(hub: &Hub) -> DResult<usize> {
+    sync_keeping(hub, "paperclip", vec![], &[PAPERCLIP_DELIVERY_ERROR.into()]).await
+}
+
+pub async fn clear_paperclip_delivery_error(hub: &Hub) -> DResult<usize> {
+    sync_keeping(hub, "paperclip", vec![], &[PAPERCLIP_ROUTING_ERROR.into()]).await
 }
 
 // ── Producers ───────────────────────────────────────────────────────────────
@@ -637,16 +648,31 @@ fn key_safe(key: &str) -> String {
 /// clear its acknowledgement, so rows with the same key become one raise with
 /// a deterministic title and body.
 fn merge_same_key(raises: Vec<Raise>) -> Vec<Raise> {
-    let mut groups: std::collections::BTreeMap<String, Vec<Raise>> = std::collections::BTreeMap::new();
-    for raise in raises {
-        groups.entry(key_safe(&raise.dedupe_key)).or_default().push(raise);
+    let mut groups: BTreeMap<String, Vec<Raise>> = BTreeMap::new();
+    for mut raise in raises {
+        raise.dedupe_key = key_safe(&raise.dedupe_key);
+        groups.entry(raise.dedupe_key.clone()).or_default().push(raise);
     }
     groups
-        .into_iter()
-        .map(|(key, mut group)| {
-            group.sort_by(|a, b| (&a.title, &a.body).cmp(&(&b.title, &b.body)));
+        .into_values()
+        .map(|mut group| {
+            let rank = |r: &Raise| match r.severity {
+                Severity::Critical => 0,
+                Severity::Warning => 1,
+                Severity::Info => 2,
+            };
+            group.sort_by(|a, b| {
+                (rank(a), &a.title, &a.body, &a.subject_type, &a.subject_id, &a.url).cmp(&(
+                    rank(b),
+                    &b.title,
+                    &b.body,
+                    &b.subject_type,
+                    &b.subject_id,
+                    &b.url,
+                ))
+            });
+            group.dedup();
             let mut first = group.remove(0);
-            first.dedupe_key = key;
             if !group.is_empty() {
                 let mut lines = vec![format!("{}: {}", first.title, first.body)];
                 lines.extend(group.iter().map(|r| format!("{}: {}", r.title, r.body)));
@@ -658,40 +684,113 @@ fn merge_same_key(raises: Vec<Raise>) -> Vec<Raise> {
         .collect()
 }
 
+pub fn fleet_unreadable_keep_prefixes() -> Vec<String> {
+    ["fleet:host:", "fleet:alert:", "fleet:monitoring", "fleet:nightly:", "fleet:op:", "fleet:warn:", "fleet:probe:", "fleet:offline:"]
+        .map(String::from)
+        .into()
+}
+
+pub fn fleet_keep_keys(status: &FleetStatus) -> Vec<String> {
+    let healthy: BTreeSet<_> = status.hosts.iter().filter(|h| h.health == Health::Healthy).map(|h| h.name.as_str()).collect();
+    status
+        .expected_offline_hosts
+        .iter()
+        .chain(status.offline_hosts.iter().map(|h| &h.name))
+        .filter(|name| !name.trim().is_empty() && !key_safe(name).is_empty() && !healthy.contains(name.as_str()))
+        .flat_map(|name| ["host", "warn", "probe"].map(|kind| key_safe(&format!("fleet:{kind}:{name}"))))
+        .filter(|key| !key.ends_with(':')) // Keep keys must be exact, never prefixes.
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn sorted_lines(lines: &[String]) -> String {
+    lines.iter().map(String::as_str).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join("\n")
+}
+
 /// One raise per operator concern in a snapshot. A host is named only when its
 /// health is not healthy: every host is outdated most of the day, so revision
 /// drift alone never notifies. A snapshot older than 15 minutes, or one whose
 /// age is unknowable, is itself `fleet:stale`.
 pub fn fleet_raises(status: &FleetStatus, now: DateTime<Utc>) -> Vec<Raise> {
     let mut raises = Vec::new();
-    let mut push = |dedupe_key: String, title: String, body: String| {
-        raises.push(Raise {
-            source: "fleet".into(),
-            dedupe_key,
-            severity: Severity::Warning,
-            title,
-            body,
-            subject_type: None,
-            subject_id: None,
-            url: None,
-        });
+    let mut push = |severity, dedupe_key: String, title: String, body: String| {
+        raises.push(Raise { source: "fleet".into(), dedupe_key, severity, title, body, subject_type: None, subject_id: None, url: None });
     };
+    let mut live_alerts = BTreeSet::new();
+    let mut healthy = BTreeSet::new();
     for host in &status.hosts {
-        let health = match host.health {
-            Health::Healthy => continue,
-            Health::Degraded => "degraded",
+        let (health, severity) = match host.health {
+            Health::Healthy => {
+                healthy.insert(host.name.as_str());
+                continue;
+            }
+            Health::Degraded => ("degraded", Severity::Warning),
             Health::Unreachable if status.expected_offline_hosts.contains(&host.name) => continue,
-            Health::Unreachable => "unreachable",
+            Health::Unreachable => ("unreachable", Severity::Critical),
         };
-        let body = if host.failures.is_empty() { health.to_string() } else { host.failures.join("; ") };
-        push(format!("fleet:host:{}", host.name), format!("Host {} is {health}", host.name), body);
+        live_alerts.insert(host.name.as_str());
+        let body = if host.failures.is_empty() { health.to_string() } else { sorted_lines(&host.failures) };
+        push(severity, format!("fleet:host:{}", host.name), format!("Host {} is {health}", host.name), body);
+    }
+    for offline in &status.offline_hosts {
+        let name = &offline.name;
+        if healthy.contains(name.as_str()) {
+            continue;
+        }
+        if !live_alerts.contains(name.as_str()) && (offline.last_health.as_deref() == Some("degraded") || !offline.last_failures.is_empty())
+        {
+            let mut body = sorted_lines(&offline.last_failures);
+            for (label, timestamp) in [("Last seen", offline.last_seen), ("Offline since", offline.offline_since)] {
+                if let Some(timestamp) = timestamp {
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    body.push_str(&format!("{label}: {}", timestamp.to_rfc3339()));
+                }
+            }
+            if body.is_empty() {
+                body = "Last observed health: degraded".into();
+            }
+            push(Severity::Warning, format!("fleet:host:{name}"), format!("Host {name} was degraded before going offline"), body);
+        }
+        let (label, since) =
+            if offline.offline_since.is_some() { ("Offline since", offline.offline_since) } else { ("Last seen", offline.last_seen) };
+        if let Some(since) = since.filter(|since| now.signed_duration_since(*since) > Duration::days(7)) {
+            push(
+                Severity::Warning,
+                format!("fleet:offline:{name}"),
+                format!("Host {name} offline for over 7 days"),
+                format!("{label}: {}", since.to_rfc3339()),
+            );
+        }
+    }
+    for (host, warnings) in &status.host_warnings {
+        if !warnings.is_empty() {
+            push(Severity::Info, format!("fleet:warn:{host}"), format!("Host {host} warnings"), sorted_lines(warnings));
+        }
+    }
+    for (host, coverage) in &status.probe_coverage {
+        if !coverage.user_bus_errors.is_empty() || !coverage.sections_failed.is_empty() {
+            let mut details = Vec::new();
+            if !coverage.sections_failed.is_empty() {
+                details.push(format!("Failed sections:\n{}", sorted_lines(&coverage.sections_failed)));
+            }
+            if !coverage.user_bus_errors.is_empty() {
+                details.push(format!("User bus errors:\n{}", sorted_lines(&coverage.user_bus_errors)));
+            }
+            push(Severity::Warning, format!("fleet:probe:{host}"), format!("Host {host} probe incomplete"), details.join("\n\n"));
+        }
     }
     if let Some(error) = &status.monitoring.error {
-        push("fleet:monitoring".into(), "Monitoring unreadable".into(), error.clone());
+        push(Severity::Critical, "fleet:monitoring".into(), "Monitoring unreadable".into(), error.clone());
     }
     for alert in &status.monitoring.alerts {
-        let body = if alert.detail.is_empty() { alert.group.clone() } else { alert.detail.join("; ") };
-        push(format!("fleet:alert:{}", alert.key), format!("Alert: {}", alert.name), body);
+        let mut details: Vec<_> = alert.detail.iter().map(String::as_str).collect();
+        details.sort_unstable();
+        details.dedup();
+        let body = if details.is_empty() { alert.group.clone() } else { details.join("; ") };
+        push(Severity::Warning, format!("fleet:alert:{}", alert.key), format!("Alert: {}", alert.name), body);
     }
     for op in &status.pending_ops {
         let body = if op.reason.is_empty() {
@@ -699,7 +798,7 @@ pub fn fleet_raises(status: &FleetStatus, now: DateTime<Utc>) -> Vec<Raise> {
         } else {
             format!("{} on {} — approve with `canix host ops`", op.reason, op.host)
         };
-        push(format!("fleet:op:{}", op.id), format!("Approval waiting: {}", op.title), body);
+        push(Severity::Warning, format!("fleet:op:{}", op.id), format!("Approval waiting: {}", op.title), body);
     }
     if let Some(nightly) = &status.nightly
         && nightly.failed()
@@ -713,18 +812,36 @@ pub fn fleet_raises(status: &FleetStatus, now: DateTime<Utc>) -> Vec<Raise> {
             (None, Some(hosts)) => hosts,
             (None, None) => "the run failed".to_string(),
         };
-        push(format!("fleet:nightly:{}", nightly.started_at), "Nightly update failed".into(), body);
+        push(Severity::Warning, format!("fleet:nightly:{}", nightly.started_at), "Nightly update failed".into(), body);
     }
-    match snapshot_age_secs(status, now) {
+    if let Some(nightly) = &status.nightly
+        && nightly.finished_at.is_none()
+        && let Ok(started) = DateTime::parse_from_rfc3339(&nightly.started_at)
+        && now.signed_duration_since(started) > Duration::hours(4)
+    {
+        push(
+            Severity::Warning,
+            "fleet:nightly:stalled".into(),
+            "Nightly update stalled".into(),
+            format!("Nightly update started at {} and has not finished after 4 hours", nightly.started_at),
+        );
+    }
+    match fleet_snapshot_stale(status, now) {
         // The body names the snapshot, not its age: an age changes every pass,
         // which would reopen an acknowledged outage each minute.
-        Some(age) if age > FLEET_STALE_AFTER_SECS => push(
+        (true, Some(_)) => push(
+            Severity::Critical,
             "fleet:stale".into(),
             "Fleet snapshot is stale".into(),
             format!("last snapshot generated at {}; fleet status is not evidence the fleet is healthy", status.generated_at),
         ),
-        Some(_) => {}
-        None => push("fleet:stale".into(), "Fleet snapshot is stale".into(), "generatedAt is not a time this hub can compare".into()),
+        (true, None) => push(
+            Severity::Critical,
+            "fleet:stale".into(),
+            "Fleet snapshot is stale".into(),
+            "generatedAt is not a time this hub can compare".into(),
+        ),
+        (false, _) => {}
     }
     merge_same_key(raises)
 }
@@ -734,7 +851,7 @@ pub fn fleet_unreadable(error: &str) -> Raise {
     Raise {
         source: "fleet".into(),
         dedupe_key: "fleet:stale".into(),
-        severity: Severity::Warning,
+        severity: Severity::Critical,
         title: "Fleet snapshot is unreadable".into(),
         body: error.to_string(),
         subject_type: None,
@@ -750,6 +867,12 @@ fn snapshot_age_secs(status: &FleetStatus, now: DateTime<Utc>) -> Option<i64> {
     let then = DateTime::parse_from_rfc3339(&status.generated_at).ok()?.with_timezone(&Utc);
     let age = now.signed_duration_since(then).num_seconds();
     (age >= -FLEET_CLOCK_SKEW_SECS).then_some(age)
+}
+
+/// Staleness and the trusted age in seconds, for both notifications and HTTP.
+pub fn fleet_snapshot_stale(status: &FleetStatus, now: DateTime<Utc>) -> (bool, Option<i64>) {
+    let age = snapshot_age_secs(status, now);
+    (age.is_none_or(|age| age > FLEET_STALE_AFTER_SECS), age)
 }
 
 async fn has_fresh_daily_summary(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, company_id: &str, hours: u32) -> DResult<bool> {
@@ -831,14 +954,26 @@ pub async fn expire_snoozes(hub: &Hub) -> DResult<usize> {
     Ok(changed)
 }
 
-/// Drop rows the operator both acknowledged and saw resolve, 30 days on. A
-/// delete allocates no seq, so it needs no writer lock.
+/// Drop acknowledged, resolved rows after 30 days, but keep episodes with
+/// recovery still due. A delete allocates no seq, so it needs no writer lock.
 pub async fn prune(hub: &Hub) -> DResult<u64> {
     Ok(sqlx::query(
-        "delete from notifications
-         where company_id = $1 and resolved_at < now() - interval '30 days' and read_at is not null",
+        "delete from notifications n
+         where n.company_id = $1 and n.resolved_at < now() - interval '30 days' and n.read_at is not null
+           and not exists (
+               select 1 from fleet_issue_episodes e
+               cross join lateral (
+                   select state, last_error from outbox
+                    where idempotency_key = 'fleetix-hub:fleet:ep:' || e.id || ':resolve'
+                       or idempotency_key like 'fleetix-hub:fleet:ep:' || e.id || ':resolve:g%'
+                    order by length(idempotency_key) desc, idempotency_key desc limit 1
+               ) latest
+               where e.notification_id = n.id and e.state = 'resolved' and e.paperclip_issue_id is not null
+                 and (latest.state = 'pending' or (latest.state = 'dead' and not coalesce(starts_with(latest.last_error, $2), false)))
+           )",
     )
     .bind(&hub.config.company_id)
+    .bind(crate::outbox::PERMANENT_4XX_PREFIX)
     .execute(&hub.db)
     .await?
     .rows_affected())
@@ -1217,8 +1352,58 @@ mod tests {
         .unwrap();
         let raises = fleet_raises(&status, "2026-11-10T03:10:00Z".parse().unwrap());
         assert_eq!(raises.len(), 2);
-        assert!(raises.iter().any(|r| r.dedupe_key == "fleet:host:server-1"));
+        assert!(raises.iter().any(|r| r.dedupe_key == "fleet:host:server-1" && r.severity == Severity::Critical));
         assert!(raises.iter().any(|r| r.dedupe_key == "fleet:host:awake"));
+    }
+
+    #[test]
+    fn fleet_offline_probe_and_stalled_conditions_are_stable_and_actionable() {
+        let now = "2026-11-25T12:00:00Z".parse().unwrap();
+        let mut status: FleetStatus = serde_json::from_value(json!({
+            "schemaVersion": 1, "generatedAt": "2026-11-25T11:45:00Z",
+            "hosts": [{"name": "awake", "health": "healthy", "checkedAt": "2026-11-25T12:00:00Z"}],
+            "expectedOfflineHosts": ["other", "awake", "", " \t"],
+            "offlineHosts": [
+                {"name": "nomad", "lastSeen": "2026-11-18T12:00:00Z", "offlineSince": "2026-11-17T12:00:00Z",
+                 "lastHealth": "degraded", "lastFailures": ["ssd", "service", "ssd"]},
+                {"name": "boundary", "lastSeen": "2026-11-18T12:00:00Z"}
+            ],
+            "hostWarnings": {"nomad": ["zed", "disk", "zed"]},
+            "probeCoverage": {"nomad": {"userBusErrors": ["can: no bus"], "sectionsFailed": ["users"]}},
+            "nightly": {"startedAt": "2026-11-25T07:59:59Z"},
+            "monitoring": {"error": "missing credentials"}
+        }))
+        .unwrap();
+        assert_eq!(fleet_snapshot_stale(&status, now), (false, Some(900)));
+        let raises = fleet_raises(&status, now);
+        let find = |key: &str| raises.iter().find(|r| r.dedupe_key == format!("fleet:{key}")).unwrap();
+        assert!(find("host:nomad").body.starts_with("service\nssd\nLast seen: "));
+        assert!(find("offline:nomad").body.contains("2026-11-17T12:00:00"));
+        assert!(raises.iter().all(|r| r.dedupe_key != "fleet:offline:boundary"));
+        assert_eq!((find("warn:nomad").severity, find("warn:nomad").body.as_str()), (Severity::Info, "disk\nzed"));
+        assert!(find("probe:nomad").body.contains("users"));
+        assert!(find("probe:nomad").body.contains("can: no bus"));
+        assert!(find("nightly:stalled").body.contains("2026-11-25T07:59:59Z"));
+        assert_eq!(find("monitoring").severity, Severity::Critical);
+        let keep = fleet_keep_keys(&status);
+        assert!(keep.contains(&"fleet:host:nomad".into()) && keep.contains(&"fleet:warn:other".into()));
+        assert!(keep.contains(&"fleet:probe:nomad".into()) && keep.contains(&"fleet:probe:other".into()));
+        assert!(!keep.iter().any(|k| k.ends_with(':')));
+        assert!(!keep.iter().any(|k| k.ends_with(":awake")));
+        status.snapshot.generated_at = "2026-11-25T12:01:00Z".into();
+        assert_eq!(fleet_snapshot_stale(&status, now), (false, Some(-60)));
+        status.snapshot.generated_at = "2026-11-25T12:01:01Z".into();
+        assert_eq!(fleet_snapshot_stale(&status, now), (true, None));
+        assert_eq!(fleet_unreadable("bad snapshot").severity, Severity::Critical);
+    }
+
+    #[test]
+    fn fleet_monitoring_details_are_sorted_and_unique() {
+        let mut status: FleetStatus = serde_json::from_str(FLEET_SNAPSHOT).unwrap();
+        status.snapshot.monitoring.alerts[0].detail = vec!["z".into(), "a".into(), "z".into()];
+        let now = "2026-11-10T03:10:00Z".parse().unwrap();
+        let raised = fleet_raises(&status, now);
+        assert_eq!(raised.iter().find(|r| r.dedupe_key == "fleet:alert:core_forgejo").unwrap().body, "a; z");
     }
 
     #[test]
@@ -1304,7 +1489,10 @@ mod tests {
         assert_eq!(severity("today:renewal:00000000-0000-0000-0000-00000000000b:unverifiable"), Severity::Warning);
         assert_eq!(severity("today:renewal:00000000-0000-0000-0000-00000000000c:invalid"), Severity::Critical);
         assert_eq!(severity("today:opportunity:00000000-0000-0000-0000-000000000005:shortlisted"), Severity::Info);
-        assert!(from_fleet.iter().all(|r| r.severity == Severity::Warning && r.source == "fleet"));
+        assert!(from_fleet.iter().all(|r| r.source == "fleet"));
+        for raise in &from_fleet {
+            assert_eq!(raise.severity, if raise.dedupe_key == "fleet:monitoring" { Severity::Critical } else { Severity::Warning });
+        }
 
         // Aged-out or unreadable snapshots are the same `fleet:stale` raise.
         let stale = fleet_raises(&status, generated + chrono::Duration::minutes(16));

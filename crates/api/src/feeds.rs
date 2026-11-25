@@ -149,7 +149,10 @@ pub async fn poll(http: &reqwest::Client, feed: &Feed) -> domain::feeds::Evaluat
 pub async fn run(hub: Hub, feeds: Vec<Feed>) {
     let http = match integrations::live::s3::client() {
         Ok(http) => http,
-        Err(error) => return tracing::error!(%error, "feeds: no HTTP client"),
+        Err(error) => {
+            hub.record_sync_error("monitor", &error);
+            return tracing::error!(%error, "feeds: no HTTP client");
+        }
     };
     let mut due = vec![tokio::time::Instant::now(); feeds.len()];
     let mut last: BTreeMap<String, domain::feeds::Evaluation> = BTreeMap::new();
@@ -171,9 +174,6 @@ pub async fn run(hub: Hub, feeds: Vec<Feed>) {
             *due = tokio::time::Instant::now() + feed.interval;
         }
         let synced = sync(&hub, &last).await;
-        if let Err(error) = &synced {
-            tracing::warn!(%error, "feeds: notification sync failed");
-        }
         match due.iter().min() {
             Some(next) => tokio::time::sleep_until(*next).await,
             // No feeds: one successful sync resolves removed feeds' rows.
@@ -189,7 +189,15 @@ pub async fn run(hub: Hub, feeds: Vec<Feed>) {
 pub async fn sync(hub: &Hub, last: &BTreeMap<String, domain::feeds::Evaluation>) -> domain::DResult<usize> {
     let keep: Vec<String> = last.iter().filter(|(_, e)| !e.fresh).map(|(id, _)| format!("monitor:{id}:")).collect();
     let current = last.values().flat_map(|e| e.raises.clone()).collect();
-    domain::notifications::sync_keeping(hub, "monitor", current, &keep).await
+    let synced = domain::notifications::sync_keeping(hub, "monitor", current, &keep).await;
+    match &synced {
+        Ok(_) => hub.record_sync_ok("monitor"),
+        Err(error) => {
+            hub.record_sync_error("monitor", error);
+            tracing::error!(%error, "feeds: notification sync failed");
+        }
+    }
+    synced
 }
 
 /// `pending` rows for `/v1/status` until the first poll lands.
