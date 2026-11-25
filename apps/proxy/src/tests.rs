@@ -3754,6 +3754,33 @@ async fn google_cache_aliases_share_project_routing_and_affinity() {
 }
 
 #[tokio::test]
+async fn google_pool_requests_present_an_antigravity_client_identity() {
+    // Cloud Code answers a foreign user agent with 403 SUBSCRIPTION_REQUIRED on every account.
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post(|headers: HeaderMap| async move {
+            let agents = headers.get_all("user-agent").iter().map(|v| v.to_str().unwrap().to_owned()).collect::<Vec<_>>();
+            agents.join("|")
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let agy = "antigravity/cli/1.5.13 (aidev_client; os_type=linux; arch=amd64)";
+    for (sent, upstream) in
+        [(Some("curl/8.11.1"), router::ANTIGRAVITY_USER_AGENT), (None, router::ANTIGRAVITY_USER_AGENT), (Some(agy), agy)]
+    {
+        let mut req = http.request("POST", "/v1internal:generateContent").bearer_auth("inference-fixture").json(&json!({}));
+        if let Some(sent) = sent {
+            req = req.header("user-agent", sent);
+        }
+        assert_eq!(req.send().await.unwrap().text().await.unwrap(), upstream, "{sent:?}");
+    }
+}
+
+#[tokio::test]
 async fn google_rejects_duplicate_wire_cache_fields_before_dispatch() {
     let mock = serve(Router::new().route("/v1internal:generateContent", post(|| async { "dispatched" }))).await;
     let dir = Scratch::new();
