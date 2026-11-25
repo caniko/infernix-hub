@@ -331,6 +331,19 @@ fn classify(
             _ => Other,
         }
     };
+    // Google refuses a request it will not serve (a model outside the plan, a resource the
+    // caller cannot reach) with the same bare PERMISSION_DENIED or SUBSCRIPTION_REQUIRED from
+    // every account. Only a project- or location-level reason says the account itself is barred.
+    if lane == Lane::Google
+        && source == Inference
+        && kind == PermissionDenied
+        && http == Some(403)
+        && codes().next().is_some()
+        && codes().all(|code| ["PERMISSION_DENIED", "SUBSCRIPTION_REQUIRED"].iter().any(|s| code.eq_ignore_ascii_case(s)))
+        && !says(&["location", "country", "region"])
+    {
+        return None;
+    }
     let mut result = local_error(kind, source, "");
     result.http_status = http;
     result.provider_code = if kind == VerificationRequired && lane == Lane::Google {
@@ -459,6 +472,23 @@ pub(crate) mod tests {
         }
         assert_eq!(http(Lane::Google, 404, "", QuotaProbe).unwrap().kind, ProbeFailed);
         assert_eq!(http(Lane::Google, 302, "", Inference).unwrap().kind, Other);
+    }
+
+    #[test]
+    fn google_generic_inference_403_is_request_scoped() {
+        for body in [
+            r#"{"error":{"code":403,"status":"PERMISSION_DENIED","message":"The caller does not have permission"}}"#,
+            r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"@type":"google.rpc.ErrorInfo","reason":"SUBSCRIPTION_REQUIRED"}]}}"#,
+        ] {
+            assert!(http(Lane::Google, 403, body, Inference).is_none(), "{body}");
+            assert_eq!(http(Lane::Google, 403, body, QuotaProbe).unwrap().kind, PermissionDenied, "{body}");
+        }
+        for body in [
+            r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"@type":"google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}]}}"#,
+            r#"{"error":{"code":403,"status":"PERMISSION_DENIED","message":"User location is not supported."}}"#,
+        ] {
+            assert_eq!(http(Lane::Google, 403, body, Inference).unwrap().kind, PermissionDenied, "{body}");
+        }
     }
 
     #[test]

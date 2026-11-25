@@ -1281,29 +1281,35 @@ impl Pool {
             self.bound(lane, session)
                 .filter(|id| !filter.subscriptions_only || self.accounts.get(*id).is_some_and(|a| filter.allows_in(self, a)))
         };
+        let soonest = |a: &Account| {
+            let reset = |applies: fn(&QuotaWindow) -> bool| {
+                a.windows
+                    .iter()
+                    .filter(|w| applies(w) && window_applies_to_model(w, model))
+                    .filter_map(|w| w.resets_at)
+                    .filter(|t| *t > now)
+                    .min()
+                    .unwrap_or(DateTime::<Utc>::MAX_UTC)
+            };
+            let weekly = reset(|w| {
+                w.kind == QuotaWindowKind::Weekly
+                    || (w.kind == QuotaWindowKind::ModelScoped && w.window_duration_mins.is_none_or(|m| m >= 1440))
+            });
+            let session = reset(|w| w.kind == QuotaWindowKind::Session);
+            (weekly, session, std::cmp::Reverse(a.priority))
+        };
+        // Antigravity subscriptions drain the soonest weekly reset first: a session bound to a
+        // later-resetting account moves back once that account's 5-hour window frees up.
+        let drain_soonest = lane == Lane::Google && self.policy.strategy == RouteStrategy::SoonestReset;
         let sticky = session.and_then(bound).or_else(|| parent.and_then(bound));
-        if let Some(a) = sticky.and_then(|id| options.iter().find(|a| a.id == id)) {
+        if let Some(a) = sticky.and_then(|id| options.iter().find(|a| a.id == id))
+            && (!drain_soonest || options.iter().all(|b| soonest(b).0 >= soonest(a).0))
+        {
             return Some((*a).clone());
         }
         let first = *options.first()?;
         match self.policy.strategy {
-            RouteStrategy::SoonestReset => options.sort_by_key(|a| {
-                let reset = |applies: fn(&QuotaWindow) -> bool| {
-                    a.windows
-                        .iter()
-                        .filter(|w| applies(w) && window_applies_to_model(w, model))
-                        .filter_map(|w| w.resets_at)
-                        .filter(|t| *t > now)
-                        .min()
-                        .unwrap_or(DateTime::<Utc>::MAX_UTC)
-                };
-                let weekly = reset(|w| {
-                    w.kind == QuotaWindowKind::Weekly
-                        || (w.kind == QuotaWindowKind::ModelScoped && w.window_duration_mins.is_none_or(|m| m >= 1440))
-                });
-                let session = reset(|w| w.kind == QuotaWindowKind::Session);
-                (weekly, session, std::cmp::Reverse(a.priority))
-            }),
+            RouteStrategy::SoonestReset => options.sort_by_key(|a| soonest(a)),
             RouteStrategy::FillFirst => options.sort_by(|a, b| {
                 let used = |a: &Account| {
                     a.windows

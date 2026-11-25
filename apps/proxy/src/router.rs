@@ -2424,11 +2424,6 @@ impl GoogleError {
             source,
             &account_secrets(account),
         )?;
-        // A generic in-band 403 can be specific to the requested resource.
-        let has_details = raw.pointer("/error/details").or_else(|| raw.pointer("/response/error/details")).is_some_and(Value::is_array);
-        if classified.kind == AccountErrorKind::PermissionDenied && !has_details && source == AccountErrorSource::Inference {
-            return None;
-        }
         classified.source = source;
         Some(classified)
     }
