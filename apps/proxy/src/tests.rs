@@ -128,6 +128,40 @@ fn quota_ranking_is_model_specific_and_breaks_weekly_ties_with_session_resets() 
 }
 
 #[test]
+fn antigravity_affinity_yields_to_the_soonest_weekly_reset_with_5h_quota() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+    let mut pool = Pool::default();
+    let now = Utc::now();
+    let windows = |weekly, five_hour_left| {
+        parse_antigravity_summary(
+            &json!({"buckets":[
+                {"bucketId":"gemini-5h", "window":"5h", "remainingFraction":five_hour_left, "resetTime":now + TimeDelta::hours(2)},
+                {"bucketId":"gemini-weekly", "window":"weekly", "remainingFraction":0.5, "resetTime":now + TimeDelta::hours(weekly)}
+            ]}),
+            now,
+        )
+    };
+    for (name, weekly) in [("soon.json", 10), ("late.json", 40)] {
+        let mut accounts = pool::parse_credentials(name, &json!({"type":"google","access_token":name}), false).unwrap();
+        accounts[0].windows = windows(weekly, 0.0);
+        pool.insert(accounts);
+    }
+    pool.policy.strategy = SoonestReset;
+    pool.accounts.get_mut("late.json").unwrap().windows = windows(40, 0.5);
+    let pick = |pool: &mut Pool| pool.pick(Lane::Google, (Some("s"), None), "gemini-4-neon-high", None, &[], now).unwrap().id;
+    // soon.json has no 5-hour quota left, so the session lands on late.json and binds there.
+    assert_eq!(pick(&mut pool), "late.json");
+    pool.bind(Lane::Google, "s", "late.json");
+    assert_eq!(pick(&mut pool), "late.json");
+    // Once soon.json's 5-hour window frees up, the bound session moves back to it.
+    pool.accounts.get_mut("soon.json").unwrap().windows = windows(10, 0.5);
+    assert_eq!(pick(&mut pool), "soon.json");
+    // Other strategies keep plain stickiness.
+    pool.policy.strategy = FillFirst;
+    assert_eq!(pick(&mut pool), "late.json");
+}
+
+#[test]
 fn round_robin_cursors_follow_eligible_accounts() {
     for strategy in [RoundRobin, WeightedRoundRobin] {
         for (lane, first, second) in [(Lane::Google, "gemini-neon", "gemini-argon"), (Lane::Claude, "claude-opus-4", "claude-sonnet-4")] {
@@ -5214,11 +5248,45 @@ async fn google_billing_error_array_quarantines_without_quota_proof() {
 #[tokio::test]
 async fn google_permission_error_array_quarantines_without_quota_proof() {
     check_google_error_array_quarantine(
-        json!([{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Permission denied"}}]),
+        json!([{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Permission denied","details":[
+            {"@type":"google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}
+        ]}}]),
         AccountErrorKind::PermissionDenied,
-        "PERMISSION_DENIED",
+        "SERVICE_DISABLED",
     )
     .await;
+}
+
+#[tokio::test]
+async fn google_request_scoped_403_reaches_the_client_without_quarantining_the_pool() {
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post(|axum::Json(body): axum::Json<Value>| async move { (StatusCode::FORBIDDEN, axum::Json(body["reply"].clone())) }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    for reply in [
+        json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"The caller does not have permission"}}),
+        json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"You do not have a valid license of this product.","details":[
+            {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SUBSCRIPTION_REQUIRED"}
+        ]}}),
+    ] {
+        let res = http
+            .request("POST", "/v1internal:generateContent")
+            .bearer_auth("inference-fixture")
+            .json(&json!({"model":"gemini-neon","reply":reply}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(res.json::<Value>().await.unwrap(), reply);
+        let state = proxy.state.read().await;
+        assert!(state.pool.accounts.values().all(|a| a.last_error.is_none()), "{reply}");
+        assert_eq!(state.activity.back().unwrap().attempts.len(), 1, "{reply}");
+    }
 }
 
 async fn check_google_error_array_quarantine(body: Value, kind: AccountErrorKind, provider_code: &str) {
