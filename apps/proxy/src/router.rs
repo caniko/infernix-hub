@@ -33,6 +33,18 @@ use crate::{
 
 pub(crate) const REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024;
 pub(crate) const POOL_QUOTA_HEADER: &str = "x-fleetix-pool-quota";
+/// Cloud Code licenses Antigravity by client identity: any other user agent gets
+/// 403 SUBSCRIPTION_REQUIRED (inference) or PERMISSION_DENIED (metadata) from every account.
+pub(crate) const ANTIGRAVITY_USER_AGENT: &str = "antigravity/hub/2.24.0";
+
+/// The Cloud Code user agent for a pooled request: Antigravity's own client keeps its version.
+fn cloud_code_user_agent(headers: &HeaderMap) -> HeaderValue {
+    headers
+        .get(header::USER_AGENT)
+        .filter(|ua| ua.as_bytes().starts_with(b"antigravity/"))
+        .cloned()
+        .unwrap_or(HeaderValue::from_static(ANTIGRAVITY_USER_AGENT))
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct LocalPoolResponse;
@@ -693,6 +705,7 @@ pub(crate) async fn forward_authorized(
                     let name = key.as_str();
                     if (request_header(name) || (name == "anthropic-beta" && account.api_key && lane == Lane::Claude))
                         && !connection.iter().any(|s| s.eq_ignore_ascii_case(name))
+                        && !(lane == Lane::Google && !account.api_key && key == header::USER_AGENT)
                     {
                         req = req.header(key, value);
                     }
@@ -715,7 +728,10 @@ pub(crate) async fn forward_authorized(
                     Lane::Google if account.api_key => {
                         req.header(header::ACCEPT_ENCODING, "identity").header("x-goog-api-key", &account.access)
                     }
-                    Lane::Google => req.header(header::ACCEPT_ENCODING, "identity").bearer_auth(&account.access),
+                    Lane::Google => req
+                        .header(header::ACCEPT_ENCODING, "identity")
+                        .header(header::USER_AGENT, cloud_code_user_agent(&parts.headers))
+                        .bearer_auth(&account.access),
                     _ => req.bearer_auth(&account.access),
                 }
             };

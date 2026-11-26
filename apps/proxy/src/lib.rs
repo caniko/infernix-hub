@@ -764,7 +764,7 @@ impl Proxy {
                 .http
                 .post(url)
                 .bearer_auth(token)
-                .header("user-agent", "antigravity/hub/2.24.0")
+                .header("user-agent", crate::router::ANTIGRAVITY_USER_AGENT)
                 .json(&serde_json::json!({"metadata":{"ideType":"ANTIGRAVITY"}}));
             if let Ok(raw) = provider_json(request).await
                 && let Some(project) = pool::text(&raw, &["cloudaicompanionProject", "/cloudaicompanionProject/id"])
@@ -787,7 +787,7 @@ impl Proxy {
             self.http
                 .post(url)
                 .bearer_auth(access)
-                .header("user-agent", "antigravity/hub/2.24.0")
+                .header("user-agent", crate::router::ANTIGRAVITY_USER_AGENT)
                 .json(&body)
                 .timeout(Duration::from_secs(12))
         };

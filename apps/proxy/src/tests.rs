@@ -3754,6 +3754,33 @@ async fn google_cache_aliases_share_project_routing_and_affinity() {
 }
 
 #[tokio::test]
+async fn google_pool_requests_present_an_antigravity_client_identity() {
+    // Cloud Code answers a foreign user agent with 403 SUBSCRIPTION_REQUIRED on every account.
+    let mock = serve(Router::new().route(
+        "/v1internal:generateContent",
+        post(|headers: HeaderMap| async move {
+            let agents = headers.get_all("user-agent").iter().map(|v| v.to_str().unwrap().to_owned()).collect::<Vec<_>>();
+            agents.join("|")
+        }),
+    ))
+    .await;
+    let dir = Scratch::new();
+    let proxy = google_routing_fixture(&dir, &mock).await;
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let agy = "antigravity/cli/1.5.13 (aidev_client; os_type=linux; arch=amd64)";
+    for (sent, upstream) in
+        [(Some("curl/8.11.1"), router::ANTIGRAVITY_USER_AGENT), (None, router::ANTIGRAVITY_USER_AGENT), (Some(agy), agy)]
+    {
+        let mut req = http.request("POST", "/v1internal:generateContent").bearer_auth("inference-fixture").json(&json!({}));
+        if let Some(sent) = sent {
+            req = req.header("user-agent", sent);
+        }
+        assert_eq!(req.send().await.unwrap().text().await.unwrap(), upstream, "{sent:?}");
+    }
+}
+
+#[tokio::test]
 async fn google_rejects_duplicate_wire_cache_fields_before_dispatch() {
     let mock = serve(Router::new().route("/v1internal:generateContent", post(|| async { "dispatched" }))).await;
     let dir = Scratch::new();
@@ -5255,6 +5282,26 @@ async fn google_permission_error_array_quarantines_without_quota_proof() {
         "SERVICE_DISABLED",
     )
     .await;
+}
+
+#[tokio::test]
+async fn codex_missing_scope_403_reaches_the_client_without_quarantining_the_pool() {
+    let reply = json!({"error":{"message":"You have insufficient permissions for this operation. Missing scopes: api.model.read.","type":"invalid_request_error"}});
+    let upstream = reply.clone();
+    let mock = serve(Router::new().route("/v1/models", get(move || async move { (StatusCode::FORBIDDEN, axum::Json(upstream)) }))).await;
+    let dir = Scratch::new();
+    let proxy = fixture(&dir, &mock);
+    for name in ["codex-a.json", "codex-b.json"] {
+        let credential = json!({"type":"codex","access_token":name,"account_id":name});
+        proxy.state.write().await.pool.insert(pool::parse_credentials(name, &credential, true).unwrap());
+    }
+    let server = serve(proxy.clone().app()).await;
+    let res = Http::new(&server).request("GET", "/v1/models").bearer_auth("inference-fixture").send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(res.json::<Value>().await.unwrap(), reply);
+    let state = proxy.state.read().await;
+    assert!(state.pool.accounts.values().all(|a| a.last_error.is_none()));
+    assert_eq!(state.activity.back().unwrap().attempts.len(), 1);
 }
 
 #[tokio::test]
