@@ -83,9 +83,9 @@ pub(super) fn Activity(providers: Vec<ProviderSummary>, mut selected: Signal<Str
     };
     rsx! {
         section { class: "glass-card stack",
-            div { class: "tab-bar", role: "group", aria_label: "Activity views",
+            div { class: "segmented activity-subtabs", role: "group", aria_label: "Activity views",
                 for (i, label) in TABS.into_iter().enumerate() {
-                    button { key: "{label}", class: if tab() == i { "tab-btn active" } else { "tab-btn" }, aria_pressed: tab() == i,
+                    button { key: "{label}", class: "seg-btn", aria_pressed: tab() == i,
                         onclick: move |_| { if i == 7 { seed.set(None); } tab.set(i); }, "{label}" }
                 }
             }
@@ -505,7 +505,7 @@ fn Compare(scope: ActivityScope) -> Element {
                     else if latency_result.as_ref().is_some_and(Result::is_err) { " Latency could not be loaded." }
                 }
                 BreakdownTable { label: "Model and effort comparison", empty: report.rows.is_empty(), headers: &[
-                    "Model", "Effort", "Reqs", "Est. cost (% share)", "vs base", "Median TTFT", "Fail %"
+                    "Model", "Effort", "Reqs", "Est. cost (% share)", "$/req", "Cost vs base", "Median TTFT", "Fail %"
                 ],
                     for r in &report.rows {
                         tr { key: "{r.key}",
@@ -513,6 +513,7 @@ fn Compare(scope: ActivityScope) -> Element {
                             td { "{text(&r.effort)}" }
                             td { "{fmt_count(r.requests)}" }
                             td { ShareBar { label: usd(r.api_equivalent_cost_usd), value: r.api_equivalent_cost_usd, total: total_cost, show_share: true } }
+                            td { "{money(r.mean_cost_per_request)}" }
                             td { {baseline_delta(r.baseline_cost_multiple)} }
                             td {
                                 if let Some(ms) = ttft(r) {

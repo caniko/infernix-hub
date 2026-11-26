@@ -13,7 +13,7 @@ use crate::{
     actions, api,
     components::{Chip, EmptyState, ErrorCard, Loading, Panel},
     format, labels,
-    state::Store,
+    state::{Store, Workspace},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +153,11 @@ pub fn NotificationsView() -> Element {
                                 title: "No open notifications".to_string(),
                                 hint: Some("Inbox notifications are separate from live Fleet status. Check Command Center for active host or service issues.".to_string()),
                                 actions: Some(rsx! {
+                                    button {
+                                        class: "btn secondary",
+                                        onclick: move |_| store.set_workspace(Workspace::Command),
+                                        "Open Command Center"
+                                    }
                                     button {
                                         class: "btn secondary",
                                         onclick: move |_| {

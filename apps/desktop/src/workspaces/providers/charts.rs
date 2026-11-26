@@ -389,6 +389,10 @@ fn midnight(at: DateTime<Utc>) -> DateTime<Utc> {
 }
 
 fn time_ticks(view: TimeBounds, width: f64, compact: bool, dates: bool) -> Vec<(DateTime<Utc>, String)> {
+    let hourly = !dates && view.end - view.start <= TimeDelta::hours(48);
+    let hour_offset = |at: DateTime<Utc>| {
+        TimeDelta::seconds(at.timestamp().rem_euclid(3600)) + TimeDelta::nanoseconds(i64::from(at.timestamp_subsec_nanos()))
+    };
     let count = if compact || width < 200.0 {
         3
     } else if width < 360.0 && dates {
@@ -415,10 +419,19 @@ fn time_ticks(view: TimeBounds, width: f64, compact: bool, dates: bool) -> Vec<(
             .collect::<Vec<_>>()
     };
     let mut times = vec![view.start, view.end];
+    let mut ticks = labels(&times);
     let boundaries: Vec<_> = (1..=2).map(|day| midnight(view.start) + TimeDelta::days(day)).filter(|&at| !dates && at < view.end).collect();
     let mut regular: Vec<_> = (1..count - 1)
         .map(|i| view.at(f64::from(i) / f64::from(count - 1)))
-        .map(|at| if dates { midnight(at + TimeDelta::hours(12)) } else { at })
+        .map(|at| {
+            if dates {
+                midnight(at + TimeDelta::hours(12))
+            } else if hourly {
+                at - hour_offset(at)
+            } else {
+                at
+            }
+        })
         .collect();
     // Keep rollover ticks first, and fill gaps rather than clustering regular ticks around midnight.
     regular.sort_by_key(|at| std::cmp::Reverse(times.iter().chain(&boundaries).map(|anchor| (*anchor - *at).abs()).min()));
@@ -431,18 +444,29 @@ fn time_ticks(view: TimeBounds, width: f64, compact: bool, dates: bool) -> Vec<(
             continue;
         }
         times.insert(index, at);
-        let ticks = labels(&times);
-        let fits = ticks.windows(2).enumerate().all(|(i, pair)| {
-            let label_width = |label: &str| label.len() as f64 * 6.7;
-            let left = label_width(&pair[0].1) * if i == 0 { 1.0 } else { 0.5 };
-            let right = label_width(&pair[1].1) * if i + 2 == ticks.len() { 1.0 } else { 0.5 };
-            (view.fraction(pair[1].0) - view.fraction(pair[0].0)) * width >= left + right + 6.0
-        });
-        if !fits {
+        let mut candidate = labels(&times);
+        let last = candidate.len() - 1;
+        let fits = |i: usize, pair: &[(DateTime<Utc>, String)]| {
+            let left = pair[0].1.len() as f64 * if i == 0 { 6.7 } else { 3.35 };
+            let right = pair[1].1.len() as f64 * if i + 1 == last { 6.7 } else { 3.35 };
+            left == 0.0 || right == 0.0 || (view.fraction(pair[1].0) - view.fraction(pair[0].0)) * width >= left + right + 6.0
+        };
+        // Keep the endpoint gridlines at the viewport bounds, but prefer a whole-hour label when they collide.
+        if hourly {
+            if hour_offset(view.start) != TimeDelta::zero() && !fits(0, &candidate[..2]) {
+                candidate[0].1.clear();
+            }
+            if hour_offset(view.end) != TimeDelta::zero() && !fits(last - 1, &candidate[last - 1..]) {
+                candidate[last].1.clear();
+            }
+        }
+        if candidate.windows(2).enumerate().all(|(i, pair)| fits(i, pair)) {
+            ticks = candidate;
+        } else {
             times.remove(index);
         }
     }
-    labels(&times)
+    ticks
 }
 
 #[component]
@@ -488,7 +512,9 @@ pub(super) fn TimeAxis(
                     rsx! {
                         line { x1: "{x}", x2: "{x}", y1: "{y1}", y2: "{y2}",
                             class: if grid { "chart-gridline subtle time-gridline" } else { "chart-gridline" } }
-                        text { x: "{x}", y: "{plot.bottom + label_offset}", text_anchor: anchor, "{label}" }
+                         if !label.is_empty() {
+                             text { x: "{x}", y: "{plot.bottom + label_offset}", text_anchor: anchor, "{label}" }
+                         }
                     }
                 }
             }
@@ -814,7 +840,7 @@ fn QuotaExplorer(
                 }
             }
         }
-        div { class: "row quota-plot-controls",
+        div { class: "row quota-plot-controls quota-legend-slot",
             if has_layout_choice {
                 div { class: "segmented", role: "group", aria_label: "Quota chart layout",
                     button { class: "seg-btn", aria_pressed: !small, onclick: move |_| { multiples.set(Some(false)); scrub.clear(); }, "Overlay" }
@@ -1366,7 +1392,7 @@ fn InteractiveBars(
                         }
                     }
                     if rhythm && items.iter().any(|item| item.failures > 0) {
-                        span { class: "chart-legend-item form-help", span { class: "chart-swatch outlier", aria_hidden: "true" } "Failed requests" }
+                        span { class: "chart-legend-item form-help", span { class: "chart-swatch outlier", aria_hidden: "true" } "Hour with ≥1 failure" }
                     }
                     span { class: "chart-inspect form-help", "{INSPECT}" }
                 }
@@ -1512,7 +1538,8 @@ pub(super) fn CacheHitRateChart(points: Vec<ActivityTrendPoint>, #[props(default
     let count = points.len();
     let width = (measure.width)().max(100.0);
     let plot = TimePlotBox { bottom: 118.0, ..activity_plot(width) };
-    let volume = TimePlotBox { top: plot.bottom + 22.0, bottom: plot.bottom + 46.0, ..plot };
+    let volume_top = plot.bottom + 22.0;
+    let volume = TimePlotBox { top: volume_top, bottom: volume_top + 44.0, ..plot };
     let inspection = TimePlotBox { bottom: volume.bottom, ..plot };
     let height = volume.bottom + 24.0;
     let step = (plot.right - plot.left) / count.max(1) as f64;
@@ -1603,13 +1630,14 @@ fn HeatmapScale(metric: Metric, max: f64) -> Element {
     };
     rsx! {
         div { class: "activity-heat-scale", aria_label: "Heatmap color scale: zero to {peak}{unit}",
+            span { class: "chart-heat-swatch zero", aria_hidden: "true" }
             span { class: "mono", "0" }
-            span { "Less" }
+            span { "Low" }
             for step in [0.12, 0.36, 0.65, 1.0] {
                 span { class: if metric == Metric::CacheHitRate { "chart-heat-swatch cache" } else { "chart-heat-swatch" },
                     style: "opacity: {step}", aria_hidden: "true" }
             }
-            span { "More" }
+            span { "Peak" }
             span { class: "mono", "{peak}{unit}" }
         }
     }
@@ -1686,12 +1714,16 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric, #[props(d
                     for h in 0..24 {
                         {
                             let value = value_at(d, h);
-                            let intensity = value.unwrap_or_default();
                             let is_active = active == Some((d, h));
                             let cx = 35.0 + step * h as f64;
                             let cy = 18 + 18 * d;
                             let outside = !in_scope(d);
-                            let state = if outside { "activity-heat-outside" } else if value.is_none() { "activity-heat-na" } else { cell_class };
+                            let (state, opacity) = match (outside, value) {
+                                (true, _) => ("activity-heat-outside", 1.0),
+                                (false, None) => ("activity-heat-na", 1.0),
+                                (false, Some(0.0)) => ("activity-heat-zero", 1.0),
+                                (false, Some(intensity)) => (cell_class, 0.12 + 0.88 * (intensity / max).clamp(0.0, 1.0)),
+                            };
                             let active_class = if is_active { "chart-cell-active" } else { "" };
                             let description = if outside { "Outside selected window".into() } else if value.is_none() {
                                 "N/A · no input tokens".into()
@@ -1705,8 +1737,7 @@ pub(super) fn ActivityHeatmap(cells: Vec<HeatmapCell>, metric: Metric, #[props(d
                                     rx: "2",
                                     class: "{state} {active_class} chart-hit",
                                     fill: if outside { format!("url(#{hatch})") } else { String::new() },
-                                     opacity: if outside || value.is_none() { 1.0 } else if intensity == 0.0 { 0.04 }
-                                         else { 0.12 + 0.88 * (intensity / max).clamp(0.0, 1.0) },
+                                    opacity,
                                     onmouseenter: move |_| hovered.set(Some((d, h))),
                                     title { "{day} {h:02}:00 · {description}" }
                                 }
@@ -1951,6 +1982,30 @@ mod tests {
     }
 
     #[test]
+    fn hourly_ticks_snap_interiors_and_hide_a_fractional_label_near_midnight() {
+        let midnight = DateTime::UNIX_EPOCH + TimeDelta::days(1);
+        let start = midnight - TimeDelta::hours(10) + TimeDelta::minutes(15);
+        let view = TimeBounds { start, end: start + TimeDelta::days(1) };
+        let ticks = time_ticks(view, 1000.0, false, false);
+        assert_eq!(ticks[0], (view.start, "Jan 01 14:15".into()));
+        assert_eq!(ticks[4], (view.end, "14:15".into()));
+        assert!(ticks[1..4].iter().all(|(at, _)| at.timestamp().rem_euclid(3600) == 0));
+        assert!(ticks.contains(&(midnight, "Jan 02 00:00".into())));
+
+        let start = midnight - TimeDelta::minutes(15);
+        let view = TimeBounds { start, end: start + TimeDelta::days(1) };
+        let ticks = time_ticks(view, 260.0, true, false);
+        assert_eq!(ticks, [(view.start, String::new()), (midnight, "Jan 02 00:00".into()), (view.end, "23:45".into())]);
+        let end = midnight + TimeDelta::minutes(15);
+        let view = TimeBounds { start: end - TimeDelta::hours(48), end };
+        let ticks = time_ticks(view, 1000.0, false, false);
+        assert_eq!(ticks.len(), 5);
+        assert_eq!(ticks[4], (view.end, String::new()));
+        assert!(ticks[1..4].iter().all(|(at, _)| at.timestamp().rem_euclid(3600) == 0));
+        assert!(ticks.contains(&(midnight, "Jan 02 00:00".into())));
+    }
+
+    #[test]
     fn quota_pool_defaults_to_multiples_only_above_six_series() {
         assert!(!quota_defaults_to_multiples(true, 6));
         assert!(quota_defaults_to_multiples(true, 7));
@@ -1975,8 +2030,8 @@ mod tests {
         }
         let mutations = VirtualDom::new(app).rebuild_to_vec();
         let heights = svg_attribute_values(&mutations, "height");
-        assert!(heights.contains(&"12")); // Half the input of the highest-volume bucket.
-        assert!(heights.contains(&"24"));
+        assert!(heights.contains(&"22")); // Half the input of the highest-volume bucket.
+        assert!(heights.contains(&"44"));
         assert!(!heights.contains(&"0")); // No empty volume rectangle for the unobserved bucket.
         let rendered = format!("{mutations:?}");
         assert!(rendered.contains("activity-volume-bar"));
@@ -1985,6 +2040,30 @@ mod tests {
         assert!(rendered.contains("0.0%"));
         assert!(rendered.contains("—"));
         assert!(!rendered.contains("activity-cache-segment"));
+    }
+
+    #[test]
+    fn heatmap_distinguishes_zero_low_missing_and_outside_cells() {
+        fn app() -> Element {
+            let zero = HeatmapCell {
+                day_of_week: 0,
+                hour: 0,
+                requests: 1,
+                tokens: 100,
+                input_tokens: 100,
+                cache_read_tokens: 0,
+                cache_hit_rate: 0.0,
+                api_equivalent_cost_usd: 0.0,
+            };
+            let low = HeatmapCell { hour: 1, cache_read_tokens: 1, cache_hit_rate: 0.01, ..zero.clone() };
+            let peak = HeatmapCell { hour: 2, cache_read_tokens: 100, cache_hit_rate: 1.0, ..zero.clone() };
+            rsx! { ActivityHeatmap { cells: vec![zero, low, peak], metric: Metric::CacheHitRate, covered_weekdays: vec![0] } }
+        }
+        let mutations = VirtualDom::new(app).rebuild_to_vec();
+        let classes = svg_attribute_values(&mutations, "class");
+        for state in ["activity-heat-zero", "chart-heat-cache", "activity-heat-na", "activity-heat-outside"] {
+            assert!(classes.iter().any(|class| class.split_whitespace().any(|token| token == state)), "{state}");
+        }
     }
 
     #[test]

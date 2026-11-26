@@ -352,7 +352,7 @@ fn AttentionRow(title: String, detail: String, workspace: Workspace, item: Optio
                 strong { "{title}" }
                 span { class: "muted", style: "font-size: 12px;", "{detail}" }
             }
-            span { class: "row-chevron nowrap-unit", style: "color: var(--honey); font-size: 12px;",
+            span { class: "row-action-pill nowrap-unit",
                 "{action} "
                 span { aria_hidden: "true", "›" }
             }
@@ -537,7 +537,7 @@ fn AlertRow(alert: ServiceAlert) -> Element {
                     span { class: "alert-detail", "The service failed its health check." }
                 }
             }
-            span { class: "btn btn-xs nowrap-unit",
+            span { class: "row-action-pill nowrap-unit",
                 if selected {
                     "Selected"
                 } else {

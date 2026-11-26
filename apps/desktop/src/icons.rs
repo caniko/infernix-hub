@@ -11,6 +11,7 @@ const MEMORY: &str = include_str!("../assets/icons/memory.svg");
 const AGENTS: &str = include_str!("../assets/icons/agents.svg");
 const SETTINGS: &str = include_str!("../assets/icons/settings.svg");
 const USAGE: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4v16h16M8 15l4-5 4 2 4-6"/></svg>"#;
+const RADAR: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><path d="m12 12 6.4-6.4"/><circle cx="8" cy="16" r="1.2" fill="currentColor" stroke="none"/></svg>"#;
 const BELL: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg>"#;
 const ALERT: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 4.6 2.5 18a1.6 1.6 0 0 0 1.4 2.4h16.2a1.6 1.6 0 0 0 1.4-2.4L13.7 4.6a2 2 0 0 0-3.4 0ZM12 9v4m0 4h.01"/></svg>"#;
 const CALENDAR: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4m8-4v4m-8 7h2m4 0h2m-8 3h2"/></svg>"#;
@@ -29,7 +30,7 @@ pub fn workspace(w: Workspace) -> &'static str {
         Workspace::Providers => USAGE,
         Workspace::Today => SUN,
         Workspace::News => DOCUMENTS,
-        Workspace::Intelligence => USAGE,
+        Workspace::Intelligence => RADAR,
         Workspace::Studio => SPARKLES,
         Workspace::Calendar => CALENDAR,
         Workspace::Mail => MAIL,
@@ -43,3 +44,13 @@ pub fn workspace(w: Workspace) -> &'static str {
 pub const PERSONA: &str = AGENTS;
 #[allow(dead_code)]
 pub const INSPECTOR: &str = SETTINGS;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intelligence_and_provider_usage_have_distinct_icons() {
+        assert_ne!(workspace(Workspace::Intelligence), workspace(Workspace::Providers));
+    }
+}

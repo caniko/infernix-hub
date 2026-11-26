@@ -72,7 +72,7 @@ fn CaptureEditor(policy: CapturePolicy) -> Element {
         _ => None,
     };
     rsx! {
-        dl { class: "kv-grid content-bounded", aria_label: "Capture counters",
+        dl { class: "kv-grid content-bounded capture-counters-grid", aria_label: "Capture counters",
             for (label, value) in [
                 ("Bodies", policy.health.stored_bodies),
                 ("Bytes", policy.health.stored_bytes),
@@ -376,7 +376,7 @@ fn Settings(providers: Vec<ProviderSummary>) -> Element {
             fieldset { class: "form-stack", disabled: !operator || saving(), style: "border: 0; padding: 0; margin: 0; min-width: 0;",
                 div { class: "form-grid-2 content-bounded", style: "align-items: start; max-width: 36rem;",
                     div { class: "form-field",
-                        label { class: "form-help", r#for: "provider-reload-interval", "Provider reload interval" }
+                        label { class: "form-help", r#for: "provider-reload-interval", "Provider reload interval (sec)" }
                         input { id: "provider-reload-interval", class: "input", r#type: "number", min: "5", max: "3600",
                             aria_describedby: "provider-reload-help", value: cadence(), oninput: move |e| cadence.set(e.value()) }
                         p { id: "provider-reload-help", class: "form-help", "5–3,600 seconds between automatic reloads." }
@@ -390,7 +390,7 @@ fn Settings(providers: Vec<ProviderSummary>) -> Element {
                 }
                 Check { label: "Mask emails", value: settings.mask_emails, change: move |v| draft.write().mask_emails = v }
                 h3 { "Notifications" }
-                div { class: "form-grid-2 content-bounded", style: "max-width: 28rem; row-gap: 4px;", role: "group", aria_label: "Notifications",
+                div { class: "form-grid-2 content-bounded", style: "max-width: 36rem; row-gap: 4px;", role: "group", aria_label: "Notifications",
                     Check { label: "Limit hit", value: settings.notify_limit_hit, change: move |v| draft.write().notify_limit_hit = v }
                     Check { label: "Limit reset", value: settings.notify_limit_reset, change: move |v| draft.write().notify_limit_reset = v }
                     Check { label: "Account switch", value: settings.notify_account_switch, change: move |v| draft.write().notify_account_switch = v }
