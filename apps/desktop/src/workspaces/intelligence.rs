@@ -21,6 +21,15 @@ use crate::{
 struct ClearanceDraft {
     audience: Option<Audience>,
     rationale: String,
+    review_key: Option<ReviewKey>,
+}
+
+type ReviewKey = (i32, i32, String);
+
+impl ClearanceDraft {
+    fn audience_for(&self, review_key: &ReviewKey) -> Option<Audience> {
+        self.audience.filter(|_| self.review_key.as_ref() == Some(review_key))
+    }
 }
 
 type ClearanceDrafts = Signal<HashMap<Uuid, ClearanceDraft>>;
@@ -443,7 +452,12 @@ fn ClearanceForm(
     saving: bool,
     on_clear: EventHandler<SignalClearanceIn>,
 ) -> Element {
-    let ClearanceDraft { audience, rationale } = drafts.read().get(&id).cloned().unwrap_or_default();
+    let review_key = (review.revision, review.policy_version, review.projection_sha256.clone());
+    let draft = drafts.read().get(&id).cloned().unwrap_or_default();
+    let audience = draft.audience_for(&review_key);
+    let reconfirm = draft.audience.is_some() && audience.is_none();
+    let choice_key = review_key.clone();
+    let rationale = draft.rationale;
     let ready = !saving && audience.is_some() && !rationale.trim().is_empty();
     rsx! {
         form { class: "stack",
@@ -451,7 +465,7 @@ fn ClearanceForm(
                 event.prevent_default();
                 let drafts = drafts.peek();
                 if !saving && let Some(draft) = drafts.get(&id)
-                    && let Some(audience) = draft.audience && !draft.rationale.trim().is_empty()
+                    && let Some(audience) = draft.audience_for(&review_key) && !draft.rationale.trim().is_empty()
                 {
                     on_clear.call(SignalClearanceIn {
                         audience,
@@ -470,12 +484,20 @@ fn ClearanceForm(
             }
             label { "Clearance audience"
                 select { class: "input", required: true, disabled: saving, value: audience.map(Audience::as_str).unwrap_or_default(),
-                    onchange: move |event| drafts.write().entry(id).or_default().audience = Audience::parse(&event.value()),
-                    option { value: "", "Choose audience" }
+                    onchange: move |event| {
+                        let mut drafts = drafts.write();
+                        let draft = drafts.entry(id).or_default();
+                        draft.audience = Audience::parse(&event.value());
+                        draft.review_key = draft.audience.map(|_| choice_key.clone());
+                    },
+                    option { value: "", selected: audience.is_none(), "Choose audience" }
                     for level in Audience::ALL {
-                        option { value: level.as_str(), "{audience_label(*level)}" }
+                        option { value: level.as_str(), selected: audience == Some(*level), "{audience_label(*level)}" }
                     }
                 }
+            }
+            if reconfirm {
+                p { class: "form-help", role: "status", "Signal revision changed — confirm the audience again before clearing." }
             }
             label { "Rationale"
                 textarea { class: "input", required: true, disabled: saving, maxlength: 4000,
@@ -498,34 +520,55 @@ mod tests {
 
     #[test]
     fn clearance_draft_survives_an_empty_filter_result_and_reset() {
-        fn app(query_handle: Rc<Cell<Option<Signal<IntelSignalQuery>>>>) -> Element {
+        check_clearance_remount(|_| {}, false);
+    }
+
+    #[test]
+    fn clearance_draft_requires_reconfirmation_after_each_review_identity_change() {
+        check_clearance_remount(|review| review.revision += 1, true);
+        check_clearance_remount(|review| review.policy_version += 1, true);
+        check_clearance_remount(|review| review.projection_sha256.push_str("-changed"), true);
+    }
+
+    fn check_clearance_remount(update_review: impl FnOnce(&mut IntelSignalReview), reconfirm: bool) {
+        type Handles = Rc<Cell<Option<(Signal<IntelSignalQuery>, Signal<IntelSignalReview>)>>>;
+        #[derive(Clone, PartialEq, Props)]
+        struct TestProps {
+            handles: Handles,
+            submitted: Rc<Cell<Option<Audience>>>,
+        }
+        fn app(TestProps { handles, submitted }: TestProps) -> Element {
             let query = use_signal(IntelSignalQuery::default);
             let drafts = use_signal(HashMap::new);
-            query_handle.set(Some(query));
-            let review = IntelSignalReview {
+            let review = use_signal(|| IntelSignalReview {
                 projection_sha256: "projection".into(),
                 policy_version: 1,
                 revision: 1,
                 first_seen_at: DateTime::UNIX_EPOCH,
                 updated_at: DateTime::UNIX_EPOCH,
-            };
+            });
+            handles.set(Some((query, review)));
             rsx! {
                 if has_signal_filters(&query.read()) {
                     p { "{empty_signal_title(&query.read())}" }
                 } else {
-                    ClearanceForm { id: Uuid::nil(), drafts, review, source_default_audience: Audience::OperatorOnly, saving: false, on_clear: |_| {} }
+                    ClearanceForm {
+                        id: Uuid::nil(), drafts, review: review.cloned(), source_default_audience: Audience::OperatorOnly,
+                        saving: false, on_clear: move |input: SignalClearanceIn| submitted.set(Some(input.audience)),
+                    }
                 }
             }
         }
 
         set_event_converter(Box::new(SerializedHtmlEventConverter));
-        let query_handle = Rc::new(Cell::new(None));
-        let mut dom = VirtualDom::new_with_props(app, query_handle.clone());
+        let handles = Rc::new(Cell::new(None));
+        let submitted = Rc::new(Cell::new(None));
+        let mut dom = VirtualDom::new_with_props(app, TestProps { handles: handles.clone(), submitted: submitted.clone() });
         let initial = dom.rebuild_to_vec();
-        let mut query = query_handle.get().unwrap();
-        let dispatch = |name, value: &str| {
+        let (mut query, mut review) = handles.get().unwrap();
+        let dispatch = |dom: &VirtualDom, edits: &[Mutation], name, value: &str| {
             let mut id = None;
-            for mutation in &initial.edits {
+            for mutation in edits {
                 match mutation {
                     Mutation::PushId { id: current } => id = Some(*current),
                     Mutation::NewEventListener { name: listener } if listener == name => {
@@ -540,15 +583,18 @@ mod tests {
         };
         let audience = Audience::CompanyInternal.as_str();
         let rationale = "Reviewed the source evidence";
-        dispatch("change", audience);
-        dispatch("input", rationale);
+        dispatch(&dom, &initial.edits, "change", audience);
+        dispatch(&dom, &initial.edits, "input", rationale);
         let typed = format!("{:?}", dom.render_immediate_to_vec());
         assert!(typed.contains(audience) && typed.contains(rationale));
 
         dom.in_runtime(|| query.write().state = Some(SignalState::Acknowledged));
         let empty = format!("{:?}", dom.render_immediate_to_vec());
         assert!(empty.contains("No matching signals."));
-        dom.in_runtime(|| query.set(IntelSignalQuery::default()));
+        dom.in_runtime(|| {
+            update_review(&mut review.write());
+            query.set(IntelSignalQuery::default());
+        });
         let reset = dom.render_immediate_to_vec();
         let values: Vec<_> = reset
             .edits
@@ -558,8 +604,29 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(values.first(), Some(&audience)); // Select value, before its option values.
+        let expected = if reconfirm { "" } else { audience };
+        assert_eq!(values.first(), Some(&expected)); // Select value, before its option values.
         assert_eq!(values.last(), Some(&rationale)); // Textarea value.
+        assert_eq!(format!("{reset:?}").contains("Signal revision changed"), reconfirm);
+        let selected: Vec<_> = reset
+            .edits
+            .iter()
+            .filter_map(|mutation| match mutation {
+                Mutation::SetAttribute { name, value: AttributeValue::Bool(selected), .. } if name == "selected" => Some(*selected),
+                _ => None,
+            })
+            .collect();
+        let expected_selection: Vec<_> =
+            std::iter::once(reconfirm).chain(Audience::ALL.iter().map(|level| level.as_str() == expected)).collect();
+        assert_eq!(selected, expected_selection);
+        dispatch(&dom, &reset.edits, "submit", "");
+        assert_eq!(submitted.get(), (!reconfirm).then_some(Audience::CompanyInternal));
+        if reconfirm {
+            dispatch(&dom, &reset.edits, "change", audience);
+            dom.render_immediate_to_vec();
+            dispatch(&dom, &reset.edits, "submit", "");
+            assert_eq!(submitted.get(), Some(Audience::CompanyInternal));
+        }
     }
 
     #[test]
