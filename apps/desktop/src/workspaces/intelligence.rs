@@ -22,11 +22,20 @@ struct ClearanceDraft {
     audience: Option<Audience>,
     rationale: String,
     review_key: Option<ReviewKey>,
+    reconfirm: bool,
 }
 
 type ReviewKey = (i32, i32, String);
 
 impl ClearanceDraft {
+    fn invalidate_for(&mut self, review_key: &ReviewKey) {
+        if self.audience.is_some() && self.review_key.as_ref() != Some(review_key) {
+            self.audience = None;
+            self.review_key = None;
+            self.reconfirm = true;
+        }
+    }
+
     fn audience_for(&self, review_key: &ReviewKey) -> Option<Audience> {
         self.audience.filter(|_| self.review_key.as_ref() == Some(review_key))
     }
@@ -453,9 +462,14 @@ fn ClearanceForm(
     on_clear: EventHandler<SignalClearanceIn>,
 ) -> Element {
     let review_key = (review.revision, review.policy_version, review.projection_sha256.clone());
+    if drafts.peek().get(&id).is_some_and(|draft| draft.audience.is_some() && draft.review_key.as_ref() != Some(&review_key))
+        && let Some(draft) = drafts.write().get_mut(&id)
+    {
+        draft.invalidate_for(&review_key);
+    }
     let draft = drafts.read().get(&id).cloned().unwrap_or_default();
     let audience = draft.audience_for(&review_key);
-    let reconfirm = draft.audience.is_some() && audience.is_none();
+    let reconfirm = draft.reconfirm;
     let choice_key = review_key.clone();
     let rationale = draft.rationale;
     let ready = !saving && audience.is_some() && !rationale.trim().is_empty();
@@ -489,6 +503,9 @@ fn ClearanceForm(
                         let draft = drafts.entry(id).or_default();
                         draft.audience = Audience::parse(&event.value());
                         draft.review_key = draft.audience.map(|_| choice_key.clone());
+                        if draft.audience.is_some() {
+                            draft.reconfirm = false;
+                        }
                     },
                     option { value: "", selected: audience.is_none(), "Choose audience" }
                     for level in Audience::ALL {
@@ -528,6 +545,78 @@ mod tests {
         check_clearance_remount(|review| review.revision += 1, true);
         check_clearance_remount(|review| review.policy_version += 1, true);
         check_clearance_remount(|review| review.projection_sha256.push_str("-changed"), true);
+    }
+
+    #[test]
+    fn clearance_draft_stays_invalidated_after_policy_rollback() {
+        type Handles = Rc<Cell<Option<(Signal<IntelSignalQuery>, Signal<IntelSignalReview>)>>>;
+        #[derive(Clone, PartialEq, Props)]
+        struct TestProps {
+            handles: Handles,
+            submitted: Rc<Cell<Option<Audience>>>,
+        }
+        fn app(TestProps { handles, submitted }: TestProps) -> Element {
+            let query = use_signal(IntelSignalQuery::default);
+            let drafts = use_signal(HashMap::new);
+            let review = use_signal(|| IntelSignalReview {
+                projection_sha256: "projection".into(),
+                policy_version: 1,
+                revision: 1,
+                first_seen_at: DateTime::UNIX_EPOCH,
+                updated_at: DateTime::UNIX_EPOCH,
+            });
+            handles.set(Some((query, review)));
+            rsx! {
+                ClearanceForm {
+                    id: Uuid::nil(), drafts, review: review.cloned(), source_default_audience: Audience::OperatorOnly,
+                    saving: false, on_clear: move |input: SignalClearanceIn| submitted.set(Some(input.audience)),
+                }
+            }
+        }
+
+        set_event_converter(Box::new(SerializedHtmlEventConverter));
+        let handles = Rc::new(Cell::new(None));
+        let submitted = Rc::new(Cell::new(None));
+        let mut dom = VirtualDom::new_with_props(app, TestProps { handles: handles.clone(), submitted: submitted.clone() });
+        let initial = dom.rebuild_to_vec();
+        let (_, mut review) = handles.get().unwrap();
+        let dispatch = |dom: &VirtualDom, edits: &[Mutation], name, value: &str| {
+            let mut id = None;
+            for mutation in edits {
+                match mutation {
+                    Mutation::PushId { id: current } => id = Some(*current),
+                    Mutation::NewEventListener { name: listener } if listener == name => {
+                        let data = PlatformEventData::new(Box::new(SerializedFormData::new(value.into(), vec![])));
+                        dom.runtime().handle_event(name, Event::new(Rc::new(data), true).into_any(), id.unwrap());
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("No {name} listener in clearance form");
+        };
+        let audience = Audience::CompanyInternal.as_str();
+        let rationale = "Reviewed under policy v1";
+        dispatch(&dom, &initial.edits, "change", audience);
+        dispatch(&dom, &initial.edits, "input", rationale);
+        dom.render_immediate_to_vec();
+
+        // Transition v1 -> v2 (observes mismatch and invalidates stored audience/key).
+        dom.in_runtime(|| review.write().policy_version = 2);
+        let under_v2 = dom.render_immediate_to_vec();
+        assert!(format!("{under_v2:?}").contains("Signal revision changed"));
+
+        // Roll back v2 -> v1 without re-selecting audience: must remain cleared and blocked.
+        dom.in_runtime(|| review.write().policy_version = 1);
+        dom.render_immediate_to_vec();
+        dispatch(&dom, &initial.edits, "submit", "");
+        assert_eq!(submitted.get(), None);
+
+        // Re-selecting audience under v1 restores submission and clears reconfirmation state.
+        dispatch(&dom, &initial.edits, "change", audience);
+        dom.render_immediate_to_vec();
+        dispatch(&dom, &initial.edits, "submit", "");
+        assert_eq!(submitted.get(), Some(Audience::CompanyInternal));
     }
 
     fn check_clearance_remount(update_review: impl FnOnce(&mut IntelSignalReview), reconfirm: bool) {
