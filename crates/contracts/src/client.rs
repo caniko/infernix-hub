@@ -137,11 +137,20 @@ impl HubClient {
     pub async fn intel_decide(&self, id: Uuid, body: &SignalDecisionIn) -> Result<IntelSignal, ClientError> {
         self.post(&format!("/intel/signals/{id}/decision"), body).await
     }
+    /// First clearance only (an omitted generation is treated as zero).
     pub async fn intel_clear(&self, id: Uuid, body: &SignalClearanceIn) -> Result<IntelSignal, ClientError> {
+        self.post(&format!("/intel/signals/{id}/clearance"), body).await
+    }
+    /// Clear using the generation from the signal that was reviewed.
+    pub async fn intel_clear_with_generation(&self, id: Uuid, body: &ClearSignalIn) -> Result<IntelSignal, ClientError> {
         self.post(&format!("/intel/signals/{id}/clearance"), body).await
     }
     pub async fn intel_sources(&self) -> Result<Vec<IntelSourceStatus>, ClientError> {
         self.get("/intel/sources").await
+    }
+
+    pub async fn intel_promote_from_mail(&self, body: &PromoteFromMailIn) -> Result<SignalBatchOut, ClientError> {
+        self.post("/intel/promotions/from-mail", body).await
     }
     pub async fn news(&self) -> Result<Vec<NewsItem>, ClientError> {
         self.get("/news").await

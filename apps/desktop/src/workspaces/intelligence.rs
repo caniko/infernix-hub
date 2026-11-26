@@ -1,11 +1,12 @@
-//! Operator review of policy-scoped signals. Evidence and projections are text, never markup or navigation.
+//! Review of policy-scoped signals. Evidence and projections are text, never markup or navigation.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use contracts::{
-    Audience, IntelRunStatus, IntelSignal, IntelSignalDetail, IntelSignalQuery, IntelSignalReview, IntelSourceStatus, ProvenanceMethod,
-    Severity, SignalClearanceIn, SignalDecisionAction, SignalDecisionIn, SignalState, client::HubClient,
+    Audience, ClearSignalIn, IntelRunStatus, IntelSignal, IntelSignalDetail, IntelSignalPage, IntelSignalQuery, IntelSignalReview,
+    IntelSourceStatus, ProvenanceMethod, Role, Severity, SignalClearanceIn, SignalDecisionAction, SignalDecisionIn, SignalState,
+    SystemStatus, client::HubClient,
 };
 use dioxus::prelude::*;
 use uuid::Uuid;
@@ -14,7 +15,7 @@ use crate::{
     api,
     components::{Chip, EmptyState, ErrorCard, Loading},
     format, labels,
-    state::{Store, UiError},
+    state::{Loaded, Store, UiError},
 };
 
 #[derive(Clone, Default)]
@@ -25,7 +26,7 @@ struct ClearanceDraft {
     reconfirm: bool,
 }
 
-type ReviewKey = (i32, i32, String);
+type ReviewKey = (i32, i32, String, i64);
 
 impl ClearanceDraft {
     fn invalidate_for(&mut self, review_key: &ReviewKey) {
@@ -43,12 +44,71 @@ impl ClearanceDraft {
 
 type ClearanceDrafts = Signal<HashMap<Uuid, ClearanceDraft>>;
 
+fn use_revocation_poll<T: 'static>(status: Signal<Loaded<SystemStatus>>, mut resource: Resource<T>) {
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(api::POLL_INTERVAL_MS)).await;
+            if !resource.pending() && status.peek().data.as_ref().is_some_and(|status| status.principal.role != Role::Operator) {
+                resource.restart();
+            }
+        }
+    });
+}
+
+fn can_review(status: Option<&SystemStatus>) -> bool {
+    status
+        .is_some_and(|status| status.principal.role == Role::Operator || status.capabilities.as_ref().is_some_and(|caps| caps.intel_review))
+}
+
+fn clearance_audiences(status: Option<&SystemStatus>) -> &[Audience] {
+    match status {
+        Some(status) if status.principal.role == Role::Operator => Audience::ALL,
+        Some(status) => {
+            status.capabilities.as_ref().filter(|caps| caps.intel_clear).map_or(&[], |caps| caps.intel_clear_audiences.as_slice())
+        }
+        None => &[],
+    }
+}
+
+fn page_revokes_selection(
+    query: &IntelSignalQuery,
+    result: &Result<IntelSignalPage, UiError>,
+    id: Uuid,
+    watched: Option<&(Uuid, IntelSignalQuery)>,
+) -> bool {
+    match result {
+        Err(error) => error.access_lost(),
+        // Changing filters or pages is not a revocation. A refresh of the
+        // same page that held this selection is authoritative for that view.
+        Ok(page) => {
+            watched.is_some_and(|(watched_id, watched_query)| *watched_id == id && watched_query == query)
+                && !page.items.iter().any(|item| item.id == id)
+        }
+    }
+}
+
+fn evict_signal(selected: &mut Option<Uuid>, drafts: &mut HashMap<Uuid, ClearanceDraft>, id: Uuid) {
+    drafts.remove(&id);
+    if *selected == Some(id) {
+        *selected = None;
+    }
+}
+
+fn discard_denied_clearance(drafts: &mut HashMap<Uuid, ClearanceDraft>, id: Uuid, error: &UiError) {
+    if error.access_lost() {
+        drafts.remove(&id);
+    }
+}
+
 #[component]
 pub fn IntelligenceView() -> Element {
     let client = use_context::<HubClient>();
-    let mut selected = use_context::<Store>().selected_signal;
+    let store = use_context::<Store>();
+    let mut selected = store.selected_signal;
     let mut query = use_signal(IntelSignalQuery::default);
-    let drafts = use_signal(HashMap::new);
+    let mut drafts = use_signal(HashMap::new);
+    let mut watched = use_signal(|| None::<(Uuid, IntelSignalQuery)>);
+    let mut refresh = use_signal(|| 0u64);
     let source_client = client.clone();
     let mut sources = use_resource(move || {
         let client = source_client.clone();
@@ -57,15 +117,36 @@ pub fn IntelligenceView() -> Element {
     let mut stream = use_resource(move || {
         let client = client.clone();
         let query = query.cloned();
+        refresh();
         async move {
             let result = api::intel_signals(&client, &query).await;
+            if result.as_ref().is_err_and(UiError::access_lost) {
+                // This denial covers the stream, not just the selected row.
+                drafts.write().clear();
+            }
+            let current = *selected.peek();
+            if let Some(id) = current {
+                if page_revokes_selection(&query, &result, id, watched.peek().as_ref()) {
+                    evict_signal(&mut selected.write(), &mut drafts.write(), id);
+                    watched.set(None);
+                } else if result.as_ref().is_ok_and(|page| page.items.iter().any(|item| item.id == id)) {
+                    watched.set(Some((id, query.clone())));
+                }
+            }
             (query, result)
         }
     });
+    use_revocation_poll(store.status, stream);
+    use_revocation_poll(store.status, sources);
     let filters = query.cloned();
     let source_data = sources.cloned();
     let source_options = source_data.as_ref().and_then(|result| result.as_ref().ok());
     let page = stream.cloned().filter(|(loaded_query, _)| *loaded_query == filters);
+    let detail_revoked = move |id| {
+        evict_signal(&mut selected.write(), &mut drafts.write(), id);
+        stream.clear();
+        stream.restart();
+    };
     let has_signal_page = matches!(&page, Some((_, Ok(_))));
     let empty_title = match &page {
         Some((_, Ok(page))) if page.items.is_empty() => Some(empty_signal_title(&filters)),
@@ -156,7 +237,10 @@ pub fn IntelligenceView() -> Element {
                                         key: "{id}",
                                         class: if selected() == Some(id) { "context-item active" } else { "context-item" },
                                         aria_pressed: selected() == Some(id),
-                                        onclick: move |_| selected.set(Some(id)),
+                                        onclick: move |_| {
+                                            watched.set(Some((id, query.peek().clone())));
+                                            selected.set(Some(id));
+                                        },
                                         span { class: "ctx-title", style: "overflow-wrap: anywhere;", "{signal.title}" }
                                         {signal_badges(&signal)}
                                         span { class: "ctx-meta", "{state_label(signal.state)} · {age(signal.occurred_at)}" }
@@ -179,7 +263,7 @@ pub fn IntelligenceView() -> Element {
             div { class: "content-bounded",
                 div { class: "work-head",
                     h1 { "Intelligence" }
-                    button { class: "btn btn-glass btn-xs", onclick: move |_| { sources.restart(); stream.restart(); }, "Refresh sources and signals" }
+                    button { class: "btn btn-glass btn-xs", onclick: move |_| { sources.restart(); refresh += 1; }, "Refresh sources and signals" }
                 }
                 section { class: "panel",
                     h2 { "Source health" }
@@ -201,9 +285,13 @@ pub fn IntelligenceView() -> Element {
                         title: title.to_string(),
                         hint: empty_stream.then(|| "Set up a source if none are listed above, or check Source health for ingest errors. Then refresh sources and signals.".to_string()),
                     }
-                } else if let Some(id) = selected() {
-                    SignalDetail { key: "{id}", id, drafts, on_changed: move |_| stream.restart() }
-                } else if has_signal_page {
+                }
+                if let Some(id) = selected() {
+                    SignalDetail {
+                        key: "{id}", id, drafts, refresh, visible: empty_title.is_none(),
+                        on_changed: move |_| stream.restart(), on_revoked: detail_revoked,
+                    }
+                } else if has_signal_page && empty_title.is_none() {
                     EmptyState { title: "Select a signal".to_string() }
                 }
             }
@@ -297,8 +385,16 @@ fn signal_badges(signal: &IntelSignal) -> Element {
 }
 
 #[component]
-fn SignalDetail(id: Uuid, mut drafts: ClearanceDrafts, on_changed: EventHandler<()>) -> Element {
+fn SignalDetail(
+    id: Uuid,
+    mut drafts: ClearanceDrafts,
+    refresh: Signal<u64>,
+    visible: bool,
+    on_changed: EventHandler<()>,
+    on_revoked: EventHandler<Uuid>,
+) -> Element {
     let client = use_context::<HubClient>();
+    let store = use_context::<Store>();
     let mut generation = use_signal(|| 0u64);
     let mut saving = use_signal(|| false);
     let mut error = use_signal(|| None::<UiError>);
@@ -307,10 +403,23 @@ fn SignalDetail(id: Uuid, mut drafts: ClearanceDrafts, on_changed: EventHandler<
     let detail = use_resource(move || {
         let client = detail_client.clone();
         let version = generation();
-        async move { (version, api::intel_signal(&client, id).await) }
+        refresh();
+        async move {
+            let result = api::intel_signal(&client, id).await;
+            if result.as_ref().is_err_and(UiError::access_lost) {
+                on_revoked.call(id);
+            }
+            (version, result)
+        }
     });
-    let mutate = use_callback(move |request: Result<SignalDecisionIn, SignalClearanceIn>| {
-        if *saving.peek() {
+    use_revocation_poll(store.status, detail);
+    let mutate = use_callback(move |request: Result<SignalDecisionIn, ClearSignalIn>| {
+        let status = store.status.peek();
+        let permitted = match &request {
+            Ok(_) => can_review(status.data.as_ref()),
+            Err(input) => clearance_audiences(status.data.as_ref()).contains(&input.reviewed.audience),
+        };
+        if *saving.peek() || !permitted {
             return;
         }
         saving.set(true);
@@ -332,9 +441,18 @@ fn SignalDetail(id: Uuid, mut drafts: ClearanceDrafts, on_changed: EventHandler<
                     on_changed.call(());
                     notice.set(Some("Signal updated."));
                 }
-                Err(e) => {
-                    if e.code == "stale_revision" {
+                Err(mut e) => {
+                    if clearing {
+                        discard_denied_clearance(&mut drafts.write(), id, &e);
+                    }
+                    if e.status == Some(409) && e.code == "stale_revision" {
+                        e.message = "This signal changed while you were reviewing it. Reloading the latest revision; review it before trying again.".into();
                         generation += 1;
+                    } else if e.access_lost() {
+                        generation += 1;
+                        if e.status == Some(404) {
+                            on_revoked.call(id);
+                        }
                     }
                     error.set(Some(e));
                 }
@@ -342,7 +460,15 @@ fn SignalDetail(id: Uuid, mut drafts: ClearanceDrafts, on_changed: EventHandler<
             saving.set(false);
         });
     });
+    if !visible {
+        return VNode::empty();
+    }
     let version = generation();
+    let status = store.status.read();
+    let operator = status.data.as_ref().is_some_and(|status| status.principal.role == Role::Operator);
+    let can_review = can_review(status.data.as_ref());
+    let allowed_audiences = clearance_audiences(status.data.as_ref()).to_vec();
+    drop(status);
     rsx! {
         if let Some(e) = error.cloned() {
             ErrorCard { code: e.code, message: e.message }
@@ -359,34 +485,40 @@ fn SignalDetail(id: Uuid, mut drafts: ClearanceDrafts, on_changed: EventHandler<
             Some(Ok(detail)) => {
                 let review = detail.signal.review.clone();
                 let source_default_audience = detail.signal.source_default_audience;
+                let clearance_generation = detail.signal.clearance_generation;
                 rsx! {
                     SignalBody { detail }
-                    section { class: "panel glass-card",
-                        h2 { "Operator actions" }
-                        div { class: "row",
-                            for (label, action, hours) in [
-                                ("Acknowledge", SignalDecisionAction::Acknowledge, None),
-                                ("Dismiss", SignalDecisionAction::Dismiss, None),
-                                ("Snooze 24h", SignalDecisionAction::Snooze, Some(24)),
-                                ("Snooze 7d", SignalDecisionAction::Snooze, Some(168)),
-                                ("Reopen", SignalDecisionAction::Reopen, None),
-                            ] {
-                                button {
-                                    key: "{label}", class: "btn btn-glass btn-xs", disabled: saving(),
-                                    onclick: move |_| mutate.call(Ok(SignalDecisionIn {
-                                        action,
-                                        until: hours.map(|hours| Utc::now() + TimeDelta::hours(hours)),
-                                        note: None,
-                                    })),
-                                    "{label}"
+                    if can_review && (operator || review.is_some()) {
+                        section { class: "panel glass-card",
+                            h2 { if operator { "Operator actions" } else { "Review actions" } }
+                            div { class: "row",
+                                for (label, action, hours) in [
+                                    ("Acknowledge", SignalDecisionAction::Acknowledge, None),
+                                    ("Dismiss", SignalDecisionAction::Dismiss, None),
+                                    ("Snooze 24h", SignalDecisionAction::Snooze, Some(24)),
+                                    ("Snooze 7d", SignalDecisionAction::Snooze, Some(168)),
+                                    ("Reopen", SignalDecisionAction::Reopen, None),
+                                ] {
+                                    button {
+                                        key: "{label}", class: "btn btn-glass btn-xs", disabled: saving(),
+                                        onclick: move |_| mutate.call(Ok(SignalDecisionIn {
+                                            action,
+                                            until: hours.map(|hours| Utc::now() + TimeDelta::hours(hours)),
+                                            note: None,
+                                        })),
+                                        "{label}"
+                                    }
                                 }
                             }
                         }
                     }
-                    if let Some(review) = review {
+                    if !allowed_audiences.is_empty() && let Some(review) = review {
                         section { class: "panel glass-card",
                             h2 { "Audience clearance" }
-                            ClearanceForm { id, drafts, review, source_default_audience, saving: saving(), on_clear: move |input| mutate.call(Err(input)) }
+                            ClearanceForm {
+                                id, drafts, review, source_default_audience, allowed_audiences, clearance_generation,
+                                saving: saving(), on_clear: move |input| mutate.call(Err(input)),
+                            }
                         }
                     }
                 }
@@ -458,17 +590,21 @@ fn ClearanceForm(
     mut drafts: ClearanceDrafts,
     review: IntelSignalReview,
     source_default_audience: Audience,
+    allowed_audiences: Vec<Audience>,
+    clearance_generation: i64,
     saving: bool,
-    on_clear: EventHandler<SignalClearanceIn>,
+    on_clear: EventHandler<ClearSignalIn>,
 ) -> Element {
-    let review_key = (review.revision, review.policy_version, review.projection_sha256.clone());
+    let review_key = (review.revision, review.policy_version, review.projection_sha256.clone(), clearance_generation);
     if drafts.peek().get(&id).is_some_and(|draft| draft.audience.is_some() && draft.review_key.as_ref() != Some(&review_key))
         && let Some(draft) = drafts.write().get_mut(&id)
     {
         draft.invalidate_for(&review_key);
     }
     let draft = drafts.read().get(&id).cloned().unwrap_or_default();
-    let audience = draft.audience_for(&review_key);
+    let audience = draft.audience_for(&review_key).filter(|audience| allowed_audiences.contains(audience));
+    let submit_audiences = allowed_audiences.clone();
+    let change_audiences = allowed_audiences.clone();
     let reconfirm = draft.reconfirm;
     let choice_key = review_key.clone();
     let rationale = draft.rationale;
@@ -479,15 +615,19 @@ fn ClearanceForm(
                 event.prevent_default();
                 let drafts = drafts.peek();
                 if !saving && let Some(draft) = drafts.get(&id)
-                    && let Some(audience) = draft.audience_for(&review_key) && !draft.rationale.trim().is_empty()
+                    && let Some(audience) = draft.audience_for(&review_key).filter(|audience| submit_audiences.contains(audience))
+                    && !draft.rationale.trim().is_empty()
                 {
-                    on_clear.call(SignalClearanceIn {
-                        audience,
-                        revision: review.revision,
-                        policy_version: review.policy_version,
-                        source_default_audience,
-                        projection_sha256: review.projection_sha256.clone(),
-                        rationale: draft.rationale.trim().to_string(),
+                    on_clear.call(ClearSignalIn {
+                        reviewed: SignalClearanceIn {
+                            audience,
+                            revision: review.revision,
+                            policy_version: review.policy_version,
+                            source_default_audience,
+                            projection_sha256: review.projection_sha256.clone(),
+                            rationale: draft.rationale.trim().to_string(),
+                        },
+                        expected_clearance_generation: Some(clearance_generation),
                     });
                 }
             },
@@ -501,20 +641,20 @@ fn ClearanceForm(
                     onchange: move |event| {
                         let mut drafts = drafts.write();
                         let draft = drafts.entry(id).or_default();
-                        draft.audience = Audience::parse(&event.value());
+                        draft.audience = Audience::parse(&event.value()).filter(|audience| change_audiences.contains(audience));
                         draft.review_key = draft.audience.map(|_| choice_key.clone());
                         if draft.audience.is_some() {
                             draft.reconfirm = false;
                         }
                     },
                     option { value: "", selected: audience.is_none(), "Choose audience" }
-                    for level in Audience::ALL {
-                        option { value: level.as_str(), selected: audience == Some(*level), "{audience_label(*level)}" }
+                    for level in Audience::ALL.iter().copied().filter(|level| allowed_audiences.contains(level)) {
+                        option { value: level.as_str(), selected: audience == Some(level), "{audience_label(level)}" }
                     }
                 }
             }
             if reconfirm {
-                p { class: "form-help", role: "status", "Signal revision changed — confirm the audience again before clearing." }
+                p { class: "form-help", role: "status", "Signal review or clearance changed — confirm the audience again before clearing." }
             }
             label { "Rationale"
                 textarea { class: "input", required: true, disabled: saving, maxlength: 4000,
@@ -529,6 +669,127 @@ fn ClearanceForm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_review_and_clearance_follow_capabilities() {
+        let mut status = api::test_status(contracts::Role::Member, None);
+        assert!(!can_review(Some(&status)));
+        assert!(clearance_audiences(Some(&status)).is_empty());
+        status.capabilities =
+            Some(contracts::Capabilities { intel_read: true, intel_review: true, intel_clear: true, ..Default::default() });
+        assert!(can_review(Some(&status)));
+        assert!(clearance_audiences(Some(&status)).is_empty());
+        status.capabilities.as_mut().unwrap().intel_clear_audiences = vec![Audience::CompanyInternal];
+        assert_eq!(clearance_audiences(Some(&status)), &[Audience::CompanyInternal]);
+        status.capabilities.as_mut().unwrap().intel_clear = false;
+        assert!(clearance_audiences(Some(&status)).is_empty());
+        status.principal.role = contracts::Role::Operator;
+        status.capabilities = None;
+        assert!(can_review(Some(&status)));
+        assert_eq!(clearance_audiences(Some(&status)), Audience::ALL);
+    }
+
+    #[test]
+    fn revoked_signals_evict_selection_and_draft() {
+        let id = Uuid::new_v4();
+        let query = IntelSignalQuery::default();
+        let missing = Ok(IntelSignalPage { items: vec![], next_cursor: None });
+        let watched = Some((id, query.clone()));
+        let filtered = IntelSignalQuery { state: Some(SignalState::New), ..Default::default() };
+        assert!(!page_revokes_selection(&filtered, &missing, id, watched.as_ref()));
+        for result in [missing, Err(forbidden_or_missing(403)), Err(forbidden_or_missing(404))] {
+            let mut selected = Some(id);
+            let mut drafts = HashMap::from([(id, ClearanceDraft::default())]);
+            assert!(page_revokes_selection(&query, &result, id, watched.as_ref()));
+            evict_signal(&mut selected, &mut drafts, id);
+            assert_eq!(selected, None);
+            assert!(drafts.is_empty());
+        }
+        for status in [403, 404] {
+            let mut selected = Some(id);
+            let mut drafts = HashMap::from([(id, ClearanceDraft::default())]);
+            if forbidden_or_missing(status).access_lost() {
+                evict_signal(&mut selected, &mut drafts, id);
+            }
+            assert!(selected.is_none() && drafts.is_empty());
+        }
+        assert!(!forbidden_or_missing(500).access_lost());
+    }
+
+    fn forbidden_or_missing(status: u16) -> UiError {
+        UiError::from_client(contracts::client::ClientError::Api {
+            status,
+            error: contracts::ApiError { code: "opaque".into(), message: "test".into(), correlation_id: None },
+        })
+    }
+
+    #[test]
+    fn clearance_denial_discards_rationale_and_audience() {
+        let id = Uuid::new_v4();
+        for status in [403, 404, 409, 500] {
+            let draft =
+                ClearanceDraft { rationale: "Sensitive draft".into(), audience: Some(Audience::CompanyInternal), ..Default::default() };
+            let mut drafts = HashMap::from([(id, draft)]);
+            discard_denied_clearance(&mut drafts, id, &forbidden_or_missing(status));
+            assert_eq!(drafts.is_empty(), matches!(status, 403 | 404));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_revocation_poll_replaces_cached_source_diagnostics() {
+        fn app() -> Element {
+            let status = use_signal(|| {
+                crate::state::Loaded::ready(api::test_status(
+                    Role::Agent,
+                    Some(contracts::Capabilities { intel_read: true, ..Default::default() }),
+                ))
+            });
+            let mut first = use_signal(|| true);
+            let sources = use_resource(move || async move {
+                let monitor = *first.peek();
+                first.set(false);
+                IntelSourceStatus {
+                    id: "test.feed".into(),
+                    company_id: "test".into(),
+                    policy_version: 1,
+                    default_audience: Audience::CompanyInternal,
+                    last_ingest_at: None,
+                    last_event_at: None,
+                    last_status: Some(IntelRunStatus::Failed),
+                    last_error_code: None,
+                    last_error_detail: monitor.then(|| "restricted error".into()),
+                    watermark: monitor.then(|| serde_json::json!("restricted watermark")),
+                    stale: false,
+                    stale_after_secs: 60,
+                }
+            });
+            use_revocation_poll(status, sources);
+            let text = match sources.cloned() {
+                None => "loading",
+                Some(source) if source.last_error_detail.is_some() && source.watermark.is_some() => "restricted error and watermark",
+                Some(source) if source.last_error_detail.is_none() && source.watermark.is_none() => "diagnostics redacted",
+                Some(_) => "partial redaction",
+            };
+            rsx! { p { "{text}" } }
+        }
+
+        let mut dom = VirtualDom::new(app);
+        dom.rebuild_to_vec();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut saw_diagnostics = false;
+            loop {
+                dom.wait_for_work().await;
+                let edits = format!("{:?}", dom.render_immediate_to_vec());
+                saw_diagnostics |= edits.contains("restricted error and watermark");
+                if edits.contains("diagnostics redacted") {
+                    assert!(saw_diagnostics);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("non-operator source polling did not replace cached diagnostics");
+    }
     use dioxus::{
         dioxus_core::{AttributeValue, Mutation},
         html::{PlatformEventData, SerializedFormData, SerializedHtmlEventConverter, set_event_converter},
@@ -537,14 +798,19 @@ mod tests {
 
     #[test]
     fn clearance_draft_survives_an_empty_filter_result_and_reset() {
-        check_clearance_remount(|_| {}, false);
+        check_clearance_remount(|_| {}, 5, false);
     }
 
     #[test]
     fn clearance_draft_requires_reconfirmation_after_each_review_identity_change() {
-        check_clearance_remount(|review| review.revision += 1, true);
-        check_clearance_remount(|review| review.policy_version += 1, true);
-        check_clearance_remount(|review| review.projection_sha256.push_str("-changed"), true);
+        check_clearance_remount(|review| review.revision += 1, 5, true);
+        check_clearance_remount(|review| review.policy_version += 1, 5, true);
+        check_clearance_remount(|review| review.projection_sha256.push_str("-changed"), 5, true);
+    }
+
+    #[test]
+    fn concurrent_clearance_requires_reconfirmation_and_submits_latest_generation() {
+        check_clearance_remount(|_| {}, 6, true);
     }
 
     #[test]
@@ -569,7 +835,8 @@ mod tests {
             rsx! {
                 ClearanceForm {
                     id: Uuid::nil(), drafts, review: review.cloned(), source_default_audience: Audience::OperatorOnly,
-                    saving: false, on_clear: move |input: SignalClearanceIn| submitted.set(Some(input.audience)),
+                    allowed_audiences: Audience::ALL.to_vec(), clearance_generation: 0,
+                    saving: false, on_clear: move |input: ClearSignalIn| submitted.set(Some(input.reviewed.audience)),
                 }
             }
         }
@@ -604,7 +871,7 @@ mod tests {
         // Transition v1 -> v2 (observes mismatch and invalidates stored audience/key).
         dom.in_runtime(|| review.write().policy_version = 2);
         let under_v2 = dom.render_immediate_to_vec();
-        assert!(format!("{under_v2:?}").contains("Signal revision changed"));
+        assert!(format!("{under_v2:?}").contains("confirm the audience again"));
 
         // Roll back v2 -> v1 without re-selecting audience: must remain cleared and blocked.
         dom.in_runtime(|| review.write().policy_version = 1);
@@ -619,12 +886,13 @@ mod tests {
         assert_eq!(submitted.get(), Some(Audience::CompanyInternal));
     }
 
-    fn check_clearance_remount(update_review: impl FnOnce(&mut IntelSignalReview), reconfirm: bool) {
-        type Handles = Rc<Cell<Option<(Signal<IntelSignalQuery>, Signal<IntelSignalReview>)>>>;
+    fn check_clearance_remount(update_review: impl FnOnce(&mut IntelSignalReview), latest_generation: i64, reconfirm: bool) {
+        type Handles = Rc<Cell<Option<(Signal<IntelSignalQuery>, Signal<IntelSignalReview>, Signal<i64>)>>>;
+        type Submission = (Audience, Option<i64>);
         #[derive(Clone, PartialEq, Props)]
         struct TestProps {
             handles: Handles,
-            submitted: Rc<Cell<Option<Audience>>>,
+            submitted: Rc<Cell<Option<Submission>>>,
         }
         fn app(TestProps { handles, submitted }: TestProps) -> Element {
             let query = use_signal(IntelSignalQuery::default);
@@ -636,14 +904,18 @@ mod tests {
                 first_seen_at: DateTime::UNIX_EPOCH,
                 updated_at: DateTime::UNIX_EPOCH,
             });
-            handles.set(Some((query, review)));
+            let clearance_generation = use_signal(|| 5);
+            handles.set(Some((query, review, clearance_generation)));
             rsx! {
                 if has_signal_filters(&query.read()) {
                     p { "{empty_signal_title(&query.read())}" }
                 } else {
                     ClearanceForm {
                         id: Uuid::nil(), drafts, review: review.cloned(), source_default_audience: Audience::OperatorOnly,
-                        saving: false, on_clear: move |input: SignalClearanceIn| submitted.set(Some(input.audience)),
+                        allowed_audiences: vec![Audience::CompanyInternal], clearance_generation: clearance_generation(),
+                        saving: false, on_clear: move |input: ClearSignalIn| {
+                            submitted.set(Some((input.reviewed.audience, input.expected_clearance_generation)));
+                        },
                     }
                 }
             }
@@ -654,7 +926,7 @@ mod tests {
         let submitted = Rc::new(Cell::new(None));
         let mut dom = VirtualDom::new_with_props(app, TestProps { handles: handles.clone(), submitted: submitted.clone() });
         let initial = dom.rebuild_to_vec();
-        let (mut query, mut review) = handles.get().unwrap();
+        let (mut query, mut review, mut clearance_generation) = handles.get().unwrap();
         let dispatch = |dom: &VirtualDom, edits: &[Mutation], name, value: &str| {
             let mut id = None;
             for mutation in edits {
@@ -672,8 +944,12 @@ mod tests {
         };
         let audience = Audience::CompanyInternal.as_str();
         let rationale = "Reviewed the source evidence";
-        dispatch(&dom, &initial.edits, "change", audience);
+        assert!(!format!("{initial:?}").contains(Audience::PublicCleared.as_str()));
         dispatch(&dom, &initial.edits, "input", rationale);
+        dispatch(&dom, &initial.edits, "change", Audience::PublicCleared.as_str());
+        dispatch(&dom, &initial.edits, "submit", "");
+        assert_eq!(submitted.get(), None);
+        dispatch(&dom, &initial.edits, "change", audience);
         let typed = format!("{:?}", dom.render_immediate_to_vec());
         assert!(typed.contains(audience) && typed.contains(rationale));
 
@@ -682,6 +958,7 @@ mod tests {
         assert!(empty.contains("No matching signals."));
         dom.in_runtime(|| {
             update_review(&mut review.write());
+            clearance_generation.set(latest_generation);
             query.set(IntelSignalQuery::default());
         });
         let reset = dom.render_immediate_to_vec();
@@ -696,7 +973,7 @@ mod tests {
         let expected = if reconfirm { "" } else { audience };
         assert_eq!(values.first(), Some(&expected)); // Select value, before its option values.
         assert_eq!(values.last(), Some(&rationale)); // Textarea value.
-        assert_eq!(format!("{reset:?}").contains("Signal revision changed"), reconfirm);
+        assert_eq!(format!("{reset:?}").contains("confirm the audience again"), reconfirm);
         let selected: Vec<_> = reset
             .edits
             .iter()
@@ -705,16 +982,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let expected_selection: Vec<_> =
-            std::iter::once(reconfirm).chain(Audience::ALL.iter().map(|level| level.as_str() == expected)).collect();
-        assert_eq!(selected, expected_selection);
+        assert_eq!(selected, [reconfirm, !reconfirm]);
+        let expected_submission = Some((Audience::CompanyInternal, Some(latest_generation)));
         dispatch(&dom, &reset.edits, "submit", "");
-        assert_eq!(submitted.get(), (!reconfirm).then_some(Audience::CompanyInternal));
+        assert_eq!(submitted.get(), if reconfirm { None } else { expected_submission });
         if reconfirm {
             dispatch(&dom, &reset.edits, "change", audience);
             dom.render_immediate_to_vec();
             dispatch(&dom, &reset.edits, "submit", "");
-            assert_eq!(submitted.get(), Some(Audience::CompanyInternal));
+            assert_eq!(submitted.get(), expected_submission);
         }
     }
 

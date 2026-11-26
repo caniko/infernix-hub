@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
-use contracts::{MailBiOverview, MailSearchQuery, MailTriageOverride, client::HubClient};
+use contracts::{MailBiOverview, MailMessageSummary, MailSearchQuery, MailTriageOverride, client::HubClient};
 use dioxus::prelude::*;
 use uuid::Uuid;
 
@@ -11,8 +11,15 @@ use crate::{
     api,
     components::{Chip, EmptyState, ErrorCard, Loading},
     shell::ContextItem,
-    state::Store,
+    state::{Store, UiError},
 };
+
+fn mail_selection_revoked(id: Uuid, result: &Result<Vec<MailMessageSummary>, UiError>) -> bool {
+    match result {
+        Ok(items) => !items.iter().any(|item| item.id == id),
+        Err(error) => error.access_lost(),
+    }
+}
 
 #[component]
 pub fn MailView() -> Element {
@@ -46,7 +53,14 @@ pub fn MailView() -> Element {
             classification: classification(),
             ..Default::default()
         };
-        async move { api::timed(client.list_mail_messages(&query)).await }
+        async move {
+            let result = api::timed(client.list_mail_messages(&query)).await;
+            let current = *selected.peek();
+            if current.is_some_and(|id| mail_selection_revoked(id, &result)) {
+                selected.set(None);
+            }
+            result
+        }
     });
 
     rsx! {
@@ -126,7 +140,14 @@ pub fn MailView() -> Element {
                     Some(Ok(items)) => rsx! {
                         div { class: "row",
                             for item in items {
-                                Chip { key: "{item.id}", label: format!("{} · {}", item.label, item.status), tone: status_tone(&item.status) }
+                                Chip {
+                                    key: "{item.id}",
+                                    label: format!("{} · {} · {}", item.label, match item.visibility {
+                                        contracts::MailVisibility::Shared => "Shared",
+                                        contracts::MailVisibility::Private => "Private",
+                                    }, item.status),
+                                    tone: status_tone(&item.status),
+                                }
                             }
                         }
                     },
@@ -171,7 +192,17 @@ pub fn MailView() -> Element {
             }
             if !insights() {
                 if let Some(id) = selected() {
-                    MessageDetail { key: "{id}", id, on_changed: move |_| { overview.restart(); messages.restart(); } }
+                    MessageDetail {
+                        key: "{id}", id,
+                        on_changed: move |_| { overview.restart(); messages.restart(); },
+                        on_revoked: move |id| {
+                            if *selected.peek() == Some(id) {
+                                selected.set(None);
+                            }
+                            messages.clear();
+                            messages.restart();
+                        },
+                    }
                 } else {
                     EmptyState { title: "Select a message".to_string() }
                 }
@@ -190,15 +221,22 @@ pub(super) fn status_tone(status: &str) -> Option<String> {
 }
 
 #[component]
-fn MessageDetail(id: Uuid, on_changed: EventHandler<()>) -> Element {
+fn MessageDetail(id: Uuid, on_changed: EventHandler<()>, on_revoked: EventHandler<Uuid>) -> Element {
     let client = use_context::<HubClient>();
     let store = use_context::<Store>();
     let mut saving = use_signal(|| false);
     let mut updated = use_signal(|| None);
     let detail_client = client.clone();
-    let detail = use_resource(move || {
+    let mut detail = use_resource(move || {
         let client = detail_client.clone();
-        async move { api::timed(client.get_mail_message(id)).await }
+        async move {
+            let result = api::timed(client.get_mail_message(id)).await;
+            if result.as_ref().is_err_and(UiError::access_lost) {
+                updated.set(None);
+                on_revoked.call(id);
+            }
+            result
+        }
     });
     let triage = use_callback(move |junk| {
         let client = client.clone();
@@ -210,7 +248,14 @@ fn MessageDetail(id: Uuid, on_changed: EventHandler<()>) -> Element {
                     updated.set(Some(value));
                     on_changed.call(());
                 }
-                Err(e) => store.notify(false, format!("{} — {}", e.code, e.message)),
+                Err(e) => {
+                    if e.access_lost() {
+                        updated.set(None);
+                        detail.clear();
+                        on_revoked.call(id);
+                    }
+                    store.notify(false, format!("{} — {}", e.code, e.message));
+                }
             }
             saving.set(false);
         });
@@ -302,6 +347,25 @@ fn MailInsights(bi: MailBiOverview, on_select: EventHandler<Uuid>) -> Element {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refreshed_inbox_evicts_a_selection_no_longer_in_the_list() {
+        let id = Uuid::new_v4();
+        assert!(mail_selection_revoked(id, &Ok(vec![])));
+        let mut unavailable = crate::state::UiError::new("offline", "Refresh failed");
+        unavailable.status = Some(500);
+        assert!(!mail_selection_revoked(id, &Err(unavailable)));
+        for status in [403, 404] {
+            let mut denied = crate::state::UiError::new("denied", "Access lost");
+            denied.status = Some(status);
+            assert!(mail_selection_revoked(id, &Err(denied)));
         }
     }
 }

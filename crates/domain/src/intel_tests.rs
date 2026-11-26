@@ -56,15 +56,18 @@ async fn put(hub: &Hub, actor: &Actor, batch: SignalBatchIn) -> IngestReceipt {
     first(ingest_batch(hub, actor, batch, None).await.unwrap())
 }
 
-fn clearance(signal: &IntelSignal) -> SignalClearanceIn {
+fn clearance(signal: &IntelSignal) -> ClearSignalIn {
     let review = signal.review.as_ref().unwrap();
-    SignalClearanceIn {
-        audience: Audience::PublicCleared,
-        revision: review.revision,
-        policy_version: review.policy_version,
-        source_default_audience: signal.source_default_audience,
-        projection_sha256: review.projection_sha256.clone(),
-        rationale: "Approved for public release".into(),
+    ClearSignalIn {
+        reviewed: SignalClearanceIn {
+            audience: Audience::PublicCleared,
+            revision: review.revision,
+            policy_version: review.policy_version,
+            source_default_audience: signal.source_default_audience,
+            projection_sha256: review.projection_sha256.clone(),
+            rationale: "Approved for public release".into(),
+        },
+        expected_clearance_generation: Some(signal.clearance_generation),
     }
 }
 
@@ -81,6 +84,19 @@ fn intel_config_rejects_unsafe_grants_and_invalid_source_ids() {
     let mut bad_config = intel.clone();
     bad_config.grants.get_mut("reader").unwrap().max_audience = Audience::OperatorOnly;
     assert!(bad_config.validate().is_err());
+    let mut bad_config = intel.clone();
+    bad_config.grants.get_mut("writer").unwrap().clear_audiences = vec![Audience::OperatorOnly];
+    assert!(bad_config.validate().is_err());
+    bad_config.grants.get_mut("writer").unwrap().clear_audiences = vec![Audience::CompanyInternal];
+    assert!(bad_config.validate().is_err());
+    let mut portfolio = intel.clone();
+    let grant = portfolio.grants.get_mut("reader").unwrap();
+    grant.company_id = None;
+    assert!(portfolio.validate().is_err());
+    let grant = portfolio.grants.get_mut("reader").unwrap();
+    grant.companies = vec!["acme".into(), "other".into()];
+    grant.monitor_sources.push("social.trends".into());
+    assert!(portfolio.validate().is_ok());
     let mut bad_config = intel.clone();
     bad_config.sources.insert("Acme/feed".into(), intel.sources["acme.feed"].clone());
     assert!(bad_config.validate().is_err());
@@ -116,11 +132,14 @@ async fn intel_postgres_visibility_and_revision_lifecycle() {
     assert_eq!(content::today(&hub, &reader).await.unwrap().intelligence[0].subject_id, id);
     assert!(content::today(&hub, &outside).await.unwrap().intelligence.is_empty());
     assert!(content::today(&hub, &ungranted).await.unwrap().intelligence.is_empty());
-    assert_eq!(list_sources(&hub, &reader).await.unwrap().len(), 2);
-    let reader_status = list_sources(&hub, &reader).await.unwrap().remove(1);
+    assert_eq!(list_sources(&hub, &reader).await.unwrap().len(), 1);
+    let reader_status = list_sources(&hub, &reader).await.unwrap().remove(0);
     assert_eq!(reader_status.last_error_code.as_deref(), Some("unavailable"));
     assert!(reader_status.last_error_detail.is_none() && reader_status.watermark.is_none());
-    let monitor = list_sources(&hub, &writer).await.unwrap().remove(1);
+    assert!(list_sources(&hub, &writer).await.unwrap().is_empty());
+    let mut monitoring_hub = hub.clone();
+    Arc::make_mut(&mut monitoring_hub.config).intel.grants.get_mut("writer").unwrap().max_audience = Audience::CompanyInternal;
+    let monitor = list_sources(&monitoring_hub, &writer).await.unwrap().remove(0);
     assert_eq!(monitor.watermark, Some(json!({"page":4})));
     assert!(monitor.last_error_detail.is_some());
 
@@ -170,7 +189,7 @@ async fn intel_postgres_visibility_and_revision_lifecycle() {
     assert_eq!(clear_signal(&hub, &op, id, public.clone()).await.unwrap_err().code(), "stale_revision");
     assert_eq!(put(&hub, &op, a.clone()).await.revision, 3);
     let reverted = get_signal(&hub, &op, id).await.unwrap();
-    assert_eq!(reverted.signal.review.unwrap().projection_sha256, public.projection_sha256);
+    assert_eq!(reverted.signal.review.unwrap().projection_sha256, public.reviewed.projection_sha256);
     assert_eq!(reverted.revisions.iter().map(|r| r.revision).collect::<Vec<_>>(), vec![3, 2, 1]);
     assert_eq!(reverted.revisions[0].payload, reverted.revisions[2].payload);
     assert!(reverted.signal.cleared_audience.is_none());
@@ -203,7 +222,7 @@ async fn intel_postgres_visibility_and_revision_lifecycle() {
     assert!(matches!(history(&db, "signal", &id.to_string()).await, Err(DomainError::NotFound(_))));
     for (source, key) in [(Some("intel"), "acme:signal"), (None, "intel:signal")] {
         let input = serde_json::from_value(json!({"source":source,"dedupe_key":key,"severity":"warning","title":"signal"})).unwrap();
-        assert_eq!(notifications::post(&hub, &op, input).await.unwrap_err().code(), "reserved_key");
+        assert_eq!(notifications::post(&hub, &op, None, input).await.unwrap_err().code(), "reserved_key");
     }
 
     let mail_id: Uuid = sqlx::query_scalar(
@@ -240,15 +259,15 @@ async fn intel_postgres_visibility_and_revision_lifecycle() {
     let mut narrowed = a.clone();
     narrowed.signals[0].severity = reopened.severity;
     narrowed.signals[0].audience = Some(Audience::OperatorOnly);
-    assert_eq!(put(&hub, &op, narrowed).await.revision, review.revision + 1);
+    assert_eq!(put(&hub, &op, narrowed).await.revision, review.reviewed.revision + 1);
     let tightened = get_signal(&hub, &op, id).await.unwrap();
-    assert_eq!(tightened.signal.review.unwrap().projection_sha256, review.projection_sha256);
-    assert_eq!(tightened.revisions[0].revision, review.revision + 1);
+    assert_eq!(tightened.signal.review.unwrap().projection_sha256, review.reviewed.projection_sha256);
+    assert_eq!(tightened.revisions[0].revision, review.reviewed.revision + 1);
     assert_eq!(tightened.revisions[0].payload["sticky_min_audience"], "operator_only");
     assert!(tightened.signal.cleared_audience.is_none());
     assert_eq!(clear_signal(&hub, &op, id, review.clone()).await.unwrap_err().code(), "stale_revision");
     assert!(matches!(get_signal(&hub, &outside, id).await, Err(DomainError::NotFound(_))));
-    assert_eq!(put(&hub, &op, a).await.revision, review.revision + 2);
+    assert_eq!(put(&hub, &op, a).await.revision, review.reviewed.revision + 2);
     assert!(matches!(get_signal(&hub, &reader, id).await, Err(DomainError::NotFound(_))));
 
     let restricted = batch("acme.drift", "Restricted report", Audience::OperatorOnly);
@@ -274,7 +293,7 @@ async fn intel_postgres_clearance_revoked_by_source_default_change() {
     let signal = get_signal(&hub, &op, id).await.unwrap().signal;
     assert_eq!(signal.base_audience, Audience::OperatorOnly);
     let reviewed = clearance(&signal);
-    assert_eq!(reviewed.source_default_audience, Audience::PersonaEligible);
+    assert_eq!(reviewed.reviewed.source_default_audience, Audience::PersonaEligible);
     clear_signal(&hub, &op, id, reviewed.clone()).await.unwrap();
     assert_eq!(get_signal(&hub, &outside, id).await.unwrap().signal.effective_audience, Audience::PublicCleared);
 
@@ -284,7 +303,7 @@ async fn intel_postgres_clearance_revoked_by_source_default_change() {
     let current = get_signal(&hub, &op, id).await.unwrap().signal;
     assert_eq!(current.base_audience, signal.base_audience);
     assert_eq!(current.source_default_audience, Audience::CompanyInternal);
-    assert_eq!(current.review.unwrap().policy_version, reviewed.policy_version);
+    assert_eq!(current.review.unwrap().policy_version, reviewed.reviewed.policy_version);
     assert!(matches!(clear_signal(&hub, &op, id, reviewed).await, Err(DomainError::Conflict { code: "stale_revision", .. })));
     db.close().await;
     sqlx::query(&format!("drop database {database} with (force)")).execute(&admin).await.unwrap();

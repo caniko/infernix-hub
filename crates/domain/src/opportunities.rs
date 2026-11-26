@@ -5,7 +5,7 @@
 //! is derived on read (a passed deadline while the call is still open), so no
 //! timer rewrites rows.
 
-use contracts::{Opportunity, OpportunityDecisionIn, OpportunityIn, OpportunityState, Role};
+use contracts::{Opportunity, OpportunityDecisionIn, OpportunityIn, OpportunityState, Role, TodayItem};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -24,8 +24,34 @@ const SELECT: &str = "select to_jsonb(t) from (
       o.created_at, o.updated_at
     from opportunities o";
 
+pub(crate) fn steward_grant<'a>(hub: &'a Hub, actor: &Actor) -> Option<&'a crate::intel::IntelGrant> {
+    hub.config.intel.grant(actor).ok().filter(|g| actor.principal.role == Role::Member && g.can_manage_opportunities)
+}
+
+fn scope<'a>(hub: &'a Hub, actor: &Actor, legacy: &[Role]) -> DResult<Option<Vec<&'a str>>> {
+    if let Some(grant) = steward_grant(hub, actor) {
+        return Ok(Some(grant.authorized_companies().collect()));
+    }
+    actor.require(legacy)?;
+    if actor.principal.role == Role::Agent
+        && let Ok(grant) = hub.config.intel.grant(actor)
+    {
+        return Ok(Some(grant.authorized_companies().collect()));
+    }
+    Ok((actor.principal.role != Role::Operator).then(|| vec![hub.config.company_id.as_str()]))
+}
+
+pub(crate) fn read_scope<'a>(hub: &'a Hub, actor: &Actor) -> DResult<Option<Vec<&'a str>>> {
+    scope(hub, actor, crate::ANY_READER)
+}
+
 pub async fn ingest(hub: &Hub, actor: &Actor, input: OpportunityIn) -> DResult<Opportunity> {
-    actor.require(INGESTERS)?;
+    let companies = scope(hub, actor, INGESTERS)?;
+    let company = input.company_id.as_deref().unwrap_or(&hub.config.company_id);
+    let allowed = companies.as_ref().is_none_or(|companies| companies.contains(&company));
+    if !allowed {
+        return Err(DomainError::Forbidden("caller may not ingest opportunities for this company".into()));
+    }
     if input.source.trim().is_empty()
         || input.external_id.trim().is_empty()
         || input.title.trim().is_empty()
@@ -38,6 +64,15 @@ pub async fn ingest(hub: &Hub, actor: &Actor, input: OpportunityIn) -> DResult<O
         return Err(invalid("missing_evidence", "at least one evidence entry (url and quote) is required"));
     }
     let mut tx = hub.db.begin().await?;
+    if let Some(persona) = input.persona_id
+        && !sqlx::query_scalar::<_, bool>("select exists(select 1 from personas where id = $1 and company_id = $2)")
+            .bind(persona)
+            .bind(company)
+            .fetch_one(&mut *tx)
+            .await?
+    {
+        return Err(DomainError::NotFound("persona"));
+    }
     let (id, created): (Uuid, bool) = sqlx::query_as(
         "insert into opportunities
            (id, company_id, persona_id, source, external_id, kind, title, funder, url, deadline, amount, eligibility, fit, evidence)
@@ -50,7 +85,7 @@ pub async fn ingest(hub: &Hub, actor: &Actor, input: OpportunityIn) -> DResult<O
          returning id, (xmax = 0)",
     )
     .bind(Uuid::new_v4())
-    .bind(&hub.config.company_id)
+    .bind(company)
     .bind(input.persona_id)
     .bind(&input.source)
     .bind(&input.external_id)
@@ -85,7 +120,7 @@ async fn one(tx: &mut sqlx::PgConnection, id: Uuid) -> DResult<Opportunity> {
 }
 
 pub async fn list(hub: &Hub, actor: &Actor, state: Option<OpportunityState>, due_within_days: Option<i32>) -> DResult<Vec<Opportunity>> {
-    actor.require(crate::ANY_READER)?;
+    let companies = read_scope(hub, actor)?;
     if due_within_days.is_some_and(|days| days <= 0) {
         return Err(invalid("invalid_due_within_days", "due_within_days must be a positive number of days"));
     }
@@ -93,28 +128,37 @@ pub async fn list(hub: &Hub, actor: &Actor, state: Option<OpportunityState>, due
         "{SELECT}
          where ($1::text is null or o.state = $1)
            and ($2::int is null or o.deadline <= now() + $2::int * interval '1 day')
+           and ($3::text[] is null or o.company_id = any($3))
          order by o.deadline nulls last, o.created_at desc limit 200) t"
     ))
     .bind(state.map(OpportunityState::as_str))
     .bind(due_within_days)
+    .bind(companies)
     .fetch_all(&hub.db)
     .await?;
     decode(rows)
 }
 
 pub async fn get(hub: &Hub, actor: &Actor, id: Uuid) -> DResult<Opportunity> {
-    actor.require(crate::ANY_READER)?;
-    let row: Option<Value> = sqlx::query_scalar(&format!("{SELECT} where o.id = $1) t")).bind(id).fetch_optional(&hub.db).await?;
+    let companies = read_scope(hub, actor)?;
+    let row: Option<Value> = sqlx::query_scalar(&format!("{SELECT} where o.id = $1 and ($2::text[] is null or o.company_id = any($2))) t"))
+        .bind(id)
+        .bind(companies)
+        .fetch_optional(&hub.db)
+        .await?;
     decode_one(row.ok_or(DomainError::NotFound("opportunity"))?)
 }
 
-/// Operator-only. Every change lands in the audit log; ingest can never move
-/// the state.
+/// Every decision lands in the audit log; ingest can never move the state.
 pub async fn decide(hub: &Hub, actor: &Actor, id: Uuid, input: OpportunityDecisionIn) -> DResult<Opportunity> {
-    actor.require(OPERATOR)?;
+    let companies = scope(hub, actor, OPERATOR)?;
     let mut tx = hub.db.begin().await?;
     let current: Option<String> =
-        sqlx::query_scalar("select state from opportunities where id = $1 for update").bind(id).fetch_optional(&mut *tx).await?;
+        sqlx::query_scalar("select state from opportunities where id = $1 and ($2::text[] is null or company_id = any($2)) for update")
+            .bind(id)
+            .bind(companies)
+            .fetch_optional(&mut *tx)
+            .await?;
     let current = current.ok_or(DomainError::NotFound("opportunity"))?;
     sqlx::query(
         "update opportunities
@@ -139,4 +183,22 @@ pub async fn decide(hub: &Hub, actor: &Actor, id: Uuid, input: OpportunityDecisi
     let row = one(&mut tx, id).await?;
     tx.commit().await?;
     Ok(row)
+}
+
+pub(crate) async fn today(hub: &Hub, companies: Option<Vec<&str>>) -> DResult<Vec<TodayItem>> {
+    decode(
+        sqlx::query_scalar(
+            "select to_jsonb(t) from (
+                select 'opportunity' as kind, o.title, 'opportunity' as subject_type, o.id as subject_id,
+                    case when o.deadline < now() then 'expired' else o.state end as status, o.deadline as at
+                from opportunities o
+                where o.state in ('shortlisted', 'drafting') and o.deadline < now() + interval '14 days'
+                    and ($1::text[] is null or o.company_id = any($1))
+                order by o.deadline limit 50
+            ) t",
+        )
+        .bind(companies)
+        .fetch_all(&hub.db)
+        .await?,
+    )
 }

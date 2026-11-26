@@ -14,7 +14,7 @@ pub(super) async fn check(
         return Ok(None);
     };
     if link.target_type == LinkTargetType::MailMessage {
-        let Viewer::Operator(Some(owner)) = viewer else { return Ok(None) };
+        let (Viewer::Operator(Some(owner)) | Viewer::Granted(_, Some(owner))) = viewer else { return Ok(None) };
         let found = sqlx::query_scalar("select owner from mail_messages where id = $1 and owner = $2")
             .bind(id)
             .bind(owner)
@@ -30,7 +30,7 @@ pub(super) async fn check(
         let owner: Option<String> = sqlx::query_scalar("select owner from intel_signals where id = $1").bind(id).fetch_one(conn).await?;
         return Ok(Some(owner));
     }
-    if matches!(viewer, Viewer::Granted(g) if g.company_id != company) {
+    if !viewer.in_company(company) {
         return Ok(None);
     }
     // News is public and global, including for authorized ingest-only writers.
@@ -38,13 +38,33 @@ pub(super) async fn check(
         let found: bool = sqlx::query_scalar("select exists(select 1 from news_items where id = $1)").bind(id).fetch_one(conn).await?;
         return Ok(found.then_some(None));
     }
-    if !crate::ANY_READER.contains(&actor.principal.role) {
+    let legacy_reader = crate::ANY_READER.contains(&actor.principal.role);
+    if matches!(link.target_type, LinkTargetType::Opportunity | LinkTargetType::Project) {
+        let companies = match viewer {
+            Viewer::Operator(_) => None,
+            Viewer::Granted(grant, _)
+                if actor.principal.role == Role::Member
+                    && (link.target_type == LinkTargetType::Project || grant.can_manage_opportunities) =>
+            {
+                Some(grant.authorized_companies().collect::<Vec<_>>())
+            }
+            _ if legacy_reader => Some(vec![company]),
+            _ => return Ok(None),
+        };
+        let sql = if link.target_type == LinkTargetType::Opportunity {
+            "select exists(select 1 from opportunities where id=$1 and ($2::text[] is null or company_id=any($2)))"
+        } else {
+            "select exists(select 1 from projects where id=$1 and ($2::text[] is null or company_id=any($2)))"
+        };
+        let found: bool = sqlx::query_scalar(sql).bind(id).bind(companies).fetch_one(conn).await?;
+        return Ok(found.then_some(None));
+    }
+    if !legacy_reader {
         return Ok(None);
     }
     // Legacy readers are role-scoped; explicitly constrain their endpoints by
     // the signal tenant as well.
     let sql = match link.target_type {
-        LinkTargetType::Opportunity => "select exists(select 1 from opportunities where id = $1 and company_id = $2)",
         LinkTargetType::Relationship => {
             "select exists(select 1 from relationships r join accounts a on a.id = r.account_id
              where r.id = $1 and a.company_id = $2)"
@@ -53,9 +73,8 @@ pub(super) async fn check(
             "select exists(select 1 from content_items c join personas p on p.id = c.persona_id
              where c.id = $1 and p.company_id = $2)"
         }
-        LinkTargetType::Project => "select exists(select 1 from projects where id = $1 and company_id = $2)",
         LinkTargetType::Persona => "select exists(select 1 from personas where id = $1 and company_id = $2)",
-        LinkTargetType::News | LinkTargetType::MailMessage | LinkTargetType::Signal => unreachable!(),
+        _ => unreachable!(),
     };
     let found: bool = sqlx::query_scalar(sql).bind(id).bind(company).fetch_one(conn).await?;
     Ok(found.then_some(None))

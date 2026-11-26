@@ -8,8 +8,8 @@ use std::{future::Future, time::Duration};
 
 use chrono::{DateTime, Utc};
 use contracts::{
-    AckNotificationsIn, Asset, AssetState, ContentItem, IntelSignal, IntelSignalDetail, IntelSignalPage, IntelSignalQuery,
-    IntelSourceStatus, PublicationIntent, RenewalRenewedIn, SignalClearanceIn, SignalDecisionIn, SnoozeNotificationIn,
+    AckNotificationsIn, Asset, AssetState, ClearSignalIn, ContentItem, IntelSignal, IntelSignalDetail, IntelSignalPage, IntelSignalQuery,
+    IntelSourceStatus, PublicationIntent, RenewalRenewedIn, Role, SignalDecisionIn, SnoozeNotificationIn, SystemStatus,
     client::{ClientError, HubClient},
 };
 use dioxus::prelude::*;
@@ -64,8 +64,8 @@ pub async fn intel_decide(client: &HubClient, id: Uuid, input: &SignalDecisionIn
     timed(client.intel_decide(id, input)).await
 }
 
-pub async fn intel_clear(client: &HubClient, id: Uuid, input: &SignalClearanceIn) -> Result<IntelSignal, UiError> {
-    timed(client.intel_clear(id, input)).await
+pub async fn intel_clear(client: &HubClient, id: Uuid, input: &ClearSignalIn) -> Result<IntelSignal, UiError> {
+    timed(client.intel_clear_with_generation(id, input)).await
 }
 
 pub async fn create_persona(client: &HubClient, name: &str) -> Result<contracts::Persona, UiError> {
@@ -90,10 +90,49 @@ fn put<T: 'static>(mut signal: Signal<Loaded<T>>, value: T) {
     signal.set(Loaded::ready(value));
 }
 
+pub fn poll_operations(status: Option<&SystemStatus>) -> bool {
+    status.is_some_and(|status| matches!(status.principal.role, Role::Operator | Role::Agent))
+}
+
+pub fn can_load_renewals(status: Option<&SystemStatus>) -> bool {
+    status.is_some()
+}
+
+pub fn can_mark_renewals(status: Option<&SystemStatus>) -> bool {
+    status.is_some_and(|status| matches!(status.principal.role, Role::Operator | Role::Member))
+}
+
+pub fn connection_label(status: &Loaded<SystemStatus>) -> &'static str {
+    if status.error.is_some() {
+        "Hub offline"
+    } else if status.data.is_some() {
+        "Hub online"
+    } else {
+        "Connecting…"
+    }
+}
+
+#[cfg(test)]
+pub fn test_status(role: Role, capabilities: Option<contracts::Capabilities>) -> SystemStatus {
+    SystemStatus {
+        api_version: "v1".into(),
+        fixture_mode: false,
+        production_paused: false,
+        principal: contracts::Principal { id: Uuid::nil(), name: "test".into(), role },
+        integrations: vec![],
+        feeds: vec![],
+        capabilities,
+        sync_failures: vec![],
+    }
+}
+
 /// Refresh the fleet snapshot. A failure keeps the last good snapshot and
 /// surfaces the error; the hub answers `fleet_status_unconfigured` when no
 /// file is configured.
 pub async fn refresh_fleet(store: Store, client: HubClient) {
+    if !poll_operations(store.status.peek().data.as_ref()) {
+        return;
+    }
     match timed(client.fleet_status()).await {
         Ok(status) => put(store.fleet, status),
         Err(error) => keep(store.fleet, error),
@@ -116,12 +155,30 @@ pub async fn refresh_base(store: Store, client: HubClient) {
     store.set_poll_busy(true);
 
     match timed(client.status()).await {
-        Ok(v) => put(store.status, v),
+        Ok(v) => {
+            if !crate::Workspace::Intelligence.available(Some(&v)) {
+                let mut selected = store.selected_signal;
+                selected.set(None);
+            }
+            put(store.status, v);
+        }
         Err(e) => keep(store.status, e),
+    }
+    let (operations, member) = {
+        let status = store.status.peek();
+        (poll_operations(status.data.as_ref()), status.data.as_ref().is_some_and(|status| status.principal.role == Role::Member))
+    };
+    if !operations && !member {
+        store.set_poll_busy(false);
+        return;
     }
     match timed(client.today()).await {
         Ok(v) => put(store.today, v),
         Err(e) => keep(store.today, e),
+    }
+    if !operations {
+        store.set_poll_busy(false);
+        return;
     }
     match timed(client.news()).await {
         Ok(v) => put(store.news, v),
@@ -239,6 +296,9 @@ pub async fn load_chat(store: Store, client: HubClient, subject: &'static str, i
 
 /// Refresh the detail reads for the current selections.
 pub async fn refresh_selected(store: Store, client: HubClient) {
+    if !poll_operations(store.status.peek().data.as_ref()) {
+        return;
+    }
     if let Some(id) = (store.selected_content).cloned() {
         load_content_detail(store, client.clone(), id).await;
     }
@@ -343,8 +403,8 @@ pub async fn refresh_renewals(store: Store, client: HubClient) {
     }
 }
 
-/// Operator-only: record a renewal. Without a cadence the seed cannot compute
-/// a due date, so the caller must pass one.
+/// Record an operator renewal or a member's own renewal. Without a cadence,
+/// the caller must pass a due date.
 pub async fn mark_renewed(store: Store, client: HubClient, key: String, due: Option<DateTime<Utc>>) {
     match timed(client.renewal_renewed(&key, &RenewalRenewedIn { due_at: due })).await {
         Ok(renewal) => {
@@ -414,6 +474,28 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use contracts::{IntentState, PublicationIntent};
+
+    #[test]
+    fn member_uses_shared_poll_without_losing_hub_health() {
+        let mut status = Loaded::ready(test_status(Role::Member, None));
+        assert!(!poll_operations(status.data.as_ref()));
+        assert_eq!(connection_label(&status), "Hub online");
+        assert!(!poll_operations(None));
+        use crate::Workspace;
+        assert_eq!(
+            Workspace::ALL.into_iter().filter(|workspace| workspace.available(status.data.as_ref())).collect::<Vec<_>>(),
+            [Workspace::Notifications, Workspace::Today]
+        );
+        status.data.as_mut().unwrap().capabilities =
+            Some(contracts::Capabilities { intel_read: true, mail: true, calendar: true, ..Default::default() });
+        assert_eq!(
+            Workspace::ALL.into_iter().filter(|workspace| workspace.available(status.data.as_ref())).collect::<Vec<_>>(),
+            [Workspace::Notifications, Workspace::Today, Workspace::Intelligence, Workspace::Calendar, Workspace::Mail]
+        );
+        for role in [Role::Operator, Role::Agent] {
+            assert!(poll_operations(Some(&test_status(role, None))));
+        }
+    }
 
     fn intent(account: &str, hour: u32) -> PublicationIntent {
         PublicationIntent {

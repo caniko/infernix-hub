@@ -10,7 +10,7 @@ use crate::{
     actions::{self, Action, PaletteEntry},
     api,
     format::fuzzy_filter,
-    state::Loaded,
+    state::{Loaded, Store},
 };
 
 #[derive(Default)]
@@ -45,12 +45,14 @@ fn move_to(mut active: Signal<usize>, index: usize) {
 #[component]
 pub fn CommandPalette(inspector_available: bool, on_action: EventHandler<Action>, on_close: EventHandler<()>) -> Element {
     let client = use_context::<HubClient>();
+    let store = use_context::<Store>();
+    let operations = api::poll_operations(store.status.read().data.as_ref());
     let mut query = use_signal(String::new);
     let mut active = use_signal(|| 0usize);
     let mut search = use_signal(PaletteSearch::default);
 
     let mut on_input = move |value: String| {
-        let will_search = value.trim().len() >= 2;
+        let will_search = operations && value.trim().len() >= 2;
         let generation = search.write().begin(will_search);
         query.set(value.clone());
         active.set(0);
@@ -74,7 +76,12 @@ pub fn CommandPalette(inspector_available: bool, on_action: EventHandler<Action>
 
     let needle = query.cloned();
     let mut all_actions = actions::static_entries();
-    all_actions.retain(|entry| inspector_available || entry.action != Action::ToggleInspector);
+    all_actions.retain(|entry| match entry.action {
+        Action::Workspace(workspace) => workspace.available(store.status.read().data.as_ref()),
+        Action::ToggleInspector => inspector_available,
+        Action::RefreshFleet => operations,
+        _ => true,
+    });
     let labels: Vec<&str> = all_actions.iter().map(|entry| entry.label.as_str()).collect();
     let mut entries: Vec<PaletteEntry> =
         fuzzy_filter(&needle, &labels).into_iter().filter_map(|index| all_actions.get(index).cloned()).collect();
@@ -84,7 +91,7 @@ pub fn CommandPalette(inspector_available: bool, on_action: EventHandler<Action>
         let state = search.read();
         (state.generation, state.result.clone())
     };
-    if let Some(hits) = result.data {
+    if operations && let Some(hits) = result.data {
         entries.extend(hits.iter().map(actions::search_entry));
     }
 

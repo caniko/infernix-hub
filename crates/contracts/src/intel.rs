@@ -67,6 +67,10 @@ pub struct SignalProvenance {
     #[serde(default)]
     pub model: Option<String>,
     pub method: ProvenanceMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_by: Option<String>,
 }
 
 fn empty_object() -> Value {
@@ -124,6 +128,29 @@ pub struct SignalBatchIn {
     pub signals: Vec<SignalIn>,
 }
 
+/// Only explicitly supplied redacted fields enter the signal. The message ID
+/// is used for the access check, not the signal's provenance or links.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromoteFromMailIn {
+    pub mail_message_id: Uuid,
+    pub source_id: String,
+    pub idempotency_key: String,
+    pub kind: SignalKind,
+    pub severity: Severity,
+    pub title: String,
+    pub summary: String,
+    #[serde(default = "empty_object")]
+    pub facts: Value,
+    /// Keep the original JSON until the server has checked for private fields.
+    pub evidence: Value,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub external_id: Option<String>,
+    pub project_id: Option<Uuid>,
+    #[serde(default)]
+    pub links: Vec<SignalLinkIn>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum SignalBatchOut {
@@ -143,6 +170,8 @@ pub struct IntelSignal {
     /// Fixed to `PublicCleared` in cross-company public reads.
     pub source_default_audience: Audience,
     pub cleared_audience: Option<Audience>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub clearance_generation: i64,
     /// Review and storage metadata is absent from cross-company public reads.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub review: Option<IntelSignalReview>,
@@ -166,6 +195,10 @@ pub struct IntelSignal {
     pub persona_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +267,15 @@ pub struct SignalClearanceIn {
     pub source_default_audience: Audience,
     pub projection_sha256: String,
     pub rationale: String,
+}
+
+/// Generation-aware clearance. The legacy request remains valid on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClearSignalIn {
+    #[serde(flatten)]
+    pub reviewed: SignalClearanceIn,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_clearance_generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

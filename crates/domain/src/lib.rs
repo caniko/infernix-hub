@@ -201,7 +201,7 @@ pub const OPERATOR_OR_COLLECTOR: &[Role] = &[Role::Operator, Role::Collector];
 impl HubConfig {
     fn resolve_owner(&self, actor: &Actor) -> DResult<String> {
         let name = &actor.principal.name;
-        if self.principal_owners.is_empty() {
+        if self.principal_owners.is_empty() && matches!(actor.principal.role, Role::Operator | Role::Member) {
             return Ok(name.clone());
         }
         self.principal_owners
@@ -262,6 +262,19 @@ pub(crate) async fn audit(
 }
 
 pub async fn history(db: &PgPool, subject_type: &str, subject_id: &str) -> DResult<Vec<contracts::HistoryEntry>> {
+    history_in_scope(db, subject_type, subject_id, None).await
+}
+
+pub async fn history_for_actor(hub: &Hub, actor: &Actor, subject_type: &str, subject_id: &str) -> DResult<Vec<contracts::HistoryEntry>> {
+    if subject_type == "opportunity" && actor.principal.role == Role::Agent {
+        let id = uuid::Uuid::parse_str(subject_id).map_err(|_| DomainError::NotFound("opportunity"))?;
+        opportunities::get(hub, actor, id).await?;
+    }
+    let owner = (subject_type == "notification" && actor.principal.role == Role::Operator).then_some(actor.principal.name.as_str());
+    history_in_scope(&hub.db, subject_type, subject_id, owner).await
+}
+
+async fn history_in_scope(db: &PgPool, subject_type: &str, subject_id: &str, owner: Option<&str>) -> DResult<Vec<contracts::HistoryEntry>> {
     if matches!(subject_type, "signal" | "intel_source") {
         return Err(DomainError::NotFound("history"));
     }
@@ -276,16 +289,19 @@ pub async fn history(db: &PgPool, subject_type: &str, subject_id: &str) -> DResu
             return Err(DomainError::NotFound("renewal"));
         }
     }
-    // A member's own acknowledgements and snoozes name rows the operator may not
-    // see (its renewal notifications), so notification history omits them.
+    // Old bulk notification audits have no owner marker. Hide those rather than
+    // exposing identifiers from the former cross-owner operator view.
     let rows: Vec<Value> = sqlx::query_scalar(
         "select to_jsonb(a) from (select id, at, actor, action, subject_type, subject_id, correlation_id, detail
-         from audit_log where subject_type = $1 and subject_id = $2
-           and not ($1 = 'notification' and actor like 'member:%')
+         from audit_log a where subject_type = $1 and subject_id = $2
+           and ($1 <> 'notification'
+                or ($2 = '*' and a.detail ? 'owner' and (a.detail->>'owner' is null or a.detail->>'owner' = $3))
+                or exists (select 1 from notifications n where n.id::text=$2 and (n.owner is null or n.owner=$3)))
          order by id desc limit 200) a",
     )
     .bind(subject_type)
     .bind(subject_id)
+    .bind(owner)
     .fetch_all(db)
     .await?;
     decode(rows)
@@ -351,5 +367,22 @@ mod owner_tests {
         assert!(matches!(config.resolve_owner(&procedure), Err(DomainError::Forbidden(_))));
         assert!(matches!(Hub::sync_owner(&user, "alice"), Err(DomainError::Forbidden(_))));
         assert_eq!(Hub::sync_owner(&procedure, "alice").unwrap(), "alice");
+    }
+
+    #[test]
+    fn empty_mail_owner_map_only_falls_back_for_humans() {
+        let mut config = HubConfig::default();
+        let mut actor = Actor::system();
+        for role in [Role::Agent, Role::Ingest, Role::Procedure, Role::Collector] {
+            actor.principal.role = role;
+            assert!(matches!(config.resolve_owner(&actor), Err(DomainError::Forbidden(_))));
+        }
+        for role in [Role::Operator, Role::Member] {
+            actor.principal.role = role;
+            assert_eq!(config.resolve_owner(&actor).unwrap(), actor.principal.name);
+        }
+        actor.principal.role = Role::Agent;
+        config.principal_owners.insert(actor.principal.name.clone(), "mapped".into());
+        assert_eq!(config.resolve_owner(&actor).unwrap(), "mapped");
     }
 }

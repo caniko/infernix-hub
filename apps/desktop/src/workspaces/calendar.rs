@@ -16,10 +16,12 @@ use crate::{
 
 #[component]
 pub fn CalendarView() -> Element {
+    let store = use_context::<Store>();
+    let operations = api::poll_operations(store.status.read().data.as_ref());
     let personal_enabled = std::env::var("HUB_PERSONAL_CALENDAR").as_deref() != Ok("0");
     let personal = use_signal(|| personal_enabled);
-    if personal() {
-        rsx! { PersonalSchedule { personal } }
+    if !operations || personal() {
+        rsx! { PersonalSchedule { personal, operations } }
     } else {
         rsx! { PublishingSchedule { personal, personal_enabled } }
     }
@@ -36,7 +38,7 @@ fn ScheduleMode(mut personal: Signal<bool>) -> Element {
 }
 
 #[component]
-fn PersonalSchedule(personal: Signal<bool>) -> Element {
+fn PersonalSchedule(personal: Signal<bool>, operations: bool) -> Element {
     let store = use_context::<Store>();
     let client = use_context::<HubClient>();
     let mut syncing = use_signal(|| false);
@@ -79,7 +81,7 @@ fn PersonalSchedule(personal: Signal<bool>) -> Element {
             div { class: "work-head content-bounded",
                 div {
                     h1 { "Calendar" }
-                    ScheduleMode { personal }
+                    if operations { ScheduleMode { personal } }
                     p { class: "form-help", "Next 14 days · UTC" }
                 }
                 div { class: "spacer" }

@@ -34,7 +34,10 @@ enum Cmd {
         intel_config: Option<std::path::PathBuf>,
     },
     /// Run the worker only.
-    Worker,
+    Worker {
+        #[arg(long)]
+        mail_config: Option<std::path::PathBuf>,
+    },
     /// Apply migrations and exit; `--check` only reports (exit 1 if not current).
     Migrate {
         #[arg(long)]
@@ -130,9 +133,10 @@ async fn run() -> anyhow::Result<()> {
             s.intel_config = intel_config.or(s.intel_config);
             fleetix_hubd::run(s, Vec::new()).await?;
         }
-        Cmd::Worker => {
-            let s = Settings::from_env()?;
-            let (state, _fx) = bootstrap::build(&s).await?;
+        Cmd::Worker { mail_config } => {
+            let mut s = Settings::from_env()?;
+            s.mail_config = mail_config.or(s.mail_config);
+            let (state, _fx) = bootstrap::build_worker(&s).await?;
             worker::run(state.hub, Duration::from_secs(2)).await;
         }
         Cmd::Dev { database_url, bind } => {

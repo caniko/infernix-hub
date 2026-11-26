@@ -173,7 +173,10 @@
       },
       "OpportunityIn": {
         "description": "See hub_contracts::OpportunityIn",
-        "type": "object"
+        "type": "object",
+        "properties": {
+          "company_id": {"type":["string","null"]}
+        }
       },
       "PauseIn": {
         "description": "See hub_contracts::PauseIn",
@@ -243,6 +246,19 @@
         "description": "See hub_contracts::SystemStatus",
         "type": "object",
         "properties": {
+          "capabilities": {
+            "type": "object",
+            "properties": {
+              "intel_read": {"type":"boolean","default":false},
+              "intel_write": {"type":"boolean","default":false},
+              "intel_review": {"type":"boolean","default":false},
+              "intel_clear": {"type":"boolean","default":false},
+              "intel_clear_audiences": {"type":"array","default":[],"items":{"enum":["operator_only","company_internal","persona_eligible","public_cleared"]}},
+              "opportunities_manage": {"type":"boolean","default":false},
+              "mail": {"type":"boolean","default":false},
+              "calendar": {"type":"boolean","default":false}
+            }
+          },
           "syncFailures": {
             "description": "Active producer sync failures, with diagnostics. Omitted when no producer is failing.",
             "type": "array",
@@ -1679,6 +1695,47 @@
         "x-roles": "see domain command"
       }
     },
+    "/v1/intel/promotions/from-mail": {
+      "post": {
+        "operationId": "intel_promote_from_mail",
+        "x-roles": "operator or member with source write access",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json":{"schema":{"type":"object",
+            "required":["mail_message_id","source_id","idempotency_key","kind","severity","title","summary","evidence"],
+            "additionalProperties":false,
+            "properties":{
+              "mail_message_id":{"type":"string","format":"uuid"},
+              "source_id":{"type":"string"},
+              "idempotency_key":{"type":"string","minLength":1,"maxLength":128},
+              "kind":{"enum":["change","metric","mention","announcement","release","funding","partnership","risk","trend","ops"]},
+              "severity":{"enum":["info","warning","critical"]},
+              "title":{"type":"string","maxLength":200},
+              "summary":{"type":"string","maxLength":4000},
+              "facts":{},
+              "evidence":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","required":["url","quote"],
+                "properties":{"url":{"type":"string"},"quote":{"type":"string"}}}},
+              "occurred_at":{"type":["string","null"],"format":"date-time"},
+              "external_id":{"type":["string","null"],"deprecated":true,"description":"Ignored. The server generates the promotion external ID."},
+              "project_id":{"type":["string","null"],"format":"uuid"},
+              "links":{"type":"array","maxItems":32,"items":{"type":"object","required":["target_type","target_id","relation"],
+                "properties":{"target_type":{"type":"string","not":{"const":"mail_message"}},"target_id":{"type":"string","format":"uuid"},
+                  "relation":{"type":"string"}}}}
+            }
+          }}}
+        },
+        "responses": {
+          "200": {"description":"SignalBatchOut for one redacted, ownerless signal"},
+          "400": {"description":"Promotion facts or evidence contain private mail data, or evidence is malformed"},
+          "403": {"description":"Caller may not write to the source"},
+          "404": {"description":"Mail message, source, or link target not found or not visible"},
+          "409": {"description":"Idempotency conflict or source company mismatch"},
+          "422": {"description":"Invalid promotion"},
+          "429": {"description":"Daily source budget exceeded"}
+        },
+        "security": [{"bearer":[]}]
+      }
+    },
     "/v1/intel/signals": {
       "get": {
         "operationId": "intel_signals",
@@ -1706,7 +1763,7 @@
       },
       "post": {
         "operationId": "intel_ingest",
-        "description": "Ingests an authorized source run and its signals atomically. Only operators receive per-signal receipts; all other writers get only the delivery ID and accepted count. Replays are subject to current authorization.",
+        "description": "Ingests a source run and its signals in one transaction. Operators and granted reviewers get per-signal receipts. Other writers get a delivery ID and accepted count. Replays use current permissions.",
         "parameters": [{"in":"header","name":"Idempotency-Key","schema":{"type":"string","maxLength":128}}],
         "requestBody": {
           "required": true,
@@ -1731,7 +1788,7 @@
       "get": {
         "operationId": "intel_signal",
         "responses": {
-          "200": {"description":"IntelSignalDetail: revision history is operator-only; cross-company public reads omit private metadata and links"},
+          "200": {"description":"IntelSignalDetail. Granted reviewers see notes and revisions only with base-classification access. Clearance-only reads omit links, notes, and history."},
           "403": {"description":"No matching intelligence grant"},
           "404": {"description":"Signal not found or not visible"}
         },
@@ -1742,7 +1799,7 @@
       "parameters": [{"in":"path","name":"id","required":true,"schema":{"type":"string","format":"uuid"}}],
       "post": {
         "operationId": "intel_decide",
-        "x-roles": "operator",
+        "x-roles": "operator or granted reviewer",
         "requestBody": {
           "required": true,
           "content": {"application/json":{"schema":{"type":"object","required":["action"],"properties":{
@@ -1753,7 +1810,7 @@
         },
         "responses": {
           "200": {"description":"Updated IntelSignal"},
-          "403": {"description":"Operator required"},
+          "403": {"description":"Caller may not review this signal"},
           "404": {"description":"Signal not found or not visible"},
           "422": {"description":"Invalid decision"}
         },
@@ -1764,7 +1821,7 @@
       "parameters": [{"in":"path","name":"id","required":true,"schema":{"type":"string","format":"uuid"}}],
       "post": {
         "operationId": "intel_clear",
-        "x-roles": "operator",
+        "x-roles": "operator or caller with a clearance grant",
         "requestBody": {
           "required": true,
           "content": {"application/json":{"schema":{"type":"object",
@@ -1772,6 +1829,7 @@
             "properties":{
               "audience":{"enum":["operator_only","company_internal","persona_eligible","public_cleared"]},
               "revision":{"type":"integer"},
+              "expected_clearance_generation":{"type":["integer","null"],"minimum":0},
               "policy_version":{"type":"integer"},
               "source_default_audience":{"enum":["operator_only","company_internal","persona_eligible","public_cleared"]},
               "projection_sha256":{"type":"string"},
@@ -1781,9 +1839,9 @@
         },
         "responses": {
           "200": {"description":"Updated IntelSignal"},
-          "403": {"description":"Operator required"},
+          "403": {"description":"Caller may not clear this signal to the requested audience"},
           "404": {"description":"Signal not found or not visible"},
-          "409": {"description":"Stale revision, projection digest, or source policy"},
+          "409": {"description":"Stale revision, projection digest, source policy, or clearance generation"},
           "422": {"description":"Invalid clearance or owner-scoped signal"}
         },
         "security": [{"bearer":[]}]
@@ -2002,6 +2060,7 @@
     "/v1/notifications/sync": {
       "post": {
         "operationId": "sync_notifications",
+        "parameters": [{"in": "query", "name": "owner", "required": false, "schema": {"type": "string"}}],
         "security": [{"bearer": []}],
         "x-roles": "operator, agent, procedure, member",
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["source", "items"], "properties": {"source": {"type": "string"}, "items": {"type": "array", "items": {"type": "object", "required": ["dedupe_key", "severity", "title"], "properties": {"dedupe_key": {"type": "string"}, "severity": {"type": "string", "enum": ["info", "warning", "critical"]}, "title": {"type": "string"}, "body": {"type": "string"}, "subject_type": {"type": "string", "nullable": true}, "subject_id": {"type": "string", "nullable": true}, "url": {"type": "string", "nullable": true}}}}}}}}},
@@ -3136,6 +3195,7 @@
     "/v1/status": {
       "get": {
         "operationId": "status",
+        "description": "Members get their principal and capabilities without fleet or integration diagnostics.",
         "responses": {
           "200": {
             "content": {
@@ -3212,6 +3272,7 @@
     "/v1/today": {
       "get": {
         "operationId": "today",
+        "description": "Members get only visible intelligence and opportunities in companies they are authorized to manage.",
         "responses": {
           "200": {
             "content": {

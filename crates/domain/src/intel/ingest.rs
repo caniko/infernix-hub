@@ -9,36 +9,168 @@ struct Delivery {
 }
 
 impl Delivery {
-    fn response(self, operator: bool) -> SignalBatchOut {
+    async fn response(self, conn: &mut PgConnection, hub: &Hub, viewer: &Viewer<'_>) -> DResult<SignalBatchOut> {
         let Self { delivery_id, receipts } = self;
-        if operator {
-            SignalBatchOut::Receipts { delivery_id, receipts }
-        } else {
-            SignalBatchOut::Accepted { delivery_id, accepted_count: receipts.len() }
+        if viewer.can_review() {
+            let mut ids: Vec<_> = receipts.iter().map(|receipt| receipt.id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let unique_count = ids.len();
+            let mut sql = visible_sql(hub, viewer, true);
+            let visible = sql.push(" and s.id = any(").push_bind(ids).push(")").build_query_scalar::<Uuid>().fetch_all(conn).await?;
+            if visible.len() == unique_count {
+                return Ok(SignalBatchOut::Receipts { delivery_id, receipts });
+            }
         }
+        Ok(SignalBatchOut::Accepted { delivery_id, accepted_count: receipts.len() })
     }
 }
 
-pub async fn ingest_batch(hub: &Hub, actor: &Actor, mut input: SignalBatchIn, key: Option<&str>) -> DResult<SignalBatchOut> {
+pub async fn ingest_batch(hub: &Hub, actor: &Actor, input: SignalBatchIn, key: Option<&str>) -> DResult<SignalBatchOut> {
+    ingest_delivery(hub, actor, input, key, None).await
+}
+
+const PROMOTION_EXTERNAL_ID_PREFIX: &str = "redacted-mail:";
+
+pub async fn promote_from_mail(hub: &Hub, actor: &Actor, mut input: PromoteFromMailIn) -> DResult<SignalBatchOut> {
+    actor.require(&[Role::Operator, Role::Member])?;
+    let hyphenated = input.mail_message_id.to_string();
+    let compact = input.mail_message_id.simple().to_string();
+    let mut values = vec![&input.facts, &input.evidence];
+    let contains_id = |text: &str| {
+        let text = text.chars().filter(|c| !c.is_control()).collect::<String>().to_ascii_lowercase();
+        text.contains(&hyphenated) || text.contains(&compact)
+    };
+    const RAW_MAIL_KEYS: &[&str] = &[
+        "body_text",
+        "body_html",
+        "raw_path",
+        "message_id_header",
+        "headers",
+        "raw_body",
+        "raw_headers",
+        "eml_path",
+        "mail_message_id",
+        "raw_eml",
+        "rfc822",
+        "attachments",
+    ];
+    let forbidden = || invalid("invalid_promotion_payload", "promotions must not contain raw mail fields or the private message ID");
+    while let Some(value) = values.pop() {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if RAW_MAIL_KEYS.iter().any(|raw| key.eq_ignore_ascii_case(raw)) || contains_id(key) {
+                        return Err(forbidden());
+                    }
+                    values.push(value);
+                }
+            }
+            Value::Array(items) => values.extend(items),
+            Value::String(text) if contains_id(text) => return Err(forbidden()),
+            _ => (),
+        }
+    }
+    if contains_id(&input.title) || contains_id(&input.summary) {
+        return Err(forbidden());
+    }
+    let evidence =
+        serde_json::from_value(input.evidence.clone()).map_err(|_| invalid("invalid_promotion_payload", "invalid promotion evidence"))?;
+    // Ignore legacy caller-supplied IDs, including when hashing an intent for replay.
+    input.external_id = None;
+    let now = Utc::now();
+    let run_id = format!(
+        "{PROMOTION_EXTERNAL_ID_PREFIX}{}",
+        sha256_hex(canonical_json(&json!([actor.principal.id, input.idempotency_key])).as_bytes())
+    );
+    let batch = SignalBatchIn {
+        source: input.source_id.clone(),
+        run: SourceRunIn {
+            run_id: run_id.clone(),
+            status: IntelRunStatus::Ok,
+            finished_at: now,
+            watermark: json!({}),
+            error_code: None,
+            error_detail: None,
+        },
+        signals: vec![SignalIn {
+            external_id: run_id.clone(),
+            kind: input.kind,
+            severity: input.severity,
+            title: input.title.clone(),
+            summary: input.summary.clone(),
+            occurred_at: input.occurred_at.unwrap_or(now),
+            expires_at: None,
+            audience: None,
+            confidence: 1.0,
+            evidence,
+            facts: input.facts.clone(),
+            subjects: Vec::new(),
+            links: input.links.clone(),
+            persona_id: None,
+            project_id: input.project_id,
+            backfill: false,
+            provenance: SignalProvenance {
+                producer: "redacted_mail".into(),
+                run_id,
+                git_rev: None,
+                model: None,
+                method: ProvenanceMethod::Observed,
+                promoted_from: Some("redacted_mail".into()),
+                promoted_by: Some(actor.name()),
+            },
+        }],
+    };
+    ingest_delivery(hub, actor, batch, Some(&input.idempotency_key), Some(&input)).await
+}
+
+async fn ingest_delivery(
+    hub: &Hub,
+    actor: &Actor,
+    mut input: SignalBatchIn,
+    key: Option<&str>,
+    promotion: Option<&PromoteFromMailIn>,
+) -> DResult<SignalBatchOut> {
+    let mut tx = hub.db.begin().await?;
+    if let Some(promotion) = promotion {
+        crate::mail::lock_mail_message_owner(&mut tx, &hub.resolve_owner(actor)?, promotion.mail_message_id, true).await?;
+        if promotion.links.iter().any(|link| link.target_type == LinkTargetType::MailMessage) {
+            return Err(invalid("invalid_promotion_link", "a redacted promotion cannot link to a mail message"));
+        }
+    }
     let config = &hub.config.intel;
     let viewer = Viewer::new(hub, actor)?;
-    let operator = matches!(viewer, Viewer::Operator(_));
-    if matches!(&viewer, Viewer::Granted(g) if !g.write_sources.contains(&input.source)) {
+    if matches!(&viewer, Viewer::Granted(g, _) if !g.write_sources.contains(&input.source)) {
         return Err(DomainError::Denied { code: "intel_write_denied", message: "caller may not write to this source".into() });
     }
     let policy = config.sources.get(&input.source).ok_or(DomainError::NotFound("intel source"))?;
     let company = &policy.company_id;
-    if matches!(&viewer, Viewer::Granted(g) if g.company_id != *company) {
+    if !viewer.in_company(company) {
         return Err(DomainError::Denied { code: "intel_write_denied", message: "caller may not write to this source".into() });
     }
     if key.is_some_and(|key| key.is_empty() || key.len() > 128 || !key.bytes().all(|c| c.is_ascii_graphic())) {
         return Err(invalid("invalid_idempotency_key", "idempotency key must be 1 to 128 visible ASCII characters"));
     }
+    let operation = if promotion.is_some() { "promotion" } else { "ingest" };
+    let promotion_key = promotion.map(|p| format!("promo:{}:{}", actor.principal.id, p.idempotency_key));
+    let key = promotion_key.as_deref().or(key);
     if input.signals.len() > 100 {
         return Err(invalid("invalid_batch", "an intel batch may contain at most 100 signals"));
     }
-    let request_hash = key.map(|_| sha256_hex(canonical_json(&json!({"v": "intel-delivery-v1", "batch": input})).as_bytes()));
-    let mut tx = hub.db.begin().await?;
+    if promotion.is_none() {
+        // Promotion provenance is assigned by the server, never by a producer.
+        for item in &mut input.signals {
+            item.provenance.promoted_from = None;
+            item.provenance.promoted_by = None;
+        }
+    }
+    let request_hash = key.map(|_| {
+        let payload = match promotion {
+            Some(p) => json!({"v":"intel-mail-promotion-v1", "actor":actor.principal.id, "promotion":p}),
+            None => json!({"v":"intel-delivery-v1", "batch":input}),
+        };
+        sha256_hex(canonical_json(&payload).as_bytes())
+    });
 
     // Serialize all deliveries for a source, including its first delivery,
     // without writing anything before authorization and the replay lookup.
@@ -54,24 +186,30 @@ pub async fn ingest_batch(hub: &Hub, actor: &Actor, mut input: SignalBatchIn, ke
     let mut checked = Vec::with_capacity(input.signals.len());
     for mut item in input.signals {
         clean_item(&mut item, policy)?;
-        checked.push(check_item(&mut tx, hub, actor, &viewer, company, item).await?);
+        let item = check_item(&mut tx, hub, actor, &viewer, company, item, promotion.is_some()).await?;
+        if promotion.is_some() && item.owner.is_some() {
+            return Err(invalid("invalid_promotion_link", "a redacted promotion cannot link to an owner-scoped target"));
+        }
+        checked.push(item);
     }
     if let Some((key, hash)) = key.zip(request_hash.as_ref()) {
         let previous: Option<(String, Value)> = sqlx::query_as(
-            "select request_sha256,receipt_json from intel_deliveries where company_id = $1 and source_id = $2 and idempotency_key = $3",
+            "select request_sha256,receipt_json from intel_deliveries
+              where company_id = $1 and source_id = $2 and idempotency_key = $3 and operation = $4",
         )
         .bind(company)
         .bind(&input.source)
         .bind(key)
+        .bind(operation)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some((stored_hash, receipt)) = previous {
             if stored_hash != *hash {
                 return Err(conflict("idempotency_conflict", "idempotency key was used for a different batch"));
             }
-            let delivery: Delivery = decode_one(receipt)?;
+            let response = decode_one::<Delivery>(receipt)?.response(&mut tx, hub, &viewer).await?;
             tx.commit().await?;
-            return Ok(delivery.response(operator));
+            return Ok(response);
         }
     }
 
@@ -114,19 +252,21 @@ pub async fn ingest_batch(hub: &Hub, actor: &Actor, mut input: SignalBatchIn, ke
         last_event = last_event.max(Some(checked.item.occurred_at));
         receipts.push(upsert_signal(&mut tx, actor, &input.source, policy, checked).await?);
     }
-    sqlx::query(
-        "update intel_sources set policy_version = $2, last_ingest_at = now(), last_event_at = greatest(last_event_at,$3),
+    if promotion.is_none() {
+        sqlx::query(
+            "update intel_sources set policy_version = $2, last_ingest_at = now(), last_event_at = greatest(last_event_at,$3),
            last_status = $4, watermark = $5, last_error_code = $6, last_error_detail = $7, updated_at = now() where id = $1",
-    )
-    .bind(&input.source)
-    .bind(policy.policy_version)
-    .bind(last_event)
-    .bind(run.status.as_str())
-    .bind(&run.watermark)
-    .bind(&run.error_code)
-    .bind(&run.error_detail)
-    .execute(&mut *tx)
-    .await?;
+        )
+        .bind(&input.source)
+        .bind(policy.policy_version)
+        .bind(last_event)
+        .bind(run.status.as_str())
+        .bind(&run.watermark)
+        .bind(&run.error_code)
+        .bind(&run.error_detail)
+        .execute(&mut *tx)
+        .await?;
+    }
     let delivery_id = Uuid::new_v4();
     audit(
         &mut tx,
@@ -143,18 +283,21 @@ pub async fn ingest_batch(hub: &Hub, actor: &Actor, mut input: SignalBatchIn, ke
     let delivery = Delivery { delivery_id, receipts };
     if let Some((key, hash)) = key.zip(request_hash) {
         sqlx::query(
-            "insert into intel_deliveries (company_id,source_id,idempotency_key,request_sha256,receipt_json) values ($1,$2,$3,$4,$5)",
+            "insert into intel_deliveries (company_id,source_id,idempotency_key,request_sha256,receipt_json,operation)
+             values ($1,$2,$3,$4,$5,$6)",
         )
         .bind(company)
         .bind(input.source)
         .bind(key)
         .bind(hash)
         .bind(json!(delivery))
+        .bind(operation)
         .execute(&mut *tx)
         .await?;
     }
+    let response = delivery.response(&mut tx, hub, &viewer).await?;
     tx.commit().await?;
-    Ok(delivery.response(operator))
+    Ok(response)
 }
 
 fn clean_json(value: &mut Value, code: &'static str) -> DResult<()> {
@@ -261,7 +404,15 @@ async fn check_item(
     viewer: &Viewer<'_>,
     company: &str,
     mut item: SignalIn,
+    is_promotion: bool,
 ) -> DResult<CheckedSignal> {
+    if !is_promotion
+        && ["promo:", PROMOTION_EXTERNAL_ID_PREFIX]
+            .iter()
+            .any(|prefix| item.external_id.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix)))
+    {
+        return Err(invalid("reserved_intel_external_id", "signal external ID uses a reserved promotion prefix"));
+    }
     // Hash the JSONB form that readers will see, including normalized numbers.
     let (associations, facts): (bool, Value) = sqlx::query_as(
         "select ($2::uuid is null or exists(select 1 from personas where company_id = $1 and id = $2))

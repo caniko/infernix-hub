@@ -387,8 +387,23 @@ pub struct SystemStatus {
     /// are configured or the producer loop is not running here.
     #[serde(default)]
     pub feeds: Vec<FeedState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Capabilities>,
     #[serde(default, rename = "syncFailures", alias = "sync_failures", skip_serializing_if = "Vec::is_empty")]
     pub sync_failures: Vec<SyncFailure>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Capabilities {
+    pub intel_read: bool,
+    pub intel_write: bool,
+    pub intel_review: bool,
+    pub intel_clear: bool,
+    pub intel_clear_audiences: Vec<Audience>,
+    pub opportunities_manage: bool,
+    pub mail: bool,
+    pub calendar: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -876,6 +891,9 @@ wire_enum!(OpportunityState {
 /// a scout. The identity is `(company_id, source, external_id)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpportunityIn {
+    /// Omitted by legacy producers, which write to the Hub's configured company.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company_id: Option<String>,
     pub persona_id: Option<Uuid>,
     pub source: String,
     /// The sender's stable id; a replay updates facts instead of duplicating.

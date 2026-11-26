@@ -87,12 +87,15 @@ pub fn NotificationsView() -> Element {
     let mut filter = use_signal(|| Filter::Open);
     let feed = (store.notifications).cloned();
     let renewals = (store.renewals).cloned();
+    let operations = use_memo(move || api::poll_operations(store.status.read().data.as_ref()));
+    let renewal_access = use_memo(move || api::can_load_renewals(store.status.read().data.as_ref()));
 
     // Renewal expansions read `GET /v1/renewals`; one read per visit suffices.
     let renewals_client = client.clone();
-    use_future(move || {
-        let client = renewals_client.clone();
-        async move { api::refresh_renewals(store, client).await }
+    use_effect(move || {
+        if renewal_access() {
+            spawn(api::refresh_renewals(store, renewals_client.clone()));
+        }
     });
 
     let current = filter.cloned();
@@ -136,7 +139,7 @@ pub fn NotificationsView() -> Element {
                     onclick: move |_| filter.set(Filter::All),
                     "All"
                 }
-                if let Some(error) = renewals.error.clone() {
+                if renewal_access() && let Some(error) = renewals.error.clone() {
                     span { class: "label-tech bad", "renewals: {error.code}" }
                 }
             }
@@ -151,12 +154,14 @@ pub fn NotificationsView() -> Element {
                         if current == Filter::Open {
                             EmptyState {
                                 title: "No open notifications".to_string(),
-                                hint: Some("Inbox notifications are separate from live Fleet status. Check Command Center for active host or service issues.".to_string()),
+                                hint: operations().then(|| "Inbox notifications are separate from live Fleet status. Check Command Center for active host or service issues.".to_string()),
                                 actions: Some(rsx! {
-                                    button {
-                                        class: "btn secondary",
-                                        onclick: move |_| store.set_workspace(Workspace::Command),
-                                        "Open Command Center"
+                                    if operations() {
+                                        button {
+                                            class: "btn secondary",
+                                            onclick: move |_| store.set_workspace(Workspace::Command),
+                                            "Open Command Center"
+                                        }
                                     }
                                     button {
                                         class: "btn secondary",
@@ -179,7 +184,10 @@ pub fn NotificationsView() -> Element {
                 } else {
                     div { class: "stack",
                         for notification in list.iter() {
-                            NotificationRow { key: "{notification.id}", notification: notification.clone() }
+                            NotificationRow {
+                                key: "{notification.id}", notification: notification.clone(),
+                                operations: operations(), renewal_access: renewal_access(),
+                            }
                         }
                     }
                 }
@@ -189,11 +197,12 @@ pub fn NotificationsView() -> Element {
 }
 
 #[component]
-fn NotificationRow(notification: Notification) -> Element {
+fn NotificationRow(notification: Notification, operations: bool, renewal_access: bool) -> Element {
     let store = use_context::<Store>();
     let client = use_context::<HubClient>();
     let renewals = (store.renewals).cloned();
-    let renewal = if notification.subject_type.as_deref() == Some("renewal") {
+    let can_mark_renewals = api::can_mark_renewals(store.status.read().data.as_ref());
+    let renewal = if renewal_access && notification.subject_type.as_deref() == Some("renewal") {
         renewals.data.as_deref().and_then(|list| renewal_for(list, notification.subject_id.as_deref())).cloned()
     } else {
         None
@@ -266,7 +275,7 @@ fn NotificationRow(notification: Notification) -> Element {
                     button { class: "btn secondary btn-xs", onclick: snooze_day, "Snooze 1 d" }
                     button { class: "btn secondary btn-xs", onclick: snooze_week, "Snooze 1 w" }
                 }
-                if let Some((subject_type, subject_id)) = subject {
+                if operations && let Some((subject_type, subject_id)) = subject {
                     button {
                         class: "btn secondary btn-xs",
                         onclick: move |_| actions::open_subject(store, &subject_type, subject_id),
@@ -274,7 +283,7 @@ fn NotificationRow(notification: Notification) -> Element {
                     }
                 }
             }
-            if notification.subject_type.as_deref() == Some("renewal") && renewal.is_none() {
+            if renewal_access && notification.subject_type.as_deref() == Some("renewal") && renewal.is_none() {
                 p { class: "label-tech", "Renewal details are unavailable right now." }
             }
             if let Some(renewal) = renewal.as_ref() {
@@ -306,19 +315,21 @@ fn NotificationRow(notification: Notification) -> Element {
                             }
                         }
                     }
-                    div { class: "row",
-                        if needs_due {
-                            label { class: "form-field",
-                                "New due date (UTC)"
-                                input {
-                                    class: "input",
-                                    r#type: "datetime-local",
-                                    value: "{due}",
-                                    oninput: move |event| due.set(event.value()),
+                    if can_mark_renewals {
+                        div { class: "row",
+                            if needs_due {
+                                label { class: "form-field",
+                                    "New due date (UTC)"
+                                    input {
+                                        class: "input",
+                                        r#type: "datetime-local",
+                                        value: "{due}",
+                                        oninput: move |event| due.set(event.value()),
+                                    }
                                 }
                             }
+                            button { class: "btn primary btn-xs", onclick: mark_renewed, "Mark renewed" }
                         }
-                        button { class: "btn primary btn-xs", onclick: mark_renewed, "Mark renewed" }
                     }
                 }
             }
@@ -413,6 +424,17 @@ mod tests {
         snoozed.snoozed_until = Some(now + chrono::Duration::days(1));
         assert_eq!(closed_label(&snoozed, now), Some("snoozed"), "unread but snoozed is not acknowledged");
         assert_eq!(closed_label(&notification(Uuid::new_v4(), "today", 3, true), now), None);
+    }
+
+    #[test]
+    fn members_can_load_and_mark_their_notification_renewals() {
+        for (role, allowed) in [(contracts::Role::Member, true), (contracts::Role::Operator, true), (contracts::Role::Agent, false)] {
+            let status = api::test_status(role, None);
+            assert!(api::can_load_renewals(Some(&status)));
+            assert_eq!(api::can_mark_renewals(Some(&status)), allowed);
+        }
+        assert!(!api::can_load_renewals(None));
+        assert!(!api::can_mark_renewals(None));
     }
 
     #[test]

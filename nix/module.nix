@@ -319,7 +319,7 @@
     archive_raw_dir = mail.archiveRawDir;
     accounts = lib.mapAttrsToList (_: account:
       {
-        inherit (account) owner label provider transport address enabled;
+        inherit (account) owner label provider transport address enabled visibility;
         password_file = runtimeCredential account.passwordFile;
         export_dir = account.exportDir;
       }
@@ -420,6 +420,11 @@ in {
             owner = ownerOption;
             label = labelOption name;
             enabled = enabledOption;
+            visibility = mkOption {
+              type = types.enum ["private" "shared"];
+              default = "private";
+              description = "Private to the owner, or shared with authenticated human owners.";
+            };
             provider = mkOption {
               type = types.enum ["gmail" "protonmail" "tutanota" "imap" "export_dir"];
               description = "Mail provider.";

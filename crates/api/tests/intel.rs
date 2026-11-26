@@ -30,7 +30,7 @@ async fn intel_http() {
         "sources":{"acme.feed":{"company_id":"acme","default_audience":"company_internal",
             "kinds":["change"],"trust_tier":"llm","stale_after_secs":3600,"max_signals_per_day":3}},
         "grants":{
-            "writer":{"role":"ingest","company_id":"acme","max_audience":"persona_eligible","write_sources":["acme.feed"]},
+            "writer":{"role":"ingest","company_id":"acme","max_audience":"company_internal","write_sources":["acme.feed"]},
             "reader":{"role":"agent","company_id":"other","max_audience":"company_internal"}
         }
     }"#,
