@@ -28,7 +28,7 @@ pub mod fleet {
     pub use fleetix::status::*;
     use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct FleetStatus {
         #[serde(flatten)]
@@ -46,6 +46,8 @@ pub mod fleet {
         pub offline_hosts: Vec<OfflineHostSnapshot>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pub probe_coverage: BTreeMap<String, ProbeCoverage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub switch_train_gates: Option<SwitchTrainGateSummary>,
     }
 
     /// Snapshot-safe projection: no command arguments or raw errors.
@@ -92,6 +94,53 @@ pub mod fleet {
         pub sections_failed: Vec<String>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SwitchTrainGateSummary {
+        pub active_trains: Vec<SwitchTrainGateActivity>,
+        pub memory_gate: MemoryGateStatus,
+        pub intents: Vec<SwitchIntentGateSummary>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SwitchTrainGateActivity {
+        pub id: String,
+        pub hosts: Vec<String>,
+        pub phase: String,
+        pub started_at: Option<String>,
+        pub waited_seconds: Option<u64>,
+        pub detail: Option<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct MemoryGateStatus {
+        pub mem_available_gib: f64,
+        pub mem_floor_gib: f64,
+        pub scope_budget_gib: f64,
+        pub admissible: bool,
+        pub top_cgroup_holders: Vec<CgroupMemoryHolder>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CgroupMemoryHolder {
+        pub path: String,
+        pub current_gib: f64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SwitchIntentGateSummary {
+        pub id: String,
+        pub hosts: Vec<String>,
+        pub action: String,
+        pub owner: String,
+        pub deadline: String,
+        pub remaining_seconds: u64,
+    }
+
     impl std::ops::Deref for FleetStatus {
         type Target = fleetix::status::FleetStatus;
 
@@ -105,8 +154,15 @@ pub mod fleet {
         let wire = serde_json::json!({"schemaVersion": 1, "generatedAt": "2026-11-25T00:00:00Z", "hosts": [], "monitoring": {}});
         let status: FleetStatus = serde_json::from_value(wire).unwrap();
         let encoded = serde_json::to_value(&status).unwrap();
-        for key in ["expectedOfflineHosts", "pendingPostSwitchActions", "postSwitchError", "hostWarnings", "offlineHosts", "probeCoverage"]
-        {
+        for key in [
+            "expectedOfflineHosts",
+            "pendingPostSwitchActions",
+            "postSwitchError",
+            "hostWarnings",
+            "offlineHosts",
+            "probeCoverage",
+            "switchTrainGates",
+        ] {
             assert!(encoded.get(key).is_none(), "{key}");
         }
         assert_eq!(serde_json::from_value::<FleetStatus>(encoded).unwrap(), status);
@@ -154,6 +210,18 @@ pub mod fleet {
                 "node-alpha": {"inspectedUsers": ["can"], "userBusErrors": ["skipped dejana 1001 non-root"],
                           "sectionsOk": ["system"], "sectionsFailed": ["users"]},
                 "node-beta": {"inspectedUsers": ["can"], "userBusErrors": [], "sectionsOk": ["users"], "sectionsFailed": []}
+            },
+            "switchTrainGates": {
+                "activeTrains": [
+                    {"id": "train-1", "hosts": ["node-alpha"], "phase": "waiting", "startedAt": "2026-11-25T12:00:00Z",
+                     "waitedSeconds": 23, "detail": "memory gate"},
+                    {"id": "train-2", "hosts": ["node-beta"], "phase": "queued", "startedAt": null,
+                     "waitedSeconds": null, "detail": null}
+                ],
+                "memoryGate": {"memAvailableGib": 12.5, "memFloorGib": 16.0, "scopeBudgetGib": 8.0, "admissible": false,
+                               "topCgroupHolders": [{"path": "/build.slice", "currentGib": 3.25}]},
+                "intents": [{"id": "intent-1", "hosts": ["node-alpha"], "action": "switch", "owner": "operator",
+                             "deadline": "2026-11-25T13:00:00Z", "remainingSeconds": 1200}]
             }
         });
         let status: FleetStatus = serde_json::from_value(wire.clone()).unwrap();
@@ -391,6 +459,8 @@ pub struct SystemStatus {
     pub capabilities: Option<Capabilities>,
     #[serde(default, rename = "syncFailures", alias = "sync_failures", skip_serializing_if = "Vec::is_empty")]
     pub sync_failures: Vec<SyncFailure>,
+    #[serde(default, rename = "switchTrainGates", skip_serializing_if = "Option::is_none")]
+    pub switch_train_gates: Option<fleet::SwitchTrainGateSummary>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -587,7 +587,11 @@ async fn openapi() -> impl IntoResponse {
 }
 
 async fn status(State(s): State<AppState>, Caller(a): Caller) -> R<SystemStatus> {
-    call!(a, domain::system::status(&s.hub, &a))
+    let mut status = domain::system::status(&s.hub, &a).await.map_err(err(&a))?;
+    if a.principal.role != Role::Member {
+        status.switch_train_gates = read_fleet_status(s.fleet_status_file.as_deref()).await.ok().and_then(|fleet| fleet.switch_train_gates);
+    }
+    Ok(Json(status))
 }
 
 async fn humanize(State(s): State<AppState>, Caller(a): Caller, Json(input): Json<HumanizeInput>) -> R<HumanizePreview> {
