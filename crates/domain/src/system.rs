@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use contracts::{Account, PauseIn, Principal, Role, SyncFailure, SystemStatus};
+use contracts::{Account, Audience, Capabilities, PauseIn, Principal, Role, SyncFailure, SystemStatus};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -102,17 +102,37 @@ pub async fn issue_token(db: &sqlx::PgPool, name: &str, role: Role, token: Optio
 }
 
 pub async fn status(hub: &Hub, actor: &Actor) -> DResult<SystemStatus> {
-    actor.require(&[Role::Operator, Role::Agent, Role::Procedure, Role::Ingest])?;
-    let mut conn = hub.db.acquire().await?;
-    let paused = crate::release::production_paused(&mut conn).await?;
+    actor.require(&[Role::Operator, Role::Agent, Role::Procedure, Role::Ingest, Role::Member])?;
+    let member = actor.principal.role == Role::Member;
+    let operator = actor.principal.role == Role::Operator;
+    let grant = hub.config.intel.grant(actor).ok();
+    let owner = hub.resolve_owner(actor).is_ok();
+    let paused = if member {
+        false
+    } else {
+        let mut conn = hub.db.acquire().await?;
+        crate::release::production_paused(&mut conn).await?
+    };
+    let intel_clear_audiences =
+        if operator { Audience::ALL.to_vec() } else { grant.map(|g| g.clear_audiences.clone()).unwrap_or_default() };
     Ok(SystemStatus {
         api_version: contracts::API_VERSION.into(),
-        fixture_mode: hub.config.integrations.iter().any(|i| i.mode == contracts::AdapterMode::Fixture),
+        fixture_mode: !member && hub.config.integrations.iter().any(|i| i.mode == contracts::AdapterMode::Fixture),
         production_paused: paused,
         principal: actor.principal.clone(),
-        integrations: hub.config.integrations.clone(),
-        feeds: hub.feeds.read().map(|f| f.clone()).unwrap_or_default(),
-        sync_failures: hub.sync_failures(),
+        integrations: if member { Vec::new() } else { hub.config.integrations.clone() },
+        feeds: if member { Vec::new() } else { hub.feeds.read().map(|f| f.clone()).unwrap_or_default() },
+        capabilities: Some(Capabilities {
+            intel_read: operator || grant.is_some(),
+            intel_write: operator || grant.is_some_and(|g| !g.write_sources.is_empty()),
+            intel_review: operator || grant.is_some_and(|g| g.can_review),
+            intel_clear: !intel_clear_audiences.is_empty(),
+            intel_clear_audiences,
+            opportunities_manage: operator || crate::opportunities::steward_grant(hub, actor).is_some(),
+            mail: owner,
+            calendar: owner,
+        }),
+        sync_failures: if member { Vec::new() } else { hub.sync_failures() },
     })
 }
 

@@ -712,9 +712,9 @@ pub fn IndividualWizard(persona_id: Option<Uuid>, project_id: Option<Uuid>, on_c
                                         let persona = if let Some(persona_id) = id() {
                                             saved_persona().or_else(|| (store.personas).cloned().data.unwrap_or_default().into_iter().find(|p| p.id == persona_id))
                                         } else { match api::create_persona(&client, &name).await { Ok(p) => { id.set(Some(p.id)); saved_persona.set(Some(p.clone())); Some(p) }, Err(e) => { error.set(Some(e)); busy.set(false); return; } } };
-                                        let Some(persona) = persona else { error.set(Some(UiError { code: "persona_not_loaded".into(), message: "Reload and try again.".into() })); busy.set(false); return };
+                                        let Some(persona) = persona else { error.set(Some(UiError::new("persona_not_loaded", "Reload and try again."))); busy.set(false); return };
                                         if proposal().is_none() && persona.pending_proposals > 0 {
-                                            error.set(Some(UiError { code: "proposal_pending".into(), message: "A canon proposal is already pending. Send it for comments from the individual page.".into() }));
+                                            error.set(Some(UiError::new("proposal_pending", "A canon proposal is already pending. Send it for comments from the individual page.")));
                                             busy.set(false); return;
                                         }
                                         if proposal().is_none() {

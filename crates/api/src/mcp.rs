@@ -93,7 +93,7 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
             Effect::Read,
             read_tool(
                 "hub_today",
-                "Operator queues: pending reviews, active production, due releases, failed operations and overdue interactions.",
+                "Today's queues and intelligence, scoped to the caller's capabilities.",
                 hub.clone(),
                 |hub| async move { hub.today().await.map(|value| json_text!(value)) },
             ),
@@ -133,6 +133,7 @@ fn routes(ctx: &ClientContext) -> Vec<(Effect, ToolRoute<()>)> {
         (Effect::Write, draft_reply_tool(hub.clone())),
         (Effect::Write, assistant_draft_tool(hub.clone())),
         (Effect::Write, ingest_opportunity_tool(hub.clone())),
+        (Effect::Write, decide_opportunity_tool(hub.clone())),
         (Effect::Write, notify_tool(hub.clone())),
         (Effect::Write, summary_tool(hub.clone())),
         (
@@ -524,6 +525,7 @@ fn ingest_opportunity_tool(hub: HubClient) -> ToolRoute<()> {
             "File a funding call, fellowship, prize, venue or programme. Body fields follow the hub `OpportunityIn` contract; at least one evidence entry is required.",
             schema(
                 json!({
+                    "company_id": { "type": "string", "description": "Target company; defaults to the Hub's configured company." },
                     "persona_id": { "type": ["string", "null"], "description": "Optional persona UUID." },
                     "source": { "type": "string", "description": "Feed identity, e.g. `n8n:funder-feed`." },
                     "external_id": { "type": "string", "description": "Sender's stable id; retries reuse it." },
@@ -551,6 +553,31 @@ fn ingest_opportunity_tool(hub: HubClient) -> ToolRoute<()> {
                     Err(error) => failed(format!("invalid OpportunityIn: {error}")),
                 }
             }
+        },
+    )
+}
+
+fn decide_opportunity_tool(hub: HubClient) -> ToolRoute<()> {
+    mail_tool(
+        hub,
+        Tool::new(
+            "hub_decide_opportunity",
+            "Record a decision on an opportunity you are authorized to manage.",
+            schema(
+                json!({
+                    "id":{"type":"string","format":"uuid"},
+                    "state":{"enum":["new","shortlisted","drafting","submitted","awarded","rejected","declined"]},
+                    "note":{"type":"string"},
+                    "paperclip_issue_id":{"type":"string"}
+                }),
+                &["id", "state"],
+            ),
+        ),
+        |hub, args| async move {
+            let id = serde_json::from_value(args["id"].clone()).map_err(|_| "id must be a UUID")?;
+            let body = serde_json::from_value(args).map_err(|_| "invalid opportunity decision")?;
+            let item = hub.decide_opportunity(id, &body).await.map_err(|e| e.to_string())?;
+            Ok(json_text!(item))
         },
     )
 }
@@ -951,6 +978,7 @@ mod tests {
                 ("hub_draft_reply", Effect::Write),
                 ("hub_assistant_draft_reply", Effect::Write),
                 ("hub_ingest_opportunity", Effect::Write),
+                ("hub_decide_opportunity", Effect::Write),
                 ("hub_notify", Effect::Write),
                 ("hub_post_summary", Effect::Write),
                 ("hub_providers", Effect::Read),
@@ -972,6 +1000,10 @@ mod tests {
                 ("hub_intel_signal", Effect::Read),
                 ("hub_intel_sources", Effect::Read),
                 ("hub_intel_ingest", Effect::Write),
+                ("hub_intel_list", Effect::Read),
+                ("hub_intel_decide", Effect::Write),
+                ("hub_intel_clear", Effect::Write),
+                ("hub_intel_promote_from_mail", Effect::Write),
             ]
         );
         let mut names: Vec<&str> = actual.iter().map(|(name, _)| *name).collect();

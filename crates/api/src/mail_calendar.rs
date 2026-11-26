@@ -169,10 +169,10 @@ impl Runtime {
         Ok(Self { mail, calendar, client, credentials_dir: std::env::var_os("CREDENTIALS_DIRECTORY").map(Into::into) })
     }
 
-    pub async fn register(&self, hub: &Hub) -> DResult<()> {
+    pub async fn register(&self, hub: &Hub, mail_config_managed: bool) -> DResult<()> {
         let actor = Actor::system();
-        for config in &self.mail.accounts {
-            hub.upsert_mail_account_system(&actor, &config.owner, &config.account).await?;
+        if mail_config_managed {
+            hub.register_configured_mail_accounts(&actor, self.mail.accounts.iter().map(|c| (c.owner.as_str(), &c.account))).await?;
         }
         for config in &self.calendar.sources {
             hub.upsert_calendar_source_system(&actor, &config.owner, &config.source).await?;
@@ -264,21 +264,23 @@ impl Runtime {
         read_runtime_credential(self.credentials_dir.as_deref(), name, fallback).await
     }
 
-    async fn sync_mail(&self, hub: &Hub, owner: Option<&str>) {
+    async fn sync_mail(&self, hub: &Hub, caller: Option<(&str, bool)>) {
         let actor = Actor::system();
         for config in self.mail.accounts.iter().filter(|c| {
-            c.account.enabled && owner.is_none_or(|owner| owner == c.owner) && matches!(c.account.transport.as_str(), "imap" | "export_dir")
+            c.account.enabled
+                && matches!(c.account.transport.as_str(), "imap" | "export_dir")
+                && caller.is_none_or(|(owner, human)| human || owner == c.owner)
         }) {
-            if let Err(error) = self.sync_account(hub, &actor, config).await {
+            if let Err(error) = self.sync_account(hub, &actor, config, caller.map(|(owner, _)| owner)).await {
                 tracing::warn!(code = error.code(), "mail sync state could not be updated");
             }
         }
     }
 
-    async fn sync_account(&self, hub: &Hub, actor: &Actor, config: &AccountConfig) -> DResult<()> {
+    async fn sync_account(&self, hub: &Hub, actor: &Actor, config: &AccountConfig, caller_owner: Option<&str>) -> DResult<()> {
         let owner = &config.owner;
         let account = hub.mail_account_system(actor, owner, &config.account.label).await?;
-        let Some(lease) = hub.acquire_mail_sync_lease(actor, owner, account.id, LEASE_SECONDS).await? else {
+        let Some(lease) = hub.acquire_mail_sync_lease_for(actor, owner, account.id, LEASE_SECONDS, caller_owner).await? else {
             return Ok(());
         };
         let result = tokio::time::timeout(PASS_TIMEOUT, async {
@@ -565,7 +567,8 @@ async fn ingest(State(state): State<AppState>, Caller(actor): Caller, Json(body)
 
 async fn mail_sync(State(state): State<AppState>, Caller(actor): Caller) -> R<Vec<MailAccount>> {
     let owner = state.hub.resolve_owner(&actor).map_err(err(&actor))?;
-    state.mail_calendar.sync_mail(&state.hub, Some(&owner)).await;
+    let human = matches!(actor.principal.role, Role::Operator | Role::Member);
+    state.mail_calendar.sync_mail(&state.hub, Some((&owner, human))).await;
     call!(actor, state.hub.list_mail_accounts(&actor))
 }
 

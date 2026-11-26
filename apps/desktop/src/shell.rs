@@ -25,7 +25,8 @@ pub fn Sidebar(workspace: Signal<Workspace>, mut nav_open: Signal<bool>, narrow:
         }
     };
     let groups: [(&str, Vec<Workspace>); 2] = ["FLEET", "STUDIO"].map(|section| {
-        let items = Workspace::ALL.iter().copied().filter(|w| w.section() == section).collect();
+        let status = store.status.read();
+        let items = Workspace::ALL.iter().copied().filter(|w| w.section() == section && w.available(status.data.as_ref())).collect();
         (section, items)
     });
     use_effect(move || {
@@ -153,7 +154,7 @@ pub struct StatusSeg {
 #[component]
 pub fn StatusBar(
     connection: StatusSeg,
-    fleet: StatusSeg,
+    fleet: Option<StatusSeg>,
     production_paused: bool,
     integrations: Vec<StatusSeg>,
     version: String,
@@ -161,7 +162,9 @@ pub fn StatusBar(
     rsx! {
         footer { class: "statusbar",
             StatusSegment { seg: connection }
-            StatusSegment { seg: fleet }
+            if let Some(seg) = fleet {
+                StatusSegment { seg }
+            }
             if production_paused {
                 StatusSegment { seg: StatusSeg { label: "Production paused".into(), tone: "warn".into() } }
             }

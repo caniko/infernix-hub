@@ -63,6 +63,7 @@ impl ApiErr {
             DomainError::Forbidden(_) | DomainError::Denied { .. } => StatusCode::FORBIDDEN,
             DomainError::NotFound(_) => StatusCode::NOT_FOUND,
             DomainError::Conflict { .. } => StatusCode::CONFLICT,
+            DomainError::Invalid { code: "invalid_promotion_payload" | "reserved_intel_external_id", .. } => StatusCode::BAD_REQUEST,
             DomainError::Invalid { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             DomainError::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             DomainError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
@@ -154,6 +155,7 @@ pub fn router_with(state: AppState, pack_routes: Vec<(String, Router<AppState>)>
         .route("/intel/signals/{id}/decision", post(intel::decide))
         .route("/intel/signals/{id}/clearance", post(intel::clear))
         .route("/intel/sources", get(intel::sources))
+        .route("/intel/promotions/from-mail", post(intel::promote_from_mail))
         .route("/search", get(search))
         .route("/history/{subject_type}/{id}", get(history))
         .route("/ingest/news", post(ingest_news))
@@ -723,11 +725,13 @@ async fn search(State(s): State<AppState>, Caller(a): Caller, Query(q): Query<Se
     call!(a, domain::content::search(&s.hub, &a, &q.q))
 }
 async fn history(State(s): State<AppState>, Caller(a): Caller, Path((t, id)): Path<(String, String)>) -> R<Vec<HistoryEntry>> {
-    // Notification audit rows name members and what they dismissed; only the
-    // operator may see them.
+    // Signal audit is always unavailable, including to granted stewards.
+    if matches!(t.as_str(), "signal" | "intel_source") {
+        return call!(a, domain::history_for_actor(&s.hub, &a, &t, &id));
+    }
     let readers = if t == "notification" { domain::OPERATOR } else { domain::ANY_READER };
     a.require(readers).map_err(err(&a))?;
-    call!(a, domain::history(&s.hub.db, &t, &id))
+    call!(a, domain::history_for_actor(&s.hub, &a, &t, &id))
 }
 
 fn idempotency(h: &HeaderMap) -> Option<String> {
@@ -843,12 +847,22 @@ async fn notification_list(State(s): State<AppState>, Caller(a): Caller, Query(q
     }
 }
 
-async fn raise_notification(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<RaiseNotificationIn>) -> R<Notification> {
-    call!(a, domain::notifications::post(&s.hub, &a, b))
+async fn raise_notification(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Query(q): Query<NotificationsQ>,
+    Json(b): Json<RaiseNotificationIn>,
+) -> R<Notification> {
+    call!(a, domain::notifications::post(&s.hub, &a, q.owner.as_deref(), b))
 }
 
-async fn sync_notifications(State(s): State<AppState>, Caller(a): Caller, Json(b): Json<SyncNotificationsIn>) -> R<SyncNotificationsOut> {
-    let changed = domain::notifications::sync_api(&s.hub, &a, b).await.map_err(err(&a))?;
+async fn sync_notifications(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Query(q): Query<NotificationsQ>,
+    Json(b): Json<SyncNotificationsIn>,
+) -> R<SyncNotificationsOut> {
+    let changed = domain::notifications::sync_api(&s.hub, &a, q.owner.as_deref(), b).await.map_err(err(&a))?;
     Ok(Json(SyncNotificationsOut { changed }))
 }
 

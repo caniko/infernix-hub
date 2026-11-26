@@ -3237,6 +3237,7 @@ async fn open_procedures_are_polled_least_recently_first_so_none_starves() {
 
 fn opportunity_in(external_id: &str, deadline: Option<chrono::DateTime<Utc>>) -> OpportunityIn {
     OpportunityIn {
+        company_id: None,
         persona_id: None,
         source: "n8n:funder-feed".into(),
         external_id: external_id.into(),
@@ -3779,8 +3780,8 @@ async fn member_notifications_are_isolated() {
     domain::system::issue_token(&h.hub.db, "other", Role::Member, Some("other".into())).await.unwrap();
     let member = HubClient::new(&h.url, "member");
     let other = HubClient::new(&h.url, "other");
-    assert_eq!(code(member.today().await.unwrap_err()), "forbidden");
-    assert_eq!(code(member.get::<serde_json::Value>("/status").await.unwrap_err()), "forbidden");
+    assert_eq!(member.today().await.unwrap(), Today::default());
+    assert!(member.status().await.unwrap().integrations.is_empty());
     assert_eq!(code(member.get::<serde_json::Value>("/fleet/status").await.unwrap_err()), "forbidden");
     assert_eq!(code(member.secrets().await.unwrap_err()), "forbidden");
     assert_eq!(code(h.op.secrets().await.unwrap_err()), "secret_inventory_unconfigured");
@@ -3800,8 +3801,7 @@ async fn member_notifications_are_isolated() {
     assert_eq!(other.notifications(None, 0, true).await.unwrap().items[0].id, theirs.id);
     assert!(member.notifications(Some(0), 0, true).await.unwrap().items.iter().all(|row| row.id == own.id));
     assert!(h.op.notifications(Some(0), 0, true).await.unwrap().items.iter().all(|row| row.id == op.id));
-    let view: NotificationPage = h.op.get("/notifications?owner=dejana&state=all").await.unwrap();
-    assert_eq!(view.items[0].id, own.id);
+    assert_eq!(code(h.op.get::<NotificationPage>("/notifications?owner=dejana&state=all").await.unwrap_err()), "forbidden");
     assert_eq!(code(member.get::<NotificationPage>("/notifications?owner=other").await.unwrap_err()), "forbidden");
     assert_eq!(code(h.agent.get::<NotificationPage>("/notifications?owner=dejana").await.unwrap_err()), "forbidden");
     let ack = |id| AckNotificationsIn { ids: vec![id], all: false };
@@ -3812,17 +3812,20 @@ async fn member_notifications_are_isolated() {
     assert_eq!(code(h.op.snooze_notification(own.id, &until).await.unwrap_err()), "not_found");
     member.snooze_notification(own.id, &until).await.unwrap();
     assert_eq!(member.notifications(None, 0, true).await.unwrap().open, 0);
-    let _: Notification = h.op.post(&format!("/notifications/{}/snooze?owner=dejana", own.id), &until).await.unwrap();
+    assert_eq!(
+        code(h.op.post::<_, Notification>(&format!("/notifications/{}/snooze?owner=dejana", own.id), &until).await.unwrap_err()),
+        "forbidden"
+    );
     let all = AckNotificationsIn { ids: vec![], all: true };
     h.op.ack_notifications(&all).await.unwrap();
     assert!(other.notifications(None, 0, true).await.unwrap().items[0].read_at.is_none());
-    let _: NotificationPage = h.op.post("/notifications/ack?owner=other", &all).await.unwrap();
-    assert!(other.notifications(None, 0, true).await.unwrap().items[0].read_at.is_some());
+    assert_eq!(code(h.op.post::<_, NotificationPage>("/notifications/ack?owner=other", &all).await.unwrap_err()), "forbidden");
+    assert!(other.notifications(None, 0, true).await.unwrap().items[0].read_at.is_none());
     member.ack_notifications(&ack(own.id)).await.unwrap();
     assert!(member.notifications(None, 0, true).await.unwrap().items[0].read_at.is_some());
     let history = format!("/history/notification/{}", own.id);
     assert_eq!(code(h.agent.get::<Vec<HistoryEntry>>(&history).await.unwrap_err()), "forbidden");
-    assert!(!h.op.get::<Vec<HistoryEntry>>(&history).await.unwrap().is_empty());
+    assert!(h.op.get::<Vec<HistoryEntry>>(&history).await.unwrap().is_empty());
     let long_source = RaiseNotificationIn { source: Some("s".repeat(65)), ..notification_in("long", "") };
     assert_eq!(code(member.raise_notification(&long_source).await.unwrap_err()), "invalid_source");
     for client in [&h.op, &h.agent, &h.procedure] {
@@ -4583,18 +4586,23 @@ async fn member_renewals_are_private_and_produced() {
     let notes = member.notifications(None, 0, true).await.unwrap();
     assert!(notes.items.iter().any(|n| n.dedupe_key == "member:dejana:renewal:private:overdue" && n.severity == Severity::Critical));
     assert!(h.op.notifications(None, 0, true).await.unwrap().items.iter().all(|n| !n.dedupe_key.contains("private")));
-    let inspected: NotificationPage = h.op.get("/notifications?owner=dejana&state=all").await.unwrap();
-    assert_eq!((inspected.open, inspected.critical), (0, 0));
-    assert!(inspected.items.is_empty());
+    assert_eq!(code(h.op.get::<NotificationPage>("/notifications?owner=dejana&state=all").await.unwrap_err()), "forbidden");
     let private_note = notes.items.iter().find(|n| n.dedupe_key == "member:dejana:renewal:private:overdue").unwrap();
     let ack = AckNotificationsIn { ids: vec![private_note.id], all: false };
-    assert_eq!(code(h.op.post::<_, NotificationPage>("/notifications/ack?owner=dejana", &ack).await.unwrap_err()), "not_found");
+    assert_eq!(code(h.op.post::<_, NotificationPage>("/notifications/ack?owner=dejana", &ack).await.unwrap_err()), "forbidden");
     let until = SnoozeNotificationIn { until: Utc::now() + chrono::Duration::hours(1) };
     assert_eq!(
         code(h.op.post::<_, Notification>(&format!("/notifications/{}/snooze?owner=dejana", private_note.id), &until).await.unwrap_err()),
-        "not_found"
+        "forbidden"
     );
-    let _: NotificationPage = h.op.post("/notifications/ack?owner=dejana", &AckNotificationsIn { ids: vec![], all: true }).await.unwrap();
+    assert_eq!(
+        code(
+            h.op.post::<_, NotificationPage>("/notifications/ack?owner=dejana", &AckNotificationsIn { ids: vec![], all: true })
+                .await
+                .unwrap_err()
+        ),
+        "forbidden"
+    );
     assert!(member.notifications(None, 0, true).await.unwrap().items.iter().all(|n| n.read_at.is_none()));
     assert!(notes.items.iter().any(|n| n.dedupe_key == "member:dejana:renewal:removed:overdue" && n.resolved_at.is_none()));
     domain::sqlx::query("delete from renewals where key = 'removed'").execute(&h.hub.db).await.unwrap();

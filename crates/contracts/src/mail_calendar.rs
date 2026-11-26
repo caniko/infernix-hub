@@ -8,6 +8,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailVisibility {
+    #[default]
+    Private,
+    Shared,
+}
+
+impl MailVisibility {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Shared => "shared",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MailTransportConfig {
@@ -22,6 +39,8 @@ pub struct MailTransportConfig {
 pub struct MailAccount {
     pub id: Uuid,
     pub owner: String,
+    #[serde(default)]
+    pub visibility: MailVisibility,
     pub label: String,
     pub provider: String,
     pub transport: String,
@@ -39,6 +58,8 @@ pub struct MailAccount {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MailAccountUpsert {
+    #[serde(default)]
+    pub visibility: MailVisibility,
     pub label: String,
     pub provider: String,
     pub transport: String,

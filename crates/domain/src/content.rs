@@ -265,14 +265,25 @@ async fn today_items(hub: &Hub, sql: &str) -> DResult<Vec<TodayItem>> {
 }
 
 pub async fn today(hub: &Hub, actor: &Actor) -> DResult<Today> {
-    actor.require(crate::ANY_READER)?;
-    let mut today = system_today(hub).await?;
+    if actor.principal.role == contracts::Role::Member {
+        let opportunities = match crate::opportunities::steward_grant(hub, actor) {
+            Some(grant) => crate::opportunities::today(hub, Some(grant.authorized_companies().collect())).await?,
+            None => Vec::new(),
+        };
+        return Ok(Today { intelligence: crate::intel::today_for_actor(hub, actor).await?, opportunities, ..Today::default() });
+    }
+    let companies = crate::opportunities::read_scope(hub, actor)?;
+    let mut today = today_in_scope(hub, companies).await?;
     today.intelligence = crate::intel::today_for_actor(hub, actor).await?;
     Ok(today)
 }
 
 /// The same read for the producer loop, which has no request and no role.
 pub async fn system_today(hub: &Hub) -> DResult<Today> {
+    today_in_scope(hub, None).await
+}
+
+async fn today_in_scope(hub: &Hub, opportunity_companies: Option<Vec<&str>>) -> DResult<Today> {
     Ok(Today {
         pending_reviews: today_items(
             hub,
@@ -352,15 +363,7 @@ pub async fn system_today(hub: &Hub) -> DResult<Today> {
              order by at",
         )
         .await?,
-        opportunities: today_items(
-            hub,
-            "select 'opportunity' as kind, o.title, 'opportunity' as subject_type, o.id as subject_id,
-               case when o.deadline < now() then 'expired' else o.state end as status, o.deadline as at
-             from opportunities o
-             where o.state in ('shortlisted', 'drafting') and o.deadline is not null and o.deadline < now() + interval '14 days'
-             order by o.deadline",
-        )
-        .await?,
+        opportunities: crate::opportunities::today(hub, opportunity_companies).await?,
         renewals: crate::renewals::today(hub).await?,
         intelligence: Vec::new(),
     })

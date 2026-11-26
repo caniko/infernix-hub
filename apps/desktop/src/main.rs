@@ -92,7 +92,15 @@ fn App() -> Element {
     let mut narrow_nav = use_signal(|| false);
     let inspector_selection = use_memo(move || {
         let workspace = (store.workspace).cloned();
+        let workspace = if workspace.available(store.status.read().data.as_ref()) { workspace } else { Workspace::Today };
         (workspace, store.inspector_item(workspace))
+    });
+    use_effect(move || {
+        if let Some(status) = store.status.read().data.as_ref()
+            && !(store.workspace)().available(Some(status))
+        {
+            store.set_workspace(Workspace::Today);
+        }
     });
     use_effect(move || {
         let (_, selected) = inspector_selection.cloned();
@@ -117,20 +125,6 @@ fn App() -> Element {
         }
     });
 
-    // The fleet snapshot has its own cadence: another tool rewrites it every
-    // few minutes, so polling it with the 1.5s content poll would be noise.
-    let fleet_client = client.clone();
-    use_future(move || {
-        let client = fleet_client.clone();
-        async move {
-            api::refresh_fleet(store, client.clone()).await;
-            loop {
-                tokio::time::sleep(Duration::from_secs(api::FLEET_POLL_SECS)).await;
-                api::refresh_fleet(store, client.clone()).await;
-            }
-        }
-    });
-
     // Notifications are a server-held long poll, not a timer: one snapshot,
     // then the change feed as it happens (the tray consumes the same feed).
     let notification_client = client.clone();
@@ -140,37 +134,48 @@ fn App() -> Element {
     });
 
     // Detail loads follow the selections.
+    let can_load_operations = move || api::poll_operations(store.status.peek().data.as_ref());
     let content_client = client.clone();
     use_effect(move || {
-        if let Some(id) = (store.selected_content).cloned() {
+        if let Some(id) = (store.selected_content).cloned()
+            && can_load_operations()
+        {
             let client = content_client.clone();
             spawn(api::load_content_detail(store, client, id));
         }
     });
     let relationship_client = client.clone();
     use_effect(move || {
-        if let Some(id) = (store.selected_relationship).cloned() {
+        if let Some(id) = (store.selected_relationship).cloned()
+            && can_load_operations()
+        {
             let client = relationship_client.clone();
             spawn(api::load_relationship_detail(store, client, id));
         }
     });
     let canon_client = client.clone();
     use_effect(move || {
-        if let Some(id) = (store.selected_persona).cloned() {
+        if let Some(id) = (store.selected_persona).cloned()
+            && can_load_operations()
+        {
             let client = canon_client.clone();
             spawn(api::load_canon(store, client, id));
         }
     });
     let content_chat_client = client.clone();
     use_effect(move || {
-        if let Some(id) = (store.selected_content).cloned() {
+        if let Some(id) = (store.selected_content).cloned()
+            && can_load_operations()
+        {
             let client = content_chat_client.clone();
             spawn(api::load_chat(store, client, "content", id));
         }
     });
     let persona_chat_client = client.clone();
     use_effect(move || {
-        if let Some(id) = (store.selected_persona).cloned() {
+        if let Some(id) = (store.selected_persona).cloned()
+            && can_load_operations()
+        {
             let client = persona_chat_client.clone();
             spawn(api::load_chat(store, client, "persona", id));
         }
@@ -235,15 +240,9 @@ fn App() -> Element {
     });
 
     let status = (store.status).cloned();
+    let operations = api::poll_operations(status.data.as_ref());
     let live = status.data.is_some() && status.error.is_none();
-    let status_label = if live {
-        "Hub online"
-    } else if status.error.is_some() {
-        "Hub offline"
-    } else {
-        "Connecting…"
-    }
-    .to_string();
+    let status_label = api::connection_label(&status).to_string();
     let fixture = status.data.as_ref().is_some_and(|status| status.fixture_mode);
     let (all_fixture, simulated_integrations): (bool, Vec<String>) = status
         .data
@@ -384,6 +383,9 @@ fn App() -> Element {
         document::Title { "fleetix hub" }
         style { dangerous_inner_html: theme::style_sheet() }
         div { class: "app",
+            if operations {
+                FleetPoll {}
+            }
             shell::Sidebar { workspace: store.workspace, nav_open: store.nav_open, narrow: narrow_nav }
             div { class: "main",
                 shell::Topbar {
@@ -441,7 +443,7 @@ fn App() -> Element {
                     label: status_label,
                     tone: if live { "live" } else if status.error.is_some() { "bad" } else { "" }.into(),
                 },
-                fleet: fleet_segment,
+                fleet: operations.then_some(fleet_segment),
                 production_paused,
                 integrations,
                 version: format!("API {api_version} · Fleetix Hub v{}", env!("CARGO_PKG_VERSION")),
@@ -455,4 +457,21 @@ fn App() -> Element {
             }
         }
     }
+}
+
+// Mount only after status authorizes fleet access; refresh immediately, then every 30s.
+#[component]
+fn FleetPoll() -> Element {
+    let store = use_context::<Store>();
+    let client = use_context::<contracts::client::HubClient>();
+    use_future(move || {
+        let client = client.clone();
+        async move {
+            loop {
+                api::refresh_fleet(store, client.clone()).await;
+                tokio::time::sleep(Duration::from_secs(api::FLEET_POLL_SECS)).await;
+            }
+        }
+    });
+    VNode::empty()
 }

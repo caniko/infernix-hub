@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{Actor, DResult, DomainError, Hub, audit, conflict, decode, decode_one, invalid};
 
-pub use ingest::ingest_batch;
+pub use ingest::{ingest_batch, promote_from_mail};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -57,12 +57,31 @@ pub enum IntelTrustTier {
 pub struct IntelGrant {
     pub role: Role,
     pub principal_id: Option<Uuid>,
-    pub company_id: String,
+    #[serde(default)]
+    pub company_id: Option<String>,
+    #[serde(default)]
+    pub companies: Vec<String>,
     pub max_audience: Audience,
     #[serde(default)]
     pub write_sources: Vec<String>,
     #[serde(default)]
     pub monitor_sources: Vec<String>,
+    #[serde(default)]
+    pub can_review: bool,
+    #[serde(default)]
+    pub clear_audiences: Vec<Audience>,
+    #[serde(default)]
+    pub can_manage_opportunities: bool,
+}
+
+impl IntelGrant {
+    pub fn authorized_companies(&self) -> impl Iterator<Item = &str> {
+        self.company_id.iter().chain(&self.companies).map(String::as_str)
+    }
+
+    pub fn has_company(&self, id: &str) -> bool {
+        self.authorized_companies().any(|company| company == id)
+    }
 }
 
 fn valid_source(id: &str) -> bool {
@@ -78,14 +97,18 @@ impl IntelConfig {
             return Err(bad("invalid intel source id, company, or policy version"));
         }
         for grant in self.grants.values() {
-            if !valid_company(&grant.company_id) || grant.max_audience == Audience::OperatorOnly {
+            if grant.authorized_companies().next().is_none()
+                || !grant.authorized_companies().all(valid_company)
+                || grant.max_audience == Audience::OperatorOnly
+                || grant.clear_audiences.iter().any(|audience| audience.rank() > grant.max_audience.rank())
+            {
                 return Err(bad("invalid intel grant company or audience"));
             }
             if grant
                 .write_sources
                 .iter()
                 .chain(&grant.monitor_sources)
-                .any(|id| !self.sources.get(id).is_some_and(|p| p.company_id == grant.company_id))
+                .any(|id| !self.sources.get(id).is_some_and(|p| grant.has_company(&p.company_id)))
             {
                 return Err(bad("intel grants may only reference configured sources in their own company"));
             }
@@ -93,7 +116,7 @@ impl IntelConfig {
         Ok(())
     }
 
-    fn grant(&self, actor: &Actor) -> DResult<&IntelGrant> {
+    pub(crate) fn grant(&self, actor: &Actor) -> DResult<&IntelGrant> {
         let principal = &actor.principal;
         self.grants
             .get(&principal.name)
@@ -108,7 +131,7 @@ impl IntelConfig {
 
 enum Viewer<'a> {
     Operator(Option<String>),
-    Granted(&'a IntelGrant),
+    Granted(&'a IntelGrant, Option<String>),
 }
 
 impl<'a> Viewer<'a> {
@@ -116,14 +139,30 @@ impl<'a> Viewer<'a> {
         if actor.principal.role == Role::Operator {
             Ok(Self::Operator(hub.resolve_owner(actor).ok().filter(|owner| !owner.is_empty())))
         } else {
-            Ok(Self::Granted(hub.config.intel.grant(actor)?))
+            let owner = (actor.principal.role == Role::Member).then(|| hub.resolve_owner(actor).ok()).flatten();
+            Ok(Self::Granted(hub.config.intel.grant(actor)?, owner))
         }
     }
 
-    fn company(&self) -> Option<&str> {
+    fn in_company(&self, company: &str) -> bool {
         match self {
-            Self::Operator(_) => None,
-            Self::Granted(grant) => Some(&grant.company_id),
+            Self::Operator(_) => true,
+            Self::Granted(grant, _) => grant.has_company(company),
+        }
+    }
+
+    fn can_review(&self) -> bool {
+        match self {
+            Self::Operator(_) => true,
+            Self::Granted(grant, _) => grant.can_review,
+        }
+    }
+
+    // Granted viewers only receive ownerless rows from visible_sql.
+    fn can_access_base(&self, signal: &IntelSignal) -> bool {
+        match self {
+            Self::Operator(_) => true,
+            Self::Granted(grant, _) => grant.has_company(&signal.company_id) && signal.base_audience.rank() <= grant.max_audience.rank(),
         }
     }
 }
@@ -136,7 +175,7 @@ const PUBLIC_PROJECTION_FIELDS: &[&str] =
 /// Keep the audience test in SQL so paging/filtering happens after authority,
 /// not after fetching a page of rows from other tenants. Unknown or rebound
 /// policies are useful for operator cleanup only.
-fn visible_sql(hub: &Hub, viewer: &Viewer<'_>) -> QueryBuilder<'static, Postgres> {
+fn visible_sql(hub: &Hub, viewer: &Viewer<'_>, ids_only: bool) -> QueryBuilder<'static, Postgres> {
     let policies: Vec<_> = hub
         .config
         .intel
@@ -146,26 +185,37 @@ fn visible_sql(hub: &Hub, viewer: &Viewer<'_>) -> QueryBuilder<'static, Postgres
             |(id, p)| json!({"id": id, "company_id": p.company_id, "version": p.policy_version, "default_rank": p.default_audience.rank()}),
         )
         .collect();
-    let mut sql = QueryBuilder::new(
-        "select case when v.cross_company then
+    let mut sql = QueryBuilder::new("select ");
+    if ids_only {
+        sql.push("s.id");
+    } else {
+        sql.push(
+            "case when v.cross_company then
           (select jsonb_object_agg(key, value) from jsonb_each(to_jsonb(s)) where key = any(",
-    );
-    sql.push_bind(PUBLIC_PROJECTION_FIELDS).push(
-        ")) || jsonb_build_object('id', s.id, 'company_id', s.company_id, 'source_id', s.source_id,
+        );
+        sql.push_bind(PUBLIC_PROJECTION_FIELDS).push(
+            ")) || jsonb_build_object('id', s.id, 'company_id', s.company_id, 'source_id', s.source_id,
               'base_audience', 'public_cleared', 'effective_audience', 'public_cleared',
               'source_default_audience', 'public_cleared', 'cleared_audience', 'public_cleared', 'state', 'new')
           else (to_jsonb(s) - array['owner','owner_namespace','sticky_min_audience','cleared_revision',
               'cleared_base_audience','cleared_source_default_audience','cleared_policy_version','cleared_sha256',
-              'dismissed_severity','operator_note','search'])
+              'dismissed_severity','operator_note','search','cleared_at']
+              - case when v.clearance_only then array['external_id','persona_id','project_id','snoozed_until']
+                else array[]::text[] end)
            || jsonb_build_object('base_audience', a.names[b.rank + 1], 'effective_audience', a.names[e.rank + 1],
               'source_default_audience', a.names[coalesce(p.default_rank, 3) + 1],
+              'state', case when v.clearance_only then 'new' else s.state end,
+              'updated_at', case when v.clearance_only then coalesce(s.cleared_at, s.first_seen_at) else s.updated_at end,
+              'clearance_generation', case when v.clearance_only then 0 else s.clearance_generation end,
               'cleared_audience', case when c.valid then s.cleared_audience end, 'policy_version', coalesce(p.version, 0))",
-    );
-    if matches!(viewer, Viewer::Operator(_)) {
-        sql.push(" || jsonb_build_object('operator_note', s.operator_note)");
+        );
+        if matches!(viewer, Viewer::Operator(_)) {
+            sql.push(" || jsonb_build_object('operator_note', s.operator_note)");
+        }
+        sql.push(" end");
     }
     sql.push(
-        " end from intel_signals s
+        " from intel_signals s
           cross join (select array['public_cleared','persona_eligible','company_internal','operator_only'] as names) a
           left join jsonb_to_recordset(",
     )
@@ -179,18 +229,30 @@ fn visible_sql(hub: &Hub, viewer: &Viewer<'_>) -> QueryBuilder<'static, Postgres
                and s.cleared_base_audience = a.names[b.rank + 1]
                and s.cleared_source_default_audience = a.names[p.default_rank + 1]) as valid) c
            cross join lateral (select case when c.valid then array_position(a.names, s.cleared_audience) - 1 else b.rank end as rank) e
-           cross join lateral (select coalesce(s.company_id <> ",
+            cross join lateral (select coalesce(not (s.company_id = any(",
     )
-    .push_bind(viewer.company().map(str::to_owned))
-    .push(", false) as cross_company) v where (s.owner is null");
+    .push_bind(match viewer {
+        Viewer::Operator(_) => None,
+        Viewer::Granted(grant, _) => Some(grant.authorized_companies().map(str::to_owned).collect::<Vec<_>>()),
+    })
+    .push(")), false) as cross_company, ")
+    .push_bind(match viewer {
+        Viewer::Operator(_) => 3,
+        Viewer::Granted(grant, _) => i32::from(grant.max_audience.rank()),
+    })
+    .push(
+        "::int as viewer_rank) scope
+           cross join lateral (select scope.cross_company, b.rank > scope.viewer_rank as clearance_only) v
+           where (s.owner is null",
+    );
     match viewer {
         Viewer::Operator(owner) => {
             sql.push(" or s.owner = ").push_bind(owner.clone());
         }
-        Viewer::Granted(grant) => {
-            sql.push(" and p.id is not null and (case when v.cross_company then c.valid and e.rank = 0 else e.rank <= ")
-                .push_bind(i32::from(grant.max_audience.rank()))
-                .push(" end)");
+        Viewer::Granted(..) => {
+            sql.push(
+                " and p.id is not null and (case when v.cross_company then c.valid and e.rank = 0 else e.rank <= scope.viewer_rank end)",
+            );
         }
     }
     sql.push(")");
@@ -198,7 +260,7 @@ fn visible_sql(hub: &Hub, viewer: &Viewer<'_>) -> QueryBuilder<'static, Postgres
 }
 
 async fn visible_signal(conn: &mut PgConnection, hub: &Hub, viewer: &Viewer<'_>, id: Uuid) -> DResult<Option<IntelSignal>> {
-    let mut sql = visible_sql(hub, viewer);
+    let mut sql = visible_sql(hub, viewer, false);
     let row = sql.push(" and s.id = ").push_bind(id).build_query_scalar::<Value>().fetch_optional(conn).await?;
     row.map(decode_one).transpose()
 }
@@ -217,7 +279,7 @@ pub async fn list_signals(hub: &Hub, actor: &Actor, query: IntelSignalQuery) -> 
 }
 
 async fn list_visible(hub: &Hub, viewer: &Viewer<'_>, query: IntelSignalQuery, today: bool) -> DResult<IntelSignalPage> {
-    let mut sql = visible_sql(hub, viewer);
+    let mut sql = visible_sql(hub, viewer, false);
     if let Some(source) = query.source {
         if !valid_source(&source) {
             return Err(invalid("invalid_source", "invalid intel source id"));
@@ -228,7 +290,7 @@ async fn list_visible(hub: &Hub, viewer: &Viewer<'_>, query: IntelSignalQuery, t
         sql.push(" and s.kind = ").push_bind(kind.as_str());
     }
     if let Some(state) = query.state {
-        sql.push(" and (case when v.cross_company then 'new' else s.state end) = ").push_bind(state.as_str());
+        sql.push(" and (case when v.cross_company or v.clearance_only then 'new' else s.state end) = ").push_bind(state.as_str());
     }
     if let Some(severity) = query.severity_min {
         sql.push(" and array_position(array['info','warning','critical'], s.severity) - 1 >= ").push_bind(severity_rank(severity));
@@ -237,10 +299,10 @@ async fn list_visible(hub: &Hub, viewer: &Viewer<'_>, query: IntelSignalQuery, t
         sql.push(" and e.rank <= ").push_bind(i32::from(audience.rank()));
     }
     if let Some(persona) = query.persona {
-        sql.push(" and not v.cross_company and s.persona_id = ").push_bind(persona);
+        sql.push(" and not (v.cross_company or v.clearance_only) and s.persona_id = ").push_bind(persona);
     }
     if let Some(project) = query.project {
-        sql.push(" and not v.cross_company and s.project_id = ").push_bind(project);
+        sql.push(" and not (v.cross_company or v.clearance_only) and s.project_id = ").push_bind(project);
     }
     if let Some(subject) = query.subject {
         let subject = bounded(&subject, 2048, false, "invalid_subject")?;
@@ -261,7 +323,7 @@ async fn list_visible(hub: &Hub, viewer: &Viewer<'_>, query: IntelSignalQuery, t
         sql.push(" and (s.expires_at is null or s.expires_at > now())");
     }
     if today {
-        sql.push(" and (v.cross_company or s.snoozed_until is null or s.snoozed_until <= now())");
+        sql.push(" and (v.cross_company or v.clearance_only or s.snoozed_until is null or s.snoozed_until <= now())");
     }
     if let Some(cursor) = query.cursor {
         let parsed = (|| {
@@ -314,13 +376,15 @@ pub async fn get_signal(hub: &Hub, actor: &Actor, id: Uuid) -> DResult<IntelSign
     let viewer = Viewer::new(hub, actor)?;
     let mut tx = hub.db.begin().await?;
     sqlx::query("set transaction isolation level repeatable read, read only").execute(&mut *tx).await?;
-    let signal = visible_signal(&mut tx, hub, &viewer, id).await?.ok_or(DomainError::NotFound("signal"))?;
-    let links = if viewer.company().is_some_and(|company| company != signal.company_id) {
-        Vec::new()
-    } else {
-        links::read(&mut tx, hub, actor, &viewer, &signal).await?
-    };
-    let revisions = if matches!(viewer, Viewer::Operator(_)) {
+    let mut signal = visible_signal(&mut tx, hub, &viewer, id).await?.ok_or(DomainError::NotFound("signal"))?;
+    let base_authority = viewer.can_access_base(&signal);
+    let links = if base_authority { links::read(&mut tx, hub, actor, &viewer, &signal).await? } else { Vec::new() };
+    let review = base_authority && viewer.can_review();
+    if review && matches!(viewer, Viewer::Granted(..)) {
+        signal.operator_note =
+            sqlx::query_scalar("select operator_note from intel_signals where id = $1").bind(id).fetch_one(&mut *tx).await?;
+    }
+    let revisions = if review {
         decode(
             sqlx::query_scalar(
                 "select to_jsonb(r) - 'signal_id' from intel_signal_revisions r where signal_id = $1 order by revision desc",
@@ -336,23 +400,56 @@ pub async fn get_signal(hub: &Hub, actor: &Actor, id: Uuid) -> DResult<IntelSign
     Ok(IntelSignalDetail { signal, links, revisions })
 }
 
-async fn lock_for_review(conn: &mut PgConnection, hub: &Hub, viewer: &Viewer<'_>, id: Uuid) -> DResult<Option<String>> {
-    let Viewer::Operator(owner) = viewer else {
-        visible_signal(conn, hub, viewer, id).await?.ok_or(DomainError::NotFound("signal"))?;
-        return Err(DomainError::Forbidden("only an operator can review signals".into()));
+async fn lock_for_review(
+    conn: &mut PgConnection,
+    hub: &Hub,
+    viewer: &Viewer<'_>,
+    id: Uuid,
+    clearance: Option<Audience>,
+) -> DResult<(IntelSignal, Option<String>)> {
+    let caller_owner = match viewer {
+        Viewer::Operator(owner) => owner.as_deref(),
+        Viewer::Granted(..) => None,
     };
-    sqlx::query_scalar("select owner from intel_signals where id = $1 and (owner is null or owner = $2) for update")
-        .bind(id)
-        .bind(owner)
-        .fetch_optional(conn)
-        .await?
-        .ok_or(DomainError::NotFound("signal"))
+    // Don't take locks on invisible rows. Recheck after locking because ingest may
+    // have changed the projection or effective audience while we were waiting.
+    let authorize = |signal: &IntelSignal| {
+        let Viewer::Granted(grant, _) = viewer else { return Ok(()) };
+        let allowed = match clearance {
+            None => grant.can_review,
+            Some(audience) => grant.clear_audiences.contains(&audience),
+        };
+        if !allowed || !viewer.can_access_base(signal) {
+            return Err(DomainError::Forbidden("caller may not review or clear this signal".into()));
+        }
+        Ok(())
+    };
+    if matches!(viewer, Viewer::Granted(..)) {
+        let signal = visible_signal(conn, hub, viewer, id).await?.ok_or(DomainError::NotFound("signal"))?;
+        authorize(&signal)?;
+    }
+    let owner: Option<String> =
+        sqlx::query_scalar("select owner from intel_signals where id = $1 and (owner is null or owner = $2) for update")
+            .bind(id)
+            .bind(caller_owner)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or(DomainError::NotFound("signal"))?;
+    let signal = visible_signal(conn, hub, viewer, id).await?.ok_or_else(|| {
+        if clearance.is_some() && matches!(viewer, Viewer::Granted(..)) {
+            conflict("stale_revision", "signal revision, projection or policy has changed")
+        } else {
+            DomainError::NotFound("signal")
+        }
+    })?;
+    authorize(&signal)?;
+    Ok((signal, owner))
 }
 
 pub async fn decide_signal(hub: &Hub, actor: &Actor, id: Uuid, input: SignalDecisionIn) -> DResult<IntelSignal> {
     let viewer = Viewer::new(hub, actor)?;
     let mut tx = hub.db.begin().await?;
-    lock_for_review(&mut tx, hub, &viewer, id).await?;
+    lock_for_review(&mut tx, hub, &viewer, id, None).await?;
     let note = input.note.as_deref().map(|s| bounded(s, 4000, true, "invalid_note")).transpose()?;
     let update = match input.action {
         SignalDecisionAction::Acknowledge => "state = 'acknowledged', dismissed_severity = null, snoozed_until = null",
@@ -374,13 +471,18 @@ pub async fn decide_signal(hub: &Hub, actor: &Actor, id: Uuid, input: SignalDeci
     Ok(signal)
 }
 
-pub async fn clear_signal(hub: &Hub, actor: &Actor, id: Uuid, input: SignalClearanceIn) -> DResult<IntelSignal> {
+pub async fn clear_signal(hub: &Hub, actor: &Actor, id: Uuid, input: ClearSignalIn) -> DResult<IntelSignal> {
+    let ClearSignalIn { reviewed: input, expected_clearance_generation } = input;
     let viewer = Viewer::new(hub, actor)?;
     let mut tx = hub.db.begin().await?;
-    if lock_for_review(&mut tx, hub, &viewer, id).await?.is_some() {
+    let (signal, owner) = lock_for_review(&mut tx, hub, &viewer, id, Some(input.audience)).await?;
+    if owner.is_some() {
         return Err(invalid("owner_signal_cannot_widen", "owner-scoped signals cannot be cleared"));
     }
-    let signal = visible_signal(&mut tx, hub, &viewer, id).await?.ok_or(DomainError::NotFound("signal"))?;
+    let expected_gen = expected_clearance_generation.unwrap_or(0);
+    if signal.clearance_generation != expected_gen {
+        return Err(conflict("stale_revision", "signal clearance has changed"));
+    }
     let policy = hub.config.intel.policy(&signal.source_id, &signal.company_id);
     let review = signal.review.ok_or_else(|| DomainError::Internal("missing operator review metadata".into()))?;
     let Some(policy) = policy.filter(|p| {
@@ -389,12 +491,13 @@ pub async fn clear_signal(hub: &Hub, actor: &Actor, id: Uuid, input: SignalClear
             && review.revision == input.revision
             && review.projection_sha256 == input.projection_sha256
     }) else {
-        return Err(conflict("stale_revision", "signal revision, projection or policy has changed"));
+        return Err(conflict("stale_revision", "signal revision, projection, policy or clearance has changed"));
     };
     let rationale = bounded(&input.rationale, 4000, false, "invalid_rationale")?;
     sqlx::query(
         "update intel_signals set cleared_audience = $2, cleared_revision = $3, cleared_policy_version = $4,
-             cleared_sha256 = $5, cleared_base_audience = $6, cleared_source_default_audience = $7, updated_at = now() where id = $1",
+              cleared_sha256 = $5, cleared_base_audience = $6, cleared_source_default_audience = $7,
+              clearance_generation = clearance_generation + 1, cleared_at = now(), updated_at = now() where id = $1",
     )
     .bind(id)
     .bind(input.audience.as_str())
@@ -431,8 +534,12 @@ pub async fn list_sources(hub: &Hub, actor: &Actor) -> DResult<Vec<IntelSourceSt
         .filter_map(|(id, policy)| {
             let monitor = match &viewer {
                 Viewer::Operator(_) => true,
-                Viewer::Granted(grant) if grant.company_id == policy.company_id => grant.monitor_sources.contains(id),
-                Viewer::Granted(_) => return None,
+                Viewer::Granted(grant, _)
+                    if grant.has_company(&policy.company_id) && policy.default_audience.rank() <= grant.max_audience.rank() =>
+                {
+                    grant.monitor_sources.contains(id)
+                }
+                Viewer::Granted(..) => return None,
             };
             Some(json!({"id": id, "company_id": policy.company_id, "policy_version": policy.policy_version,
             "default_audience": policy.default_audience, "stale_after_secs": policy.stale_after_secs, "monitor": monitor}))

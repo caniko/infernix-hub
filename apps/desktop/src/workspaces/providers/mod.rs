@@ -759,6 +759,7 @@ mod tests {
                     production_paused: false,
                     integrations: vec![],
                     feeds: vec![],
+                    capabilities: None,
                     sync_failures: vec![],
                     principal: contracts::Principal { id: Uuid::nil(), name: "test".into(), role: Role::Operator },
                 };

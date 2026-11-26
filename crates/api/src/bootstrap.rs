@@ -253,6 +253,14 @@ pub(crate) fn require_live_approvals(
 }
 
 pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
+    build_with_mail_policy(s, true).await
+}
+
+pub async fn build_worker(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
+    build_with_mail_policy(s, s.mail_config.is_some()).await
+}
+
+async fn build_with_mail_policy(s: &Settings, mail_config_managed: bool) -> anyhow::Result<(AppState, Fixtures)> {
     let intel: domain::intel::IntelConfig = load_runtime_json(s.intel_config.as_deref(), "intel")?;
     intel.validate()?;
     let principal_owners = load_runtime_json(s.principal_owners_config.as_deref(), "principal owners")?;
@@ -541,7 +549,7 @@ pub async fn build(s: &Settings) -> anyhow::Result<(AppState, Fixtures)> {
             }
         }
     }
-    mail_calendar.register(&hub).await.context("registering mail accounts and calendar sources")?;
+    mail_calendar.register(&hub, mail_config_managed).await.context("registering mail accounts and calendar sources")?;
     Ok((
         AppState {
             hub,

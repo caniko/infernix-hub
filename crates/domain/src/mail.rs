@@ -34,7 +34,25 @@ const MESSAGE_SCOPE: &str = "
     from mail_messages m
     join mail_accounts a on (a.owner,a.id) = (m.owner,m.account_id)
     join mail_analysis n on (n.owner,n.message_id) = (m.owner,m.id)
-    where m.owner = $1";
+    where (a.owner = $1 or ($3 and a.visibility = 'shared'))";
+
+pub(crate) fn human_mail_access(actor: &Actor) -> bool {
+    matches!(actor.principal.role, Role::Operator | Role::Member)
+}
+
+/// Same access rule as message reads; hold the account policy through a write.
+pub(crate) async fn lock_mail_message_owner(conn: &mut PgConnection, owner: &str, id: Uuid, shared: bool) -> DResult<String> {
+    sqlx::query_scalar(
+        "select m.owner from mail_messages m join mail_accounts a on (a.owner,a.id)=(m.owner,m.account_id)
+         where (a.owner=$1 or ($3 and a.visibility='shared')) and m.id=$2 for share of a, m",
+    )
+    .bind(owner)
+    .bind(id)
+    .bind(shared)
+    .fetch_optional(conn)
+    .await?
+    .ok_or(DomainError::NotFound("mail message"))
+}
 
 fn require_class(class: &str) -> DResult<()> {
     if CLASSES.contains(&class) { Ok(()) } else { Err(invalid("mail_classification", "invalid mail classification")) }
@@ -42,6 +60,35 @@ fn require_class(class: &str) -> DResult<()> {
 
 impl Hub {
     pub async fn upsert_mail_account_system(&self, actor: &Actor, owner: &str, input: &MailAccountUpsert) -> DResult<MailAccount> {
+        Self::upsert_mail_account(&mut *self.db.acquire().await?, actor, owner, input).await
+    }
+
+    /// Reconcile the full managed mail policy, revoking shared visibility for omitted accounts.
+    /// Call only from a process that owns the mail configuration.
+    pub async fn register_configured_mail_accounts<'a>(
+        &self,
+        actor: &Actor,
+        accounts: impl IntoIterator<Item = (&'a str, &'a MailAccountUpsert)>,
+    ) -> DResult<()> {
+        actor.require(&[Role::Procedure])?;
+        let mut tx = self.db.begin().await?;
+        sqlx::query("select pg_advisory_xact_lock(hashtextextended('hub.mail.config', 0))").execute(&mut *tx).await?;
+        let mut shared = Vec::new();
+        for (owner, input) in accounts {
+            let account = Self::upsert_mail_account(&mut tx, actor, owner, input).await?;
+            if input.visibility == MailVisibility::Shared {
+                shared.push(account.id);
+            }
+        }
+        sqlx::query("update mail_accounts set visibility='private', updated_at=now() where visibility='shared' and not (id=any($1))")
+            .bind(shared)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn upsert_mail_account(conn: &mut PgConnection, actor: &Actor, owner: &str, input: &MailAccountUpsert) -> DResult<MailAccount> {
         let owner = Self::sync_owner(actor, owner)?;
         if input.label.trim().is_empty()
             || !matches!(input.provider.as_str(), "gmail" | "protonmail" | "tutanota" | "imap" | "export_dir")
@@ -51,10 +98,10 @@ impl Hub {
         }
         decode_one(
             sqlx::query_scalar(
-                "insert into mail_accounts as a (owner,label,provider,transport,address,config_json,enabled,status)
-             values ($1,$2,$3,$4,$5,$6,$7,case when $7 then 'idle' else 'disabled' end)
+                "insert into mail_accounts as a (owner,label,provider,transport,address,config_json,enabled,status,visibility)
+              values ($1,$2,$3,$4,$5,$6,$7,case when $7 then 'idle' else 'disabled' end,$8)
              on conflict (owner,label) do update set provider=excluded.provider, transport=excluded.transport,
-               address=excluded.address, config_json=excluded.config_json, enabled=excluded.enabled,
+                address=excluded.address, config_json=excluded.config_json, enabled=excluded.enabled, visibility=excluded.visibility,
                status=case when not excluded.enabled then 'disabled' when not a.enabled then 'idle' else a.status end,
                sync_leased_by=case when excluded.enabled then a.sync_leased_by end,
                sync_leased_until=case when excluded.enabled then a.sync_leased_until end, updated_at=now()
@@ -67,7 +114,8 @@ impl Hub {
             .bind(&input.address)
             .bind(Json(&input.config_json))
             .bind(input.enabled)
-            .fetch_one(&self.db)
+            .bind(input.visibility.as_str())
+            .fetch_one(conn)
             .await?,
         )
     }
@@ -75,8 +123,9 @@ impl Hub {
     pub async fn list_mail_accounts(&self, actor: &Actor) -> DResult<Vec<MailAccount>> {
         let owner = self.resolve_owner(actor)?;
         decode(
-            sqlx::query_scalar("select to_jsonb(a) from mail_accounts a where owner=$1 order by label")
+            sqlx::query_scalar("select to_jsonb(a) from mail_accounts a where owner=$1 or ($2 and visibility='shared') order by label")
                 .bind(owner)
+                .bind(human_mail_access(actor))
                 .fetch_all(&self.db)
                 .await?,
         )
@@ -95,16 +144,29 @@ impl Hub {
 
     /// Returns a unique token for this acquisition, not a stable worker ID.
     pub async fn acquire_mail_sync_lease(&self, actor: &Actor, owner: &str, id: Uuid, seconds: u32) -> DResult<Option<Uuid>> {
+        self.acquire_mail_sync_lease_for(actor, owner, id, seconds, None).await
+    }
+
+    pub async fn acquire_mail_sync_lease_for(
+        &self,
+        actor: &Actor,
+        owner: &str,
+        id: Uuid,
+        seconds: u32,
+        caller_owner: Option<&str>,
+    ) -> DResult<Option<Uuid>> {
         let owner = Self::sync_owner(actor, owner)?;
         let token = Uuid::new_v4();
         let acquired = sqlx::query(
             "update mail_accounts set sync_leased_by=$3, sync_leased_until=now()+make_interval(secs=>$4)
-             where owner=$1 and id=$2 and enabled and (sync_leased_until is null or sync_leased_until<=now())",
+             where owner=$1 and id=$2 and enabled and (sync_leased_until is null or sync_leased_until<=now())
+               and ($5::text is null or owner=$5 or visibility='shared')",
         )
         .bind(owner)
         .bind(id)
         .bind(token.to_string())
         .bind(f64::from(seconds.clamp(1, 3600)))
+        .bind(caller_owner)
         .execute(&self.db)
         .await?;
         if acquired.rows_affected() == 1 {
@@ -332,8 +394,15 @@ impl Hub {
 
     pub async fn list_mail_messages(&self, actor: &Actor, query: &MailSearchQuery) -> DResult<Vec<MailMessageSummary>> {
         let owner = self.resolve_owner(actor)?;
+        let shared = human_mail_access(actor);
         if let Some(id) = query.account_id {
-            self.require_mail_account(&owner, id).await?;
+            sqlx::query_scalar::<_, Uuid>("select id from mail_accounts where (owner=$1 or ($3 and visibility='shared')) and id=$2")
+                .bind(&owner)
+                .bind(id)
+                .bind(shared)
+                .fetch_optional(&self.db)
+                .await?
+                .ok_or(DomainError::NotFound("mail account"))?;
         }
         if let Some(class) = &query.classification {
             require_class(class)?;
@@ -344,19 +413,20 @@ impl Hub {
         }
         let sql = format!(
             "select to_jsonb(t) from (select {MESSAGE_SUMMARY} {MESSAGE_SCOPE}
-             and ($2::uuid is null or m.account_id=$2) and ($3::text is null or a.provider=$3)
-             and ($4::text is null or coalesce(n.user_override_classification,n.classification)=$4)
-             and ($5 or not coalesce(n.user_override_junk,n.is_junk))
-             and ($6::text is null
+             and ($2::uuid is null or m.account_id=$2) and ($4::text is null or a.provider=$4)
+             and ($5::text is null or coalesce(n.user_override_classification,n.classification)=$5)
+             and ($6 or not coalesce(n.user_override_junk,n.is_junk))
+             and ($7::text is null
                 or to_tsvector('simple',coalesce(m.subject,'') || ' ' || coalesce(m.from_addr,'') || ' ' ||
-                     coalesce(m.from_name,'') || ' ' || coalesce(m.body_text,'')) @@ websearch_to_tsquery('simple',$6)
-                or m.subject ilike $7 escape '!' or m.from_addr ilike $7 escape '!'
-                or m.from_name ilike $7 escape '!' or m.body_text ilike $7 escape '!')
-             order by m.received_at desc,m.id limit $8 offset $9) t",
+                     coalesce(m.from_name,'') || ' ' || coalesce(m.body_text,'')) @@ websearch_to_tsquery('simple',$7)
+                or m.subject ilike $8 escape '!' or m.from_addr ilike $8 escape '!'
+                or m.from_name ilike $8 escape '!' or m.body_text ilike $8 escape '!')
+             order by m.received_at desc,m.id limit $9 offset $10) t",
         );
         let rows = sqlx::query_scalar(&sql)
             .bind(owner)
             .bind(query.account_id)
+            .bind(shared)
             .bind(&query.provider)
             .bind(&query.classification)
             .bind(query.include_junk)
@@ -372,7 +442,7 @@ impl Hub {
     pub async fn get_mail_message(&self, actor: &Actor, id: Uuid) -> DResult<MailMessageDetail> {
         let owner = self.resolve_owner(actor)?;
         let mut conn = self.db.acquire().await?;
-        mail_detail(&mut conn, &owner, id).await
+        mail_detail(&mut conn, &owner, id, human_mail_access(actor)).await
     }
 
     pub async fn override_mail_triage(&self, actor: &Actor, id: Uuid, input: &MailTriageOverride) -> DResult<MailMessageDetail> {
@@ -381,6 +451,7 @@ impl Hub {
             require_class(class)?;
         }
         let mut tx = self.db.begin().await?;
+        let owner = lock_mail_message_owner(&mut tx, &owner, id, human_mail_access(actor)).await?;
         sqlx::query(
             "update mail_analysis set user_override_classification=case when $3 then $4 else user_override_classification end,
                user_override_junk=case when $5 then $6 else user_override_junk end where owner=$1 and message_id=$2",
@@ -393,7 +464,7 @@ impl Hub {
         .bind(input.is_junk.flatten())
         .execute(&mut *tx)
         .await?;
-        let detail = mail_detail(&mut tx, &owner, id).await?;
+        let detail = mail_detail(&mut tx, &owner, id, false).await?;
         tx.commit().await?;
         Ok(detail)
     }
@@ -403,11 +474,12 @@ impl Hub {
         decode(
             sqlx::query_scalar(&format!(
                 "select to_jsonb(t) from (select {MESSAGE_SUMMARY},{MESSAGE_DETAIL} {MESSAGE_SCOPE}
-             and (not $3 or not coalesce(n.user_override_junk,n.is_junk)) and n.analyzer_kind='heuristic'
+             and (not $4 or not coalesce(n.user_override_junk,n.is_junk)) and n.analyzer_kind='heuristic'
              order by m.received_at desc,m.id limit $2) t",
             ))
             .bind(owner)
             .bind(i64::from(limit.clamp(1, 100)))
+            .bind(false)
             .bind(skip_junk)
             .fetch_all(&self.db)
             .await?,
@@ -433,12 +505,13 @@ impl Hub {
     }
 
     pub async fn mail_bi_overview(&self, actor: &Actor) -> DResult<MailBiOverview> {
-        self.mail_overview_for_owner(&self.resolve_owner(actor)?, None, None).await
+        self.mail_overview_for_owner(&self.resolve_owner(actor)?, human_mail_access(actor), None, None).await
     }
 
     async fn mail_overview_for_owner(
         &self,
         owner: &str,
+        shared: bool,
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
     ) -> DResult<MailBiOverview> {
@@ -450,7 +523,7 @@ impl Hub {
                 from mail_messages m
                 join mail_accounts a on (a.owner,a.id)=(m.owner,m.account_id)
                 join mail_analysis n on (n.owner,n.message_id)=(m.owner,m.id)
-                where m.owner=$1 and ($2::timestamptz is null or m.received_at >= $2)
+                where (a.owner=$1 or ($4 and a.visibility='shared')) and ($2::timestamptz is null or m.received_at >= $2)
                   and ($3::timestamptz is null or m.received_at < $3)
              ), business as (
                 select * from scoped where not junk and classification in ('business','financial','invoice','receipt','legal','action_required')
@@ -491,7 +564,7 @@ impl Hub {
                     (select from_domain as key,count(*) as message_count from scoped where junk and from_domain<>''
                      group by 1 order by 2 desc,1 limit 10) x),'[]')
              ) from scoped",
-        ).bind(owner).bind(from).bind(to).fetch_one(&self.db).await?)
+        ).bind(owner).bind(from).bind(to).bind(shared).fetch_one(&self.db).await?)
     }
 
     pub async fn create_mail_bi_digest(&self, actor: &Actor, kind: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> DResult<MailBiDigest> {
@@ -499,7 +572,9 @@ impl Hub {
         if kind.trim().is_empty() || kind.len() > 64 || from >= to {
             return Err(invalid("mail_digest_period", "invalid digest period or period kind"));
         }
-        let overview = self.mail_overview_for_owner(&owner, Some(from), Some(to)).await?;
+        // A stored digest can outlive a sharing change. Keep its inputs owner-only;
+        // the live overview applies the current shared-account policy instead.
+        let overview = self.mail_overview_for_owner(&owner, false, Some(from), Some(to)).await?;
         let highlights = json!({
             "recurring_vendors": overview.recurring_vendors,
             "open_action_items": overview.open_action_items,
@@ -552,11 +627,12 @@ impl Hub {
     }
 }
 
-async fn mail_detail(conn: &mut PgConnection, owner: &str, id: Uuid) -> DResult<MailMessageDetail> {
+async fn mail_detail(conn: &mut PgConnection, owner: &str, id: Uuid, shared: bool) -> DResult<MailMessageDetail> {
     decode_one(
         sqlx::query_scalar(&format!("select to_jsonb(t) from (select {MESSAGE_SUMMARY},{MESSAGE_DETAIL} {MESSAGE_SCOPE} and m.id=$2) t"))
             .bind(owner)
             .bind(id)
+            .bind(shared)
             .fetch_optional(conn)
             .await?
             .ok_or(DomainError::NotFound("mail message"))?,

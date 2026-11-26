@@ -32,6 +32,23 @@ pub enum Workspace {
 }
 
 impl Workspace {
+    pub fn available(self, status: Option<&SystemStatus>) -> bool {
+        if self == Self::Intelligence {
+            return status.is_some_and(|status| {
+                status.principal.role == contracts::Role::Operator || status.capabilities.as_ref().is_some_and(|caps| caps.intel_read)
+            });
+        }
+        if crate::api::poll_operations(status) {
+            return true;
+        }
+        match self {
+            Self::Today | Self::Notifications => true,
+            Self::Mail => status.and_then(|status| status.capabilities.as_ref()).is_some_and(|caps| caps.mail),
+            Self::Calendar => status.and_then(|status| status.capabilities.as_ref()).is_some_and(|caps| caps.calendar),
+            _ => false,
+        }
+    }
+
     pub const ALL: [Workspace; 15] = [
         Workspace::Notifications,
         Workspace::Command,
@@ -198,20 +215,25 @@ pub fn start_workspace(args: &[String]) -> (Workspace, Option<String>) {
 pub struct UiError {
     pub code: String,
     pub message: String,
+    pub status: Option<u16>,
 }
 
 impl UiError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { code: code.into(), message: message.into() }
+        Self { code: code.into(), message: message.into(), status: None }
     }
 
     pub fn from_client(error: contracts::client::ClientError) -> Self {
         match error {
             contracts::client::ClientError::Api { status, error } => {
-                Self { code: error.code, message: format!("{} (HTTP {status})", error.message) }
+                Self { code: error.code, message: format!("{} (HTTP {status})", error.message), status: Some(status) }
             }
-            contracts::client::ClientError::Transport(message) => Self { code: "transport".into(), message },
+            contracts::client::ClientError::Transport(message) => Self::new("transport", message),
         }
+    }
+
+    pub fn access_lost(&self) -> bool {
+        matches!(self.status, Some(403 | 404))
     }
 }
 
@@ -506,6 +528,17 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intelligence_follows_the_current_read_grant_for_non_operators() {
+        for role in [contracts::Role::Member, contracts::Role::Agent] {
+            let mut status = crate::api::test_status(role, Some(contracts::Capabilities { intel_read: true, ..Default::default() }));
+            assert!(Workspace::Intelligence.available(Some(&status)));
+            status.capabilities.as_mut().unwrap().intel_read = false;
+            assert!(!Workspace::Intelligence.available(Some(&status)));
+        }
+        assert!(Workspace::Intelligence.available(Some(&crate::api::test_status(contracts::Role::Operator, None))));
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()

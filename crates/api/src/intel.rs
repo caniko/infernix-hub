@@ -38,11 +38,19 @@ pub(super) async fn clear(
     State(s): State<AppState>,
     Caller(a): Caller,
     Path(id): Path<Uuid>,
-    Json(body): Json<SignalClearanceIn>,
+    Json(body): Json<ClearSignalIn>,
 ) -> R<IntelSignal> {
     call!(a, intel::clear_signal(&s.hub, &a, id, body))
 }
 
 pub(super) async fn sources(State(s): State<AppState>, Caller(a): Caller) -> R<Vec<IntelSourceStatus>> {
     call!(a, intel::list_sources(&s.hub, &a))
+}
+
+pub(super) async fn promote_from_mail(
+    State(s): State<AppState>,
+    Caller(a): Caller,
+    Json(body): Json<PromoteFromMailIn>,
+) -> R<SignalBatchOut> {
+    call!(a, intel::promote_from_mail(&s.hub, &a, body))
 }
