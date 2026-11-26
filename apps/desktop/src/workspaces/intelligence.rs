@@ -1,5 +1,7 @@
 //! Operator review of policy-scoped signals. Evidence and projections are text, never markup or navigation.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, TimeDelta, Utc};
 use contracts::{
     Audience, IntelRunStatus, IntelSignal, IntelSignalDetail, IntelSignalQuery, IntelSignalReview, IntelSourceStatus, ProvenanceMethod,
@@ -15,11 +17,20 @@ use crate::{
     state::{Store, UiError},
 };
 
+#[derive(Clone, Default)]
+struct ClearanceDraft {
+    audience: Option<Audience>,
+    rationale: String,
+}
+
+type ClearanceDrafts = Signal<HashMap<Uuid, ClearanceDraft>>;
+
 #[component]
 pub fn IntelligenceView() -> Element {
     let client = use_context::<HubClient>();
     let mut selected = use_context::<Store>().selected_signal;
     let mut query = use_signal(IntelSignalQuery::default);
+    let drafts = use_signal(HashMap::new);
     let source_client = client.clone();
     let mut sources = use_resource(move || {
         let client = source_client.clone();
@@ -173,7 +184,7 @@ pub fn IntelligenceView() -> Element {
                         hint: empty_stream.then(|| "Set up a source if none are listed above, or check Source health for ingest errors. Then refresh sources and signals.".to_string()),
                     }
                 } else if let Some(id) = selected() {
-                    SignalDetail { key: "{id}", id, on_changed: move |_| stream.restart() }
+                    SignalDetail { key: "{id}", id, drafts, on_changed: move |_| stream.restart() }
                 } else if has_signal_page {
                     EmptyState { title: "Select a signal".to_string() }
                 }
@@ -268,7 +279,7 @@ fn signal_badges(signal: &IntelSignal) -> Element {
 }
 
 #[component]
-fn SignalDetail(id: Uuid, on_changed: EventHandler<()>) -> Element {
+fn SignalDetail(id: Uuid, mut drafts: ClearanceDrafts, on_changed: EventHandler<()>) -> Element {
     let client = use_context::<HubClient>();
     let mut generation = use_signal(|| 0u64);
     let mut saving = use_signal(|| false);
@@ -289,12 +300,16 @@ fn SignalDetail(id: Uuid, on_changed: EventHandler<()>) -> Element {
         notice.set(None);
         let client = client.clone();
         spawn(async move {
+            let clearing = request.is_err();
             let result = match request {
                 Ok(input) => api::intel_decide(&client, id, &input).await,
                 Err(input) => api::intel_clear(&client, id, &input).await,
             };
             match result {
                 Ok(_) => {
+                    if clearing {
+                        drafts.write().remove(&id);
+                    }
                     generation += 1;
                     on_changed.call(());
                     notice.set(Some("Signal updated."));
@@ -353,7 +368,7 @@ fn SignalDetail(id: Uuid, on_changed: EventHandler<()>) -> Element {
                     if let Some(review) = review {
                         section { class: "panel glass-card",
                             h2 { "Audience clearance" }
-                            ClearanceForm { key: "{version}", review, source_default_audience, saving: saving(), on_clear: move |input| mutate.call(Err(input)) }
+                            ClearanceForm { id, drafts, review, source_default_audience, saving: saving(), on_clear: move |input| mutate.call(Err(input)) }
                         }
                     }
                 }
@@ -421,27 +436,30 @@ fn SignalBody(detail: IntelSignalDetail) -> Element {
 
 #[component]
 fn ClearanceForm(
+    id: Uuid,
+    mut drafts: ClearanceDrafts,
     review: IntelSignalReview,
     source_default_audience: Audience,
     saving: bool,
     on_clear: EventHandler<SignalClearanceIn>,
 ) -> Element {
-    let mut audience = use_signal(|| None::<Audience>);
-    let mut rationale = use_signal(String::new);
-    let ready = !saving && audience().is_some() && !rationale.read().trim().is_empty();
+    let ClearanceDraft { audience, rationale } = drafts.read().get(&id).cloned().unwrap_or_default();
+    let ready = !saving && audience.is_some() && !rationale.trim().is_empty();
     rsx! {
         form { class: "stack",
             onsubmit: move |event| {
                 event.prevent_default();
-                let rationale = rationale.read().trim().to_string();
-                if !saving && !rationale.is_empty() && let Some(audience) = audience() {
+                let drafts = drafts.peek();
+                if !saving && let Some(draft) = drafts.get(&id)
+                    && let Some(audience) = draft.audience && !draft.rationale.trim().is_empty()
+                {
                     on_clear.call(SignalClearanceIn {
                         audience,
                         revision: review.revision,
                         policy_version: review.policy_version,
                         source_default_audience,
                         projection_sha256: review.projection_sha256.clone(),
-                        rationale,
+                        rationale: draft.rationale.trim().to_string(),
                     });
                 }
             },
@@ -451,8 +469,8 @@ fn ClearanceForm(
                 dt { "Projection SHA-256" } dd { code { "{review.projection_sha256}" } }
             }
             label { "Clearance audience"
-                select { class: "input", required: true, disabled: saving, value: audience().map(Audience::as_str).unwrap_or_default(),
-                    onchange: move |event| audience.set(Audience::parse(&event.value())),
+                select { class: "input", required: true, disabled: saving, value: audience.map(Audience::as_str).unwrap_or_default(),
+                    onchange: move |event| drafts.write().entry(id).or_default().audience = Audience::parse(&event.value()),
                     option { value: "", "Choose audience" }
                     for level in Audience::ALL {
                         option { value: level.as_str(), "{audience_label(*level)}" }
@@ -461,7 +479,7 @@ fn ClearanceForm(
             }
             label { "Rationale"
                 textarea { class: "input", required: true, disabled: saving, maxlength: 4000,
-                    value: rationale(), oninput: move |event| rationale.set(event.value()),
+                    value: rationale, oninput: move |event| drafts.write().entry(id).or_default().rationale = event.value(),
                 }
             }
             button { class: "btn btn-glass btn-xs", r#type: "submit", disabled: !ready, "Clear Audience" }
@@ -472,6 +490,77 @@ fn ClearanceForm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dioxus::{
+        dioxus_core::{AttributeValue, Mutation},
+        html::{PlatformEventData, SerializedFormData, SerializedHtmlEventConverter, set_event_converter},
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn clearance_draft_survives_an_empty_filter_result_and_reset() {
+        fn app(query_handle: Rc<Cell<Option<Signal<IntelSignalQuery>>>>) -> Element {
+            let query = use_signal(IntelSignalQuery::default);
+            let drafts = use_signal(HashMap::new);
+            query_handle.set(Some(query));
+            let review = IntelSignalReview {
+                projection_sha256: "projection".into(),
+                policy_version: 1,
+                revision: 1,
+                first_seen_at: DateTime::UNIX_EPOCH,
+                updated_at: DateTime::UNIX_EPOCH,
+            };
+            rsx! {
+                if has_signal_filters(&query.read()) {
+                    p { "{empty_signal_title(&query.read())}" }
+                } else {
+                    ClearanceForm { id: Uuid::nil(), drafts, review, source_default_audience: Audience::OperatorOnly, saving: false, on_clear: |_| {} }
+                }
+            }
+        }
+
+        set_event_converter(Box::new(SerializedHtmlEventConverter));
+        let query_handle = Rc::new(Cell::new(None));
+        let mut dom = VirtualDom::new_with_props(app, query_handle.clone());
+        let initial = dom.rebuild_to_vec();
+        let mut query = query_handle.get().unwrap();
+        let dispatch = |name, value: &str| {
+            let mut id = None;
+            for mutation in &initial.edits {
+                match mutation {
+                    Mutation::PushId { id: current } => id = Some(*current),
+                    Mutation::NewEventListener { name: listener } if listener == name => {
+                        let data = PlatformEventData::new(Box::new(SerializedFormData::new(value.into(), vec![])));
+                        dom.runtime().handle_event(name, Event::new(Rc::new(data), true).into_any(), id.unwrap());
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("No {name} listener in clearance form");
+        };
+        let audience = Audience::CompanyInternal.as_str();
+        let rationale = "Reviewed the source evidence";
+        dispatch("change", audience);
+        dispatch("input", rationale);
+        let typed = format!("{:?}", dom.render_immediate_to_vec());
+        assert!(typed.contains(audience) && typed.contains(rationale));
+
+        dom.in_runtime(|| query.write().state = Some(SignalState::Acknowledged));
+        let empty = format!("{:?}", dom.render_immediate_to_vec());
+        assert!(empty.contains("No matching signals."));
+        dom.in_runtime(|| query.set(IntelSignalQuery::default()));
+        let reset = dom.render_immediate_to_vec();
+        let values: Vec<_> = reset
+            .edits
+            .iter()
+            .filter_map(|mutation| match mutation {
+                Mutation::SetAttribute { name, value: AttributeValue::Text(value), .. } if name == "value" => Some(value.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(values.first(), Some(&audience)); // Select value, before its option values.
+        assert_eq!(values.last(), Some(&rationale)); // Textarea value.
+    }
 
     #[test]
     fn empty_signal_pages_distinguish_filters_from_pagination() {

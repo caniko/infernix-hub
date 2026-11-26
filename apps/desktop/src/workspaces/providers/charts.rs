@@ -388,6 +388,19 @@ fn midnight(at: DateTime<Utc>) -> DateTime<Utc> {
     at.date_naive().and_time(chrono::NaiveTime::MIN).and_utc()
 }
 
+const TIME_LABEL_CHAR_PX: f64 = 6.7;
+
+fn tick_label_anchor(x: f64, left: f64, right: f64, label: &str) -> &'static str {
+    let half_label_px = label.len() as f64 * TIME_LABEL_CHAR_PX / 2.0;
+    if x - left < half_label_px {
+        "start"
+    } else if right - x < half_label_px {
+        "end"
+    } else {
+        "middle"
+    }
+}
+
 fn time_ticks(view: TimeBounds, width: f64, compact: bool, dates: bool) -> Vec<(DateTime<Utc>, String)> {
     let hourly = !dates && view.end - view.start <= TimeDelta::hours(48);
     let hour_offset = |at: DateTime<Utc>| {
@@ -446,21 +459,34 @@ fn time_ticks(view: TimeBounds, width: f64, compact: bool, dates: bool) -> Vec<(
         times.insert(index, at);
         let mut candidate = labels(&times);
         let last = candidate.len() - 1;
-        let fits = |i: usize, pair: &[(DateTime<Utc>, String)]| {
-            let left = pair[0].1.len() as f64 * if i == 0 { 6.7 } else { 3.35 };
-            let right = pair[1].1.len() as f64 * if i + 1 == last { 6.7 } else { 3.35 };
-            left == 0.0 || right == 0.0 || (view.fraction(pair[1].0) - view.fraction(pair[0].0)) * width >= left + right + 6.0
+        let fits = |pair: &[(DateTime<Utc>, String)]| {
+            let [(a, left_label), (b, right_label)] = pair else { unreachable!() };
+            if left_label.is_empty() || right_label.is_empty() {
+                return true;
+            }
+            let (a, b) = (view.fraction(*a) * width, view.fraction(*b) * width);
+            let left_extent = match tick_label_anchor(a, 0.0, width, left_label) {
+                "start" => 1.0,
+                "end" => 0.0,
+                _ => 0.5,
+            } * left_label.len() as f64;
+            let right_extent = match tick_label_anchor(b, 0.0, width, right_label) {
+                "end" => 1.0,
+                "start" => 0.0,
+                _ => 0.5,
+            } * right_label.len() as f64;
+            b - a >= (left_extent + right_extent) * TIME_LABEL_CHAR_PX + 6.0
         };
         // Keep the endpoint gridlines at the viewport bounds, but prefer a whole-hour label when they collide.
         if hourly {
-            if hour_offset(view.start) != TimeDelta::zero() && !fits(0, &candidate[..2]) {
+            if hour_offset(view.start) != TimeDelta::zero() && !fits(&candidate[..2]) {
                 candidate[0].1.clear();
             }
-            if hour_offset(view.end) != TimeDelta::zero() && !fits(last - 1, &candidate[last - 1..]) {
+            if hour_offset(view.end) != TimeDelta::zero() && !fits(&candidate[last - 1..]) {
                 candidate[last].1.clear();
             }
         }
-        if candidate.windows(2).enumerate().all(|(i, pair)| fits(i, pair)) {
+        if candidate.windows(2).all(fits) {
             ticks = candidate;
         } else {
             times.remove(index);
@@ -505,15 +531,16 @@ pub(super) fn TimeAxis(
     let (y1, y2) = if grid { (plot.top, plot.bottom) } else { (plot.bottom, plot.bottom + 4.0) };
     rsx! {
         g { class: "time-axis", pointer_events: "none",
-            for (i, (at, label)) in ticks.iter().enumerate() {
+            for (at, label) in &ticks {
                 {
                     let x = plot.x(view, *at);
-                    let anchor = if i == 0 { "start" } else if i == ticks.len() - 1 { "end" } else { "middle" };
+                    let label_x = x.clamp(plot.left, plot.right);
+                    let anchor = tick_label_anchor(label_x, plot.left, plot.right, label);
                     rsx! {
                         line { x1: "{x}", x2: "{x}", y1: "{y1}", y2: "{y2}",
                             class: if grid { "chart-gridline subtle time-gridline" } else { "chart-gridline" } }
                          if !label.is_empty() {
-                             text { x: "{x}", y: "{plot.bottom + label_offset}", text_anchor: anchor, "{label}" }
+                             text { x: "{label_x}", y: "{plot.bottom + label_offset}", text_anchor: anchor, "{label}" }
                          }
                     }
                 }
@@ -2006,6 +2033,31 @@ mod tests {
     }
 
     #[test]
+    fn snapped_midnight_gridline_stays_exact_and_label_faces_inward() {
+        const PLOT: TimePlotBox = TimePlotBox { left: 48.0, right: 1048.0, top: 8.0, bottom: 150.0 };
+        fn view() -> TimeBounds {
+            let end = DateTime::UNIX_EPOCH + TimeDelta::days(1) + TimeDelta::minutes(15);
+            TimeBounds { start: end - TimeDelta::hours(48), end }
+        }
+        fn app() -> Element {
+            rsx! { TimeAxis { plot: PLOT, view: view(), grid: true } }
+        }
+        let mutations = VirtualDom::new(app).rebuild_to_vec();
+        let midnight = midnight(view().end);
+        let grid_x = PLOT.x(view(), midnight).to_string();
+        assert!(svg_attribute_values(&mutations, "x1").contains(&grid_x.as_str()));
+        assert!(svg_attribute_values(&mutations, "x2").contains(&grid_x.as_str()));
+
+        let positions = svg_attribute_values(&mutations, "x");
+        let anchors = svg_attribute_values(&mutations, "text-anchor");
+        let i = positions.iter().position(|&x| x == grid_x).unwrap();
+        assert_eq!(anchors[i], "end");
+        let label_right = positions[i].parse::<f64>().unwrap();
+        let label_left = label_right - "Jan 02 00:00".len() as f64 * 6.7;
+        assert!(label_left >= PLOT.left && label_right <= PLOT.right);
+    }
+
+    #[test]
     fn quota_pool_defaults_to_multiples_only_above_six_series() {
         assert!(!quota_defaults_to_multiples(true, 6));
         assert!(quota_defaults_to_multiples(true, 7));
@@ -2060,10 +2112,27 @@ mod tests {
             rsx! { ActivityHeatmap { cells: vec![zero, low, peak], metric: Metric::CacheHitRate, covered_weekdays: vec![0] } }
         }
         let mutations = VirtualDom::new(app).rebuild_to_vec();
-        let classes = svg_attribute_values(&mutations, "class");
-        for state in ["activity-heat-zero", "chart-heat-cache", "activity-heat-na", "activity-heat-outside"] {
-            assert!(classes.iter().any(|class| class.split_whitespace().any(|token| token == state)), "{state}");
-        }
+        let classes: Vec<_> = svg_attribute_values(&mutations, "class").into_iter().filter(|class| class.ends_with(" chart-hit")).collect();
+        let opacities: Vec<_> = mutations
+            .edits
+            .iter()
+            .filter_map(|edit| match edit {
+                Mutation::SetAttribute { name, value: AttributeValue::Float(opacity), .. } if name == "opacity" => Some(*opacity),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(classes.len(), 7 * 24);
+        assert_eq!(opacities.len(), classes.len());
+        let cell = |day: usize, hour: usize| (classes[day * 24 + hour], opacities[day * 24 + hour]);
+        assert_eq!(cell(0, 0), ("activity-heat-zero  chart-hit", 1.0));
+        let (low_class, low_opacity) = cell(0, 1);
+        assert_eq!(low_class, "chart-heat-cache  chart-hit");
+        assert!((low_opacity - 0.1288).abs() < 1e-12);
+        let (peak_class, peak_opacity) = cell(0, 2);
+        assert_eq!((peak_class, peak_opacity), ("chart-heat-cache  chart-hit", 1.0));
+        assert!(peak_opacity > low_opacity);
+        assert_eq!(cell(0, 3), ("activity-heat-na  chart-hit", 1.0));
+        assert_eq!(cell(1, 0), ("activity-heat-outside  chart-hit", 1.0));
     }
 
     #[test]
