@@ -791,6 +791,7 @@ mod tests {
                     last_observed_at: None,
                 },
                 accounts: vec![],
+                routed_account_ids: None,
                 account_count: 0,
                 enabled_accounts: 0,
                 pools: vec![],
@@ -798,8 +799,18 @@ mod tests {
                 preferred_account_id: None,
                 next_pick_account_id: None,
             };
+            let mut routed = provider.clone();
+            routed.descriptor.id = "routed-provider".into();
+            routed.routed_account_ids = Some(Default::default());
+            routed.accounts.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "old-account", "provider_id": "routed-provider",
+                    "source_account_id": "old-account", "display_name": "Retained login",
+                }))
+                .unwrap(),
+            );
             rsx! {
-                dashboard::Dashboard { providers: vec![provider.clone()], stale: false, all_providers: true }
+                dashboard::Dashboard { providers: vec![provider.clone(), routed], stale: false, all_providers: true }
                 OperationButton { provider, label: "Must not render",
                     command: ProviderCommand::Quota(QuotaCommand::RefreshQuota { account_id: None }) }
             }
@@ -809,6 +820,8 @@ mod tests {
         assert!(output.contains("Not observed"));
         assert!(output.contains("Future provider · No quota reading · Not observed"));
         assert!(!output.contains("Must not render"));
+        assert!(output.contains("Other account quota history"));
+        assert!(output.contains("Retained login"));
     }
 
     #[test]
