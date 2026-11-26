@@ -50,10 +50,32 @@ impl Lane {
     }
 }
 
+#[derive(Clone, Copy)]
+enum QuotaTarget<'a> {
+    Model(&'a str),
+    GoogleGemini,
+}
+
+fn is_google_gemini_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("gemini-") && !model.contains("argon")
+}
+
+#[cfg(test)]
 pub(crate) fn window_applies_to_model(w: &QuotaWindow, model: &str) -> bool {
+    window_applies(w, QuotaTarget::Model(model))
+}
+
+fn window_applies(w: &QuotaWindow, target: QuotaTarget<'_>) -> bool {
     if w.kind == QuotaWindowKind::Spend || w.unit == QuotaUnit::Credits {
         return false;
     }
+    let QuotaTarget::Model(model) = target else {
+        let key = w.window_key.to_ascii_lowercase();
+        return !key.starts_with("gemini-argon")
+            && !key.starts_with("3p-")
+            && (key.starts_with("gemini-") || w.scope_model.as_deref().is_none_or(|scope| scope.eq_ignore_ascii_case("gemini")));
+    };
     let Some(scope) = &w.scope_model else { return true };
     if model.is_empty() {
         return false;
@@ -442,8 +464,11 @@ impl Account {
         self.quota_cooldown(None).map(|cooldown| cooldown.until)
     }
 
-    fn scoped_cooldown(&self, model: &str) -> Option<Cooldown> {
-        model_cooldown_scope(self.lane, model).and_then(|scope| self.quota_cooldown(Some(&scope)))
+    fn scoped_cooldown(&self, target: QuotaTarget<'_>) -> Option<Cooldown> {
+        match target {
+            QuotaTarget::Model(model) => model_cooldown_scope(self.lane, model).and_then(|scope| self.quota_cooldown(Some(&scope))),
+            QuotaTarget::GoogleGemini => self.quota_cooldown(Some("gemini")),
+        }
     }
 
     fn quota_cooldown(&self, scope: Option<&str>) -> Option<Cooldown> {
@@ -504,14 +529,16 @@ impl Account {
         self.pending_quota.iter().any(|pending| (pending.scope.is_none() || pending.scope == scope) && pending.blocks_verification(now))
     }
 
-    fn active_quota_windows<'a>(&'a self, now: DateTime<Utc>, model: &'a str) -> impl Iterator<Item = &'a QuotaWindow> {
-        self.windows
-            .iter()
-            .filter(move |w| window_applies_to_model(w, model) && enforces_quota(w) && quota_window_active(self.lane, w, now))
+    fn active_quota_windows<'a>(&'a self, now: DateTime<Utc>, target: QuotaTarget<'a>) -> impl Iterator<Item = &'a QuotaWindow> {
+        self.windows.iter().filter(move |w| window_applies(w, target) && enforces_quota(w) && quota_window_active(self.lane, w, now))
     }
 
     pub fn quota_limited_until(&self, now: DateTime<Utc>, model: &str) -> Option<DateTime<Utc>> {
-        self.active_quota_windows(now, model)
+        self.quota_limited_until_for(now, QuotaTarget::Model(model))
+    }
+
+    fn quota_limited_until_for(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> Option<DateTime<Utc>> {
+        self.active_quota_windows(now, target)
             .map(|w| {
                 w.resets_at.unwrap_or_else(|| {
                     if self.lane == Lane::Google {
@@ -521,8 +548,94 @@ impl Account {
                     }
                 })
             })
-            .chain(self.quota_cooldown(None).into_iter().chain(self.scoped_cooldown(model)).map(|c| c.until).filter(|until| *until > now))
+            .chain(self.quota_cooldown(None).into_iter().chain(self.scoped_cooldown(target)).map(|c| c.until).filter(|until| *until > now))
             .max()
+    }
+
+    fn google_preview_targets(&self) -> Vec<QuotaTarget<'_>> {
+        if !self.models.is_empty() {
+            return self.models.iter().map(String::as_str).filter(|m| is_google_gemini_model(m)).map(QuotaTarget::Model).collect();
+        }
+        let mut targets: Vec<QuotaTarget<'_>> = self
+            .windows
+            .iter()
+            .filter_map(|w| w.scope_model.as_deref())
+            .filter(|s| is_google_gemini_model(s))
+            .map(QuotaTarget::Model)
+            .collect();
+        if targets.is_empty() || self.windows.iter().any(|w| window_applies(w, QuotaTarget::GoogleGemini)) {
+            targets.push(QuotaTarget::GoogleGemini);
+        }
+        targets
+    }
+
+    fn eligible_quota_targets<'a>(&'a self, now: DateTime<Utc>, target: QuotaTarget<'a>) -> Vec<QuotaTarget<'a>> {
+        match target {
+            QuotaTarget::Model(_) => self.quota_limited_until_for(now, target).is_none().then_some(target).into_iter().collect(),
+            QuotaTarget::GoogleGemini => {
+                self.google_preview_targets().into_iter().filter(|t| self.quota_limited_until_for(now, *t).is_none()).collect()
+            }
+        }
+    }
+
+    fn eligible_for_quota(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> bool {
+        if self.quarantined(now) {
+            return false;
+        }
+        match target {
+            QuotaTarget::Model(_) => self.quota_limited_until_for(now, target).is_none(),
+            QuotaTarget::GoogleGemini => !self.eligible_quota_targets(now, target).is_empty(),
+        }
+    }
+
+    fn reset_pair(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> (DateTime<Utc>, DateTime<Utc>) {
+        let reset = |applies: fn(&QuotaWindow) -> bool| {
+            self.windows
+                .iter()
+                .filter(|w| applies(w) && window_applies(w, target))
+                .filter_map(|w| w.resets_at)
+                .filter(|t| *t > now)
+                .min()
+                .unwrap_or(DateTime::<Utc>::MAX_UTC)
+        };
+        let weekly = reset(|w| {
+            w.kind == QuotaWindowKind::Weekly
+                || (w.kind == QuotaWindowKind::ModelScoped && w.window_duration_mins.is_none_or(|m| m >= 1440))
+        });
+        let session = reset(|w| w.kind == QuotaWindowKind::Session);
+        (weekly, session)
+    }
+
+    fn soonest_reset(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> (DateTime<Utc>, DateTime<Utc>, std::cmp::Reverse<i32>) {
+        let (weekly, session) = match target {
+            QuotaTarget::Model(_) => self.reset_pair(now, target),
+            QuotaTarget::GoogleGemini => self
+                .eligible_quota_targets(now, target)
+                .into_iter()
+                .map(|t| self.reset_pair(now, t))
+                .min()
+                .unwrap_or((DateTime::<Utc>::MAX_UTC, DateTime::<Utc>::MAX_UTC)),
+        };
+        (weekly, session, std::cmp::Reverse(self.priority))
+    }
+
+    fn max_used_percent(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> f64 {
+        let score = |applies: &dyn Fn(&QuotaWindow) -> bool| {
+            self.windows
+                .iter()
+                .filter(|w| matches!(w.kind, QuotaWindowKind::Weekly | QuotaWindowKind::Session | QuotaWindowKind::ModelScoped))
+                .filter(|w| applies(w))
+                .filter(|w| quota_window_active(self.lane, w, now))
+                .filter_map(|w| w.used_percent)
+                .fold(0.0_f64, f64::max)
+        };
+        match target {
+            QuotaTarget::Model(_) => score(&|w| window_applies(w, target)),
+            QuotaTarget::GoogleGemini => {
+                let targets = self.eligible_quota_targets(now, target);
+                score(&|w| targets.iter().any(|t| window_applies(w, *t)))
+            }
+        }
     }
 
     pub fn hub_id(&self) -> String {
@@ -869,7 +982,15 @@ impl<'a> AccountFilter<'a> {
     }
 
     pub(crate) fn supports(&self, pool: &Pool, account: &Account) -> bool {
-        self.allows_in(pool, account) && pool.supports(account, self.lane, self.model, self.required_project)
+        self.supports_for(pool, account, QuotaTarget::Model(self.model))
+    }
+
+    fn supports_for(&self, pool: &Pool, account: &Account, target: QuotaTarget<'_>) -> bool {
+        self.allows_in(pool, account)
+            && pool.supports(account, self.lane, self.model, self.required_project)
+            && (!matches!(target, QuotaTarget::GoogleGemini)
+                || account.models.is_empty()
+                || account.models.iter().any(|m| is_google_gemini_model(m)))
     }
 }
 
@@ -1172,14 +1293,15 @@ impl Pool {
                     let reason = if error.kind == AccountErrorKind::AuthExpired { "auth_cooldown" } else { "quarantined" };
                     block(reason, None);
                 }
+                let target = QuotaTarget::Model(model);
                 for (reason, cooldown) in
-                    [("global_cooldown", account.quota_cooldown(None)), ("scoped_cooldown", account.scoped_cooldown(model))]
+                    [("global_cooldown", account.quota_cooldown(None)), ("scoped_cooldown", account.scoped_cooldown(target))]
                 {
                     if let Some(c) = cooldown.filter(|c| c.until > now) {
                         block(reason, c.verified_reset.then_some(c.until));
                     }
                 }
-                let mut windows = account.active_quota_windows(now, model).peekable();
+                let mut windows = account.active_quota_windows(now, target).peekable();
                 if windows.peek().is_some() {
                     // A cached reset must have been credible when observed, not just when read.
                     let reset = windows.try_fold(now, |latest, w| {
@@ -1263,12 +1385,23 @@ impl Pool {
     pub(crate) fn pick_for(
         &mut self,
         filter: &AccountFilter<'_>,
+        affinity: (Option<&str>, Option<&str>),
+        tried: &[String],
+        now: DateTime<Utc>,
+    ) -> Option<Account> {
+        self.pick_with_quota(filter, QuotaTarget::Model(filter.model), affinity, tried, now)
+    }
+
+    fn pick_with_quota(
+        &mut self,
+        filter: &AccountFilter<'_>,
+        target: QuotaTarget<'_>,
         (session, parent): (Option<&str>, Option<&str>),
         tried: &[String],
         now: DateTime<Utc>,
     ) -> Option<Account> {
-        let AccountFilter { lane, model, .. } = *filter;
-        let eligible = |a: &&Account| filter.supports(self, a) && a.eligible(now, model) && !tried.contains(&a.id);
+        let lane = filter.lane;
+        let eligible = |a: &&Account| filter.supports_for(self, a, target) && a.eligible_for_quota(now, target) && !tried.contains(&a.id);
         if let Some(a) = self.preferred(lane).and_then(|id| self.accounts.get(id)).filter(eligible) {
             return Some(a.clone());
         }
@@ -1281,23 +1414,7 @@ impl Pool {
             self.bound(lane, session)
                 .filter(|id| !filter.subscriptions_only || self.accounts.get(*id).is_some_and(|a| filter.allows_in(self, a)))
         };
-        let soonest = |a: &Account| {
-            let reset = |applies: fn(&QuotaWindow) -> bool| {
-                a.windows
-                    .iter()
-                    .filter(|w| applies(w) && window_applies_to_model(w, model))
-                    .filter_map(|w| w.resets_at)
-                    .filter(|t| *t > now)
-                    .min()
-                    .unwrap_or(DateTime::<Utc>::MAX_UTC)
-            };
-            let weekly = reset(|w| {
-                w.kind == QuotaWindowKind::Weekly
-                    || (w.kind == QuotaWindowKind::ModelScoped && w.window_duration_mins.is_none_or(|m| m >= 1440))
-            });
-            let session = reset(|w| w.kind == QuotaWindowKind::Session);
-            (weekly, session, std::cmp::Reverse(a.priority))
-        };
+        let soonest = |a: &Account| a.soonest_reset(now, target);
         // Antigravity subscriptions drain the soonest weekly reset first: a session bound to a
         // later-resetting account moves back once that account's 5-hour window frees up.
         let drain_soonest = lane == Lane::Google && self.policy.strategy == RouteStrategy::SoonestReset;
@@ -1311,16 +1428,10 @@ impl Pool {
         match self.policy.strategy {
             RouteStrategy::SoonestReset => options.sort_by_key(|a| soonest(a)),
             RouteStrategy::FillFirst => options.sort_by(|a, b| {
-                let used = |a: &Account| {
-                    a.windows
-                        .iter()
-                        .filter(|w| matches!(w.kind, QuotaWindowKind::Weekly | QuotaWindowKind::Session | QuotaWindowKind::ModelScoped))
-                        .filter(|w| window_applies_to_model(w, model))
-                        .filter(|w| quota_window_active(a.lane, w, now))
-                        .filter_map(|w| w.used_percent)
-                        .fold(0.0_f64, f64::max)
-                };
-                b.priority.cmp(&a.priority).then_with(|| used(b).total_cmp(&used(a))).then_with(|| b.success.cmp(&a.success))
+                b.priority
+                    .cmp(&a.priority)
+                    .then_with(|| b.max_used_percent(now, target).total_cmp(&a.max_used_percent(now, target)))
+                    .then_with(|| b.success.cmp(&a.success))
             }),
             RouteStrategy::RoundRobin | RouteStrategy::WeightedRoundRobin => {
                 let weighted = self.policy.strategy == RouteStrategy::WeightedRoundRobin;
@@ -1364,7 +1475,13 @@ impl Pool {
             cursors: self.cursors.clone(),
             ..Self::default()
         };
-        copy.pick(lane, (None, None), "", None, &[], Utc::now()).map(|a| a.id)
+        let now = Utc::now();
+        if lane == Lane::Google {
+            copy.pick_with_quota(&AccountFilter::shared(lane, "", None), QuotaTarget::GoogleGemini, (None, None), &[], now)
+        } else {
+            copy.pick(lane, (None, None), "", None, &[], now)
+        }
+        .map(|a| a.id)
     }
 
     pub fn bound(&self, lane: Lane, id: &str) -> Option<&str> {

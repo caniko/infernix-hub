@@ -128,6 +128,227 @@ fn quota_ranking_is_model_specific_and_breaks_weekly_ties_with_session_resets() 
 }
 
 #[test]
+fn google_preview_uses_neon_reset_order_and_eligibility() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+
+    let mut pool = Pool::default();
+    pool.policy.strategy = SoonestReset;
+    let now = Utc::now();
+    let at = |hours| now + TimeDelta::hours(hours);
+    for (id, neon, remaining, argon, third_party) in [
+        ("google-a.json", Some(at(30)), 0.5, at(40), at(1)),
+        ("google-untouched.json", None, 1.0, at(2), at(40)),
+        ("google-window.json", Some(at(8)), 0.0, at(40), at(40)),
+        ("google-cooldown.json", Some(at(10)), 0.5, at(40), at(40)),
+        ("google-z.json", Some(at(20)), 0.5, at(4), at(30)),
+    ] {
+        let mut accounts = pool::parse_credentials(id, &json!({"type":"google","access_token":id}), false).unwrap();
+        accounts[0].windows = parse_antigravity_summary(
+            &json!({"buckets":[
+                {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":remaining,"resetTime":neon},
+                {"bucketId":"gemini-argon-weekly","window":"weekly","remainingFraction":0.5,"resetTime":argon},
+                {"bucketId":"3p-weekly","window":"weekly","remainingFraction":0.5,"resetTime":third_party},
+            ]}),
+            now,
+        );
+        pool.insert(accounts);
+    }
+    let cooldown = pool::Cooldown { until: at(1), verified_reset: false };
+    pool.accounts.get_mut("google-cooldown.json").unwrap().scoped_cooldowns.insert("gemini".into(), cooldown);
+    pool.accounts.get_mut("google-z.json").unwrap().scoped_cooldowns.insert("3p".into(), cooldown);
+
+    for (model, scope, expected) in [
+        ("gemini-4-neon", "gemini", "google-z.json"),
+        ("gemini-4-neon-low", "gemini", "google-z.json"),
+        ("gemini-4-neon-medium", "gemini", "google-z.json"),
+        ("gemini-4-neon-high", "gemini", "google-z.json"),
+        ("gemini-4-neon-xhigh", "gemini", "google-z.json"),
+        ("gemini-pro-orchestrator-neon", "gemini", "google-z.json"),
+        ("gemini-argon", "gemini-argon", "google-untouched.json"),
+        ("gemini-4-argon-high", "gemini-argon", "google-untouched.json"),
+        ("claude-opus-4", "3p", "google-a.json"),
+        ("gpt-5", "3p", "google-a.json"),
+        ("orchestrator-neon", "other", "google-a.json"),
+    ] {
+        assert_eq!(pool::model_cooldown_scope(Lane::Google, model).as_deref(), Some(scope), "{model}");
+        for window in &pool.accounts["google-a.json"].windows {
+            assert_eq!(pool::window_applies_to_model(window, model), window.window_key == format!("{scope}-weekly"), "{model}");
+        }
+        assert_eq!(pool.pick(Lane::Google, (None, None), model, None, &[], now).unwrap().id, expected, "{model}");
+    }
+    assert_eq!(pool.preview(Lane::Google).as_deref(), Some("google-z.json"));
+}
+
+#[test]
+fn google_preview_ranks_allowlisted_credentials_by_gemini_quota() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+
+    let mut pool = Pool::default();
+    let now = Utc::now();
+    let at = |hours| now + TimeDelta::hours(hours);
+    for (id, model, reset, remaining, other_remaining) in
+        [("google-a.json", "gemini-3.8-flash", at(20), 0.6, 0.01), ("google-z.json", "gemini-4-neon-high", at(30), 0.2, 0.9)]
+    {
+        let mut accounts = pool::parse_credentials(id, &json!({"type":"google","access_token":id,"models":[model]}), false).unwrap();
+        assert_eq!(accounts[0].models, [model]);
+        accounts[0].windows = parse_antigravity_summary(
+            &json!({"buckets":[
+                {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":remaining,"resetTime":reset},
+                {"bucketId":"gemini-argon-weekly","window":"weekly","remainingFraction":other_remaining,"resetTime":at(1)},
+                {"bucketId":"3p-weekly","window":"weekly","remainingFraction":other_remaining,"resetTime":at(1)},
+            ]}),
+            now,
+        );
+        pool.insert(accounts);
+    }
+
+    pool.policy.strategy = SoonestReset;
+    assert_eq!(pool.preview(Lane::Google).as_deref(), Some("google-a.json"));
+    pool.policy.strategy = FillFirst;
+    assert_eq!(pool.preview(Lane::Google).as_deref(), Some("google-z.json"));
+    assert_eq!(pool.pick(Lane::Google, (None, None), "gemini-4-neon-high", None, &[], now).unwrap().id, "google-z.json");
+    assert!(pool.pick(Lane::Google, (None, None), "gemini-4-neon", None, &[], now).is_none());
+
+    for account in pool.accounts.values_mut() {
+        account.windows.iter_mut().find(|w| w.window_key == "gemini-weekly").unwrap().used_percent = Some(100.0);
+    }
+    let restricted = [("google-3p.json", "claude-opus-5-5"), ("google-argon.json", "gemini-4-argon")];
+    for (id, model) in restricted {
+        pool.insert(pool::parse_credentials(id, &json!({"type":"google","access_token":id,"models":[model]}), false).unwrap());
+    }
+    for strategy in [SoonestReset, FillFirst, RoundRobin, WeightedRoundRobin] {
+        pool.policy.strategy = strategy;
+        assert_eq!(pool.preview(Lane::Google), None);
+        for (id, model) in restricted {
+            assert_eq!(pool.pick(Lane::Google, (None, None), model, None, &[], now).unwrap().id, id, "{model}");
+        }
+    }
+    pool.overrides.insert(Lane::Google, "google-3p.json".into());
+    assert_eq!(pool.preferred(Lane::Google), Some("google-3p.json"));
+    assert_eq!(pool.preview(Lane::Google), None);
+
+    // Nonstandard bucket keys scoped to an exact Gemini model block preview for both allowlisted and unrestricted credentials.
+    for with_allowlist in [true, false] {
+        let mut custom_pool = Pool::default();
+        let raw = if with_allowlist {
+            json!({"type":"google","access_token":"c","models":["gemini-4-neon-high"]})
+        } else {
+            json!({"type":"google","access_token":"c"})
+        };
+        let mut custom = pool::parse_credentials("google-custom.json", &raw, false).unwrap();
+        custom[0].windows = parse_antigravity_summary(
+            &json!({"groups":[{"displayName":"gemini-4-neon-high","buckets":[
+                {"bucketId":"custom-neon","window":"weekly","remainingFraction":0.0,"resetTime":at(10)},
+            ]}]}),
+            now,
+        );
+        custom_pool.insert(custom);
+        assert_eq!(custom_pool.preview(Lane::Google), None, "with_allowlist={with_allowlist}");
+        assert!(custom_pool.pick(Lane::Google, (None, None), "gemini-4-neon-high", None, &[], now).is_none());
+    }
+
+    // Multi-model allowlisted and unrestricted credentials both compare complete (weekly, session) pairs per model.
+    for with_allowlist in [true, false] {
+        let mut pair_pool = Pool::default();
+        pair_pool.policy.strategy = SoonestReset;
+        for (id, neon_w, neon_s, flash_w, flash_s) in [("google-a.json", 10, 5, 20, 1), ("google-b.json", 10, 3, 10, 2)] {
+            let raw = if with_allowlist {
+                json!({"type":"google","access_token":id,"models":["gemini-4-neon-high","gemini-3.8-flash"]})
+            } else {
+                json!({"type":"google","access_token":id})
+            };
+            let mut accounts = pool::parse_credentials(id, &raw, false).unwrap();
+            accounts[0].windows = parse_antigravity_summary(
+                &json!({"groups":[
+                    {"displayName":"gemini-4-neon-high","buckets":[
+                        {"bucketId":"custom-neon-w","window":"weekly","remainingFraction":0.5,"resetTime":at(neon_w)},
+                        {"bucketId":"custom-neon-s","window":"5h","remainingFraction":0.5,"resetTime":at(neon_s)},
+                    ]},
+                    {"displayName":"gemini-3.8-flash","buckets":[
+                        {"bucketId":"custom-flash-w","window":"weekly","remainingFraction":0.5,"resetTime":at(flash_w)},
+                        {"bucketId":"custom-flash-s","window":"5h","remainingFraction":0.5,"resetTime":at(flash_s)},
+                    ]},
+                ]}),
+                now,
+            );
+            pair_pool.insert(accounts);
+        }
+        assert_eq!(pair_pool.preview(Lane::Google).as_deref(), Some("google-b.json"), "with_allowlist={with_allowlist}");
+    }
+
+    // Unrestricted Google accounts also consider nonstandard exact-model Gemini buckets in SoonestReset and FillFirst.
+    let mut unrestricted = Pool::default();
+    let mut a = pool::parse_credentials("google-a.json", &json!({"type":"google","access_token":"a"}), false).unwrap();
+    a[0].windows = parse_antigravity_summary(
+        &json!({"buckets":[{"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.8,"resetTime":at(20)}]}),
+        now,
+    );
+    let mut z = pool::parse_credentials("google-z.json", &json!({"type":"google","access_token":"z"}), false).unwrap();
+    z[0].windows = parse_antigravity_summary(
+        &json!({"groups":[{"displayName":"gemini-4-neon-high","buckets":[
+            {"bucketId":"custom-neon","window":"weekly","remainingFraction":0.3,"resetTime":at(10)},
+        ]}]}),
+        now,
+    );
+    unrestricted.insert(a);
+    unrestricted.insert(z);
+    unrestricted.policy.strategy = SoonestReset;
+    assert_eq!(unrestricted.preview(Lane::Google).as_deref(), Some("google-z.json"));
+    unrestricted.policy.strategy = FillFirst;
+    assert_eq!(unrestricted.preview(Lane::Google).as_deref(), Some("google-z.json"));
+}
+
+#[test]
+fn preview_keeps_non_google_lanes_model_agnostic() {
+    use integrations::providers::{
+        claude::parse_claude_oauth_usage,
+        opencode::{parse_chatgpt_wham_usage, parse_opencode_go_usage},
+    };
+
+    let mut pool = Pool::default();
+    pool.policy.strategy = SoonestReset;
+    let now = Utc::now();
+    for lane in [Lane::Claude, Lane::Codex, Lane::Go] {
+        for (suffix, hours, used) in [("a", 20, 40), ("blocked", 1, 100), ("z", 10, 40)] {
+            let id = format!("{}-{suffix}.json", lane.name());
+            let mut accounts = pool::parse_credentials(&id, &json!({"type":lane.name(),"access_token":id}), false).unwrap();
+            let reset = now + TimeDelta::hours(hours);
+            accounts[0].windows = match lane {
+                Lane::Claude => parse_claude_oauth_usage(
+                    &json!({
+                        "five_hour":{"utilization":used,"resets_at":now + TimeDelta::hours(2)},
+                        "seven_day":{"utilization":40,"resets_at":reset},
+                    }),
+                    now,
+                ),
+                Lane::Codex => {
+                    parse_chatgpt_wham_usage(
+                        &json!({"rate_limit":{"secondary_window":{"used_percent":used,"reset_at":reset.timestamp()}}}),
+                        now,
+                    )
+                    .1
+                }
+                Lane::Go => parse_opencode_go_usage(&json!({"usage":{"weekly":{"percent":used,"resetsAt":reset}}}), now),
+                Lane::Google => unreachable!(),
+            };
+            pool.insert(accounts);
+        }
+        let expected = format!("{}-z.json", lane.name());
+        assert_eq!(pool.preview(lane).as_deref(), Some(expected.as_str()));
+    }
+
+    let mut scoped_only = pool::parse_credentials("claude-0.json", &json!({"type":"claude","access_token":"scoped"}), false).unwrap();
+    scoped_only[0].windows =
+        parse_claude_oauth_usage(&json!({"seven_day_opus":{"utilization":40,"resets_at":now + TimeDelta::hours(1)}}), now);
+    pool.insert(scoped_only);
+    assert_eq!(pool.preview(Lane::Claude).as_deref(), Some("claude-z.json"));
+    pool.accounts.retain(|id, _| id == "claude-0.json");
+    pool.accounts.get_mut("claude-0.json").unwrap().windows[0].used_percent = Some(100.0);
+    assert_eq!(pool.preview(Lane::Claude).as_deref(), Some("claude-0.json"));
+    assert!(pool.pick(Lane::Claude, (None, None), "claude-opus-4", None, &[], now).is_none());
+}
+
+#[test]
 fn antigravity_affinity_yields_to_the_soonest_weekly_reset_with_5h_quota() {
     use integrations::providers::antigravity::parse_antigravity_summary;
     let mut pool = Pool::default();
