@@ -95,7 +95,8 @@ assert.equal(dispatch.usageLimitContinuationOfRunId, thread.latestRunId);
 assert.equal(limitRecoveryCommand(armed, true, resetMs + 1)?.commandId, dispatch.commandId);
 
 // Forward real T3 management requests to the loopback proxy. Rewrite only the
-// literal provider URLs below to the loopback upstream; no external calls.
+// admin calls to the loopback upstream; the proxy maps
+// allowlisted usage probes itself in the offline verifier.
 const wham = "https://chatgpt.com/backend-api/wham";
 const usage = `${wham}/usage`;
 const credits = `${wham}/rate-limit-reset-credits`;
@@ -107,6 +108,7 @@ const mutations = [];
 const http = HttpClient.make((request, url) =>
   Effect.tryPromise(async () => {
     assert.equal(url.origin, proxy);
+    const headers = new Headers(request.headers);
     let body;
     if (request.body._tag === "Uint8Array") {
       body = JSON.parse(new TextDecoder().decode(request.body.body));
@@ -125,12 +127,13 @@ const http = HttpClient.make((request, url) =>
         assert.equal(target, `${credits}/consume`);
         mutations.push("consume");
       }
-      // Leave userinfo on the production deny path; the proxy must not call it.
-      if (target !== userinfo) body.url = mock + new URL(target).pathname;
+      // Leave read-only requests and userinfo unchanged so the proxy checks their real URLs.
+      if (headers.get("authorization") === "Bearer verify-mgmt-key" && target !== userinfo) {
+        body.url = mock + new URL(target).pathname;
+      }
     } else if (url.pathname.endsWith("/reset-quota")) {
       mutations.push("reset-quota");
     }
-    const headers = new Headers(request.headers);
     headers.delete("content-length");
     const response = await fetch(url, {
       headers,
@@ -145,7 +148,7 @@ const http = HttpClient.make((request, url) =>
 await Effect.runPromise(
   Effect.gen(function* () {
     const api = yield* makeCliproxyApi;
-    const hub = { url: proxy, managementKey: "verify-mgmt-key" };
+    const hub = { url: proxy, managementKey: "verify-usage-key" };
     const accounts = yield* api.readAccounts(hub);
     assert.deepEqual(accounts.map((account) => account.driver).sort(), ["antigravity", "claudeAgent", "codex"]);
     assert.deepEqual(probes.sort(), [usage, credits, claude, google, userinfo].sort());
@@ -154,7 +157,7 @@ await Effect.runPromise(
     assert.equal(codex.usageLimits.resetCredits.availableCount, 1);
     const credit = codex.usageLimits.resetCredits.nextCreditId;
     assert.equal(credit, "verify-credit");
-    const consumed = yield* api.consume(hub, codex.id, credit);
+    const consumed = yield* api.consume({ ...hub, managementKey: "verify-mgmt-key" }, codex.id, credit);
     assert.deepEqual(consumed, { outcome: "reset" });
     assert.deepEqual(mutations, ["consume", "reset-quota"]);
   }).pipe(Effect.provideService(HttpClient.HttpClient, http), Effect.provide(NodeCrypto.layer)),

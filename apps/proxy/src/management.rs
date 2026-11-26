@@ -101,13 +101,44 @@ pub(crate) fn routes(proxy: Arc<Proxy>, v8: bool) -> Router<Arc<Proxy>> {
             .route("/logs", get(logs))
             .route("/debug", get(config))
     };
-    routes.layer(middleware::from_fn_with_state(proxy, authenticate))
+    routes.layer(middleware::from_fn_with_state(proxy.clone(), move |state, req, next| authenticate(state, req, next, v8))).fallback(
+        move |req: Request| async move {
+            if bearer(req.headers()).is_some_and(|key| matches_secret(key, &proxy.config.usage_key)) {
+                if v8 { invalid_credentials() } else { usage_read_only() }.into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        },
+    )
 }
 
-async fn authenticate(State(proxy): State<Arc<Proxy>>, req: Request, next: Next) -> Response {
-    if !bearer(req.headers()).is_some_and(|key| matches_secret(key, &proxy.config.management_key)) {
-        return Failure(StatusCode::UNAUTHORIZED, "invalid management credentials").into_response();
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManagementScope {
+    Full,
+    UsageReadOnly,
+}
+
+fn invalid_credentials() -> Failure {
+    Failure(StatusCode::UNAUTHORIZED, "invalid management credentials")
+}
+
+fn usage_read_only() -> Failure {
+    Failure(StatusCode::FORBIDDEN, "usage key is read-only")
+}
+
+async fn authenticate(State(proxy): State<Arc<Proxy>>, mut req: Request, next: Next, v8: bool) -> Response {
+    let Some(key) = bearer(req.headers()) else { return invalid_credentials().into_response() };
+    let scope = if matches_secret(key, &proxy.config.management_key) {
+        ManagementScope::Full
+    } else if !v8 && matches_secret(key, &proxy.config.usage_key) {
+        if !matches!((req.method().as_str(), req.uri().path()), ("GET", "/auth-files" | "/auth-files/models") | ("POST", "/api-call")) {
+            return usage_read_only().into_response();
+        }
+        ManagementScope::UsageReadOnly
+    } else {
+        return invalid_credentials().into_response();
+    };
+    req.extensions_mut().insert(scope);
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
     for (key, value) in [
@@ -694,35 +725,58 @@ struct ApiCall {
 }
 
 pub(crate) fn allowed_call(account: &Account, url: &reqwest::Url, method: &str) -> bool {
+    !account.api_key && allowed_lane(url, method, ManagementScope::Full) == Some(account.lane)
+}
+
+fn allowed_lane(url: &reqwest::Url, method: &str, scope: ManagementScope) -> Option<Lane> {
     if url.scheme() != "https"
         || url.port().is_some()
         || url.fragment().is_some()
         || url.query().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
-        || account.api_key
     {
-        return false;
+        return None;
     }
-    matches!(
-        (account.lane, url.host_str(), method, url.path()),
-        (Lane::Claude, Some("api.anthropic.com"), "GET", "/api/oauth/usage")
-            | (Lane::Codex, Some("chatgpt.com"), "GET", "/backend-api/wham/usage" | "/backend-api/wham/rate-limit-reset-credits")
-            | (Lane::Codex, Some("chatgpt.com"), "POST", "/backend-api/wham/rate-limit-reset-credits/consume")
-            | (
-                Lane::Google,
-                Some("daily-cloudcode-pa.googleapis.com" | "cloudcode-pa.googleapis.com"),
-                "POST",
-                "/v1internal:retrieveUserQuotaSummary" | "/v1internal:fetchAvailableModels",
-            )
-            | (Lane::Go, Some("opencode.ai"), "GET", "/zen/go/v1/usage")
-    )
+    match (url.host_str(), method, url.path()) {
+        (Some("api.anthropic.com"), "GET", "/api/oauth/usage") => Some(Lane::Claude),
+        (Some("chatgpt.com"), "GET", "/backend-api/wham/usage" | "/backend-api/wham/rate-limit-reset-credits") => Some(Lane::Codex),
+        (Some("chatgpt.com"), "POST", "/backend-api/wham/rate-limit-reset-credits/consume") if scope == ManagementScope::Full => {
+            Some(Lane::Codex)
+        }
+        (
+            Some("daily-cloudcode-pa.googleapis.com" | "cloudcode-pa.googleapis.com"),
+            "POST",
+            "/v1internal:retrieveUserQuotaSummary" | "/v1internal:fetchAvailableModels",
+        ) => Some(Lane::Google),
+        (Some("opencode.ai"), "GET", "/zen/go/v1/usage") => Some(Lane::Go),
+        _ => None,
+    }
 }
 
-async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) -> Reply {
-    let account = select(&proxy, &json!({"auth_index":call.auth_index})).await?;
-    let url = reqwest::Url::parse(&call.url).map_err(|_| bad("invalid upstream URL"))?;
+async fn api_call(
+    State(proxy): State<Arc<Proxy>>,
+    axum::Extension(scope): axum::Extension<ManagementScope>,
+    Json(call): Json<ApiCall>,
+) -> Reply {
+    let url = reqwest::Url::parse(&call.url);
     let method = call.method.to_ascii_uppercase();
+    let usage_lane = if scope == ManagementScope::UsageReadOnly {
+        Some(url.as_ref().ok().and_then(|url| allowed_lane(url, &method, scope)).ok_or_else(usage_read_only)?)
+    } else {
+        None
+    };
+    let account = select(&proxy, &json!({"auth_index":call.auth_index})).await?;
+    if usage_lane.is_some_and(|lane| account.api_key || account.lane != lane) {
+        return Err(usage_read_only());
+    }
+    let url = url.map_err(|_| bad("invalid upstream URL"))?;
+    // The offline verifier uses canonical provider URLs to exercise the allowlist before remapping to loopback.
+    let url = if let (ManagementScope::UsageReadOnly, Some(mock)) = (scope, &proxy.management_mock) {
+        mock.join(url.path()).map_err(|_| upstream())?
+    } else {
+        url
+    };
     let mock = proxy.management_mock.as_ref().is_some_and(|m| {
         m.origin() == url.origin()
             && url.username().is_empty()
@@ -730,7 +784,7 @@ async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) ->
             && url.fragment().is_none()
             && matches!(method.as_str(), "GET" | "POST")
     });
-    if !mock && !allowed_call(&account, &url, &method) {
+    if scope == ManagementScope::Full && !mock && !allowed_call(&account, &url, &method) {
         return Err(Failure(StatusCode::FORBIDDEN, "upstream is not allowed for this credential"));
     }
     if call.data.as_ref().is_some_and(|s| s.len() > 64 * 1024 || method == "GET") || call.header.len() > 24 {
@@ -785,7 +839,7 @@ async fn api_call(State(proxy): State<Arc<Proxy>>, Json(call): Json<ApiCall>) ->
     let status = response.status().as_u16();
     let bytes = bounded_body(response, 2 * 1024 * 1024).await.map_err(|_| upstream())?;
     let mut body = String::from_utf8_lossy(&bytes).into_owned();
-    for secret in [&proxy.config.management_key, &proxy.config.client_key]
+    for secret in [&proxy.config.management_key, &proxy.config.client_key, &proxy.config.usage_key]
         .into_iter()
         .chain(
             fresh.iter().chain([&account]).flat_map(|a| [&a.access].into_iter().chain(a.refresh.as_ref()).chain(a.google_secret.as_ref())),

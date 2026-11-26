@@ -270,9 +270,9 @@ fn registration_and_private_keys() {
     let dir = Scratch::new();
     let path = dir.join("userdata/settings.json");
     config::write_private(&path, br#"{"theme":"dark","usageLimitSources":{"other":{"enabled":false}}}"#, true).unwrap();
-    let config = Config::new(config::DEFAULT_BIND.parse().unwrap(), &dir.join("state"), None, false, None, None).unwrap();
+    let config = Config::new(config::DEFAULT_BIND.parse().unwrap(), &dir.join("state"), None, false, None, None, None).unwrap();
     assert_ne!(config.client_key, config.management_key);
-    for name in ["client-key", "management-key"] {
+    for name in ["client-key", "management-key", "usage-key"] {
         let path = dir.join(&format!("state/{name}"));
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::read_to_string(path).unwrap().len(), 64);
@@ -387,6 +387,7 @@ fn fixture_config(dir: &Scratch, mock: &Server) -> Config {
         provenance_oauth_bin: None,
         client_key: "inference-fixture".into(),
         management_key: "management-fixture".into(),
+        usage_key: "usage-fixture".into(),
         anthropic: mock.0.clone(),
         openai: mock.0.clone(),
         codex: mock.0.clone(),
@@ -688,6 +689,7 @@ async fn scoped_worker_denies_all_other_routes_models_and_overrides_before_forwa
         assert_eq!(http.request(method, path).body(body).send().await.unwrap().status(), StatusCode::FORBIDDEN, "{method} {path}");
     }
     let post = || http.request("POST", CODEX_RESPONSES);
+    assert_eq!(post().bearer_auth("usage-fixture").body(body).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
     for (body, status) in [
         (r#"{"model":"gpt-4o"}"#, 403),
         (r#"{"model":"claude-opus-5-5"}"#, 403),
@@ -937,6 +939,7 @@ async fn scoped_worker_startup_rejects_invalid_configuration() {
     let mut config = fixture_config(&dir, &mock);
     config.client_key = "fixture-client-53c86ac4edf5931b65".into();
     config.management_key = "fixture-management-2d32793fc12cd".into();
+    config.usage_key = "fixture-usage-key-a75608a614efb834".into();
     let tcp = |addr: &str, key: Option<PathBuf>, models: &[&str]| {
         WorkerOptions {
             worker_listen: Some(addr.parse().unwrap()),
@@ -948,7 +951,7 @@ async fn scoped_worker_startup_rejects_invalid_configuration() {
     };
     let file = dir.join("worker-key");
     assert!(tcp("127.0.0.1:0", None, &["gpt-test"]).is_err());
-    for key in [&*config.client_key, &config.management_key, " ", "short", "sk-placeholder-key-fixture-12345678"] {
+    for key in [&*config.client_key, &config.management_key, &config.usage_key, " ", "short", "sk-placeholder-key-fixture-12345678"] {
         config::write_private(&file, key.as_bytes(), true).unwrap();
         assert!(tcp("127.0.0.1:0", Some(file.clone()), &["gpt-test"]).is_err());
     }
@@ -1251,6 +1254,16 @@ async fn scoped_google_worker_enforces_routes_queries_headers_models_and_strict_
     );
     let server = serve(worker.app(proxy)).await;
     let http = Http::new(&server);
+    assert_eq!(
+        http.request("POST", GOOGLE_GENERATE_CONTENT)
+            .header("x-api-key", "usage-fixture")
+            .json(&json!({"model": "gemini-4-neon-high", "request": {"contents": []}}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
 
     for (method, path) in [
         ("POST", "/v1/messages"),
@@ -2999,6 +3012,82 @@ async fn usage_windows_validates_model_diagnostics_and_does_not_change_the_pool(
     assert!(state.usage_refreshes.is_empty());
     assert!(state.activity.is_empty());
     assert_eq!(probes.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn usage_key_is_read_only() {
+    let mock = serve(
+        Router::new()
+            .route("/api/oauth/usage", get(|| async { "usage-fixture management-fixture inference-fixture" }))
+            .route("/backend-api/wham/usage", get(|| async { "codex usage" }))
+            .route("/backend-api/wham/rate-limit-reset-credits", get(|| async { "codex credits" }))
+            .route("/backend-api/wham/rate-limit-reset-credits/consume", post(|| async { "consumed" }))
+            .route("/v1internal:retrieveUserQuotaSummary", post(|| async { "google quota" }))
+            .route("/v1internal:fetchAvailableModels", post(|| async { "google models" }))
+            .route("/zen/go/v1/usage", get(|| async { "go usage" })),
+    )
+    .await;
+    let dir = Scratch::new();
+    for (file, lane) in [("codex.json", "codex"), ("google.json", "antigravity"), ("go.json", "opencode-go")] {
+        config::write_private(
+            &dir.join("auth").join(file),
+            &serde_json::to_vec(&json!({"type":lane,"access_token":"upstream-fixture","models":["test-model"]})).unwrap(),
+            true,
+        )
+        .unwrap();
+    }
+    let proxy = fixture(&dir, &mock);
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let usage = |method, path| http.request(method, path).bearer_auth("usage-fixture");
+    for (method, path, status) in [
+        ("GET", "/v0/management/auth-files", 200),
+        ("GET", "/v0/management/auth-files/models?name=a.json", 200),
+        ("DELETE", "/v0/management/auth-files", 403),
+        ("PATCH", "/v0/management/auth-files/status", 403),
+        ("PATCH", "/v0/management/auth-files/fields", 403),
+        ("POST", "/v0/management/reset-quota", 403),
+        ("GET", "/v0/management/routing/strategy", 403),
+        ("PUT", "/v0/management/routing/strategy", 403),
+        ("GET", "/v0/management/logs", 403),
+        ("GET", "/v0/management/debug", 403),
+        ("HEAD", "/v0/management/auth-files", 403),
+        ("GET", "/v0/management/unknown", 403),
+        ("GET", "/v8/management/config", 401),
+        ("POST", "/v8/management/server/shutdown", 401),
+        ("GET", "/v1/models", 401),
+        ("POST", "/v1internal:generateContent", 401),
+    ] {
+        assert_eq!(usage(method, path).send().await.unwrap().status(), status, "{method} {path}");
+    }
+    let accounts = proxy.state.read().await.pool.accounts.clone();
+    let call = "/v0/management/api-call";
+    for (account, method, url, expected) in [
+        ("codex.json", "GET", "https://chatgpt.com/backend-api/wham/usage", "codex usage"),
+        ("codex.json", "GET", "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", "codex credits"),
+        ("a.json", "GET", "https://api.anthropic.com/api/oauth/usage", "[REDACTED] [REDACTED] [REDACTED]"),
+        ("google.json", "POST", "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary", "google quota"),
+        ("google.json", "POST", "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", "google models"),
+        ("go.json", "GET", "https://opencode.ai/zen/go/v1/usage", "go usage"),
+    ] {
+        let payload = json!({"authIndex":accounts[account].auth_index,"method":method,"url":url});
+        let response = usage("POST", call).json(&payload).send().await.unwrap();
+        assert_eq!(response.status(), 200, "{method} {url}");
+        let reply: Value = response.json().await.unwrap();
+        assert_eq!(reply, json!({"status_code":200,"body":expected}));
+    }
+    for (auth_index, method, url) in [
+        (&accounts["codex.json"].auth_index[..], "POST", "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"),
+        ("unknown", "POST", "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"),
+        (&accounts["codex.json"].auth_index, "GET", "https://api.anthropic.com/api/oauth/usage"),
+        (&accounts["codex.json"].auth_index, "GET", "https://chatgpt.com/backend-api/wham/usage?unexpected=1"),
+        (&accounts["google.json"].auth_index, "POST", "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"),
+    ] {
+        let payload = json!({"authIndex": auth_index,"method":method,"url":url});
+        let response = usage("POST", call).json(&payload).send().await.unwrap();
+        assert_eq!(response.status(), 403, "{method} {url}");
+        assert!(response.text().await.unwrap().contains("usage key is read-only"));
+    }
 }
 
 #[tokio::test]
@@ -7775,6 +7864,7 @@ async fn provenance_oauth_discovers_all_antigravity_enrollments_and_deduplicates
         provenance_oauth_bin: Some(fake_bin),
         client_key: "inference-fixture".into(),
         management_key: "management-fixture".into(),
+        usage_key: "usage-fixture".into(),
         anthropic: mock.0.clone(),
         openai: mock.0.clone(),
         codex: mock.0.clone(),
@@ -7916,6 +8006,7 @@ async fn provenance_oauth_reloads_new_enrollment_on_google_auth_miss_and_throttl
         provenance_oauth_bin: Some(fake_bin),
         client_key: "inference-fixture".into(),
         management_key: "management-fixture".into(),
+        usage_key: "usage-fixture".into(),
         anthropic: mock.0.clone(),
         openai: mock.0.clone(),
         codex: mock.0.clone(),
@@ -8790,6 +8881,7 @@ fn local_discovery_skips_expired_oauth_and_excluded_providers() {
         provenance_oauth_bin: None,
         client_key: String::new(),
         management_key: String::new(),
+        usage_key: String::new(),
         anthropic: endpoint.clone(),
         openai: endpoint.clone(),
         codex: endpoint.clone(),

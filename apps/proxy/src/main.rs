@@ -35,6 +35,8 @@ enum Command {
         client_key_file: Option<PathBuf>,
         #[arg(long, env = "PROXY_MANAGEMENT_KEY_FILE")]
         management_key_file: Option<PathBuf>,
+        #[arg(long)]
+        usage_key_file: Option<PathBuf>,
         #[arg(long, env = "HUB_URL")]
         hub_url: Option<String>,
         #[arg(long, env = "HUB_TOKEN_FILE")]
@@ -56,8 +58,8 @@ enum Command {
     RegisterT3code {
         #[arg(long, default_value = DEFAULT_URL)]
         url: String,
-        #[arg(long, env = "PROXY_MANAGEMENT_KEY_FILE")]
-        management_key_file: Option<PathBuf>,
+        #[arg(long)]
+        usage_key_file: Option<PathBuf>,
         #[arg(long)]
         t3code_home: Option<PathBuf>,
         #[arg(long, default_value = SOURCE_ID)]
@@ -104,6 +106,7 @@ async fn main() -> Result<()> {
             auth_dir,
             client_key_file,
             management_key_file,
+            usage_key_file,
             hub_url,
             hub_token_file,
             register_t3code: register,
@@ -113,7 +116,8 @@ async fn main() -> Result<()> {
             worker,
             google_worker,
         } => {
-            let mut config = Config::new(bind, &state_dir(state)?, auth_dir, discover_local, client_key_file, management_key_file)?;
+            let mut config =
+                Config::new(bind, &state_dir(state)?, auth_dir, discover_local, client_key_file, management_key_file, usage_key_file)?;
             let worker = worker.validate(&config)?;
             let google_worker = google_worker.validate(&config, worker.as_ref())?;
             config.exclude_local_lanes = exclude_local_providers.into_iter().collect();
@@ -145,7 +149,7 @@ async fn main() -> Result<()> {
                 format!("http://{}", config.bind)
             };
             if register {
-                register_t3code(&config.t3code_home, SOURCE_ID, SOURCE_LABEL, &config.url, &config.management_key)?;
+                register_t3code(&config.t3code_home, SOURCE_ID, SOURCE_LABEL, &config.url, &config.usage_key)?;
             }
             let addr = config.bind;
             let proxy = Arc::new(
@@ -209,9 +213,9 @@ async fn main() -> Result<()> {
             }
             result?;
         }
-        Command::RegisterT3code { url, management_key_file, t3code_home, source_id, label } => {
+        Command::RegisterT3code { url, usage_key_file, t3code_home, source_id, label } => {
             let t3code_home = t3code_home.map(Ok).unwrap_or_else(|| config::home().map(|home| config::t3_home(&home)))?;
-            let key = config::key(&state_dir(None)?, "management-key", "PROXY_MANAGEMENT_KEY", management_key_file.as_deref(), false)?;
+            let key = config::usage_key(&state_dir(None)?, usage_key_file.as_deref(), false)?;
             register_t3code(&t3code_home, &source_id, &label, &url, &key)?;
         }
         Command::ApplyClient { client, undo, url, client_key_file } => {

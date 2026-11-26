@@ -157,13 +157,16 @@ fn make_proxy(dir: &TempDir, mock_url: &reqwest::Url, auth_files: &[(&str, Value
     let t3_home = dir.path().join("t3");
     let client_key = dir.path().join("client.key");
     let mgmt_key = dir.path().join("mgmt.key");
+    let usage_key = dir.path().join("usage.key");
     fs::create_dir_all(&auth_dir)?;
     fs::write(&client_key, "verify-client-key\n")?;
     fs::write(&mgmt_key, "verify-mgmt-key\n")?;
+    fs::write(&usage_key, "verify-usage-key\n")?;
     for (name, value) in auth_files {
         fs::write(auth_dir.join(name), serde_json::to_vec(value)?)?;
     }
-    let mut cfg = Config::new("127.0.0.1:0".parse()?, &state_dir, Some(auth_dir), false, Some(client_key), Some(mgmt_key))?;
+    let mut cfg =
+        Config::new("127.0.0.1:0".parse()?, &state_dir, Some(auth_dir), false, Some(client_key), Some(mgmt_key), Some(usage_key))?;
     cfg.home = dir.path().to_path_buf();
     cfg.t3code_home = t3_home;
     cfg.anthropic = mock_url.clone();
@@ -421,7 +424,7 @@ async fn check_t3code_settings_registration() -> Result<String> {
             }
         }))?,
     )?;
-    register_t3code(&t3_home, "fleetix-proxy", "Fleetix Agent Proxy", "http://127.0.0.1:8317", "mgmt-secret-123")?;
+    register_t3code(&t3_home, "fleetix-proxy", "Fleetix Agent Proxy", "http://127.0.0.1:8317", "usage-secret-123")?;
     let parsed: Value = serde_json::from_slice(&fs::read(&settings_path)?)?;
     ensure!(parsed["theme"] == "dark", "existing settings key was lost");
     let sources = parsed["usageLimitSources"].as_object().ok_or_else(|| anyhow!("missing usageLimitSources object"))?;
@@ -430,7 +433,7 @@ async fn check_t3code_settings_registration() -> Result<String> {
     let ours = sources.get("fleetix-proxy").ok_or_else(|| anyhow!("fleetix-proxy entry missing"))?;
     ensure!(ours["kind"] == "cliproxy", "kind must be cliproxy");
     ensure!(ours["url"] == "http://127.0.0.1:8317", "url mismatch");
-    ensure!(ours["managementKey"] == "mgmt-secret-123", "managementKey mismatch");
+    ensure!(ours["managementKey"] == "usage-secret-123", "managementKey must contain the usage key");
     ensure!(ours["enabled"] == true, "enabled must be true");
     #[cfg(unix)]
     {
@@ -536,7 +539,7 @@ async fn check_t3code_management_api_contract() -> Result<String> {
     let http = http_client()?;
 
     // 1. /v0/management/auth-files contract + zero secret leakage
-    let auth_res = http.get(server.url("/v0/management/auth-files")).bearer_auth("verify-mgmt-key").send().await?;
+    let auth_res = http.get(server.url("/v0/management/auth-files")).bearer_auth("verify-usage-key").send().await?;
     ensure!(auth_res.status() == StatusCode::OK, "auth-files status {}", auth_res.status());
     let auth_text = auth_res.text().await?;
     for secret in ["ag-access-a", "ag-refresh-a", "verify-google-secret", "cl-access-a", "cx-access-a"] {
@@ -552,13 +555,20 @@ async fn check_t3code_management_api_contract() -> Result<String> {
     ensure!(cx["id_token"]["chatgpt_account_id"] == "acct_verify_123", "codex id_token.chatgpt_account_id missing");
 
     // 2. /v0/management/api-call for Claude, Codex, and Antigravity
-    for (label, auth_index, method, path, extra_headers, data) in [
-        ("claude", cl["auth_index"].as_str().unwrap(), "GET", "/api/oauth/usage", json!({"anthropic-beta": "oauth-2025-04-20"}), None),
+    for (label, auth_index, method, url, extra_headers, data) in [
+        (
+            "claude",
+            cl["auth_index"].as_str().unwrap(),
+            "GET",
+            "https://api.anthropic.com/api/oauth/usage",
+            json!({"anthropic-beta": "oauth-2025-04-20"}),
+            None,
+        ),
         (
             "codex",
             cx["auth_index"].as_str().unwrap(),
             "GET",
-            "/backend-api/wham/usage",
+            "https://chatgpt.com/backend-api/wham/usage",
             json!({"Chatgpt-Account-Id": "acct_verify_123"}),
             None,
         ),
@@ -566,7 +576,7 @@ async fn check_t3code_management_api_contract() -> Result<String> {
             "antigravity",
             ag["auth_index"].as_str().unwrap(),
             "POST",
-            "/v1internal:retrieveUserQuotaSummary",
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
             json!({"Content-Type": "application/json", "User-Agent": "antigravity/hub/2.24.0"}),
             Some(r#"{"project":"proj-alpha"}"#),
         ),
@@ -576,13 +586,13 @@ async fn check_t3code_management_api_contract() -> Result<String> {
         let mut req = json!({
             "auth_index": auth_index,
             "method": method,
-            "url": mock.url(path),
+            "url": url,
             "header": hdr,
         });
         if let Some(body) = data {
             req["data"] = json!(body);
         }
-        let res = http.post(server.url("/v0/management/api-call")).bearer_auth("verify-mgmt-key").json(&req).send().await?;
+        let res = http.post(server.url("/v0/management/api-call")).bearer_auth("verify-usage-key").json(&req).send().await?;
         ensure!(res.status() == StatusCode::OK, "api-call {label} failed with {}", res.status());
         let body: Value = res.json().await?;
         ensure!(body["status_code"] == 200, "api-call {label} upstream status {}", body["status_code"]);

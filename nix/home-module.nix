@@ -257,6 +257,11 @@ in {
         default = null;
         description = "Existing agent proxy URL for clients, without starting a user proxy.";
       };
+      usageKeyFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "File containing the read-only usage key for the local proxy daemon and T3 Code usage-limit registration.";
+      };
       effectiveUrl = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         readOnly = true;
@@ -437,6 +442,7 @@ in {
                     )
                   ]
                   ++ lib.optionals (proxyCfg.authDir != null) ["--auth-dir" proxyCfg.authDir]
+                  ++ lib.optionals (proxyCfg.usageKeyFile != null) ["--usage-key-file" proxyCfg.usageKeyFile]
                   ++ lib.optional proxyCfg.discoverLocal "--discover-local"
                   ++ lib.optionals (proxyCfg.registerT3Code && !useDeclarativeT3Registration) [
                     "--register-t3code"
@@ -613,16 +619,22 @@ in {
       };
     })
     (lib.optionalAttrs hasDeclarativeT3UsageSources {
-      programs.t3code.usageLimitSources = lib.mkIf (localProxy && useDeclarativeT3Registration) {
-        fleetix-proxy = {
-          enable = true;
-          kind = "cliproxy";
-          label = "Fleetix Agent Proxy";
-          url = "http://${proxyCfg.bind}";
-          managementKeyFile = "${proxyCfg.stateDir}/management-key";
-          optional = true;
+      programs.t3code.usageLimitSources =
+        lib.mkIf (
+          useDeclarativeT3Registration && (localProxy || (proxyCfg.externalUrl != null && proxyCfg.usageKeyFile != null))
+        ) {
+          fleetix-proxy = {
+            enable = true;
+            kind = "cliproxy";
+            label = "Fleetix Agent Proxy";
+            url = proxyCfg.effectiveUrl;
+            managementKeyFile =
+              if proxyCfg.usageKeyFile != null
+              then proxyCfg.usageKeyFile
+              else "${proxyCfg.stateDir}/usage-key";
+            optional = proxyCfg.usageKeyFile == null;
+          };
         };
-      };
     })
   ];
 }

@@ -38,7 +38,7 @@ use crate::{
     pool::{Lane, bounded_identifier},
     router::{
         LocalPoolResponse, POOL_QUOTA_HEADER, REQUEST_BODY_LIMIT, WorkerStreamOutcome, bearer, connection_headers, forward_authorized,
-        lane_error,
+        lane_error, presents_key,
     },
 };
 
@@ -124,8 +124,10 @@ impl WorkerOptions {
         ensure!(!matches!(bind, Bind::Tcp(_)) || key.is_some(), "worker TCP listener requires a dedicated bearer");
         if let Some(key) = &key {
             ensure!(
-                !matches_secret(key, &shared.client_key) && !matches_secret(key, &shared.management_key),
-                "worker bearer must differ from the client and management keys"
+                !matches_secret(key, &shared.client_key)
+                    && !matches_secret(key, &shared.management_key)
+                    && !matches_secret(key, &shared.usage_key),
+                "worker bearer must differ from the client, management, and usage keys"
             );
         }
         Ok(Some(WorkerConfig {
@@ -490,6 +492,9 @@ async fn pool_has_secret(proxy: &Proxy, key: &str) -> bool {
 
 async fn forward(State((proxy, scope)): State<(Arc<Proxy>, Arc<Scope>)>, request: Request) -> Response {
     let (mut parts, body) = request.into_parts();
+    if presents_key(&parts.headers, &proxy.config.usage_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     if parts.headers.get_all(header::CONNECTION).iter().any(|value| value.to_str().is_err()) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -631,8 +636,9 @@ impl GoogleWorkerOptions {
             ensure!(
                 !matches_secret(key, &shared.client_key)
                     && !matches_secret(key, &shared.management_key)
+                    && !matches_secret(key, &shared.usage_key)
                     && !codex.and_then(WorkerConfig::bearer).is_some_and(|other| matches_secret(key, other)),
-                "Google worker bearer must differ from client, management, and Codex worker keys"
+                "Google worker bearer must differ from client, management, usage, and Codex worker keys"
             );
         }
         Ok(Some(GoogleWorkerConfig {
@@ -812,6 +818,9 @@ async fn prepare_google_request(
     allowed_fields: &[&str],
 ) -> Result<(axum::http::request::Parts, Map<String, Value>, Option<String>, OwnedSemaphorePermit), StatusCode> {
     let (mut parts, body) = request.into_parts();
+    if presents_key(&parts.headers, &proxy.config.usage_key) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     if parts.headers.get_all(header::CONNECTION).iter().any(|value| value.to_str().is_err()) {
         return Err(StatusCode::FORBIDDEN);
     }

@@ -29,6 +29,7 @@ pub struct Config {
     pub provenance_oauth_bin: Option<PathBuf>,
     pub client_key: String,
     pub management_key: String,
+    pub usage_key: String,
     pub anthropic: Url,
     pub openai: Url,
     pub codex: Url,
@@ -44,13 +45,19 @@ impl Config {
         discover_local: bool,
         client_file: Option<PathBuf>,
         management_file: Option<PathBuf>,
+        usage_file: Option<PathBuf>,
     ) -> Result<Self> {
         private_dir(state)?;
         let auth_dir = auth_dir.unwrap_or_else(|| state.join("auth"));
         private_dir(&auth_dir)?;
         let client_key = key(state, "client-key", "PROXY_CLIENT_KEY", client_file.as_deref(), true)?;
         let management_key = key(state, "management-key", "PROXY_MANAGEMENT_KEY", management_file.as_deref(), true)?;
+        let usage_key = usage_key(state, usage_file.as_deref(), true)?;
         ensure!(!matches_secret(&client_key, &management_key), "client and management keys must differ");
+        ensure!(
+            !matches_secret(&usage_key, &client_key) && !matches_secret(&usage_key, &management_key),
+            "usage, client, and management keys must differ"
+        );
         let upstream = |name, default| origin(&env::var(name).unwrap_or_else(|_| String::from(default)));
         let home = home()?;
         Ok(Self {
@@ -67,6 +74,7 @@ impl Config {
             provenance_oauth_bin: env::var_os("PROXY_PROVENANCE_OAUTH_BIN").filter(|p| !p.is_empty()).map(PathBuf::from),
             client_key,
             management_key,
+            usage_key,
             anthropic: upstream("PROXY_ANTHROPIC_UPSTREAM", "https://api.anthropic.com")?,
             openai: upstream("PROXY_OPENAI_UPSTREAM", "https://api.openai.com")?,
             codex: upstream("PROXY_OPENAI_UPSTREAM", "https://chatgpt.com/backend-api/codex")?,
@@ -147,6 +155,10 @@ pub(crate) fn validate_secret(raw: &str) -> Result<String> {
     let secret = raw.trim();
     ensure!(!secret.is_empty() && secret.bytes().all(|b| b.is_ascii_graphic()), "invalid secret");
     Ok(secret.to_owned())
+}
+
+pub fn usage_key(state: &Path, file: Option<&Path>, create: bool) -> Result<String> {
+    key(state, "usage-key", "PROXY_USAGE_KEY", file, create)
 }
 
 pub fn key(state: &Path, name: &str, env_name: &str, file: Option<&Path>, create: bool) -> Result<String> {

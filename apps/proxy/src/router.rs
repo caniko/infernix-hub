@@ -371,6 +371,15 @@ fn parse_bearer(value: &HeaderValue) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then_some(secret).filter(|s| !s.is_empty())
 }
 
+pub(crate) fn presents_key(headers: &HeaderMap, key: &str) -> bool {
+    headers
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .filter_map(parse_bearer)
+        .chain(headers.get_all("x-api-key").iter().filter_map(|value| value.to_str().ok()))
+        .any(|token| matches_secret(token, key))
+}
+
 pub(crate) fn lane_error(lane: Lane, status: StatusCode, message: &'static str) -> Response {
     if lane == Lane::Google {
         let rpc_status = match status {
@@ -435,15 +444,7 @@ pub(super) async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -
         _ if path.starts_with("/v1internal/") || path.starts_with("/v1internal:") || path.starts_with("/v1beta/") => Lane::Google,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    if proxy.worker_bearers.iter().any(|worker_bearer| {
-        parts
-            .headers
-            .get_all(header::AUTHORIZATION)
-            .iter()
-            .filter_map(parse_bearer)
-            .chain(parts.headers.get_all("x-api-key").iter().filter_map(|value| value.to_str().ok()))
-            .any(|token| matches_secret(token, worker_bearer))
-    }) {
+    if presents_key(&parts.headers, &proxy.config.usage_key) || proxy.worker_bearers.iter().any(|key| presents_key(&parts.headers, key)) {
         return lane_error(lane, StatusCode::UNAUTHORIZED, "invalid inference credentials");
     }
     let provided = bearer(&parts.headers);
