@@ -516,6 +516,7 @@ fn AlertsBody(status: FleetStatus, stale: bool) -> Element {
 #[component]
 fn AlertRow(alert: ServiceAlert) -> Element {
     let selected = FLEET_SELECTION.read().as_ref().is_some_and(|(workspace, key)| *workspace == Workspace::Alerts && key == &alert.key);
+    let action = attention_action(Workspace::Alerts, true);
     let duration = alert.since.as_deref().and_then(|since| down_duration(format::now_ms(), since));
     let state = duration.map_or_else(|| "Down".to_string(), |duration| format!("Down · {duration}"));
     let key = alert.key.clone();
@@ -541,7 +542,7 @@ fn AlertRow(alert: ServiceAlert) -> Element {
                 if selected {
                     "Selected"
                 } else {
-                    "Inspect "
+                    "{action} "
                     span { aria_hidden: "true", "›" }
                 }
             }

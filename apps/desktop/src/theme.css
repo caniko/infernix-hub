@@ -186,7 +186,7 @@ a:hover { color: var(--focus); text-decoration: underline; }
 .ctx-meta {
   font-size: 11px; color: var(--text-muted);
 }
-.intel-filters {
+.intel-filters:not([hidden]) {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9.5rem), 1fr));
   gap: 6px; margin-bottom: 10px;
 }
@@ -1137,6 +1137,7 @@ select.input option { background: var(--card); color: var(--text); }
   width: 26%; min-width: 112px; white-space: normal; overflow-wrap: anywhere;
 }
 .activity-comparisons > .activity-table :is(th, td):nth-child(2) { white-space: normal; overflow-wrap: anywhere; }
+.activity-comparisons .comparison-ttft-cell { padding-inline-end: 16px; }
 .activity-comparisons details .provider-table td:last-child {
   min-width: 12rem; white-space: normal; overflow-wrap: break-word;
 }

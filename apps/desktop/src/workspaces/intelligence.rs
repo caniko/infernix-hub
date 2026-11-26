@@ -42,11 +42,13 @@ pub fn IntelligenceView() -> Element {
         Some((_, Ok(page))) if page.items.is_empty() => Some(empty_signal_title(&filters)),
         _ => None,
     };
+    let empty_stream = is_empty_signal_stream(&filters, empty_title.is_some());
+    let filtered = has_signal_filters(&filters);
 
     rsx! {
         aside { class: "context", aria_label: "Signal stream",
             div { class: "context-head", h2 { "Signals" } }
-            div { class: "intel-filters", role: "group", aria_label: "Signal filters",
+            div { class: "intel-filters", hidden: empty_stream, role: "group", aria_label: "Signal filters",
                 label { class: "form-field", span { "Source" }
                     select { class: "input", value: filters.source.as_deref().unwrap_or_default(),
                         onchange: move |e| {
@@ -107,9 +109,9 @@ pub fn IntelligenceView() -> Element {
                     None => rsx! { Loading { text: "Loading signals…".to_string() } },
                     Some(Err(e)) => rsx! { ErrorCard { code: e.code, message: e.message } },
                     Some(Ok(page)) => rsx! {
-                        if let Some(title) = empty_title {
-                            p { class: "ctx-empty", "{title}" }
-                            if has_signal_filters(&filters) {
+                        if empty_title.is_some() {
+                            p { class: "ctx-empty", if filtered { "0 matches" } else { "0 signals" } }
+                            if filtered {
                                 button {
                                     class: "btn secondary btn-xs",
                                     onclick: move |_| query.set(IntelSignalQuery::default()),
@@ -166,7 +168,10 @@ pub fn IntelligenceView() -> Element {
                     }
                 }
                 if let Some(title) = empty_title {
-                    EmptyState { title: title.to_string() }
+                    EmptyState {
+                        title: title.to_string(),
+                        hint: empty_stream.then(|| "Set up a source if none are listed above, or check Source health for ingest errors. Then refresh sources and signals.".to_string()),
+                    }
                 } else if let Some(id) = selected() {
                     SignalDetail { key: "{id}", id, on_changed: move |_| stream.restart() }
                 } else if has_signal_page {
@@ -179,6 +184,10 @@ pub fn IntelligenceView() -> Element {
 
 fn has_signal_filters(query: &IntelSignalQuery) -> bool {
     query.source.is_some() || query.state.is_some() || query.severity_min.is_some() || query.audience_at_most.is_some()
+}
+
+fn is_empty_signal_stream(query: &IntelSignalQuery, empty_page: bool) -> bool {
+    empty_page && query.cursor.is_none() && !has_signal_filters(query)
 }
 
 fn empty_signal_title(query: &IntelSignalQuery) -> &'static str {
@@ -475,6 +484,18 @@ mod tests {
         query.state = Some(SignalState::Acknowledged);
         assert!(has_signal_filters(&query));
         assert_eq!(empty_signal_title(&query), "No matching signals.");
+    }
+
+    #[test]
+    fn only_an_empty_unfiltered_first_page_hides_signal_filters() {
+        let mut query = IntelSignalQuery::default();
+        assert!(is_empty_signal_stream(&query, true));
+        assert!(!is_empty_signal_stream(&query, false));
+        query.cursor = Some("next".into());
+        assert!(!is_empty_signal_stream(&query, true));
+        query.cursor = None;
+        query.state = Some(SignalState::Acknowledged);
+        assert!(!is_empty_signal_stream(&query, true));
     }
 
     #[test]

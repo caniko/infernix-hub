@@ -515,7 +515,7 @@ fn Compare(scope: ActivityScope) -> Element {
                             td { ShareBar { label: usd(r.api_equivalent_cost_usd), value: r.api_equivalent_cost_usd, total: total_cost, show_share: true } }
                             td { "{money(r.mean_cost_per_request)}" }
                             td { {baseline_delta(r.baseline_cost_multiple)} }
-                            td {
+                            td { class: "comparison-ttft-cell",
                                 if let Some(ms) = ttft(r) {
                                     ShareBar { label: format!("{ms:.1} ms"), value: ms, total: max_ttft, scale_label: "of slowest listed value" }
                                 } else { "—" }

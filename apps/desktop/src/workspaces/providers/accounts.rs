@@ -266,7 +266,7 @@ fn KeyGroupView(provider: ProviderSummary, group: KeyGroup, model_names: BTreeMa
                     command: ProviderCommand::KeyGroup(KeyGroupCommand::SetRequestIdentity { group_id: id.clone(), mode }) }
                 OperationButton { provider: provider.clone(), label: "Discover Models",
                     command: ProviderCommand::Model(ModelCommand::DiscoverModels { group_id: Some(id.clone()) }) }
-                OperationButton { provider: provider.clone(), label: "Delete group", confirm: true,
+                OperationButton { provider: provider.clone(), label: "Delete group", tone: "danger", confirm: true,
                     command: ProviderCommand::KeyGroup(KeyGroupCommand::DeleteGroup { group_id: id.clone() }) }
             }
             h4 { "Saved keys" }
