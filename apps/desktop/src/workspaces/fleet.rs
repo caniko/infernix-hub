@@ -352,7 +352,7 @@ fn AttentionRow(title: String, detail: String, workspace: Workspace, item: Optio
                 strong { "{title}" }
                 span { class: "muted", style: "font-size: 12px;", "{detail}" }
             }
-            span { class: "row-chevron nowrap-unit", style: "color: var(--honey); font-size: 12px;",
+            span { class: "row-action-pill nowrap-unit",
                 "{action} "
                 span { aria_hidden: "true", "›" }
             }
@@ -516,6 +516,7 @@ fn AlertsBody(status: FleetStatus, stale: bool) -> Element {
 #[component]
 fn AlertRow(alert: ServiceAlert) -> Element {
     let selected = FLEET_SELECTION.read().as_ref().is_some_and(|(workspace, key)| *workspace == Workspace::Alerts && key == &alert.key);
+    let action = attention_action(Workspace::Alerts, true);
     let duration = alert.since.as_deref().and_then(|since| down_duration(format::now_ms(), since));
     let state = duration.map_or_else(|| "Down".to_string(), |duration| format!("Down · {duration}"));
     let key = alert.key.clone();
@@ -537,11 +538,11 @@ fn AlertRow(alert: ServiceAlert) -> Element {
                     span { class: "alert-detail", "The service failed its health check." }
                 }
             }
-            span { class: "btn btn-xs nowrap-unit",
+            span { class: "row-action-pill nowrap-unit",
                 if selected {
                     "Selected"
                 } else {
-                    "Inspect "
+                    "{action} "
                     span { aria_hidden: "true", "›" }
                 }
             }

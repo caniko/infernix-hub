@@ -95,6 +95,8 @@ fn AccountEditor(provider: ProviderSummary, account: ModelAccount, mask: bool) -
     let mut weight = use_signal(|| account.weight.to_string());
     let mut scope = use_signal(|| "host".to_string());
     let mut target = use_signal(|| account.host.clone().unwrap_or_default());
+    let mut manage = use_signal(|| false);
+    let manage_id = use_hook(|| format!("manage-account-{}", Uuid::new_v4().simple()));
     let toggle = if account.enabled { "Disable" } else { "Enable" };
     let name = account_name(&account, mask);
     let operator = use_context::<PanelState>().operator();
@@ -107,10 +109,12 @@ fn AccountEditor(provider: ProviderSummary, account: ModelAccount, mask: bool) -
     let edit_note = can_edit(ProviderCapability::SetNote);
     rsx! {
         article { class: "hairline-row stack", style: "padding-block: 8px; gap: 4px;",
-            AccountIdentity { provider: provider.clone(), account: account.clone(), mask, show_last_used: true }
-            if let Some(note) = &account.note { p { "{note}" } }
-            if can_switch || can_renew {
-                div { class: "row",
+            div { class: "account-row-main",
+                div {
+                    AccountIdentity { provider: provider.clone(), account: account.clone(), mask, show_last_used: true }
+                    if let Some(note) = &account.note { p { "{note}" } }
+                }
+                div { class: "row account-row-actions",
                     if can_switch {
                         OperationButton { provider: provider.clone(), account: account.clone(),
                             label: "Switch account", disabled: !account.enabled,
@@ -122,10 +126,11 @@ fn AccountEditor(provider: ProviderSummary, account: ModelAccount, mask: bool) -
                         OperationButton { provider: provider.clone(), account: account.clone(), label: "Renew login", tone: "secondary",
                             command: ProviderCommand::Credential(CredentialCommand::RenewLogin { account_id: Some(id.clone()) }) }
                     }
+                    button { class: "btn secondary", aria_label: "Manage {name}", aria_expanded: manage(), aria_controls: manage_id.clone(),
+                        onclick: move |_| manage.toggle(), "Manage" }
                 }
             }
-            details {
-                summary { aria_label: "Manage {name}", "Manage" }
+            div { id: manage_id, hidden: !manage(),
                 p { class: "form-help", "Routing priority: {account.priority} · Routing weight: {account.weight}" }
                 if is_next_pick(&provider, &account) { p { class: "form-help", "{NEXT_PICK_HINT}" } }
                 div { class: "row",
@@ -261,7 +266,7 @@ fn KeyGroupView(provider: ProviderSummary, group: KeyGroup, model_names: BTreeMa
                     command: ProviderCommand::KeyGroup(KeyGroupCommand::SetRequestIdentity { group_id: id.clone(), mode }) }
                 OperationButton { provider: provider.clone(), label: "Discover Models",
                     command: ProviderCommand::Model(ModelCommand::DiscoverModels { group_id: Some(id.clone()) }) }
-                OperationButton { provider: provider.clone(), label: "Delete group", confirm: true,
+                OperationButton { provider: provider.clone(), label: "Delete group", tone: "danger", confirm: true,
                     command: ProviderCommand::KeyGroup(KeyGroupCommand::DeleteGroup { group_id: id.clone() }) }
             }
             h4 { "Saved keys" }

@@ -1,9 +1,11 @@
 //! Operator review of policy-scoped signals. Evidence and projections are text, never markup or navigation.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, TimeDelta, Utc};
 use contracts::{
-    Audience, IntelRunStatus, IntelSignal, IntelSignalDetail, IntelSignalQuery, IntelSignalReview, IntelSourceStatus, Severity,
-    SignalClearanceIn, SignalDecisionAction, SignalDecisionIn, SignalState, client::HubClient,
+    Audience, IntelRunStatus, IntelSignal, IntelSignalDetail, IntelSignalQuery, IntelSignalReview, IntelSourceStatus, ProvenanceMethod,
+    Severity, SignalClearanceIn, SignalDecisionAction, SignalDecisionIn, SignalState, client::HubClient,
 };
 use dioxus::prelude::*;
 use uuid::Uuid;
@@ -15,11 +17,38 @@ use crate::{
     state::{Store, UiError},
 };
 
+#[derive(Clone, Default)]
+struct ClearanceDraft {
+    audience: Option<Audience>,
+    rationale: String,
+    review_key: Option<ReviewKey>,
+    reconfirm: bool,
+}
+
+type ReviewKey = (i32, i32, String);
+
+impl ClearanceDraft {
+    fn invalidate_for(&mut self, review_key: &ReviewKey) {
+        if self.audience.is_some() && self.review_key.as_ref() != Some(review_key) {
+            self.audience = None;
+            self.review_key = None;
+            self.reconfirm = true;
+        }
+    }
+
+    fn audience_for(&self, review_key: &ReviewKey) -> Option<Audience> {
+        self.audience.filter(|_| self.review_key.as_ref() == Some(review_key))
+    }
+}
+
+type ClearanceDrafts = Signal<HashMap<Uuid, ClearanceDraft>>;
+
 #[component]
 pub fn IntelligenceView() -> Element {
     let client = use_context::<HubClient>();
     let mut selected = use_context::<Store>().selected_signal;
     let mut query = use_signal(IntelSignalQuery::default);
+    let drafts = use_signal(HashMap::new);
     let source_client = client.clone();
     let mut sources = use_resource(move || {
         let client = source_client.clone();
@@ -37,12 +66,19 @@ pub fn IntelligenceView() -> Element {
     let source_data = sources.cloned();
     let source_options = source_data.as_ref().and_then(|result| result.as_ref().ok());
     let page = stream.cloned().filter(|(loaded_query, _)| *loaded_query == filters);
+    let has_signal_page = matches!(&page, Some((_, Ok(_))));
+    let empty_title = match &page {
+        Some((_, Ok(page))) if page.items.is_empty() => Some(empty_signal_title(&filters)),
+        _ => None,
+    };
+    let empty_stream = is_empty_signal_stream(&filters, empty_title.is_some());
+    let filtered = has_signal_filters(&filters);
 
     rsx! {
         aside { class: "context", aria_label: "Signal stream",
             div { class: "context-head", h2 { "Signals" } }
-            div { class: "stack",
-                label { "Source"
+            div { class: "intel-filters", hidden: empty_stream, role: "group", aria_label: "Signal filters",
+                label { class: "form-field", span { "Source" }
                     select { class: "input", value: filters.source.as_deref().unwrap_or_default(),
                         onchange: move |e| {
                             let mut q = query.write();
@@ -57,7 +93,7 @@ pub fn IntelligenceView() -> Element {
                         }
                     }
                 }
-                label { "State"
+                label { class: "form-field", span { "State" }
                     select { class: "input", value: filters.state.map(SignalState::as_str).unwrap_or_default(),
                         onchange: move |e| {
                             let mut q = query.write();
@@ -66,11 +102,11 @@ pub fn IntelligenceView() -> Element {
                         },
                         option { value: "", "All states" }
                         for state in SignalState::ALL {
-                            option { value: state.as_str(), "{state}" }
+                            option { value: state.as_str(), "{state_label(*state)}" }
                         }
                     }
                 }
-                label { "Minimum severity"
+                label { class: "form-field", span { "Minimum severity" }
                     select { class: "input", value: filters.severity_min.map(Severity::as_str).unwrap_or_default(),
                         onchange: move |e| {
                             let mut q = query.write();
@@ -79,11 +115,11 @@ pub fn IntelligenceView() -> Element {
                         },
                         option { value: "", "Any severity" }
                         for severity in Severity::ALL {
-                            option { value: severity.as_str(), "{severity}" }
+                            option { value: severity.as_str(), {labels::severity(*severity).0} }
                         }
                     }
                 }
-                label { "Audience at most"
+                label { class: "form-field", span { "Audience at most" }
                     select { class: "input", value: filters.audience_at_most.map(Audience::as_str).unwrap_or_default(),
                         onchange: move |e| {
                             let mut q = query.write();
@@ -92,7 +128,7 @@ pub fn IntelligenceView() -> Element {
                         },
                         option { value: "", "Any audience" }
                         for audience in Audience::ALL {
-                            option { value: audience.as_str(), "{audience}" }
+                            option { value: audience.as_str(), "{audience_label(*audience)}" }
                         }
                     }
                 }
@@ -102,8 +138,15 @@ pub fn IntelligenceView() -> Element {
                     None => rsx! { Loading { text: "Loading signals…".to_string() } },
                     Some(Err(e)) => rsx! { ErrorCard { code: e.code, message: e.message } },
                     Some(Ok(page)) => rsx! {
-                        if page.items.is_empty() {
-                            p { class: "ctx-empty", "No matching signals." }
+                        if empty_title.is_some() {
+                            p { class: "ctx-empty", if filtered { "0 matches" } else { "0 signals" } }
+                            if filtered {
+                                button {
+                                    class: "btn secondary btn-xs",
+                                    onclick: move |_| query.set(IntelSignalQuery::default()),
+                                    "Reset filters"
+                                }
+                            }
                         }
                         for signal in page.items {
                             {
@@ -116,7 +159,8 @@ pub fn IntelligenceView() -> Element {
                                         onclick: move |_| selected.set(Some(id)),
                                         span { class: "ctx-title", style: "overflow-wrap: anywhere;", "{signal.title}" }
                                         {signal_badges(&signal)}
-                                        span { class: "form-help", "{signal.source_id} · {signal.state} · {age(signal.occurred_at)}" }
+                                        span { class: "ctx-meta", "{state_label(signal.state)} · {age(signal.occurred_at)}" }
+                                        span { class: "ctx-meta", style: "overflow-wrap: anywhere;", "Source: {signal.source_id}" }
                                     }
                                 }
                             }
@@ -144,7 +188,7 @@ pub fn IntelligenceView() -> Element {
                         Some(Err(e)) => rsx! { ErrorCard { code: e.code, message: e.message } },
                         Some(Ok(items)) if items.is_empty() => rsx! { EmptyState { title: "No intelligence sources".to_string() } },
                         Some(Ok(items)) => rsx! {
-                            div { class: "compact-kpi-grid",
+                            div { class: "intel-source-grid",
                                 for source in items {
                                     SourceHealth { key: "{source.company_id}/{source.id}", source }
                                 }
@@ -152,13 +196,62 @@ pub fn IntelligenceView() -> Element {
                         },
                     }
                 }
-                if let Some(id) = selected() {
-                    SignalDetail { key: "{id}", id, on_changed: move |_| stream.restart() }
-                } else {
+                if let Some(title) = empty_title {
+                    EmptyState {
+                        title: title.to_string(),
+                        hint: empty_stream.then(|| "Set up a source if none are listed above, or check Source health for ingest errors. Then refresh sources and signals.".to_string()),
+                    }
+                } else if let Some(id) = selected() {
+                    SignalDetail { key: "{id}", id, drafts, on_changed: move |_| stream.restart() }
+                } else if has_signal_page {
                     EmptyState { title: "Select a signal".to_string() }
                 }
             }
         }
+    }
+}
+
+fn has_signal_filters(query: &IntelSignalQuery) -> bool {
+    query.source.is_some() || query.state.is_some() || query.severity_min.is_some() || query.audience_at_most.is_some()
+}
+
+fn is_empty_signal_stream(query: &IntelSignalQuery, empty_page: bool) -> bool {
+    empty_page && query.cursor.is_none() && !has_signal_filters(query)
+}
+
+fn empty_signal_title(query: &IntelSignalQuery) -> &'static str {
+    if has_signal_filters(query) {
+        "No matching signals."
+    } else if query.cursor.is_some() {
+        "No signals on this page."
+    } else {
+        "No signals yet."
+    }
+}
+
+fn state_label(state: SignalState) -> &'static str {
+    match state {
+        SignalState::New => "New",
+        SignalState::Acknowledged => "Acknowledged",
+        SignalState::Promoted => "Promoted",
+        SignalState::Dismissed => "Dismissed",
+    }
+}
+
+fn audience_label(audience: Audience) -> &'static str {
+    match audience {
+        Audience::OperatorOnly => "Operator only",
+        Audience::CompanyInternal => "Company internal",
+        Audience::PersonaEligible => "Persona eligible",
+        Audience::PublicCleared => "Cleared for public use",
+    }
+}
+
+fn method_label(method: ProvenanceMethod) -> &'static str {
+    match method {
+        ProvenanceMethod::Observed => "Observed",
+        ProvenanceMethod::Derived => "Derived",
+        ProvenanceMethod::Llm => "LLM",
     }
 }
 
@@ -169,15 +262,15 @@ fn age(at: DateTime<Utc>) -> String {
 #[component]
 fn SourceHealth(source: IntelSourceStatus) -> Element {
     let (status, tone) = match (source.stale, source.last_status) {
-        (true, _) => ("stale", "warn"),
-        (_, Some(IntelRunStatus::Ok)) => ("ok", "ok"),
-        (_, Some(IntelRunStatus::Partial)) => ("partial", "warn"),
-        (_, Some(IntelRunStatus::Failed)) => ("failed", "bad"),
-        (_, None) => ("no runs", "muted"),
+        (true, _) => ("Stale", "warn"),
+        (_, Some(IntelRunStatus::Ok)) => ("OK", "ok"),
+        (_, Some(IntelRunStatus::Partial)) => ("Partial", "warn"),
+        (_, Some(IntelRunStatus::Failed)) => ("Failed", "bad"),
+        (_, None) => ("No runs", "muted"),
     };
     let last_ingest = source.last_ingest_at.map(age).unwrap_or_else(|| "never".to_string());
     rsx! {
-        div { class: "glass-card stat-card", style: "overflow-wrap: anywhere;",
+        div { class: "glass-card intel-source-card",
             strong { "{source.id}" }
             Chip { label: status.to_string(), tone: Some(tone.to_string()) }
             span { class: "form-help", "Last ingest: {last_ingest}" }
@@ -197,14 +290,14 @@ fn signal_badges(signal: &IntelSignal) -> Element {
     rsx! {
         span { class: "row",
             Chip { label: severity.to_string(), tone: Some(tone.to_string()) }
-            Chip { label: signal.effective_audience.to_string() }
-            Chip { label: format!("{} · {confidence:.0}%", signal.provenance.method) }
+            Chip { label: audience_label(signal.effective_audience).to_string() }
+            Chip { label: format!("{} · {confidence:.0}%", method_label(signal.provenance.method)) }
         }
     }
 }
 
 #[component]
-fn SignalDetail(id: Uuid, on_changed: EventHandler<()>) -> Element {
+fn SignalDetail(id: Uuid, mut drafts: ClearanceDrafts, on_changed: EventHandler<()>) -> Element {
     let client = use_context::<HubClient>();
     let mut generation = use_signal(|| 0u64);
     let mut saving = use_signal(|| false);
@@ -225,12 +318,16 @@ fn SignalDetail(id: Uuid, on_changed: EventHandler<()>) -> Element {
         notice.set(None);
         let client = client.clone();
         spawn(async move {
+            let clearing = request.is_err();
             let result = match request {
                 Ok(input) => api::intel_decide(&client, id, &input).await,
                 Err(input) => api::intel_clear(&client, id, &input).await,
             };
             match result {
                 Ok(_) => {
+                    if clearing {
+                        drafts.write().remove(&id);
+                    }
                     generation += 1;
                     on_changed.call(());
                     notice.set(Some("Signal updated."));
@@ -264,7 +361,7 @@ fn SignalDetail(id: Uuid, on_changed: EventHandler<()>) -> Element {
                 let source_default_audience = detail.signal.source_default_audience;
                 rsx! {
                     SignalBody { detail }
-                    section { class: "panel",
+                    section { class: "panel glass-card",
                         h2 { "Operator actions" }
                         div { class: "row",
                             for (label, action, hours) in [
@@ -285,8 +382,11 @@ fn SignalDetail(id: Uuid, on_changed: EventHandler<()>) -> Element {
                                 }
                             }
                         }
-                        if let Some(review) = review {
-                            ClearanceForm { key: "{version}", review, source_default_audience, saving: saving(), on_clear: move |input| mutate.call(Err(input)) }
+                    }
+                    if let Some(review) = review {
+                        section { class: "panel glass-card",
+                            h2 { "Audience clearance" }
+                            ClearanceForm { id, drafts, review, source_default_audience, saving: saving(), on_clear: move |input| mutate.call(Err(input)) }
                         }
                     }
                 }
@@ -302,11 +402,12 @@ fn SignalBody(detail: IntelSignalDetail) -> Element {
         section { class: "panel", style: "overflow-wrap: anywhere;",
             h2 { "{signal.title}" }
             {signal_badges(signal)}
-            p { class: "form-help", "{signal.source_id} · {signal.state} · {age(signal.occurred_at)}" }
+            p { "{state_label(signal.state)} · {age(signal.occurred_at)}" }
             if let Some(until) = signal.snoozed_until {
                 p { class: "form-help", "Snoozed until {format::fmt_dt(until)}" }
             }
             p { "{signal.summary}" }
+            p { class: "form-help", "Source: {signal.source_id}" }
             h3 { "Evidence" }
             if signal.evidence.is_empty() { p { class: "form-help", "No evidence." } }
             ul {
@@ -317,8 +418,6 @@ fn SignalBody(detail: IntelSignalDetail) -> Element {
                     }
                 }
             }
-            h3 { "Facts" }
-            pre { style: "white-space: pre-wrap;", "{signal.facts:#}" }
             h3 { "Subjects" }
             if signal.subjects.is_empty() { p { class: "form-help", "No subjects." } }
             ul {
@@ -333,13 +432,20 @@ fn SignalBody(detail: IntelSignalDetail) -> Element {
                     li { "{link.relation}: {link.target_type} {link.target_id}" }
                 }
             }
-            h3 { "Revision history" }
-            if detail.revisions.is_empty() { p { class: "form-help", "No visible revisions." } }
-            for revision in &detail.revisions {
-                details { key: "{revision.revision}",
-                    summary { "Revision {revision.revision} · {format::fmt_dt(revision.received_at)}" }
-                    code { "{revision.projection_sha256}" }
-                    pre { style: "white-space: pre-wrap;", "{revision.payload:#}" }
+            details { class: "inspector-diagnostics",
+                summary { "Diagnostics & raw payload" }
+                div { class: "stack",
+                    h3 { "Facts" }
+                    pre { style: "white-space: pre-wrap;", "{signal.facts:#}" }
+                    h3 { "Revision history" }
+                    if detail.revisions.is_empty() { p { class: "form-help", "No visible revisions." } }
+                    for revision in &detail.revisions {
+                        details { key: "{revision.revision}",
+                            summary { "Revision {revision.revision} · {format::fmt_dt(revision.received_at)}" }
+                            code { "{revision.projection_sha256}" }
+                            pre { style: "white-space: pre-wrap;", "{revision.payload:#}" }
+                        }
+                    }
                 }
             }
         }
@@ -348,51 +454,299 @@ fn SignalBody(detail: IntelSignalDetail) -> Element {
 
 #[component]
 fn ClearanceForm(
+    id: Uuid,
+    mut drafts: ClearanceDrafts,
     review: IntelSignalReview,
     source_default_audience: Audience,
     saving: bool,
     on_clear: EventHandler<SignalClearanceIn>,
 ) -> Element {
-    let mut audience = use_signal(|| None::<Audience>);
-    let mut rationale = use_signal(String::new);
-    let ready = !saving && audience().is_some() && !rationale.read().trim().is_empty();
+    let review_key = (review.revision, review.policy_version, review.projection_sha256.clone());
+    if drafts.peek().get(&id).is_some_and(|draft| draft.audience.is_some() && draft.review_key.as_ref() != Some(&review_key))
+        && let Some(draft) = drafts.write().get_mut(&id)
+    {
+        draft.invalidate_for(&review_key);
+    }
+    let draft = drafts.read().get(&id).cloned().unwrap_or_default();
+    let audience = draft.audience_for(&review_key);
+    let reconfirm = draft.reconfirm;
+    let choice_key = review_key.clone();
+    let rationale = draft.rationale;
+    let ready = !saving && audience.is_some() && !rationale.trim().is_empty();
     rsx! {
         form { class: "stack",
             onsubmit: move |event| {
                 event.prevent_default();
-                let rationale = rationale.read().trim().to_string();
-                if !saving && !rationale.is_empty() && let Some(audience) = audience() {
+                let drafts = drafts.peek();
+                if !saving && let Some(draft) = drafts.get(&id)
+                    && let Some(audience) = draft.audience_for(&review_key) && !draft.rationale.trim().is_empty()
+                {
                     on_clear.call(SignalClearanceIn {
                         audience,
                         revision: review.revision,
                         policy_version: review.policy_version,
                         source_default_audience,
                         projection_sha256: review.projection_sha256.clone(),
-                        rationale,
+                        rationale: draft.rationale.trim().to_string(),
                     });
                 }
             },
-            h3 { "Clear Audience" }
             dl { style: "overflow-wrap: anywhere;",
                 dt { "Revision" } dd { "{review.revision}" }
                 dt { "Policy version" } dd { "{review.policy_version}" }
                 dt { "Projection SHA-256" } dd { code { "{review.projection_sha256}" } }
             }
             label { "Clearance audience"
-                select { class: "input", required: true, disabled: saving, value: audience().map(Audience::as_str).unwrap_or_default(),
-                    onchange: move |event| audience.set(Audience::parse(&event.value())),
-                    option { value: "", "Choose audience" }
+                select { class: "input", required: true, disabled: saving, value: audience.map(Audience::as_str).unwrap_or_default(),
+                    onchange: move |event| {
+                        let mut drafts = drafts.write();
+                        let draft = drafts.entry(id).or_default();
+                        draft.audience = Audience::parse(&event.value());
+                        draft.review_key = draft.audience.map(|_| choice_key.clone());
+                        if draft.audience.is_some() {
+                            draft.reconfirm = false;
+                        }
+                    },
+                    option { value: "", selected: audience.is_none(), "Choose audience" }
                     for level in Audience::ALL {
-                        option { value: level.as_str(), "{level}" }
+                        option { value: level.as_str(), selected: audience == Some(*level), "{audience_label(*level)}" }
                     }
                 }
             }
+            if reconfirm {
+                p { class: "form-help", role: "status", "Signal revision changed — confirm the audience again before clearing." }
+            }
             label { "Rationale"
                 textarea { class: "input", required: true, disabled: saving, maxlength: 4000,
-                    value: rationale(), oninput: move |event| rationale.set(event.value()),
+                    value: rationale, oninput: move |event| drafts.write().entry(id).or_default().rationale = event.value(),
                 }
             }
             button { class: "btn btn-glass btn-xs", r#type: "submit", disabled: !ready, "Clear Audience" }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dioxus::{
+        dioxus_core::{AttributeValue, Mutation},
+        html::{PlatformEventData, SerializedFormData, SerializedHtmlEventConverter, set_event_converter},
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn clearance_draft_survives_an_empty_filter_result_and_reset() {
+        check_clearance_remount(|_| {}, false);
+    }
+
+    #[test]
+    fn clearance_draft_requires_reconfirmation_after_each_review_identity_change() {
+        check_clearance_remount(|review| review.revision += 1, true);
+        check_clearance_remount(|review| review.policy_version += 1, true);
+        check_clearance_remount(|review| review.projection_sha256.push_str("-changed"), true);
+    }
+
+    #[test]
+    fn clearance_draft_stays_invalidated_after_policy_rollback() {
+        type Handles = Rc<Cell<Option<(Signal<IntelSignalQuery>, Signal<IntelSignalReview>)>>>;
+        #[derive(Clone, PartialEq, Props)]
+        struct TestProps {
+            handles: Handles,
+            submitted: Rc<Cell<Option<Audience>>>,
+        }
+        fn app(TestProps { handles, submitted }: TestProps) -> Element {
+            let query = use_signal(IntelSignalQuery::default);
+            let drafts = use_signal(HashMap::new);
+            let review = use_signal(|| IntelSignalReview {
+                projection_sha256: "projection".into(),
+                policy_version: 1,
+                revision: 1,
+                first_seen_at: DateTime::UNIX_EPOCH,
+                updated_at: DateTime::UNIX_EPOCH,
+            });
+            handles.set(Some((query, review)));
+            rsx! {
+                ClearanceForm {
+                    id: Uuid::nil(), drafts, review: review.cloned(), source_default_audience: Audience::OperatorOnly,
+                    saving: false, on_clear: move |input: SignalClearanceIn| submitted.set(Some(input.audience)),
+                }
+            }
+        }
+
+        set_event_converter(Box::new(SerializedHtmlEventConverter));
+        let handles = Rc::new(Cell::new(None));
+        let submitted = Rc::new(Cell::new(None));
+        let mut dom = VirtualDom::new_with_props(app, TestProps { handles: handles.clone(), submitted: submitted.clone() });
+        let initial = dom.rebuild_to_vec();
+        let (_, mut review) = handles.get().unwrap();
+        let dispatch = |dom: &VirtualDom, edits: &[Mutation], name, value: &str| {
+            let mut id = None;
+            for mutation in edits {
+                match mutation {
+                    Mutation::PushId { id: current } => id = Some(*current),
+                    Mutation::NewEventListener { name: listener } if listener == name => {
+                        let data = PlatformEventData::new(Box::new(SerializedFormData::new(value.into(), vec![])));
+                        dom.runtime().handle_event(name, Event::new(Rc::new(data), true).into_any(), id.unwrap());
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("No {name} listener in clearance form");
+        };
+        let audience = Audience::CompanyInternal.as_str();
+        let rationale = "Reviewed under policy v1";
+        dispatch(&dom, &initial.edits, "change", audience);
+        dispatch(&dom, &initial.edits, "input", rationale);
+        dom.render_immediate_to_vec();
+
+        // Transition v1 -> v2 (observes mismatch and invalidates stored audience/key).
+        dom.in_runtime(|| review.write().policy_version = 2);
+        let under_v2 = dom.render_immediate_to_vec();
+        assert!(format!("{under_v2:?}").contains("Signal revision changed"));
+
+        // Roll back v2 -> v1 without re-selecting audience: must remain cleared and blocked.
+        dom.in_runtime(|| review.write().policy_version = 1);
+        dom.render_immediate_to_vec();
+        dispatch(&dom, &initial.edits, "submit", "");
+        assert_eq!(submitted.get(), None);
+
+        // Re-selecting audience under v1 restores submission and clears reconfirmation state.
+        dispatch(&dom, &initial.edits, "change", audience);
+        dom.render_immediate_to_vec();
+        dispatch(&dom, &initial.edits, "submit", "");
+        assert_eq!(submitted.get(), Some(Audience::CompanyInternal));
+    }
+
+    fn check_clearance_remount(update_review: impl FnOnce(&mut IntelSignalReview), reconfirm: bool) {
+        type Handles = Rc<Cell<Option<(Signal<IntelSignalQuery>, Signal<IntelSignalReview>)>>>;
+        #[derive(Clone, PartialEq, Props)]
+        struct TestProps {
+            handles: Handles,
+            submitted: Rc<Cell<Option<Audience>>>,
+        }
+        fn app(TestProps { handles, submitted }: TestProps) -> Element {
+            let query = use_signal(IntelSignalQuery::default);
+            let drafts = use_signal(HashMap::new);
+            let review = use_signal(|| IntelSignalReview {
+                projection_sha256: "projection".into(),
+                policy_version: 1,
+                revision: 1,
+                first_seen_at: DateTime::UNIX_EPOCH,
+                updated_at: DateTime::UNIX_EPOCH,
+            });
+            handles.set(Some((query, review)));
+            rsx! {
+                if has_signal_filters(&query.read()) {
+                    p { "{empty_signal_title(&query.read())}" }
+                } else {
+                    ClearanceForm {
+                        id: Uuid::nil(), drafts, review: review.cloned(), source_default_audience: Audience::OperatorOnly,
+                        saving: false, on_clear: move |input: SignalClearanceIn| submitted.set(Some(input.audience)),
+                    }
+                }
+            }
+        }
+
+        set_event_converter(Box::new(SerializedHtmlEventConverter));
+        let handles = Rc::new(Cell::new(None));
+        let submitted = Rc::new(Cell::new(None));
+        let mut dom = VirtualDom::new_with_props(app, TestProps { handles: handles.clone(), submitted: submitted.clone() });
+        let initial = dom.rebuild_to_vec();
+        let (mut query, mut review) = handles.get().unwrap();
+        let dispatch = |dom: &VirtualDom, edits: &[Mutation], name, value: &str| {
+            let mut id = None;
+            for mutation in edits {
+                match mutation {
+                    Mutation::PushId { id: current } => id = Some(*current),
+                    Mutation::NewEventListener { name: listener } if listener == name => {
+                        let data = PlatformEventData::new(Box::new(SerializedFormData::new(value.into(), vec![])));
+                        dom.runtime().handle_event(name, Event::new(Rc::new(data), true).into_any(), id.unwrap());
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("No {name} listener in clearance form");
+        };
+        let audience = Audience::CompanyInternal.as_str();
+        let rationale = "Reviewed the source evidence";
+        dispatch(&dom, &initial.edits, "change", audience);
+        dispatch(&dom, &initial.edits, "input", rationale);
+        let typed = format!("{:?}", dom.render_immediate_to_vec());
+        assert!(typed.contains(audience) && typed.contains(rationale));
+
+        dom.in_runtime(|| query.write().state = Some(SignalState::Acknowledged));
+        let empty = format!("{:?}", dom.render_immediate_to_vec());
+        assert!(empty.contains("No matching signals."));
+        dom.in_runtime(|| {
+            update_review(&mut review.write());
+            query.set(IntelSignalQuery::default());
+        });
+        let reset = dom.render_immediate_to_vec();
+        let values: Vec<_> = reset
+            .edits
+            .iter()
+            .filter_map(|mutation| match mutation {
+                Mutation::SetAttribute { name, value: AttributeValue::Text(value), .. } if name == "value" => Some(value.as_str()),
+                _ => None,
+            })
+            .collect();
+        let expected = if reconfirm { "" } else { audience };
+        assert_eq!(values.first(), Some(&expected)); // Select value, before its option values.
+        assert_eq!(values.last(), Some(&rationale)); // Textarea value.
+        assert_eq!(format!("{reset:?}").contains("Signal revision changed"), reconfirm);
+        let selected: Vec<_> = reset
+            .edits
+            .iter()
+            .filter_map(|mutation| match mutation {
+                Mutation::SetAttribute { name, value: AttributeValue::Bool(selected), .. } if name == "selected" => Some(*selected),
+                _ => None,
+            })
+            .collect();
+        let expected_selection: Vec<_> =
+            std::iter::once(reconfirm).chain(Audience::ALL.iter().map(|level| level.as_str() == expected)).collect();
+        assert_eq!(selected, expected_selection);
+        dispatch(&dom, &reset.edits, "submit", "");
+        assert_eq!(submitted.get(), (!reconfirm).then_some(Audience::CompanyInternal));
+        if reconfirm {
+            dispatch(&dom, &reset.edits, "change", audience);
+            dom.render_immediate_to_vec();
+            dispatch(&dom, &reset.edits, "submit", "");
+            assert_eq!(submitted.get(), Some(Audience::CompanyInternal));
+        }
+    }
+
+    #[test]
+    fn empty_signal_pages_distinguish_filters_from_pagination() {
+        let mut query = IntelSignalQuery::default();
+        assert!(!has_signal_filters(&query));
+        assert_eq!(empty_signal_title(&query), "No signals yet.");
+        query.cursor = Some("next".into());
+        assert!(!has_signal_filters(&query));
+        assert_eq!(empty_signal_title(&query), "No signals on this page.");
+        query.state = Some(SignalState::Acknowledged);
+        assert!(has_signal_filters(&query));
+        assert_eq!(empty_signal_title(&query), "No matching signals.");
+    }
+
+    #[test]
+    fn only_an_empty_unfiltered_first_page_hides_signal_filters() {
+        let mut query = IntelSignalQuery::default();
+        assert!(is_empty_signal_stream(&query, true));
+        assert!(!is_empty_signal_stream(&query, false));
+        query.cursor = Some("next".into());
+        assert!(!is_empty_signal_stream(&query, true));
+        query.cursor = None;
+        query.state = Some(SignalState::Acknowledged);
+        assert!(!is_empty_signal_stream(&query, true));
+    }
+
+    #[test]
+    fn signal_status_and_method_use_display_labels() {
+        assert_eq!(state_label(SignalState::Acknowledged), "Acknowledged");
+        assert_eq!(method_label(ProvenanceMethod::Observed), "Observed");
+        assert_eq!(method_label(ProvenanceMethod::Llm), "LLM");
     }
 }

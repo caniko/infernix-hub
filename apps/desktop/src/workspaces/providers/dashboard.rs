@@ -31,7 +31,7 @@ pub(super) fn Dashboard(providers: Vec<ProviderSummary>, stale: bool, all_provid
                 }
             }
         }
-        div { class: "provider-grid",
+        div { class: "provider-grid dashboard-provider-grid",
             for provider in providers {
                 ProviderCard { key: "{provider.descriptor.id}", provider, stale }
             }

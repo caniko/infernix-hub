@@ -1,5 +1,6 @@
 //! Today: the operator's queue from `GET /v1/today`.
 
+use chrono::{DateTime, Utc};
 use contracts::{Severity, Today, TodayItem};
 use dioxus::prelude::*;
 
@@ -31,6 +32,10 @@ fn row_status(subject_type: &str, status: &str) -> String {
         ("renewal", "due") => "Due soon".to_string(),
         _ => status.replace('_', " "),
     }
+}
+
+fn renewal_schedule_hint(subject_type: &str, at: Option<DateTime<Utc>>) -> Option<&'static str> {
+    (subject_type == "renewal" && at.is_none()).then_some("No due date recorded — review renewal schedule in Notifications")
 }
 
 fn row_action(subject_type: &str) -> Option<&'static str> {
@@ -104,7 +109,7 @@ pub fn TodayView() -> Element {
                         });
                         rsx! {
                             for (label, tone, items) in shown.iter().copied() {
-                                section { class: "panel", key: "{label}",
+                                section { class: "panel today-queue-list", key: "{label}",
                                     div { class: "row",
                                         if selected.is_some() {
                                             button { class: "btn ghost btn-xs", onclick: move |_| bucket.set(None), "‹ All queues" }
@@ -154,6 +159,9 @@ fn TodayRow(item: TodayItem, severity: &'static str, intelligence: bool) -> Elem
             if let Some(detail) = item.detail.as_deref().filter(|detail| *detail != item.title) {
                 p { class: "form-help", "{detail}" }
             }
+            if let Some(hint) = renewal_schedule_hint(&subject_type, item.at) {
+                p { class: "form-help", "{hint}" }
+            }
             div { class: "row",
                 span { class: "form-help", "{kind}" }
                 if let Some(at) = item.at {
@@ -200,5 +208,12 @@ mod tests {
         assert_eq!(row_action("relationship"), Some("Open conversation ›"));
         assert_eq!(row_action("opportunity"), None);
         assert_eq!(row_action("content"), Some("Open"));
+    }
+
+    #[test]
+    fn a_renewal_without_a_deadline_explains_what_to_do() {
+        assert_eq!(renewal_schedule_hint("renewal", None), Some("No due date recorded — review renewal schedule in Notifications"));
+        assert_eq!(renewal_schedule_hint("renewal", Some(chrono::DateTime::UNIX_EPOCH)), None);
+        assert_eq!(renewal_schedule_hint("opportunity", None), None);
     }
 }

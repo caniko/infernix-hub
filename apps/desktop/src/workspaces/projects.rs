@@ -199,7 +199,7 @@ pub fn ProjectsView() -> Element {
             }
             div { class: "row", style: "padding: 0 4px 10px;",
                 button { class: "btn secondary btn-xs", onclick: move |_| show_new.set(true), "New project" }
-                button { class: "btn secondary btn-xs", onclick: move |_| wizard.set(Some((None, None))), "Create individual" }
+                button { class: "btn secondary btn-xs", onclick: move |_| wizard.set(Some((None, None))), "Create standalone individual" }
             }
             div { class: "context-list",
                 match projects.data.clone() {
@@ -543,7 +543,7 @@ pub fn ProjectsView() -> Element {
                                 }
                                 section { class: "panel glass-card content-bounded",
                                     h2 { style: "font-size: 15px;", "Overview" }
-                                    div { class: "form-stack content-bounded", style: "max-width: 720px;",
+                                    div { class: "form-stack",
                                         div { class: "form-field",
                                             label { class: "label-tech", r#for: "project-premise", "Premise" }
                                             textarea { id: "project-premise", class: "input", value: "{premise}", oninput: move |e| premise.set(e.value()) }
@@ -605,7 +605,7 @@ pub fn ProjectsView() -> Element {
                                 section { class: "panel glass-card content-bounded",
                                     h2 { style: "font-size: 15px;", "Model configuration" }
                                     div { class: "form-stack",
-                                        div { class: "form-grid-2",
+                                        div { class: "form-grid-2 project-models-grid",
                                         for (role, label) in [("checker", "Checker"), ("image", "Image"), ("assistant", "Assistant"), ("three_d", "3D"), ("voice", "Voice")] {
                                             {
                                                 let selected = match role {
