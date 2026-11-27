@@ -35,6 +35,39 @@ pub async fn sync_registered_providers(hub: &Hub) -> DResult<()> {
     Ok(())
 }
 
+/// Remove fixture provider instances and `fixture-host` accounts (with their
+/// quota snapshots, samples, and reset grants) when running in live mode.
+pub async fn purge_fixture_data(hub: &Hub) -> DResult<()> {
+    let mut tx = hub.db.begin().await?;
+    sqlx::query("delete from model_provider_instances where mode = 'fixture'").execute(&mut *tx).await?;
+    sqlx::query(
+        "with removed as (
+             delete from model_accounts
+             where host = 'fixture-host'
+               and source_publisher is null
+               and publisher_host is null
+             returning provider_id, id
+         ),
+         del_latest as (
+             delete from model_quota_latest m
+             using removed r
+             where m.provider_id = r.provider_id and m.account_id = r.id
+         ),
+         del_samples as (
+             delete from model_quota_samples s
+             using removed r
+             where s.provider_id = r.provider_id and s.account_id = r.id
+         )
+         delete from model_reset_grants g
+         using removed r
+         where g.provider_id = r.provider_id and g.account_id = r.id",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn upsert_provider_descriptor(db: &sqlx::PgPool, d: &ProviderDescriptor) -> DResult<()> {
     let caps = serde_json::to_value(&d.capabilities).unwrap_or_else(|_| json!([]));
     let evs = serde_json::to_value(&d.evidence_kinds).unwrap_or_else(|_| json!([]));
@@ -145,6 +178,27 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
         .bind(provider_id)
         .bind(mode.as_str())
         .bind(verification.as_str())
+        .execute(&mut *tx)
+        .await?;
+    }
+    if mode == AdapterMode::Live {
+        sqlx::query(
+            "with removed as (
+                 delete from model_accounts
+                 where provider_id = $1
+                   and host = 'fixture-host'
+                   and source_publisher is null
+                   and publisher_host is null
+                 returning id
+             ),
+             del_grants as (
+                 delete from model_reset_grants
+                 where provider_id = $1 and account_id in (select id from removed)
+             )
+             delete from model_quota_latest
+             where provider_id = $1 and account_id in (select id from removed)",
+        )
+        .bind(provider_id)
         .execute(&mut *tx)
         .await?;
     }
@@ -315,9 +369,41 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
         }
         accounts_upserted += 1;
 
-        for win in &acct.windows {
-            insert_quota_sample(&mut tx, provider_id, &acct.id, win, win.observed_at.unwrap_or(batch.collected_at)).await?;
-            samples_inserted += 1;
+        if !acct.windows.is_empty() {
+            let mut max_incoming_observed_at: Option<DateTime<Utc>> = None;
+            let mut incoming_keys: Vec<String> = Vec::with_capacity(acct.windows.len());
+            let mut incoming_scopes: Vec<String> = Vec::with_capacity(acct.windows.len());
+            for win in &acct.windows {
+                let obs_at = win.observed_at.unwrap_or(batch.collected_at);
+                if max_incoming_observed_at.is_none_or(|prev| obs_at > prev) {
+                    max_incoming_observed_at = Some(obs_at);
+                }
+                insert_quota_sample(&mut tx, provider_id, &acct.id, win, obs_at).await?;
+                samples_inserted += 1;
+                incoming_keys.push(win.window_key.clone());
+                incoming_scopes.push(win.scope_model.as_deref().unwrap_or("").to_string());
+            }
+            if let Some(max_obs) = max_incoming_observed_at {
+                sqlx::query(
+                    "delete from model_quota_latest m
+                     where m.provider_id = $1
+                       and m.account_id = $2
+                       and m.observed_at <= $3
+                       and not exists (
+                           select 1
+                           from unnest($4::text[], $5::text[]) as incoming(window_key, scope_model_key)
+                           where incoming.window_key = m.window_key
+                             and incoming.scope_model_key = m.scope_model_key
+                       )",
+                )
+                .bind(provider_id)
+                .bind(&acct.id)
+                .bind(max_obs)
+                .bind(&incoming_keys)
+                .bind(&incoming_scopes)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         if let Some(grant) = &acct.reset_grant {
             upsert_reset_grant(&mut tx, provider_id, &acct.id, grant).await?;
@@ -330,11 +416,24 @@ async fn ingest_batch(hub: &Hub, actor: &Actor, provider_id: &str, batch: Observ
         sqlx::query(
             "with removed as (
                  delete from model_accounts
-                 where provider_id = $1 and publisher_host = $2 and publisher_user = $3
-                   and source_publisher = $4 and observation_batch_at <= $5 and id <> all($6)
+                 where provider_id = $1
+                   and id <> all($6)
+                   and (
+                       (publisher_host = $2 and publisher_user = $3
+                        and source_publisher = $4 and observation_batch_at <= $5)
+                       or ($4 = 'fleetix-agent-proxy'
+                           and host = $2 and unix_user = $3
+                           and (source_publisher is null or observation_batch_at is null)
+                           and (source_account_id like 'proxy:%' or source_account_id like 'local-%'))
+                   )
                  returning id
+             ),
+             del_grants as (
+                 delete from model_reset_grants
+                 where provider_id = $1 and account_id in (select id from removed)
              )
-             delete from model_reset_grants where provider_id = $1 and account_id in (select id from removed)",
+             delete from model_quota_latest
+             where provider_id = $1 and account_id in (select id from removed)",
         )
         .bind(provider_id)
         .bind(host)
@@ -497,7 +596,7 @@ async fn insert_quota_sample(
     account_id: &str,
     win: &QuotaWindow,
     observed_at: DateTime<Utc>,
-) -> DResult<()> {
+) -> DResult<i64> {
     let kind = serde_json::to_value(win.kind).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "custom".into());
     let unit = serde_json::to_value(win.unit).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "percent".into());
     let cadence = serde_json::to_value(win.cadence).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "unknown".into());
@@ -509,15 +608,19 @@ async fn insert_quota_sample(
 
     let used_pct = win.used_percent.map(|v| v.clamp(0.0, 100.0));
     let rem_pct = win.remaining_percent.map(|v| v.clamp(0.0, 100.0)).or_else(|| used_pct.map(|u| (100.0 - u).clamp(0.0, 100.0)));
+    let scope_model = win.scope_model.as_deref().filter(|s| !s.is_empty());
+    let scope_model_key = scope_model.unwrap_or("");
+    let sanitized_error = win.error_reason.as_deref().map(sanitize_provider_error);
 
-    sqlx::query(
+    let sample_id: i64 = sqlx::query_scalar(
         "insert into model_quota_samples
             (provider_id, account_id, window_key, label, kind, unit, used_percent, remaining_percent,
              used_amount, limit_amount, currency, resets_at, window_duration_mins, cadence, scope_model,
              status, observation_state, observed_at, stale, error_reason)
          values ($1, $2, $3, $4, $5, $6, $7, $8,
                  $9, $10, $11, $12, $13, $14, $15,
-                 $16, $17, $18, $19, $20)",
+                 $16, $17, $18, $19, $20)
+         returning id",
     )
     .bind(provider_id)
     .bind(account_id)
@@ -533,15 +636,74 @@ async fn insert_quota_sample(
     .bind(win.resets_at)
     .bind(win.window_duration_mins.map(|v| v as i32))
     .bind(&cadence)
-    .bind(&win.scope_model)
+    .bind(scope_model)
     .bind(&status)
     .bind(&obs_state)
     .bind(observed_at)
     .bind(win.stale)
-    .bind(win.error_reason.as_deref().map(sanitize_provider_error))
+    .bind(&sanitized_error)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "insert into model_quota_latest
+            (sample_id, provider_id, account_id, window_key, scope_model_key, label, kind, unit,
+             used_percent, remaining_percent, used_amount, limit_amount, currency, resets_at,
+             window_duration_mins, cadence, scope_model, status, observation_state, observed_at,
+             stale, error_reason)
+         values ($1, $2, $3, $4, $5, $6, $7, $8,
+                 $9, $10, $11, $12, $13, $14,
+                 $15, $16, $17, $18, $19, $20,
+                 $21, $22)
+         on conflict (provider_id, account_id, window_key, scope_model_key) do update set
+            sample_id = excluded.sample_id,
+            label = excluded.label,
+            kind = excluded.kind,
+            unit = excluded.unit,
+            used_percent = excluded.used_percent,
+            remaining_percent = excluded.remaining_percent,
+            used_amount = excluded.used_amount,
+            limit_amount = excluded.limit_amount,
+            currency = excluded.currency,
+            resets_at = excluded.resets_at,
+            window_duration_mins = excluded.window_duration_mins,
+            cadence = excluded.cadence,
+            scope_model = excluded.scope_model,
+            status = excluded.status,
+            observation_state = excluded.observation_state,
+            observed_at = excluded.observed_at,
+            recorded_at = now(),
+            stale = excluded.stale,
+            error_reason = excluded.error_reason
+         where excluded.observed_at > model_quota_latest.observed_at
+            or (excluded.observed_at = model_quota_latest.observed_at and excluded.sample_id >= model_quota_latest.sample_id)",
+    )
+    .bind(sample_id)
+    .bind(provider_id)
+    .bind(account_id)
+    .bind(&win.window_key)
+    .bind(scope_model_key)
+    .bind(&win.label)
+    .bind(&kind)
+    .bind(&unit)
+    .bind(used_pct)
+    .bind(rem_pct)
+    .bind(win.used_amount)
+    .bind(win.limit_amount)
+    .bind(&win.currency)
+    .bind(win.resets_at)
+    .bind(win.window_duration_mins.map(|v| v as i32))
+    .bind(&cadence)
+    .bind(scope_model)
+    .bind(&status)
+    .bind(&obs_state)
+    .bind(observed_at)
+    .bind(win.stale)
+    .bind(&sanitized_error)
     .execute(tx)
     .await?;
-    Ok(())
+
+    Ok(sample_id)
 }
 
 async fn upsert_reset_grant(tx: &mut sqlx::PgConnection, provider_id: &str, account_id: &str, grant: &ResetGrant) -> DResult<()> {
@@ -651,8 +813,8 @@ pub async fn get_provider(hub: &Hub, actor: &Actor, provider_id: &str) -> DResul
 
 pub async fn list_accounts(hub: &Hub, actor: &Actor, provider_id: &str) -> DResult<Vec<ModelAccount>> {
     actor.require(ANY_READER)?;
-    let _ = load_descriptor(hub, provider_id).await?;
-    load_accounts_with_latest_windows(&hub.db, provider_id, None, None).await
+    let desc = load_descriptor(hub, provider_id).await?;
+    load_accounts_with_latest_windows(&hub.db, provider_id, None, None, desc.mode == AdapterMode::Live).await
 }
 
 pub async fn list_models(hub: &Hub, actor: &Actor, provider_id: &str) -> DResult<Vec<DiscoveredModel>> {
@@ -724,7 +886,8 @@ pub async fn quota_report(hub: &Hub, actor: &Actor, provider_id: &str, query: Qu
     let as_of = Utc::now();
     let desc = load_descriptor(hub, provider_id).await?;
     let routed = if query.account_id.is_none() { routed_account_ids(&hub.db, provider_id).await? } else { None };
-    let accounts = load_accounts_with_latest_windows(&hub.db, provider_id, Some(as_of), routed.as_deref()).await?;
+    let accounts =
+        load_accounts_with_latest_windows(&hub.db, provider_id, Some(as_of), routed.as_deref(), desc.mode == AdapterMode::Live).await?;
     let range_hours = query.range_hours.unwrap_or(48).clamp(1, 24 * 35);
     let lookback_hours = query.lookback_hours.unwrap_or(6).clamp(1, 168);
     let horizon_hours = query.horizon_hours.unwrap_or(12).clamp(1, 168);
@@ -808,7 +971,7 @@ async fn load_descriptor(hub: &Hub, provider_id: &str) -> DResult<ProviderDescri
 
 async fn build_provider_summary(hub: &Hub, descriptor: ProviderDescriptor) -> DResult<ProviderSummary> {
     let routed_account_ids = routed_account_ids(&hub.db, &descriptor.id).await?.map(|ids| ids.into_iter().collect::<BTreeSet<_>>());
-    let accounts = load_accounts_with_latest_windows(&hub.db, &descriptor.id, None, None).await?;
+    let accounts = load_accounts_with_latest_windows(&hub.db, &descriptor.id, None, None, descriptor.mode == AdapterMode::Live).await?;
     let pool_accounts = accounts.iter().filter(|a| routed_account_ids.as_ref().is_none_or(|ids| ids.contains(&a.id)));
     let account_count = pool_accounts.clone().count();
     let enabled_accounts = pool_accounts.clone().filter(|a| a.enabled).count();
@@ -842,6 +1005,7 @@ async fn load_accounts_with_latest_windows(
     provider_id: &str,
     as_of: Option<DateTime<Utc>>,
     account_ids: Option<&[String]>,
+    exclude_fixture_host: bool,
 ) -> DResult<Vec<ModelAccount>> {
     let acct_rows: Vec<Value> = sqlx::query_scalar(
         "select to_jsonb(a) from (
@@ -859,31 +1023,51 @@ async fn load_accounts_with_latest_windows(
             from model_accounts
             where provider_id = $1
               and ($2::text[] is null or id = any($2))
+              and (not $3 or not (host = 'fixture-host' and source_publisher is null and publisher_host is null))
             order by priority desc, id asc
          ) a",
     )
     .bind(provider_id)
     .bind(account_ids)
+    .bind(exclude_fixture_host)
     .fetch_all(db)
     .await?;
 
-    let win_rows: Vec<Value> = sqlx::query_scalar(
-        "select to_jsonb(w) from (
-            select distinct on (account_id, window_key, coalesce(scope_model, ''))
-                account_id, window_key, label, kind, unit, used_percent, remaining_percent,
-                used_amount, limit_amount, currency, resets_at, window_duration_mins,
-                 cadence, nullif(scope_model, '') as scope_model, status, observation_state, observed_at, stale, error_reason
-            from model_quota_samples
-             where provider_id = $1 and ($2::timestamptz is null or observed_at <= $2)
-               and ($3::text[] is null or account_id = any($3))
-            order by account_id, window_key, coalesce(model_quota_samples.scope_model, ''), observed_at desc, id desc
-         ) w",
-    )
-    .bind(provider_id)
-    .bind(as_of)
-    .bind(account_ids)
-    .fetch_all(db)
-    .await?;
+    let win_rows: Vec<Value> = if let Some(at) = as_of {
+        sqlx::query_scalar(
+            "select to_jsonb(w) from (
+                select distinct on (account_id, window_key, coalesce(scope_model, ''))
+                    account_id, window_key, label, kind, unit, used_percent, remaining_percent,
+                    used_amount, limit_amount, currency, resets_at, window_duration_mins,
+                    cadence, nullif(scope_model, '') as scope_model, status, observation_state, observed_at, stale, error_reason
+                from model_quota_samples
+                where provider_id = $1 and observed_at <= $2
+                  and ($3::text[] is null or account_id = any($3))
+                order by account_id, window_key, coalesce(model_quota_samples.scope_model, ''), observed_at desc, id desc
+             ) w",
+        )
+        .bind(provider_id)
+        .bind(at)
+        .bind(account_ids)
+        .fetch_all(db)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            "select to_jsonb(w) from (
+                select account_id, window_key, label, kind, unit, used_percent, remaining_percent,
+                       used_amount, limit_amount, currency, resets_at, window_duration_mins,
+                       cadence, nullif(scope_model, '') as scope_model, status, observation_state, observed_at, stale, error_reason
+                from model_quota_latest
+                where provider_id = $1
+                  and ($2::text[] is null or account_id = any($2))
+                order by account_id, window_key, scope_model_key
+             ) w",
+        )
+        .bind(provider_id)
+        .bind(account_ids)
+        .fetch_all(db)
+        .await?
+    };
 
     let mut windows_by_acct: BTreeMap<String, Vec<QuotaWindow>> = BTreeMap::new();
     for row in win_rows {
@@ -927,6 +1111,7 @@ async fn load_accounts_with_latest_windows(
                     && w.observed_at.is_none_or(|fail_at| fail_at <= good_at))
             });
         }
+        dedupe_superseded_windows(&mut windows);
         acct.windows = windows;
         acct.reset_grant = grants_by_acct.remove(&acct.id);
         let has_err = acct.enrollment_state == EnrollmentState::Error
@@ -937,6 +1122,36 @@ async fn load_accounts_with_latest_windows(
         out.push(acct);
     }
     Ok(out)
+}
+
+/// Drop any unscoped (`scope_model == None`) window when a model-scoped window
+/// with the same `window_key` exists at the same or newer `observed_at`.
+fn dedupe_superseded_windows(windows: &mut Vec<QuotaWindow>) {
+    let mut max_scoped_at: BTreeMap<String, Option<DateTime<Utc>>> = BTreeMap::new();
+    for w in windows.iter() {
+        if w.scope_model.as_deref().is_some_and(|s| !s.is_empty()) {
+            max_scoped_at
+                .entry(w.window_key.clone())
+                .and_modify(|prev| {
+                    if w.observed_at > *prev {
+                        *prev = w.observed_at;
+                    }
+                })
+                .or_insert(w.observed_at);
+        }
+    }
+    windows.retain(|w| {
+        if w.scope_model.as_deref().is_none_or(str::is_empty)
+            && let Some(scoped_at) = max_scoped_at.get(&w.window_key)
+        {
+            return match (scoped_at, w.observed_at) {
+                (Some(s), Some(n)) => *s < n,
+                (Some(_), None) | (None, None) => false,
+                (None, Some(_)) => true,
+            };
+        }
+        true
+    });
 }
 
 /// Combine compatible windows across distinct eligible enabled accounts.
@@ -1637,6 +1852,11 @@ async fn apply_hub_side_effects(
             .await?;
         }
         ProviderCommand::Credential(CredentialCommand::RemoveLogin { account_id }) => {
+            sqlx::query("delete from model_quota_latest where provider_id = $1 and account_id = $2")
+                .bind(provider_id)
+                .bind(account_id)
+                .execute(&mut **tx)
+                .await?;
             sqlx::query("delete from model_reset_grants where provider_id = $1 and account_id = $2")
                 .bind(provider_id)
                 .bind(account_id)
@@ -1859,7 +2079,8 @@ pub async fn reconcile_quota_notifications(hub: &Hub) -> DResult<()> {
 
 pub async fn sync_quota_notifications(hub: &Hub, provider_id: &str) -> DResult<()> {
     let settings = get_settings(hub, &internal_operator("provider-notify")).await?;
-    let accounts = load_accounts_with_latest_windows(&hub.db, provider_id, None, None).await?;
+    let exclude_fixture = load_descriptor(hub, provider_id).await.map(|d| d.mode == AdapterMode::Live).unwrap_or(true);
+    let accounts = load_accounts_with_latest_windows(&hub.db, provider_id, None, None, exclude_fixture).await?;
     let source = format!("providers:{provider_id}");
     notifications::sync(hub, &source, quota_raises(provider_id, &settings, &accounts, Utc::now())).await?;
     Ok(())
@@ -1883,7 +2104,7 @@ pub async fn sync_provider_health_notifications(hub: &Hub, provider_id: &str) ->
 }
 
 async fn sync_provider_health(hub: &Hub, provider: &ProviderDescriptor, settings: &ProviderPanelSettings) -> DResult<()> {
-    let accounts = load_accounts_with_latest_windows(&hub.db, &provider.id, None, None).await?;
+    let accounts = load_accounts_with_latest_windows(&hub.db, &provider.id, None, None, provider.mode == AdapterMode::Live).await?;
     let publishers = sqlx::query_as(
         "select source_host, source_user, max(last_observed_at) from model_provider_publishers
          where provider_id = $1 group by source_host, source_user order by source_host, source_user",
@@ -2519,5 +2740,49 @@ mod tests {
         assert_eq!(AccountStatus::resolve(true, None, now, true, true), AccountStatus::NextPick);
         assert_eq!(AccountStatus::resolve(true, None, now, false, true), AccountStatus::Error);
         assert_eq!(AccountStatus::resolve(true, None, now, false, false), AccountStatus::Ready);
+    }
+
+    #[test]
+    fn dedupe_superseded_windows_drops_unscoped_when_scoped_is_same_or_newer() {
+        let now = Utc::now();
+        let earlier = now - Duration::minutes(5);
+        let later = now + Duration::minutes(5);
+
+        let mut unscoped_old = sample_window("3p-5h", Some(40.0), QuotaObservationState::Measured);
+        unscoped_old.scope_model = None;
+        unscoped_old.observed_at = Some(earlier);
+
+        let mut scoped_newer = sample_window("3p-5h", Some(25.0), QuotaObservationState::Measured);
+        scoped_newer.scope_model = Some("claude".into());
+        scoped_newer.observed_at = Some(now);
+
+        let mut unscoped_equal = sample_window("gemini-5h", Some(50.0), QuotaObservationState::Measured);
+        unscoped_equal.scope_model = None;
+        unscoped_equal.observed_at = Some(now);
+
+        let mut scoped_equal = sample_window("gemini-5h", Some(30.0), QuotaObservationState::Measured);
+        scoped_equal.scope_model = Some("pro".into());
+        scoped_equal.observed_at = Some(now);
+
+        let mut unscoped_newer = sample_window("weekly", Some(10.0), QuotaObservationState::Measured);
+        unscoped_newer.scope_model = None;
+        unscoped_newer.observed_at = Some(later);
+
+        let mut scoped_older = sample_window("weekly", Some(20.0), QuotaObservationState::Measured);
+        scoped_older.scope_model = Some("pro".into());
+        scoped_older.observed_at = Some(now);
+
+        let mut unscoped_only = sample_window("daily", Some(15.0), QuotaObservationState::Measured);
+        unscoped_only.scope_model = None;
+        unscoped_only.observed_at = Some(now);
+
+        let mut windows = vec![unscoped_old, scoped_newer, unscoped_equal, scoped_equal, unscoped_newer, scoped_older, unscoped_only];
+        dedupe_superseded_windows(&mut windows);
+
+        let keys: Vec<(&str, Option<&str>)> = windows.iter().map(|w| (w.window_key.as_str(), w.scope_model.as_deref())).collect();
+        assert_eq!(
+            keys,
+            vec![("3p-5h", Some("claude")), ("gemini-5h", Some("pro")), ("weekly", None), ("weekly", Some("pro")), ("daily", None),]
+        );
     }
 }

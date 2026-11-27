@@ -111,6 +111,111 @@ async fn imap_resets_uidvalidity_and_fetches_without_modifying_flags() {
     assert_eq!(cursor, serde_json::json!({"INBOX":{"uidvalidity":7,"last_uid":12}}));
 }
 
+#[test]
+fn gmail_app_password_strips_display_spaces_only() {
+    assert_eq!(imap_sync::normalize_gmail_app_password("abcd efgh ijkl mnop"), "abcdefghijklmnop");
+    assert_eq!(imap_sync::normalize_gmail_app_password("ABCD 1234 efgh 5678"), "ABCD1234efgh5678");
+    assert_eq!(imap_sync::normalize_gmail_app_password("abcdefghijklmnop"), "abcdefghijklmnop");
+    assert_eq!(imap_sync::normalize_gmail_app_password("pass with spaces"), "pass with spaces");
+    assert_eq!(imap_sync::normalize_gmail_app_password("abcd efgh ijkl mno!"), "abcd efgh ijkl mno!");
+}
+
+#[tokio::test]
+async fn imap_distinguishes_connection_auth_folder_and_archive_failures() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // 1. Connection refused -> ConnectionFailed
+    let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = closed_listener.local_addr().unwrap().port();
+    drop(closed_listener);
+    let conn = imap_sync::Connection {
+        host: "127.0.0.1",
+        port: closed_port,
+        tls: imap_sync::TlsMode::Plain,
+        username: "user",
+        password: "secret",
+    };
+    let err = imap_sync::sync_imap(&conn, &["INBOX".into()], &serde_json::Value::Null, |_, _| Ok(None)).await.unwrap_err();
+    assert_eq!(err, imap_sync::ImapSyncError::ConnectionFailed);
+    assert_eq!(err.message(), "IMAP connection failed");
+
+    // 2. LOGIN rejected -> AuthenticationFailed
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(stream);
+        socket.write_all(b"* OK Gimap ready\r\n").await.unwrap();
+        let mut cmd = String::new();
+        socket.read_line(&mut cmd).await.unwrap();
+        assert_eq!(cmd, "H1 LOGIN \"user\" \"wrong\"\r\n");
+        socket.write_all(b"H1 NO [AUTHENTICATIONFAILED] Invalid credentials\r\n").await.unwrap();
+    });
+    let conn = imap_sync::Connection { host: "127.0.0.1", port, tls: imap_sync::TlsMode::Plain, username: "user", password: "wrong" };
+    let err = imap_sync::sync_imap(&conn, &["INBOX".into()], &serde_json::Value::Null, |_, _| Ok(None)).await.unwrap_err();
+    server.await.unwrap();
+    assert_eq!(err, imap_sync::ImapSyncError::AuthenticationFailed);
+    assert_eq!(err.message(), "IMAP authentication failed");
+
+    // 3. SELECT "[Gmail]/Sent Mail" rejected -> FolderSelectionFailed
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(stream);
+        socket.write_all(b"* OK Gimap ready\r\n").await.unwrap();
+        let mut cmd = String::new();
+        socket.read_line(&mut cmd).await.unwrap();
+        assert_eq!(cmd, "H1 LOGIN \"user\" \"test\"\r\n");
+        socket.write_all(b"H1 OK authenticated\r\n").await.unwrap();
+        cmd.clear();
+        socket.read_line(&mut cmd).await.unwrap();
+        assert_eq!(cmd, "H2 SELECT \"[Gmail]/Sent Mail\"\r\n");
+        socket.write_all(b"H2 NO [NONEXISTENT] Unknown Mailbox\r\n").await.unwrap();
+    });
+    let conn = imap_sync::Connection { host: "127.0.0.1", port, tls: imap_sync::TlsMode::Plain, username: "user", password: "test" };
+    let err = imap_sync::sync_imap(&conn, &["[Gmail]/Sent Mail".into()], &serde_json::Value::Null, |_, _| Ok(None)).await.unwrap_err();
+    server.await.unwrap();
+    assert_eq!(err, imap_sync::ImapSyncError::FolderSelectionFailed);
+    assert_eq!(err.message(), "IMAP folder selection failed");
+
+    // 4. Archive callback failure -> ArchiveFailed
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(stream);
+        socket.write_all(b"* OK ready\r\n").await.unwrap();
+        for (expected, response) in [
+            ("H1 LOGIN \"user\" \"test\"\r\n", "H1 OK\r\n".to_string()),
+            ("H2 SELECT \"[Gmail]/Sent Mail\"\r\n", "* OK [UIDVALIDITY 7] current\r\nH2 OK\r\n".into()),
+            ("H3 UID SEARCH UID 1:*\r\n", "* SEARCH 12\r\nH3 OK\r\n".into()),
+            (
+                "H4 UID FETCH 12 (UID FLAGS BODY.PEEK[])\r\n",
+                format!(
+                    "* 1 FETCH (UID 12 FLAGS (\\Seen) BODY[] {{{}}}\r\n{})\r\nH4 OK\r\n",
+                    MESSAGE.len(),
+                    std::str::from_utf8(MESSAGE).unwrap()
+                ),
+            ),
+        ] {
+            let mut cmd = String::new();
+            socket.read_line(&mut cmd).await.unwrap();
+            assert_eq!(cmd, expected);
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let conn = imap_sync::Connection { host: "127.0.0.1", port, tls: imap_sync::TlsMode::Plain, username: "user", password: "test" };
+    let err = imap_sync::sync_imap(&conn, &["[Gmail]/Sent Mail".into()], &serde_json::Value::Null, |_, _| {
+        Err(std::io::Error::other("disk full"))
+    })
+    .await
+    .unwrap_err();
+    server.await.unwrap();
+    assert_eq!(err, imap_sync::ImapSyncError::ArchiveFailed);
+    assert_eq!(err.message(), "IMAP message archive failed");
+}
+
 #[tokio::test]
 async fn ics_304_is_not_an_empty_snapshot() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

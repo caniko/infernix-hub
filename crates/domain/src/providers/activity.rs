@@ -31,6 +31,18 @@ pub async fn ingest_activity(hub: &Hub, actor: &Actor, batch: ActivityIngestBatc
     let mut deduplicated = 0usize;
 
     for ex in &batch.exchanges {
+        if is_empty_model_zero_token(
+            &ex.requested_model,
+            &ex.effective_model,
+            ex.input_tokens,
+            ex.output_tokens,
+            ex.cache_read_tokens,
+            ex.cache_write_tokens,
+            ex.thinking_tokens,
+        ) {
+            deduplicated += 1;
+            continue;
+        }
         let exists: bool = sqlx::query_scalar(
             "select exists(
                 select 1 from activity_identities
@@ -289,6 +301,24 @@ pub async fn ingest_activity(hub: &Hub, actor: &Actor, batch: ActivityIngestBatc
 
 fn is_success_outcome(outcome: &str) -> bool {
     matches!(outcome, "ok" | "succeeded" | "success")
+}
+
+fn is_empty_model_zero_token(
+    requested_model: &str,
+    effective_model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    thinking_tokens: i64,
+) -> bool {
+    requested_model.trim().is_empty()
+        && effective_model.trim().is_empty()
+        && input_tokens == 0
+        && output_tokens == 0
+        && cache_read_tokens == 0
+        && cache_write_tokens == 0
+        && thinking_tokens == 0
 }
 
 fn parse_cursor(raw: &str) -> DResult<(DateTime<Utc>, Option<Uuid>)> {
@@ -572,6 +602,15 @@ fn summarize_overview(
     let mut by_model_effort: BTreeMap<String, BreakdownRow> = BTreeMap::new();
 
     for r in rows {
+        let empty_zero_token = is_empty_model_zero_token(
+            &r.requested_model,
+            &r.effective_model,
+            r.input_tokens,
+            r.output_tokens,
+            r.cache_read_tokens,
+            r.cache_write_tokens,
+            r.thinking_tokens,
+        );
         let is_fail = u64::from(!is_success_outcome(&r.outcome));
         failures += is_fail;
         let inp = r.input_tokens.max(0) as u64;
@@ -610,8 +649,10 @@ fn summarize_overview(
                 c
             }
             None => {
-                unpriced_requests += 1;
-                unpriced_models.insert(r.effective_model.clone());
+                if !empty_zero_token {
+                    unpriced_requests += 1;
+                    unpriced_models.insert(r.effective_model.clone());
+                }
                 0.0
             }
         };
@@ -657,16 +698,20 @@ fn summarize_overview(
             rb.api_equivalent_cost_usd += row_cost;
         }
 
-        let unpriced_inc = u64::from(r.api_equivalent_cost_usd.is_none());
-        add_breakdown(&mut by_model, &r.effective_model, &r.effective_model, is_fail, inp, out, cr, cw, th, row_cost, unpriced_inc);
+        let unpriced_inc = u64::from(r.api_equivalent_cost_usd.is_none() && !empty_zero_token);
+        if !empty_zero_token {
+            add_breakdown(&mut by_model, &r.effective_model, &r.effective_model, is_fail, inp, out, cr, cw, th, row_cost, unpriced_inc);
+        }
         let acct_key = format!("{}:{}", r.provider_id, r.account_id.as_deref().unwrap_or("unassigned"));
         add_breakdown(&mut by_account, &acct_key, &acct_key, is_fail, inp, out, cr, cw, th, row_cost, unpriced_inc);
         add_breakdown(&mut by_client, &r.client, &r.client, is_fail, inp, out, cr, cw, th, row_cost, unpriced_inc);
-        let me_key = match &r.effort {
-            Some(e) if !e.is_empty() => format!("{} ({e})", r.effective_model),
-            _ => r.effective_model.clone(),
-        };
-        add_breakdown(&mut by_model_effort, &me_key, &me_key, is_fail, inp, out, cr, cw, th, row_cost, unpriced_inc);
+        if !empty_zero_token {
+            let me_key = match &r.effort {
+                Some(e) if !e.is_empty() => format!("{} ({e})", r.effective_model),
+                _ => r.effective_model.clone(),
+            };
+            add_breakdown(&mut by_model_effort, &me_key, &me_key, is_fail, inp, out, cr, cw, th, row_cost, unpriced_inc);
+        }
     }
 
     for tp in trend_map.values_mut() {
@@ -1919,5 +1964,36 @@ mod tests {
         assert_eq!(legacy_ts, ts);
         assert_eq!(legacy_id, None);
         assert!(parse_cursor("not-a-timestamp").is_err());
+    }
+
+    #[test]
+    fn summarize_overview_excludes_empty_model_zero_token_rows_from_unpriced_and_model_breakdowns() {
+        let from = DateTime::parse_from_rfc3339("2026-11-22T00:00:00Z").unwrap().with_timezone(&Utc);
+        let to = from + Duration::hours(6);
+        let metadata_rpc = ExchangeRow {
+            occurred_at: from + Duration::hours(1),
+            outcome: "success".into(),
+            requested_model: "".into(),
+            effective_model: "".into(),
+            api_equivalent_cost_usd: None,
+            ..Default::default()
+        };
+        let unpriced_model = ExchangeRow {
+            occurred_at: from + Duration::hours(2),
+            outcome: "success".into(),
+            requested_model: "custom-unknown-model".into(),
+            effective_model: "custom-unknown-model".into(),
+            input_tokens: 120,
+            output_tokens: 30,
+            api_equivalent_cost_usd: None,
+            ..Default::default()
+        };
+        let report = summarize_overview(&[metadata_rpc, unpriced_model], from, to, Duration::zero(), 30).unwrap();
+        assert_eq!(report.unpriced_requests, 1);
+        assert_eq!(report.unpriced_models, vec!["custom-unknown-model".to_string()]);
+        assert_eq!(report.by_model.len(), 1);
+        assert_eq!(report.by_model[0].key, "custom-unknown-model");
+        assert_eq!(report.by_model_effort.len(), 1);
+        assert_eq!(report.by_model_effort[0].key, "custom-unknown-model");
     }
 }

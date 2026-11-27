@@ -21,6 +21,28 @@ pub(crate) fn blocking_backoff(kind: AccountErrorKind) -> Option<Duration> {
     }
 }
 
+pub(crate) fn quota_probe_429_backoff(consecutive_count: u32, retry_after: Option<Duration>) -> Duration {
+    if let Some(delay) = retry_after.filter(|d| !d.is_zero()) {
+        return delay.min(Duration::from_secs(3600));
+    }
+    match consecutive_count {
+        0 | 1 => Duration::from_secs(15 * 60),
+        2 => Duration::from_secs(30 * 60),
+        _ => Duration::from_secs(60 * 60),
+    }
+}
+
+fn parse_retry_after(headers: &HeaderMap, now: chrono::DateTime<Utc>) -> Option<Duration> {
+    let raw = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+        let secs = raw.parse::<u64>().ok().filter(|s| *s > 0)?;
+        return Some(Duration::from_secs(secs.min(3600)));
+    }
+    let until = chrono::DateTime::parse_from_rfc2822(raw).ok()?.with_timezone(&Utc);
+    let delta = (until - now).num_seconds();
+    (delta > 0).then(|| Duration::from_secs((delta as u64).min(3600)))
+}
+
 pub(crate) fn local_error(kind: AccountErrorKind, source: AccountErrorSource, message: &str) -> AccountError {
     AccountError {
         kind,
@@ -83,7 +105,13 @@ pub(crate) fn classify_upstream_http_error(
     let body = String::from_utf8_lossy(body);
     let html = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/html"))
         || body.trim_start().starts_with('<');
-    classify(lane, Some(status.as_u16()), &raw, &body, html, source, secrets)
+    let mut error = classify(lane, Some(status.as_u16()), &raw, &body, html, source, secrets)?;
+    if source == QuotaProbe && error.kind == QuotaExhausted && error.http_status == Some(429) {
+        let retry_after = parse_retry_after(headers, error.occurred_at);
+        let delay = quota_probe_429_backoff(1, retry_after);
+        error.backoff_until = chrono::TimeDelta::from_std(delay).ok().and_then(|d| error.occurred_at.checked_add_signed(d));
+    }
+    Some(error)
 }
 
 pub(crate) fn classify_oauth_error(lane: Lane, status: StatusCode, body: &[u8], secrets: &[&str]) -> AccountError {
@@ -199,7 +227,7 @@ fn classify(
     {
         let mut result = local_error(QuotaProbeUnsupported, source, "Organization policy disallows OAuth quota probes.");
         result.http_status = http;
-        result.backoff_until = Some(result.occurred_at + chrono::TimeDelta::hours(1));
+        result.backoff_until = Some(result.occurred_at + chrono::TimeDelta::hours(24));
         return Some(result);
     }
     let says = |phrases: &[&str]| phrases.iter().any(|p| lower.contains(p));
@@ -588,5 +616,38 @@ pub(crate) mod tests {
         assert!(!message.contains("private") && !message.contains("secret") && !message.contains('\n'), "{message}");
         assert!(message.contains("https://example.com"), "{message}");
         assert_eq!(sanitize(&"é".repeat(300)).chars().count(), 240);
+    }
+
+    #[test]
+    fn quota_probe_unsupported_and_429_backoffs() {
+        let org_body = r#"{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization"}}"#;
+        let unsupported = http(Lane::Claude, 403, org_body, QuotaProbe).unwrap();
+        assert_eq!(unsupported.kind, QuotaProbeUnsupported);
+        let delta = unsupported.backoff_until.unwrap() - unsupported.occurred_at;
+        assert_eq!(delta, chrono::TimeDelta::hours(24));
+
+        let no_header = http(Lane::Claude, 429, r#"{"error":{"type":"rate_limit_error"}}"#, QuotaProbe).unwrap();
+        assert_eq!(no_header.kind, QuotaExhausted);
+        assert_eq!(no_header.backoff_until.unwrap() - no_header.occurred_at, chrono::TimeDelta::minutes(15));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, axum::http::HeaderValue::from_static("120"));
+        let with_retry_after = classify_upstream_http_error(
+            Lane::Claude,
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            br#"{"error":{"type":"rate_limit_error"}}"#,
+            QuotaProbe,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(with_retry_after.backoff_until.unwrap() - with_retry_after.occurred_at, chrono::TimeDelta::seconds(120));
+
+        assert_eq!(quota_probe_429_backoff(1, None), Duration::from_secs(15 * 60));
+        assert_eq!(quota_probe_429_backoff(2, None), Duration::from_secs(30 * 60));
+        assert_eq!(quota_probe_429_backoff(3, None), Duration::from_secs(60 * 60));
+        assert_eq!(quota_probe_429_backoff(10, None), Duration::from_secs(60 * 60));
+        assert_eq!(quota_probe_429_backoff(2, Some(Duration::from_secs(240))), Duration::from_secs(240));
+        assert_eq!(quota_probe_429_backoff(1, Some(Duration::from_secs(7200))), Duration::from_secs(3600));
     }
 }

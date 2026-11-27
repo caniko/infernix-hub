@@ -56,6 +56,12 @@ pub struct Proxy {
     management_mock: Option<reqwest::Url>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuotaRefreshOutcome {
+    Updated,
+    Suppressed,
+}
+
 struct VerifiedGoogleToken {
     expires: Instant,
     client_id: String,
@@ -225,6 +231,16 @@ impl Proxy {
             "upstream account error"
         );
         self.log("warn", &format!("{} ({label}): {}", account.lane.name(), error.summary())).await;
+    }
+
+    async fn log_quota_probe_unsupported(&self, account: &Account, error: &AccountError) {
+        let label = safe_label(account);
+        tracing::info!(
+            account = %label, lane = account.lane.name(), kind = error.kind.as_str(), source = ?error.source,
+            http_status = error.http_status, message = %error.message,
+            "quota probe unsupported by organization policy"
+        );
+        self.log("info", &format!("{} ({label}): {}", account.lane.name(), error.summary())).await;
     }
 
     async fn report_account_error(&self, account: &Account, error: &AccountError) {
@@ -884,7 +900,7 @@ impl Proxy {
             .unwrap_or_else(|| probe_error("provider returned no quota evidence")))
     }
 
-    async fn refresh_usage(&self, account: &Account) -> Result<(), Box<AccountError>> {
+    async fn refresh_usage(&self, account: &Account) -> Result<QuotaRefreshOutcome, Box<AccountError>> {
         use integrations::providers::{claude, opencode};
         let mut account = {
             let mut state = self.state.write().await;
@@ -896,10 +912,18 @@ impl Proxy {
                 .get_mut(&account.id)
                 .filter(|c| !c.disabled && c.same_credential(account))
                 .ok_or_else(|| probe_error("credential changed before quota refresh"))?;
+            let now = Utc::now();
             if let Some(error) = &current.quota_probe_policy_error
-                && error.backoff_until.is_some_and(|until| until > Utc::now())
+                && error.backoff_until.is_some_and(|until| until > now)
             {
-                return Err(Box::new(error.clone()));
+                return Ok(QuotaRefreshOutcome::Suppressed);
+            }
+            if let Some(error) = &current.last_error
+                && error.source == AccountErrorSource::QuotaProbe
+                && error.kind == AccountErrorKind::QuotaExhausted
+                && error.backoff_until.is_some_and(|until| until > now)
+            {
+                return Ok(QuotaRefreshOutcome::Suppressed);
             }
             let generation = last_generation
                 .max(current.probe_generation)
@@ -1011,6 +1035,7 @@ impl Proxy {
         let had_policy_error = current.quota_probe_policy_error.take().is_some();
         let project_changed = probed_project.is_some() && current.set_google_project(probed_project);
         let changed;
+        let mut unsupported_logged = None;
         let result = match result {
             Ok((plan, email, windows, grants, next)) => {
                 if plan.is_some() {
@@ -1026,7 +1051,7 @@ impl Proxy {
                 current.observed = Some(now);
                 current.probe_failed = false;
                 changed = (error_is_current && current.clear_account_error()) || had_policy_error;
-                Ok(())
+                Ok(QuotaRefreshOutcome::Updated)
             }
             Err(e) => {
                 let unsupported = e.kind == AccountErrorKind::QuotaProbeUnsupported;
@@ -1037,6 +1062,23 @@ impl Proxy {
                     changed = true;
                 } else {
                     changed = (error_is_current && current.record_error_once(&e)) || had_policy_error;
+                    if error_is_current
+                        && e.source == AccountErrorSource::QuotaProbe
+                        && e.kind == AccountErrorKind::QuotaExhausted
+                        && let Some(last) = current
+                            .last_error
+                            .as_mut()
+                            .filter(|l| l.source == AccountErrorSource::QuotaProbe && l.kind == AccountErrorKind::QuotaExhausted)
+                    {
+                        let default_first = e.occurred_at + TimeDelta::minutes(15);
+                        let backoff_until = if last.consecutive_count >= 2 && e.backoff_until == Some(default_first) {
+                            let delay = error_classify::quota_probe_429_backoff(last.consecutive_count, None);
+                            TimeDelta::from_std(delay).ok().and_then(|d| last.occurred_at.checked_add_signed(d))
+                        } else {
+                            e.backoff_until
+                        };
+                        last.backoff_until = backoff_until.max(last.backoff_until);
+                    }
                 }
                 if current.lane == Lane::Google {
                     let now = Utc::now();
@@ -1053,7 +1095,12 @@ impl Proxy {
                     window.observation_state = QuotaObservationState::StaleLastGood;
                     window.error_reason = Some(e.summary());
                 }
-                Err(e)
+                if unsupported {
+                    unsupported_logged = Some(e);
+                    Ok(QuotaRefreshOutcome::Suppressed)
+                } else {
+                    Err(e)
+                }
             }
         };
         let probe_state_changed = was_probe_failed != current.probe_failed;
@@ -1062,7 +1109,9 @@ impl Proxy {
         if project_changed || changed || probe_state_changed {
             self.notify_hub_sync();
         }
-        if let Err(error) = &result {
+        if let Some(error) = unsupported_logged {
+            self.log_quota_probe_unsupported(&account, &error).await;
+        } else if let Err(error) = &result {
             self.log_account_error(&account, error).await;
         }
         result
@@ -1299,6 +1348,76 @@ async fn provider_response_json(response: reqwest::Response) -> Result<Value, &'
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod quota_probe_backoff_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{http::StatusCode, routing::get};
+    use serde_json::json;
+
+    use super::*;
+    use crate::tests::{Scratch, fixture, serve};
+
+    #[tokio::test]
+    async fn claude_403_policy_and_429_backoff_suppress_spam_and_502() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = serve(Router::new().route(
+            "/api/oauth/usage",
+            get({
+                let calls = calls.clone();
+                move || async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        (
+                            StatusCode::FORBIDDEN,
+                            axum::Json(json!({"type":"error","error":{"type":"permission_error",
+                                "message":"OAuth authentication is currently not allowed for this organization"}})),
+                        )
+                    } else {
+                        (StatusCode::TOO_MANY_REQUESTS, axum::Json(json!({"type":"error","error":{"type":"rate_limit_error"}})))
+                    }
+                }
+            }),
+        ))
+        .await;
+        let dir = Scratch::new();
+        let proxy = fixture(&dir, &mock);
+
+        // 1. Claude 403 org policy -> suppressed, info-logged, no warn/502, 24h backoff skips upstream.
+        let account_a = proxy.state.read().await.pool.accounts["a.json"].clone();
+        assert_eq!(proxy.refresh_usage(&account_a).await.unwrap(), QuotaRefreshOutcome::Suppressed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let state = proxy.state.read().await;
+            let err = state.pool.accounts["a.json"].quota_probe_policy_error.as_ref().unwrap();
+            assert_eq!(err.kind, AccountErrorKind::QuotaProbeUnsupported);
+            assert!(err.backoff_until.unwrap() - err.occurred_at >= TimeDelta::hours(23));
+            assert!(state.logs.iter().any(|l| l.level == "info" && l.message.contains("Organization policy")));
+            assert!(!state.logs.iter().any(|l| l.level == "warn" && l.message.contains("Organization policy")));
+        }
+        let errors = management::refresh_selected(&proxy, Some("a.json"), Some("claude")).await.unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!proxy.state.read().await.logs.iter().any(|l| l.message.contains("one or more quota probes failed")));
+
+        // 2. Claude 429 -> fresh error sets 15m backoff; second call skips upstream cleanly without warn/502.
+        let account_b = proxy.state.read().await.pool.accounts["b.json"].clone();
+        let err = proxy.refresh_usage(&account_b).await.unwrap_err();
+        assert_eq!(err.kind, AccountErrorKind::QuotaExhausted);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        {
+            let state = proxy.state.read().await;
+            let recorded = state.pool.accounts["b.json"].last_error.as_ref().unwrap();
+            assert!(recorded.backoff_until.is_some_and(|until| until > Utc::now() + TimeDelta::minutes(14)));
+        }
+        assert_eq!(proxy.refresh_usage(&account_b).await.unwrap(), QuotaRefreshOutcome::Suppressed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let errors = management::refresh_selected(&proxy, Some("b.json"), Some("claude")).await.unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+}
 
 const NIX_SANDBOX_NO_CERT_FILE: &str = "/no-cert-file.crt";
 

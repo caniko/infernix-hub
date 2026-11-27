@@ -6,8 +6,9 @@ use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    io,
+    fmt, io,
     sync::Arc,
     time::Duration,
 };
@@ -17,6 +18,83 @@ use tokio::{
     time::timeout,
 };
 use tokio_rustls::TlsConnector;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImapSyncError {
+    InvalidConfig(&'static str),
+    ConnectionFailed,
+    TlsHandshakeFailed,
+    ServerGreetingFailed,
+    StarttlsFailed,
+    AuthenticationFailed,
+    FolderSelectionFailed,
+    SearchFailed,
+    FetchFailed,
+    MessageParseFailed,
+    ArchiveFailed,
+    ProtocolError(&'static str),
+    TimedOut,
+}
+
+impl ImapSyncError {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::InvalidConfig(message) | Self::ProtocolError(message) => message,
+            Self::ConnectionFailed => "IMAP connection failed",
+            Self::TlsHandshakeFailed => "IMAP TLS handshake failed",
+            Self::ServerGreetingFailed => "IMAP server greeting failed",
+            Self::StarttlsFailed => "IMAP STARTTLS failed",
+            Self::AuthenticationFailed => "IMAP authentication failed",
+            Self::FolderSelectionFailed => "IMAP folder selection failed",
+            Self::SearchFailed => "IMAP message search failed",
+            Self::FetchFailed => "IMAP message fetch failed",
+            Self::MessageParseFailed => "IMAP message parsing failed",
+            Self::ArchiveFailed => "IMAP message archive failed",
+            Self::TimedOut => "IMAP sync timed out",
+        }
+    }
+
+    pub const fn category(self) -> &'static str {
+        match self {
+            Self::InvalidConfig(_) => "invalid_config",
+            Self::ConnectionFailed => "connection",
+            Self::TlsHandshakeFailed => "tls",
+            Self::ServerGreetingFailed => "greeting",
+            Self::StarttlsFailed => "starttls",
+            Self::AuthenticationFailed => "authentication",
+            Self::FolderSelectionFailed => "folder_selection",
+            Self::SearchFailed => "search",
+            Self::FetchFailed => "fetch",
+            Self::MessageParseFailed => "parse",
+            Self::ArchiveFailed => "archive",
+            Self::ProtocolError(_) => "protocol",
+            Self::TimedOut => "timeout",
+        }
+    }
+}
+
+impl fmt::Display for ImapSyncError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for ImapSyncError {}
+
+/// Strip display spaces from a 16-character Google app password (`xxxx xxxx xxxx xxxx`).
+pub fn normalize_gmail_app_password(password: &str) -> Cow<'_, str> {
+    let bytes = password.as_bytes();
+    if bytes.len() == 19
+        && bytes[4] == b' '
+        && bytes[9] == b' '
+        && bytes[14] == b' '
+        && bytes.iter().enumerate().all(|(i, b)| matches!(i, 4 | 9 | 14) || b.is_ascii_alphanumeric())
+    {
+        Cow::Owned(password.replace(' ', ""))
+    } else {
+        Cow::Borrowed(password)
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,9 +142,9 @@ pub fn validate_transport(host: &str, tls: TlsMode) -> io::Result<()> {
     Ok(())
 }
 
-fn quote(value: &str) -> io::Result<String> {
+fn quote(value: &str) -> Result<String, ImapSyncError> {
     if value.chars().any(char::is_control) {
-        return Err(invalid("IMAP argument contains control characters"));
+        return Err(ImapSyncError::InvalidConfig("IMAP argument contains control characters"));
     }
     Ok(format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
 }
@@ -75,57 +153,68 @@ trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 type Imap = BufReader<Box<dyn Stream>>;
 
-async fn tls(socket: Box<dyn Stream>, host: &str) -> io::Result<Box<dyn Stream>> {
-    let name = ServerName::try_from(host.to_owned()).map_err(|_| invalid("invalid IMAP TLS server name"))?;
+async fn tls(socket: Box<dyn Stream>, host: &str) -> Result<Box<dyn Stream>, ImapSyncError> {
+    let name = ServerName::try_from(host.to_owned()).map_err(|_| ImapSyncError::InvalidConfig("invalid IMAP TLS server name"))?;
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
-        .map_err(|_| invalid("invalid IMAP TLS configuration"))?
+        .map_err(|_| ImapSyncError::InvalidConfig("invalid IMAP TLS configuration"))?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Ok(Box::new(TlsConnector::from(Arc::new(config)).connect(name, socket).await.map_err(|_| invalid("IMAP TLS handshake failed"))?))
+    Ok(Box::new(TlsConnector::from(Arc::new(config)).connect(name, socket).await.map_err(|_| ImapSyncError::TlsHandshakeFailed)?))
 }
 
-async fn line(socket: &mut Imap) -> io::Result<String> {
+async fn line(socket: &mut Imap) -> Result<String, ImapSyncError> {
     const MAX_LINE: usize = 4 * 1024 * 1024;
     let mut bytes = Vec::new();
-    socket.take(MAX_LINE as u64).read_until(b'\n', &mut bytes).await?;
+    socket
+        .take(MAX_LINE as u64)
+        .read_until(b'\n', &mut bytes)
+        .await
+        .map_err(|_| ImapSyncError::ProtocolError("IMAP connection read failed"))?;
     if !bytes.ends_with(b"\r\n") {
-        return Err(invalid("incomplete or oversized IMAP response line"));
+        return Err(ImapSyncError::ProtocolError("incomplete or oversized IMAP response line"));
     }
     bytes.truncate(bytes.len() - 2);
-    String::from_utf8(bytes).map_err(|_| invalid("invalid IMAP response line"))
+    String::from_utf8(bytes).map_err(|_| ImapSyncError::ProtocolError("invalid IMAP response line"))
 }
 
 async fn command(
     socket: &mut Imap,
     sequence: &mut u64,
     cmd: &str,
-    mut response: impl FnMut(&str, Option<&[u8]>) -> io::Result<()>,
-) -> io::Result<()> {
+    on_reject: ImapSyncError,
+    mut response: impl FnMut(&str, Option<&[u8]>) -> Result<(), ImapSyncError>,
+) -> Result<(), ImapSyncError> {
     // Only one command is outstanding at a time.
     *sequence += 1;
     let tag = format!("H{sequence} ");
-    socket.write_all(format!("{tag}{cmd}\r\n").as_bytes()).await?;
-    socket.flush().await?;
+    socket
+        .write_all(format!("{tag}{cmd}\r\n").as_bytes())
+        .await
+        .map_err(|_| ImapSyncError::ProtocolError("IMAP connection write failed"))?;
+    socket.flush().await.map_err(|_| ImapSyncError::ProtocolError("IMAP connection write failed"))?;
     loop {
         let mut text = line(socket).await?;
         if let Some(status) = text.strip_prefix(tag.as_str()) {
             return if status.split_ascii_whitespace().next().is_some_and(|s| s.eq_ignore_ascii_case("OK")) {
                 Ok(())
             } else {
-                Err(invalid("IMAP command rejected"))
+                Err(on_reject)
             };
         }
         if text.to_ascii_uppercase().starts_with("* BYE") {
-            return Err(invalid("IMAP server closed the session"));
+            return Err(ImapSyncError::ProtocolError("IMAP server closed the session"));
         }
         let mut literal = None;
         if let Some(length) = text.strip_suffix('}').and_then(|s| s.rsplit_once('{')).map(|(_, n)| n) {
-            let length =
-                length.parse::<usize>().ok().filter(|n| *n <= MAX_RAW_BYTES).ok_or_else(|| invalid("invalid or oversized IMAP literal"))?;
+            let length = length
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n <= MAX_RAW_BYTES)
+                .ok_or(ImapSyncError::ProtocolError("invalid or oversized IMAP literal"))?;
             let mut bytes = vec![0; length];
-            socket.read_exact(&mut bytes).await?;
+            socket.read_exact(&mut bytes).await.map_err(|_| ImapSyncError::ProtocolError("IMAP literal read failed"))?;
             text.push_str(&line(socket).await?);
             literal = Some(bytes);
         }
@@ -140,10 +229,11 @@ pub async fn sync_imap(
     folders: &[String],
     cursor: &Value,
     mut archive: impl FnMut(&MailMessageIn, &[u8]) -> io::Result<Option<String>> + Send,
-) -> io::Result<(Vec<MailMessageIn>, Value)> {
-    validate_transport(connection.host, connection.tls)?;
+) -> Result<(Vec<MailMessageIn>, Value), ImapSyncError> {
+    validate_transport(connection.host, connection.tls)
+        .map_err(|_| ImapSyncError::InvalidConfig("plain IMAP requires an explicit loopback host"))?;
     if folders.len() > 16 || folders.iter().any(|f| f.is_empty() || f.len() > 1024) {
-        return Err(invalid("IMAP folder list exceeds limits or contains an empty folder"));
+        return Err(ImapSyncError::InvalidConfig("IMAP folder list exceeds limits or contains an empty folder"));
     }
     timeout(Duration::from_secs(120), async {
         let host = connection.host;
@@ -151,37 +241,42 @@ pub async fn sync_imap(
         let tcp = if connection.tls == TlsMode::Plain && host == "localhost" {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(socket) => socket,
-                Err(_) => TcpStream::connect(("::1", port)).await?,
+                Err(_) => TcpStream::connect(("::1", port)).await.map_err(|_| ImapSyncError::ConnectionFailed)?,
             }
         } else {
-            TcpStream::connect((host, port)).await?
+            TcpStream::connect((host, port)).await.map_err(|_| ImapSyncError::ConnectionFailed)?
         };
         let socket: Box<dyn Stream> = Box::new(tcp);
         let mut socket = BufReader::new(if connection.tls == TlsMode::Tls { tls(socket, host).await? } else { socket });
         let mut sequence = 0;
-        if !line(&mut socket).await?.to_ascii_uppercase().starts_with("* OK") {
-            return Err(invalid("invalid IMAP server greeting"));
+        let greeting = line(&mut socket).await.map_err(|_| ImapSyncError::ServerGreetingFailed)?;
+        if !greeting.to_ascii_uppercase().starts_with("* OK") {
+            return Err(ImapSyncError::ServerGreetingFailed);
         }
         if connection.tls == TlsMode::Starttls {
-            command(&mut socket, &mut sequence, "STARTTLS", |_, _| Ok(())).await?;
+            command(&mut socket, &mut sequence, "STARTTLS", ImapSyncError::StarttlsFailed, |_, _| Ok(())).await?;
             if !socket.buffer().is_empty() {
-                return Err(invalid("unexpected data before IMAP TLS upgrade"));
+                return Err(ImapSyncError::StarttlsFailed);
             }
             socket = BufReader::new(tls(socket.into_inner(), host).await?);
         }
-        command(&mut socket, &mut sequence, &format!("LOGIN {} {}", quote(connection.username)?, quote(connection.password)?), |_, _| {
-            Ok(())
-        })
+        command(
+            &mut socket,
+            &mut sequence,
+            &format!("LOGIN {} {}", quote(connection.username)?, quote(connection.password)?),
+            ImapSyncError::AuthenticationFailed,
+            |_, _| Ok(()),
+        )
         .await?;
         let mut cursors: BTreeMap<String, FolderCursor> = if cursor.is_null() {
             BTreeMap::new()
         } else {
-            serde_json::from_value(cursor.clone()).map_err(|_| invalid("invalid IMAP cursor"))?
+            serde_json::from_value(cursor.clone()).map_err(|_| ImapSyncError::InvalidConfig("invalid IMAP cursor"))?
         };
         let mut messages = Vec::new();
         for folder in folders {
             let mut validity = None;
-            command(&mut socket, &mut sequence, &format!("SELECT {}", quote(folder)?), |line, _| {
+            command(&mut socket, &mut sequence, &format!("SELECT {}", quote(folder)?), ImapSyncError::FolderSelectionFailed, |line, _| {
                 if let Some(value) = line
                     .to_ascii_uppercase()
                     .split_once("[UIDVALIDITY ")
@@ -194,18 +289,18 @@ pub async fn sync_imap(
                 Ok(())
             })
             .await?;
-            let validity = validity.ok_or_else(|| invalid("IMAP SELECT omitted UIDVALIDITY"))?;
+            let validity = validity.ok_or(ImapSyncError::FolderSelectionFailed)?;
             let cursor = cursors.entry(folder.clone()).or_default();
             if cursor.uidvalidity != validity {
                 *cursor = FolderCursor { uidvalidity: validity, last_uid: 0 };
             }
             let Some(start) = cursor.last_uid.checked_add(1) else { continue };
             let mut uids = BTreeSet::new();
-            command(&mut socket, &mut sequence, &format!("UID SEARCH UID {start}:*"), |line, _| {
+            command(&mut socket, &mut sequence, &format!("UID SEARCH UID {start}:*"), ImapSyncError::SearchFailed, |line, _| {
                 let mut fields = line.split_ascii_whitespace();
                 if fields.next() == Some("*") && fields.next().is_some_and(|s| s.eq_ignore_ascii_case("SEARCH")) {
                     for uid in fields {
-                        let uid: u32 = uid.parse().map_err(|_| invalid("invalid IMAP search UID"))?;
+                        let uid: u32 = uid.parse().map_err(|_| ImapSyncError::SearchFailed)?;
                         if uid >= start {
                             uids.insert(uid);
                             // ponytail: one bounded page per folder; repeat sync to drain large mailboxes.
@@ -223,40 +318,47 @@ pub async fn sync_imap(
             }
             let set = uids.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
             let mut fetched = BTreeSet::new();
-            command(&mut socket, &mut sequence, &format!("UID FETCH {set} (UID FLAGS BODY.PEEK[])"), |line, raw| {
-                let Some(raw) = raw else { return Ok(()) };
-                let text = line.to_ascii_uppercase();
-                if !text.starts_with("* ") || !text.contains(" FETCH (") || !text.contains("BODY[] {") {
-                    return Err(invalid("unexpected IMAP FETCH literal"));
-                }
-                let uid = text
-                    .split_once(" UID ")
-                    .or_else(|| text.split_once("(UID "))
-                    .and_then(|(_, u)| u.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u32>().ok())
-                    .filter(|u| uids.contains(u) && fetched.insert(*u))
-                    .ok_or_else(|| invalid("missing or unexpected IMAP FETCH UID"))?;
-                let mut message = parse_eml(raw, folder)?;
-                message.is_read = text
-                    .split_once("FLAGS (")
-                    .and_then(|(_, f)| f.split_once(')'))
-                    .is_some_and(|(f, _)| f.split_ascii_whitespace().any(|flag| flag == "\\SEEN"));
-                message.imap_location = Some(MailImapLocationIn { folder: folder.clone(), uidvalidity: validity.into(), uid: uid.into() });
-                message.raw_path = archive(&message, raw)?;
-                messages.push(message);
-                Ok(())
-            })
+            command(
+                &mut socket,
+                &mut sequence,
+                &format!("UID FETCH {set} (UID FLAGS BODY.PEEK[])"),
+                ImapSyncError::FetchFailed,
+                |line, raw| {
+                    let Some(raw) = raw else { return Ok(()) };
+                    let text = line.to_ascii_uppercase();
+                    if !text.starts_with("* ") || !text.contains(" FETCH (") || !text.contains("BODY[] {") {
+                        return Err(ImapSyncError::FetchFailed);
+                    }
+                    let uid = text
+                        .split_once(" UID ")
+                        .or_else(|| text.split_once("(UID "))
+                        .and_then(|(_, u)| u.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u32>().ok())
+                        .filter(|u| uids.contains(u) && fetched.insert(*u))
+                        .ok_or(ImapSyncError::FetchFailed)?;
+                    let mut message = parse_eml(raw, folder).map_err(|_| ImapSyncError::MessageParseFailed)?;
+                    message.is_read = text
+                        .split_once("FLAGS (")
+                        .and_then(|(_, f)| f.split_once(')'))
+                        .is_some_and(|(f, _)| f.split_ascii_whitespace().any(|flag| flag == "\\SEEN"));
+                    message.imap_location =
+                        Some(MailImapLocationIn { folder: folder.clone(), uidvalidity: validity.into(), uid: uid.into() });
+                    message.raw_path = archive(&message, raw).map_err(|_| ImapSyncError::ArchiveFailed)?;
+                    messages.push(message);
+                    Ok(())
+                },
+            )
             .await?;
             if fetched.len() != uids.len() {
                 // A concurrent expunge can cause this; retry SEARCH on the next run.
-                return Err(invalid("IMAP FETCH returned an incomplete batch"));
+                return Err(ImapSyncError::FetchFailed);
             }
             if let Some(last) = uids.last() {
                 cursor.last_uid = *last;
             }
         }
-        let cursors = serde_json::to_value(cursors).map_err(|_| invalid("cannot encode IMAP cursor"))?;
+        let cursors = serde_json::to_value(cursors).map_err(|_| ImapSyncError::ProtocolError("cannot encode IMAP cursor"))?;
         Ok((messages, cursors))
     })
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IMAP sync timed out"))?
+    .map_err(|_| ImapSyncError::TimedOut)?
 }

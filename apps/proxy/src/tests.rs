@@ -7708,7 +7708,9 @@ async fn quota_probe_claude_org_policy_403_backs_off_without_blocking_inference(
     let proxy = fixture(&dir, &mock);
     proxy.state.write().await.pool.policy.strategy = FillFirst;
     let account = proxy.state.read().await.pool.accounts["a.json"].clone();
-    let error = proxy.refresh_usage(&account).await.unwrap_err();
+    let outcome = proxy.refresh_usage(&account).await.unwrap();
+    assert_eq!(outcome, QuotaRefreshOutcome::Suppressed);
+    let error = proxy.state.read().await.pool.accounts["a.json"].quota_probe_policy_error.clone().unwrap();
     assert_eq!(error.kind.as_str(), "quota_probe_unsupported");
     assert_eq!((error.source, error.http_status), (AccountErrorSource::QuotaProbe, Some(403)));
     assert!(error.backoff_until.is_some_and(|until| until > Utc::now()));
@@ -7726,8 +7728,8 @@ async fn quota_probe_claude_org_policy_403_backs_off_without_blocking_inference(
     assert_eq!(proxy.state.read().await.pool.accounts["a.json"].success, 1);
     let batches = hub_sync::observations(&proxy, "host", "user").await;
     let published = batches.iter().flat_map(|batch| &batch.accounts).find(|a| a.source_account_id == "a.json").unwrap();
-    assert_eq!(published.last_error.as_ref(), Some(error.as_ref()));
-    assert_eq!(proxy.refresh_usage(&account).await.unwrap_err(), error);
+    assert_eq!(published.last_error.as_ref(), Some(&error));
+    assert_eq!(proxy.refresh_usage(&account).await.unwrap(), QuotaRefreshOutcome::Suppressed);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
