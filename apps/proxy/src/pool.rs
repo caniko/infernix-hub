@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env, fs,
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
@@ -10,7 +10,7 @@ use anyhow::{Result, anyhow, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use contracts::providers::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -53,6 +53,7 @@ impl Lane {
 #[derive(Clone, Copy)]
 enum QuotaTarget<'a> {
     Model(&'a str),
+    Bucket(Lane, &'a str),
     GoogleGemini,
 }
 
@@ -69,6 +70,12 @@ pub(crate) fn window_applies_to_model(w: &QuotaWindow, model: &str) -> bool {
 fn window_applies(w: &QuotaWindow, target: QuotaTarget<'_>) -> bool {
     if w.kind == QuotaWindowKind::Spend || w.unit == QuotaUnit::Credits {
         return false;
+    }
+    if let QuotaTarget::Bucket(lane, scope) = target {
+        return w
+            .scope_model
+            .as_deref()
+            .is_none_or(|s| if lane == Lane::Google { google_bucket(s) == scope } else { s.eq_ignore_ascii_case(scope) });
     }
     let QuotaTarget::Model(model) = target else {
         let key = w.window_key.to_ascii_lowercase();
@@ -104,13 +111,23 @@ fn window_applies(w: &QuotaWindow, target: QuotaTarget<'_>) -> bool {
     match scope.as_str() {
         _ if scope.contains("argon") => gemini && argon,
         "gemini" => gemini && !argon,
-        "claude & gpt (shared)" | "claude-gpt" => claude || gpt,
+        "3p" | "claude & gpt (shared)" | "claude-gpt" => claude || gpt,
         "claude" => claude,
         "gpt" => gpt,
         "opus" | "claude opus" => model.contains("opus"),
         "sonnet" | "claude sonnet" => model.contains("sonnet"),
         "haiku" | "claude haiku" => model.contains("haiku"),
         _ => model == scope || model.starts_with(&format!("{scope}-")) || (!scope.contains(' ') && model.contains(&scope)),
+    }
+}
+
+fn google_bucket(scope: &str) -> String {
+    let scope = scope.to_ascii_lowercase();
+    match scope.as_str() {
+        _ if scope.starts_with("gemini") && scope.contains("argon") => "gemini-argon".into(),
+        _ if scope.starts_with("gemini") => "gemini".into(),
+        _ if scope.starts_with("claude") || scope.starts_with("gpt") => "3p".into(),
+        _ => scope,
     }
 }
 
@@ -131,7 +148,9 @@ pub(crate) fn model_cooldown_scope(lane: Lane, model: &str) -> Option<String> {
 pub(crate) fn enforces_quota(w: &QuotaWindow) -> bool {
     w.kind != QuotaWindowKind::Spend
         && w.unit != QuotaUnit::Credits
-        && (w.status == QuotaStatus::Rejected || w.used_percent.is_some_and(|n| n >= 100.0))
+        && (w.status == QuotaStatus::Rejected
+            || (w.unit == QuotaUnit::Percent && effective_remaining_percent_at(w, &[], Utc::now()) == Some(0.0))
+            || w.used_percent.is_some_and(|n| n >= 100.0))
 }
 
 pub(crate) fn quota_window_active(lane: Lane, w: &QuotaWindow, now: DateTime<Utc>) -> bool {
@@ -145,7 +164,7 @@ pub(crate) fn bounded_identifier(model: &str) -> bool {
     !model.is_empty() && model.len() <= 192 && model.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-:/".contains(&b))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cooldown {
     pub until: DateTime<Utc>,
     pub verified_reset: bool,
@@ -170,7 +189,7 @@ struct PendingQuota {
 
 impl PendingQuota {
     fn blocks_verification(&self, now: DateTime<Utc>) -> bool {
-        self.reader.strong_count() != 0 || self.unverified_until.or(self.provisional.map(|c| c.until)).is_some_and(|until| until > now)
+        self.reader.strong_count() != 0 || self.unverified_until.max(self.provisional.map(|c| c.until)).is_some_and(|until| until > now)
     }
 }
 
@@ -189,6 +208,9 @@ pub struct Account {
     pub note: Option<String>,
     pub plan: Option<String>,
     pub multiplier: Option<f64>,
+    pub(super) auth_plan: Option<String>,
+    pub(super) auth_multiplier: Option<f64>,
+    pub(super) observed_plan: Option<String>,
     pub access: String,
     pub refresh: Option<String>,
     // In-memory only: labels on disk can still contain retired credentials.
@@ -401,6 +423,21 @@ impl Account {
             && self.google_secret == other.google_secret
     }
 
+    pub(crate) fn stable_credential_fingerprint(&self) -> String {
+        let identity = if self.api_key {
+            // This field holds the static key for API-key accounts, not an OAuth access token.
+            ("api_key", Some(self.access.as_str()))
+        } else if let Some(enrollment) = &self.provenance_enrollment {
+            ("enrollment", Some(enrollment.as_str()))
+        } else if let Some(refresh) = &self.refresh {
+            ("refresh_token", Some(refresh.as_str()))
+        } else {
+            ("account", self.chatgpt_user.as_deref().or(self.chatgpt_id.as_deref()).or(self.email.as_deref()))
+        };
+        let material = json!([self.lane.name(), self.auth_index, self.provider, identity, self.project]);
+        hex::encode(Sha256::digest(material.to_string()))
+    }
+
     pub fn record_account_error(&mut self, mut err: AccountError, now: DateTime<Utc>, backoff: Option<Duration>) -> bool {
         if err.source != AccountErrorSource::QuotaProbe {
             self.error_generation = self.error_generation.saturating_add(1);
@@ -450,6 +487,15 @@ impl Account {
         self.last_error.as_ref().filter(|error| error.blocks_routing(now))
     }
 
+    fn transient_recovery(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let error = self.active_quarantine(now)?;
+        error.kind.is_transient().then_some(error.backoff_until).flatten().filter(|until| *until > now)
+    }
+
+    fn quota_backoff(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.active_quarantine(now).filter(|e| e.kind == AccountErrorKind::QuotaExhausted)?.backoff_until.filter(|until| *until > now)
+    }
+
     pub(crate) fn has_account_error(&self) -> bool {
         self.reported_error().map_or(self.probe_failed, |err| err.blocks_routing(Utc::now()) || err.kind == AccountErrorKind::ProbeFailed)
     }
@@ -483,18 +529,32 @@ impl Account {
     }
 
     fn scoped_cooldown(&self, target: QuotaTarget<'_>) -> Option<Cooldown> {
+        let scope = self.target_cooldown_scope(target)?;
+        self.quota_cooldown(Some(&scope))
+    }
+
+    fn target_cooldown_scope(&self, target: QuotaTarget<'_>) -> Option<String> {
         match target {
-            QuotaTarget::Model(model) => model_cooldown_scope(self.lane, model).and_then(|scope| self.quota_cooldown(Some(&scope))),
-            QuotaTarget::GoogleGemini => self.quota_cooldown(Some("gemini")),
+            QuotaTarget::Model(model) => model_cooldown_scope(self.lane, model),
+            QuotaTarget::GoogleGemini => Some("gemini".into()),
+            QuotaTarget::Bucket(Lane::Google, scope) => Some(scope.to_owned()),
+            QuotaTarget::Bucket(..) => None,
         }
     }
 
     fn quota_cooldown(&self, scope: Option<&str>) -> Option<Cooldown> {
-        let settled = scope.map_or(self.cooldown, |scope| self.scoped_cooldowns.get(scope).copied());
+        let matches = |saved| self.same_cooldown_scope(saved, scope);
+        let settled = scope.map_or(self.cooldown, |_| {
+            self.scoped_cooldowns.iter().filter(|(key, _)| matches(Some(key))).map(|(_, cooldown)| *cooldown).reduce(Cooldown::merge)
+        });
         settled
             .into_iter()
-            .chain(self.pending_quota.iter().filter(|pending| pending.scope.as_deref() == scope).filter_map(|pending| pending.provisional))
+            .chain(self.pending_quota.iter().filter(|pending| matches(pending.scope.as_deref())).filter_map(|pending| pending.provisional))
             .reduce(Cooldown::merge)
+    }
+
+    fn same_cooldown_scope(&self, saved: Option<&str>, scope: Option<&str>) -> bool {
+        saved == scope || (self.lane == Lane::Google && saved.zip(scope).is_some_and(|(saved, scope)| google_bucket(saved) == scope))
     }
 
     pub(crate) fn begin_google_quota_read(
@@ -540,15 +600,100 @@ impl Account {
         });
     }
 
+    #[cfg(test)]
     pub(super) fn has_unverified_google_quota_read(&self, model: &str, now: DateTime<Utc>) -> bool {
-        let scope = model_cooldown_scope(self.lane, model);
+        self.has_unverified_quota_read(QuotaTarget::Model(model), now)
+    }
+
+    fn has_unverified_quota_read(&self, target: QuotaTarget<'_>, now: DateTime<Utc>) -> bool {
+        let scope = self.target_cooldown_scope(target);
         // An unread or failed body still blocks verification until its own backoff expires,
         // even if a longer cooldown wins the legacy routing decision.
-        self.pending_quota.iter().any(|pending| (pending.scope.is_none() || pending.scope == scope) && pending.blocks_verification(now))
+        self.pending_quota.iter().any(|pending| {
+            (pending.scope.is_none() || self.same_cooldown_scope(pending.scope.as_deref(), scope.as_deref()))
+                && pending.blocks_verification(now)
+        })
     }
 
     fn active_quota_windows<'a>(&'a self, now: DateTime<Utc>, target: QuotaTarget<'a>) -> impl Iterator<Item = &'a QuotaWindow> {
-        self.windows.iter().filter(move |w| window_applies(w, target) && enforces_quota(w) && quota_window_active(self.lane, w, now))
+        self.windows.iter().filter(move |w| {
+            window_applies(w, target)
+                && quota_window_active(self.lane, w, now)
+                && (enforces_quota(w)
+                    || (w.unit == QuotaUnit::Percent
+                        && self.effective_percent(w, now) == Some(0.0)
+                        // An inherited limit has the longer window's deadline, not the short window's.
+                        && !self.windows.iter().any(|longer| {
+                            window_binds(longer, w)
+                                && window_applies(longer, target)
+                                && quota_window_active(self.lane, longer, now)
+                                && enforces_quota(longer)
+                        })))
+        })
+    }
+
+    fn effective_percent(&self, window: &QuotaWindow, now: DateTime<Utc>) -> Option<f64> {
+        if self.lane == Lane::Google
+            && self.windows.iter().any(|w| w.resets_at.is_none() && window_binds(w, window) && !quota_window_active(self.lane, w, now))
+        {
+            // Google also ages out resetless evidence on a local TTL.
+            let active = self.windows.iter().filter(|w| quota_window_active(self.lane, w, now)).cloned().collect::<Vec<_>>();
+            effective_remaining_percent_at(window, &active, now)
+        } else {
+            effective_remaining_percent_at(window, &self.windows, now)
+        }
+    }
+
+    fn capacity_multiplier(&self) -> f64 {
+        self.multiplier.filter(|m| m.is_finite() && *m > 0.0).unwrap_or(1.0)
+    }
+
+    fn percent_windows<'a>(&'a self, target: QuotaTarget<'a>) -> impl Iterator<Item = &'a QuotaWindow> {
+        self.windows.iter().filter(move |w| w.unit == QuotaUnit::Percent && w.kind != QuotaWindowKind::Spend && window_applies(w, target))
+    }
+
+    fn capacity_score(&self, now: DateTime<Utc>, target: QuotaTarget<'_>, in_flight: usize) -> CapacityScore {
+        let idle_clock = |w: &QuotaWindow| {
+            w.resets_at.is_none()
+                && w.observation_state == QuotaObservationState::Measured
+                && !w.stale
+                && w.remaining_percent.map_or_else(|| w.used_percent.is_some_and(|u| u <= 0.0), |r| r >= 100.0)
+        };
+        let windows = || {
+            self.percent_windows(target)
+                .filter(|w| quota_window_active(self.lane, w, now) || idle_clock(w))
+                .filter_map(|w| Some((w, self.effective_percent(w, now)? / 100.0, infer_window_duration_mins(w))))
+        };
+        let tie = |a: &(&QuotaWindow, f64, Option<u32>), b: &(&QuotaWindow, f64, Option<u32>)| {
+            b.1.total_cmp(&a.1).then_with(|| b.0.window_key.cmp(&a.0.window_key))
+        };
+        let is_rolling =
+            |(w, _, mins): &(&QuotaWindow, f64, Option<u32>)| w.kind == QuotaWindowKind::Session || mins.is_some_and(|m| m <= 1440);
+        let session = windows().max_by(|a, b| {
+            is_rolling(a).cmp(&is_rolling(b)).then_with(|| b.2.unwrap_or(u32::MAX).cmp(&a.2.unwrap_or(u32::MAX))).then_with(|| tie(a, b))
+        });
+        let weekly = windows().filter(|(w, _, mins)| w.kind == QuotaWindowKind::Weekly || mins.is_some_and(|m| m > 1440)).max_by(|a, b| {
+            let rank = |(w, _, mins): &(&QuotaWindow, f64, Option<u32>)| mins.map(|m| (w.kind == QuotaWindowKind::Weekly || m <= 10080, m));
+            rank(a).cmp(&rank(b)).then_with(|| tie(a, b))
+        });
+        let hours = |reset: DateTime<Utc>| ((reset - now).num_seconds().max(0) as f64 / 3600.0).max(1.0);
+        // With zero measured buckets keep routing available, but do not rank unknown headroom as full.
+        let session_left = session.map(|(_, left, _)| left);
+        let rolling = session.filter(is_rolling).map(|(w, _, _)| w);
+        let multiplier = self.capacity_multiplier();
+        let rate = weekly.or(session).map(|(w, left, mins)| {
+            let hours = w.resets_at.map_or((f64::from(mins.unwrap_or(300)) / 60.0).max(1.0), hours);
+            (multiplier * left / hours) / (1.0 + in_flight as f64)
+        });
+        CapacityScore {
+            session_left,
+            session_capacity: multiplier * session_left.unwrap_or(0.0),
+            rate,
+            multiplier,
+            in_flight,
+            active: rolling.is_none_or(|w| w.resets_at.is_some_and(|r| r > now) || w.used_percent.is_some_and(|u| u > 0.0)),
+            idle: rolling.is_some_and(idle_clock),
+        }
     }
 
     pub fn quota_limited_until(&self, now: DateTime<Utc>, model: &str) -> Option<DateTime<Utc>> {
@@ -557,17 +702,62 @@ impl Account {
 
     fn quota_limited_until_for(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> Option<DateTime<Utc>> {
         self.active_quota_windows(now, target)
-            .map(|w| {
-                w.resets_at.unwrap_or_else(|| {
-                    if self.lane == Lane::Google {
-                        w.observed_at.map_or(DateTime::<Utc>::MAX_UTC, |at| at + chrono::TimeDelta::hours(1))
-                    } else {
-                        DateTime::<Utc>::MAX_UTC
-                    }
-                })
-            })
+            .map(|w| self.window_recovery(w).unwrap_or(DateTime::<Utc>::MAX_UTC))
             .chain(self.quota_cooldown(None).into_iter().chain(self.scoped_cooldown(target)).map(|c| c.until).filter(|until| *until > now))
+            .chain(self.quota_backoff(now))
             .max()
+    }
+
+    fn window_recovery(&self, w: &QuotaWindow) -> Option<DateTime<Utc>> {
+        w.resets_at
+            .or_else(|| (self.lane == Lane::Google).then_some(w.observed_at).flatten()?.checked_add_signed(chrono::TimeDelta::hours(1)))
+    }
+
+    fn bounded_recovery(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> Option<DateTime<Utc>> {
+        let quarantine = if self.active_quarantine(now).is_some() {
+            Some(self.transient_recovery(now).or_else(|| self.quota_backoff(now))?)
+        } else {
+            None
+        };
+        let window_reset =
+            self.active_quota_windows(now, target).try_fold(None, |latest, w| Some(latest.max(Some(self.window_recovery(w)?))))?;
+        let cooldown =
+            self.quota_cooldown(None).into_iter().chain(self.scoped_cooldown(target)).map(|c| c.until).filter(|at| *at > now).max();
+        window_reset.max(cooldown).max(quarantine).filter(|at| *at != DateTime::<Utc>::MAX_UTC)
+    }
+
+    fn eligibility_blockers(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> (Vec<&'static str>, Option<DateTime<Utc>>) {
+        let horizon = chrono::TimeDelta::seconds(MAX_COOLDOWN_SECS);
+        let mut reasons = Vec::new();
+        let mut latest = Some(now);
+        let mut block = |reason, at: Option<DateTime<Utc>>| {
+            reasons.push(reason);
+            latest = latest.zip(at.filter(|at| *at > now && *at - now <= horizon)).map(|(old, at)| old.max(at));
+        };
+        if let Some(error) = self.active_quarantine(now) {
+            block(if error.kind == AccountErrorKind::AuthExpired { "auth_cooldown" } else { "quarantined" }, None);
+        }
+        for (reason, cooldown) in [("global_cooldown", self.quota_cooldown(None)), ("scoped_cooldown", self.scoped_cooldown(target))] {
+            if let Some(c) = cooldown.filter(|c| c.until > now) {
+                block(reason, c.verified_reset.then_some(c.until));
+            }
+        }
+        let mut windows = self.active_quota_windows(now, target).peekable();
+        if windows.peek().is_some() {
+            // A cached reset must have been credible when measured, not just when read.
+            let reset = windows.try_fold(now, |latest, w| {
+                let (observed, at) = (w.observed_at?, w.resets_at?);
+                (!w.stale
+                    && w.observation_state == QuotaObservationState::Measured
+                    && observed <= now
+                    && observed < at
+                    && at - observed <= horizon)
+                    .then_some(latest.max(at))
+            });
+            block("quota_window", reset);
+        }
+        let verified = latest.filter(|_| !reasons.is_empty() && !self.has_unverified_quota_read(target, now));
+        (reasons, verified)
     }
 
     fn google_preview_targets(&self) -> Vec<QuotaTarget<'_>> {
@@ -589,7 +779,9 @@ impl Account {
 
     fn eligible_quota_targets<'a>(&'a self, now: DateTime<Utc>, target: QuotaTarget<'a>) -> Vec<QuotaTarget<'a>> {
         match target {
-            QuotaTarget::Model(_) => self.quota_limited_until_for(now, target).is_none().then_some(target).into_iter().collect(),
+            QuotaTarget::Model(_) | QuotaTarget::Bucket(..) => {
+                self.quota_limited_until_for(now, target).is_none().then_some(target).into_iter().collect()
+            }
             QuotaTarget::GoogleGemini => {
                 self.google_preview_targets().into_iter().filter(|t| self.quota_limited_until_for(now, *t).is_none()).collect()
             }
@@ -601,7 +793,7 @@ impl Account {
             return false;
         }
         match target {
-            QuotaTarget::Model(_) => self.quota_limited_until_for(now, target).is_none(),
+            QuotaTarget::Model(_) | QuotaTarget::Bucket(..) => self.quota_limited_until_for(now, target).is_none(),
             QuotaTarget::GoogleGemini => !self.eligible_quota_targets(now, target).is_empty(),
         }
     }
@@ -626,7 +818,7 @@ impl Account {
 
     fn soonest_reset(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> (DateTime<Utc>, DateTime<Utc>, std::cmp::Reverse<i32>) {
         let (weekly, session) = match target {
-            QuotaTarget::Model(_) => self.reset_pair(now, target),
+            QuotaTarget::Model(_) | QuotaTarget::Bucket(..) => self.reset_pair(now, target),
             QuotaTarget::GoogleGemini => self
                 .eligible_quota_targets(now, target)
                 .into_iter()
@@ -648,7 +840,7 @@ impl Account {
                 .fold(0.0_f64, f64::max)
         };
         match target {
-            QuotaTarget::Model(_) => score(&|w| window_applies(w, target)),
+            QuotaTarget::Model(_) | QuotaTarget::Bucket(..) => score(&|w| window_applies(w, target)),
             QuotaTarget::GoogleGemini => {
                 let targets = self.eligible_quota_targets(now, target);
                 score(&|w| targets.iter().any(|t| window_applies(w, *t)))
@@ -672,8 +864,19 @@ impl Account {
             "cooldown_until": self.cooldown_until(), "observed_at": self.observed, "last_used_at": self.last_used,
             "last_error": self.reported_error(),
             "preferred": pool.preferred(self.lane) == Some(self.id.as_str()),
-            "plan": self.plan.as_ref().map(|p| json!({"tier":p,"label":p,"multiplier":self.multiplier})),
         });
+        if self.plan.is_some() || self.multiplier.is_some() {
+            let mut plan = serde_json::Map::new();
+            if let Some(name) = &self.plan {
+                for key in ["name", "tier", "label"] {
+                    plan.insert(key.into(), json!(name));
+                }
+            }
+            if let Some(multiplier) = self.multiplier {
+                plan.insert("multiplier".into(), json!(multiplier));
+            }
+            row["plan"] = Value::Object(plan);
+        }
         if let Some(email) = &self.email {
             row["email"] = json!(email);
         }
@@ -859,10 +1062,29 @@ fn parse_credentials_with_options(
                     .map(str::to_owned)
             })
             .flatten();
-        let plan =
-            text(entry, &["plan", "plan_type", "/id_token/plan_type", "/id_token/chatgpt_plan_type", "/claudeAiOauth/subscriptionType"])
-                .or_else(|| text(chat, &["chatgpt_plan_type"]))
-                .map(str::to_owned);
+        let auth_plan = [entry, group, raw]
+            .into_iter()
+            .find_map(|record| {
+                text(
+                    record,
+                    &[
+                        "plan",
+                        "/plan/tier",
+                        "plan_type",
+                        "/id_token/plan_type",
+                        "/id_token/chatgpt_plan_type",
+                        "/claudeAiOauth/subscriptionType",
+                    ],
+                )
+            })
+            .map(str::to_owned);
+        let observed_plan = text(chat, &["chatgpt_plan_type"]).map(str::to_owned);
+        let auth_multiplier = [entry, group, raw].into_iter().find_map(|record| {
+            record["tier_multiplier"]
+                .as_f64()
+                .or_else(|| record.pointer("/plan/multiplier").and_then(Value::as_f64))
+                .filter(|n| n.is_finite() && *n > 0.0)
+        });
         let entry_obj = entry.as_object();
         let disabled = match entry_obj
             .and_then(|o| o.get("disabled").and_then(Value::as_bool))
@@ -895,16 +1117,16 @@ fn parse_credentials_with_options(
             lane,
             provider: if api_key && lane == Lane::Codex { "openai" } else { lane.name() },
             label: text(entry, &["label"]).or_else(|| text(raw, &["label", "name"])).unwrap_or(name).into(),
-            email: text(entry, &["email"]).or_else(|| text(&claims, &["email"])).map(str::to_owned),
+            email: text(entry, &["email"]).or_else(|| text(raw, &["email"])).or_else(|| text(&claims, &["email"])).map(str::to_owned),
             note,
-            plan,
+            plan: auth_plan.clone().or_else(|| observed_plan.clone()),
             disabled,
             priority,
             weight,
-            multiplier: raw["tier_multiplier"]
-                .as_f64()
-                .or_else(|| raw.pointer("/plan/multiplier").and_then(Value::as_f64))
-                .filter(|n| *n > 0.0),
+            multiplier: auth_multiplier,
+            auth_plan,
+            auth_multiplier,
+            observed_plan,
             access: access.into(),
             refresh: refresh.map(str::to_owned),
             redacted_labels: HashMap::new(),
@@ -958,6 +1180,111 @@ fn parse_credentials_with_options(
 }
 
 type Session = (Lane, String);
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct CooldownState {
+    version: u32,
+    accounts: BTreeMap<String, AccountQuotaState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unmatched_accounts: Vec<(String, AccountQuotaState)>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct SavedQuotaSuppression {
+    scope: Option<String>,
+    provisional: Option<Cooldown>,
+    unverified_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct AccountQuotaState {
+    route: String,
+    lane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quota_backoff_until: Option<DateTime<Utc>>,
+    cooldown: Option<Cooldown>,
+    scoped_cooldowns: BTreeMap<String, Cooldown>,
+    #[serde(default)]
+    pending_quota: Vec<SavedQuotaSuppression>,
+    windows: Vec<QuotaWindow>,
+    observed: Option<DateTime<Utc>>,
+    grants: Vec<ResetGrant>,
+    google_fallback_keys: BTreeSet<String>,
+}
+
+impl AccountQuotaState {
+    fn route(account: &Account) -> String {
+        let route = json!([
+            account.lane.name(),
+            account.api_key,
+            account.project,
+            account.base.as_ref().map(|url| url.as_str()),
+            account.chatgpt_id,
+            account.chatgpt_user,
+        ]);
+        hex::encode(Sha256::digest(route.to_string()))
+    }
+
+    fn retain_current(&mut self, lane: Lane, now: DateTime<Utc>) {
+        self.cooldown = self.cooldown.filter(|c| c.until > now);
+        self.quota_backoff_until = self.quota_backoff_until.filter(|at| *at > now);
+        let valid_scope = |scope: &str| {
+            if lane == Lane::Google { bounded_identifier(&google_bucket(scope)) } else { bounded_identifier(scope) }
+        };
+        self.scoped_cooldowns.retain(|scope, c| valid_scope(scope) && c.until > now);
+        let horizon = chrono::TimeDelta::seconds(MAX_COOLDOWN_SECS);
+        self.pending_quota.retain_mut(|pending| {
+            let valid = |at: DateTime<Utc>| at > now && at - now <= horizon;
+            pending.provisional = pending.provisional.filter(|c| valid(c.until)).map(|c| Cooldown { verified_reset: false, ..c });
+            pending.unverified_until = pending.unverified_until.filter(|at| valid(*at));
+            lane == Lane::Google
+                && pending.scope.as_deref().is_none_or(valid_scope)
+                && (pending.provisional.is_some() || pending.unverified_until.is_some())
+        });
+        self.windows.retain(|w| {
+            !w.window_key.is_empty()
+                && w.observed_at.is_none_or(|at| at <= now)
+                && (w.observed_at.is_some() || w.resets_at.is_some())
+                && (matches!(w.observation_state, QuotaObservationState::Measured | QuotaObservationState::StaleLastGood)
+                    || enforces_quota(w)
+                    || w.used_percent.is_some()
+                    || w.remaining_percent.is_some())
+                && quota_window_active(lane, w, now)
+        });
+        self.observed = self.observed.filter(|at| *at <= now);
+        self.grants.retain(|g| !g.grant_id.is_empty() && g.checked_at <= now && g.expires_at.is_none_or(|at| at > now));
+        self.google_fallback_keys.retain(|key| self.windows.iter().any(|w| &w.window_key == key));
+    }
+
+    fn has_evidence(&self) -> bool {
+        self.cooldown.is_some()
+            || self.quota_backoff_until.is_some()
+            || !self.scoped_cooldowns.is_empty()
+            || !self.pending_quota.is_empty()
+            || !self.windows.is_empty()
+            || self.observed.is_some()
+            || !self.grants.is_empty()
+    }
+
+    fn retain_unmatched(&mut self, now: DateTime<Utc>) -> bool {
+        let Some(lane) = self.lane.as_deref().and_then(Lane::parse) else { return false };
+        self.retain_current(lane, now);
+        // The last observation's timestamp alone has no active evidence to restore.
+        (self.credential_fingerprint.is_some() || self.source_fingerprint.is_some())
+            && (self.cooldown.is_some()
+                || self.quota_backoff_until.is_some()
+                || !self.scoped_cooldowns.is_empty()
+                || !self.pending_quota.is_empty()
+                || !self.windows.is_empty()
+                || !self.grants.is_empty())
+    }
+}
+
+pub(crate) const COOLDOWN_STATE_FILE: &str = "cooldown-state.json";
 
 #[derive(Serialize)]
 pub(crate) struct ModelEligibility<'a> {
@@ -1029,9 +1356,229 @@ pub struct Pool {
     affinity: HashMap<Session, (String, Instant)>,
     parents: HashMap<Session, String>,
     api_key_conflicts: BTreeSet<(Lane, [u8; 32])>,
+    undiscovered_cooldowns: Vec<(String, AccountQuotaState)>,
+    account_defaults: BTreeMap<String, Value>,
+    account_overrides: BTreeMap<String, AccountOverride>,
+    in_flight: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+const AMPLE_SESSION_HEADROOM: f64 = 0.05;
+
+struct CapacityScore {
+    session_left: Option<f64>,
+    session_capacity: f64,
+    rate: Option<f64>,
+    multiplier: f64,
+    in_flight: usize,
+    active: bool,
+    idle: bool,
+}
+
+impl CapacityScore {
+    fn ample(&self) -> bool {
+        self.session_left.is_some_and(|left| left >= AMPLE_SESSION_HEADROOM)
+    }
+}
+
+pub(crate) struct InFlightGuard {
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+    id: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = counts.entry(std::mem::take(&mut self.id)) {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
+
+const ACCOUNT_OVERRIDES_FILE: &str = "account-overrides.json";
+
+#[derive(Default, Clone, Deserialize, Serialize)]
+pub(crate) struct AccountOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nullable")]
+    pub note: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nullable")]
+    pub plan: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nullable")]
+    pub tier_multiplier: Option<Option<f64>>,
+}
+
+fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
+    Option::deserialize(d).map(Some)
+}
+
+impl AccountOverride {
+    fn matches(&self, account: &Account) -> bool {
+        self.credential_fingerprint.as_ref().is_some_and(|fp| *fp == account.stable_credential_fingerprint())
+    }
+
+    fn has_metadata(&self) -> bool {
+        self.disabled.is_some() || self.priority.is_some() || self.weight.is_some() || self.note.is_some()
+    }
+
+    fn clear_metadata(&mut self) {
+        self.disabled = None;
+        self.priority = None;
+        self.weight = None;
+        self.note = None;
+    }
+
+    fn merge(&mut self, changes: Self) {
+        self.disabled = changes.disabled.or(self.disabled);
+        self.priority = changes.priority.or(self.priority);
+        self.weight = changes.weight.or(self.weight);
+        self.note = changes.note.or(self.note.take());
+        self.plan = changes.plan.or(self.plan.take());
+        self.tier_multiplier = changes.tier_multiplier.or(self.tier_multiplier);
+    }
+
+    fn apply(&self, account: &mut Account) {
+        // Managed auth JSON is authoritative even if an older override still has duplicates.
+        if account.local {
+            account.disabled = self.disabled.unwrap_or(account.disabled);
+            account.priority = self.priority.unwrap_or(account.priority);
+            account.weight = self.weight.unwrap_or(account.weight);
+            if let Some(note) = &self.note {
+                account.note.clone_from(note);
+            }
+        }
+        if let Some(plan) = &self.plan {
+            account.plan.clone_from(plan);
+        }
+        if let Some(multiplier) = self.tier_multiplier {
+            account.multiplier = multiplier.filter(|m| m.is_finite() && *m > 0.0);
+        }
+    }
+}
+
+fn apply_account_settings(defaults: &BTreeMap<String, Value>, overrides: &BTreeMap<String, AccountOverride>, account: &mut Account) {
+    account.plan.clone_from(&account.auth_plan);
+    account.multiplier = account.auth_multiplier;
+    let stem = account.name.strip_suffix(".json").unwrap_or(&account.name);
+    for key in [Some(account.id.as_str()), Some(stem), Some(account.label.as_str()), account.email.as_deref()].into_iter().flatten() {
+        if let Some(entry) = defaults.get(&key.to_lowercase()) {
+            if account.plan.is_none() {
+                account.plan =
+                    entry["plan"].as_str().map(str::trim).filter(|s| !s.is_empty() && s.chars().count() <= 128).map(str::to_owned);
+            }
+            if account.multiplier.is_none() {
+                account.multiplier = entry["tier_multiplier"].as_f64().filter(|m| m.is_finite() && *m > 0.0);
+            }
+        }
+    }
+    if account.plan.is_none() {
+        account.plan.clone_from(&account.observed_plan);
+    }
+    if let Some(settings) = overrides.get(&account.id).filter(|settings| settings.matches(account)) {
+        settings.apply(account);
+    }
 }
 
 impl Pool {
+    pub(crate) fn acquire_in_flight(&self, id: &str) -> InFlightGuard {
+        *self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).entry(id.to_owned()).or_default() += 1;
+        InFlightGuard { counts: self.in_flight.clone(), id: id.to_owned() }
+    }
+
+    pub(crate) fn apply_account_settings(&self, account: &mut Account) {
+        apply_account_settings(&self.account_defaults, &self.account_overrides, account);
+    }
+
+    pub(crate) fn refresh_account_settings(&mut self, id: &str) -> Option<&Account> {
+        let account = self.accounts.get_mut(id)?;
+        apply_account_settings(&self.account_defaults, &self.account_overrides, account);
+        Some(account)
+    }
+
+    fn commit_account_overrides(
+        &mut self,
+        state_dir: &Path,
+        next: BTreeMap<String, AccountOverride>,
+        credential_change: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let path = state_dir.join(ACCOUNT_OVERRIDES_FILE);
+        let previous = serde_json::to_vec_pretty(&self.account_overrides)?;
+        let updated = serde_json::to_vec_pretty(&next)?;
+        if previous != updated {
+            crate::config::write_private(&path, &updated, true)?;
+        }
+        if let Err(error) = credential_change() {
+            if previous != updated
+                && let Err(rollback) = crate::config::write_private(&path, &previous, true)
+            {
+                tracing::error!(%rollback, "could not roll back proxy account overrides");
+            }
+            return Err(error);
+        }
+        self.account_overrides = next;
+        Ok(())
+    }
+
+    pub(crate) fn save_account_override(
+        &mut self,
+        state_dir: &Path,
+        id: &str,
+        mut changes: AccountOverride,
+        clean_managed_metadata: bool,
+    ) -> Result<()> {
+        let account = self.accounts.get(id).ok_or_else(|| anyhow!("account disappeared during credential edit"))?;
+        if !account.local {
+            changes.clear_metadata();
+        }
+        let previous = self.account_overrides.get(id);
+        if !changes.has_metadata()
+            && changes.plan.is_none()
+            && changes.tier_multiplier.is_none()
+            && !(clean_managed_metadata && previous.is_some_and(AccountOverride::has_metadata))
+        {
+            return Ok(());
+        }
+        let mut updated = previous.filter(|settings| settings.matches(account)).cloned().unwrap_or_default();
+        if !account.local {
+            updated.clear_metadata();
+        }
+        updated.merge(changes);
+        let mut next = self.account_overrides.clone();
+        if updated.has_metadata() || updated.plan.is_some() || updated.tier_multiplier.is_some() {
+            updated.credential_fingerprint = Some(account.stable_credential_fingerprint());
+            next.insert(id.to_owned(), updated);
+        } else {
+            next.remove(id);
+        }
+        self.commit_account_overrides(state_dir, next, || Ok(()))?;
+        self.refresh_account_settings(id);
+        Ok(())
+    }
+
+    pub(crate) fn remove_account_overrides(
+        &mut self,
+        state_dir: &Path,
+        ids: &[String],
+        credential_change: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut next = self.account_overrides.clone();
+        for id in ids {
+            next.remove(id);
+        }
+        self.commit_account_overrides(state_dir, next, credential_change)?;
+        self.undiscovered_cooldowns.retain(|(id, _)| !ids.contains(id));
+        Ok(())
+    }
+
     pub(crate) fn record_api_key_conflict(&mut self, account: &Account) {
         let mut changed = false;
         for fp in account.credential_fingerprints() {
@@ -1117,7 +1664,38 @@ impl Pool {
         }
     }
     pub fn load(config: &Config) -> Result<Self> {
-        let mut pool = Self::default();
+        #[derive(Deserialize)]
+        struct Defaults {
+            version: u32,
+            accounts: BTreeMap<String, Value>,
+        }
+        let account_defaults = config.account_defaults_file.as_deref().and_then(|path| {
+            if let Some(file) = read_json(path).and_then(|raw| serde_json::from_value::<Defaults>(raw).ok()).filter(|f| f.version == 1) {
+                return Some(file.accounts.into_iter().map(|(key, value)| (key.to_lowercase(), value)).collect());
+            }
+            tracing::warn!(path = %path.display(), "could not load proxy account defaults (expected version 1)");
+            None
+        });
+        let path = config.state_dir.join(ACCOUNT_OVERRIDES_FILE);
+        let account_overrides = match crate::config::read_text(&path) {
+            Ok(None) => None,
+            Ok(Some(raw)) => match serde_json::from_str(&raw) {
+                Ok(settings) => Some(settings),
+                Err(_) => {
+                    tracing::warn!("ignoring malformed proxy account overrides");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "could not read proxy account overrides");
+                None
+            }
+        };
+        let mut pool = Self {
+            account_defaults: account_defaults.unwrap_or_default(),
+            account_overrides: account_overrides.unwrap_or_default(),
+            ..Self::default()
+        };
         for path in paths(&config.auth_dir) {
             let Some(name) = path.file_name().and_then(|n| n.to_str()).filter(|n| filename(n)) else { continue };
             if !path.is_file() {
@@ -1134,7 +1712,129 @@ impl Pool {
         if config.discover_local {
             discover(config, &mut pool);
         }
+        pool.restore_cooldown_state(&config.state_dir.join(COOLDOWN_STATE_FILE), Utc::now());
         Ok(pool)
+    }
+
+    fn restore_cooldown_state(&mut self, path: &Path, now: DateTime<Utc>) {
+        let raw = match crate::config::read_text(path) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "could not read proxy cooldown state");
+                return;
+            }
+        };
+        let Ok(CooldownState { version: 1, accounts, unmatched_accounts }) = serde_json::from_str(&raw) else {
+            tracing::warn!("ignoring corrupt or unsupported proxy cooldown state");
+            return;
+        };
+        self.undiscovered_cooldowns = accounts.into_iter().chain(unmatched_accounts).collect();
+        self.restore_discovered_cooldowns(now);
+    }
+
+    pub(crate) fn restore_discovered_cooldowns(&mut self, now: DateTime<Utc>) {
+        self.undiscovered_cooldowns.retain_mut(|(id, saved)| {
+            if !saved.retain_unmatched(now) {
+                return false;
+            }
+            let Some(account) = self.accounts.get_mut(id) else { return true };
+            let matches = saved.credential_fingerprint.as_ref().map_or_else(
+                || saved.source_fingerprint.is_some() && account.source_fingerprint == saved.source_fingerprint,
+                |fp| *fp == account.stable_credential_fingerprint(),
+            );
+            if !matches {
+                return true;
+            }
+            if AccountQuotaState::route(account) != saved.route {
+                return true;
+            }
+            if let Some(until) = saved.quota_backoff_until
+                && account.active_quarantine(now).is_none_or(|err| err.kind == AccountErrorKind::QuotaExhausted)
+                && account.quota_backoff(now).is_none_or(|current| until > current)
+            {
+                let mut error = crate::error_classify::local_error(
+                    AccountErrorKind::QuotaExhausted,
+                    AccountErrorSource::QuotaProbe,
+                    "Quota probe backoff restored from disk.",
+                );
+                error.occurred_at = now;
+                error.backoff_until = Some(until);
+                account.last_error = Some(error);
+            }
+            if let Some(cooldown) = saved.cooldown {
+                account.cooldown = Some(account.cooldown.map_or(cooldown, |old| old.merge(cooldown)));
+            }
+            for (scope, cooldown) in std::mem::take(&mut saved.scoped_cooldowns) {
+                account.scoped_cooldowns.entry(scope).and_modify(|old| *old = old.merge(cooldown)).or_insert(cooldown);
+            }
+            account.pending_quota.extend(std::mem::take(&mut saved.pending_quota).into_iter().map(|p| PendingQuota {
+                reader: Weak::new(),
+                scope: p.scope,
+                provisional: p.provisional,
+                unverified_until: p.unverified_until,
+            }));
+            if account.observed.is_none() && account.windows.is_empty() {
+                account.windows = std::mem::take(&mut saved.windows);
+                account.observed = saved.observed;
+                account.grants = std::mem::take(&mut saved.grants);
+                account.google_fallback_keys = std::mem::take(&mut saved.google_fallback_keys);
+            }
+            false
+        });
+    }
+
+    pub(crate) fn finish_startup_discovery(&mut self, now: DateTime<Utc>) {
+        self.restore_discovered_cooldowns(now);
+    }
+
+    pub(crate) fn cooldown_state(&self, now: DateTime<Utc>) -> CooldownState {
+        let mut accounts: BTreeMap<_, _> = self
+            .accounts
+            .values()
+            .filter_map(|a| {
+                let mut pending = BTreeMap::<_, SavedQuotaSuppression>::new();
+                for p in &a.pending_quota {
+                    let entry = pending.entry(p.scope.clone()).or_insert_with(|| SavedQuotaSuppression {
+                        scope: p.scope.clone(),
+                        provisional: None,
+                        unverified_until: None,
+                    });
+                    if let Some(c) = p.provisional {
+                        entry.provisional = Some(entry.provisional.map_or(c, |old| old.merge(c)));
+                    }
+                    entry.unverified_until = entry.unverified_until.max(p.unverified_until);
+                }
+                let mut saved = AccountQuotaState {
+                    route: AccountQuotaState::route(a),
+                    lane: Some(a.lane.name().into()),
+                    source_fingerprint: None,
+                    credential_fingerprint: Some(a.stable_credential_fingerprint()),
+                    quota_backoff_until: a.quota_backoff(now),
+                    cooldown: a.cooldown,
+                    scoped_cooldowns: a.scoped_cooldowns.clone(),
+                    pending_quota: pending.into_values().collect(),
+                    windows: a.windows.clone(),
+                    observed: a.observed,
+                    grants: a.grants.clone(),
+                    google_fallback_keys: a.google_fallback_keys.clone(),
+                };
+                saved.retain_current(a.lane, now);
+                saved.has_evidence().then(|| (a.id.clone(), saved))
+            })
+            .collect();
+        let mut unmatched_accounts = Vec::new();
+        for (id, mut saved) in self.undiscovered_cooldowns.clone() {
+            if saved.retain_unmatched(now) {
+                match accounts.entry(id) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(saved);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) => unmatched_accounts.push((entry.key().clone(), saved)),
+                }
+            }
+        }
+        CooldownState { version: 1, accounts, unmatched_accounts }
     }
 
     #[cfg(test)]
@@ -1211,6 +1911,9 @@ impl Pool {
                     if a.email.is_none() {
                         a.email.clone_from(&old.email);
                     }
+                    if a.observed_plan.is_none() {
+                        a.observed_plan.clone_from(&old.observed_plan);
+                    }
                     if a.local {
                         a.label = crate::error_classify::safe_label(old);
                     }
@@ -1237,9 +1940,11 @@ impl Pool {
             } else {
                 a.scrub_label(&[]);
             }
+            self.apply_account_settings(&mut a);
             self.accounts.insert(a.id.clone(), a);
         }
         self.propagate_api_key_conflicts();
+        self.restore_discovered_cooldowns(Utc::now());
     }
 
     pub fn find(&self, id: &str) -> Option<&Account> {
@@ -1278,13 +1983,13 @@ impl Pool {
         filter: &AccountFilter<'a>,
         now: DateTime<Utc>,
     ) -> Option<ModelEligibility<'a>> {
+        bounded_identifier(filter.model).then(|| self.evaluate_eligibility(filter, now))
+    }
+
+    fn evaluate_eligibility<'a>(&'a self, filter: &AccountFilter<'a>, now: DateTime<Utc>) -> ModelEligibility<'a> {
         let lane = filter.lane;
         let model = filter.model;
         let required_project = filter.required_project;
-        if !bounded_identifier(model) {
-            return None;
-        }
-        let horizon = chrono::TimeDelta::seconds(MAX_COOLDOWN_SECS);
         let mut evaluation = ModelEligibility {
             snapshot_at: now,
             lane: lane.name(),
@@ -1302,43 +2007,11 @@ impl Pool {
                 reasons.push(reason);
             } else {
                 evaluation.supported_accounts += 1;
-                let mut account_reset = None;
-                let mut complete = true;
-                let mut block = |reason, reset_at: Option<DateTime<Utc>>| {
-                    reasons.push(reason);
-                    if let Some(at) = reset_at.filter(|at| *at > now && *at - now <= horizon) {
-                        account_reset = account_reset.max(Some(at));
-                    } else {
-                        complete = false;
-                    }
-                };
-                if let Some(error) = account.active_quarantine(now) {
-                    let reason = if error.kind == AccountErrorKind::AuthExpired { "auth_cooldown" } else { "quarantined" };
-                    block(reason, None);
-                }
-                let target = QuotaTarget::Model(model);
-                for (reason, cooldown) in
-                    [("global_cooldown", account.quota_cooldown(None)), ("scoped_cooldown", account.scoped_cooldown(target))]
-                {
-                    if let Some(c) = cooldown.filter(|c| c.until > now) {
-                        block(reason, c.verified_reset.then_some(c.until));
-                    }
-                }
-                let mut windows = account.active_quota_windows(now, target).peekable();
-                if windows.peek().is_some() {
-                    // A cached reset must have been credible when observed, not just when read.
-                    let reset = windows.try_fold(now, |latest, w| {
-                        let (observed, at) = (w.observed_at?, w.resets_at?);
-                        (observed <= now && observed < at && at - observed <= horizon).then_some(latest.max(at))
-                    });
-                    block("quota_window", reset);
-                }
+                let account_reset;
+                (reasons, account_reset) = account.eligibility_blockers(now, QuotaTarget::Model(model));
                 if reasons.is_empty() {
                     evaluation.eligible_accounts += 1;
-                } else if complete
-                    && !account.has_unverified_google_quota_read(model, now)
-                    && let Some(reset) = account_reset
-                {
+                } else if let Some(reset) = account_reset {
                     evaluation.verified_next_reset_at = Some(evaluation.verified_next_reset_at.map_or(reset, |old| old.min(reset)));
                 }
             }
@@ -1347,7 +2020,104 @@ impl Pool {
         if evaluation.eligible_accounts > 0 {
             evaluation.verified_next_reset_at = None;
         }
-        Some(evaluation)
+        evaluation
+    }
+
+    pub(crate) fn model_eligibility_summary(&self, lane: Lane, model: Option<&str>, now: DateTime<Utc>) -> Value {
+        let mut supported = 0;
+        let mut eligible = 0;
+        let mut total: f64 = 0.0;
+        let mut available: f64 = 0.0;
+        let mut best_effort = None;
+        let mut verified = None;
+        let mut reasons = BTreeSet::new();
+        for account in self.accounts.values().filter(|a| {
+            a.lane == lane && !a.disabled && model.is_none_or(|model| a.models.is_empty() || a.models.iter().any(|id| id == model))
+        }) {
+            supported += 1;
+            let capacity = account.capacity_multiplier();
+            total = (total + capacity).min(f64::MAX);
+            if account.weight == 0 {
+                reasons.insert("zero_weight");
+                continue;
+            }
+            if account.api_key && self.policy.api_key_order == ApiKeyOrder::SubscriptionsOnly {
+                reasons.insert("subscriptions_only");
+                continue;
+            }
+            let scopes: BTreeSet<_>;
+            let targets = if let Some(model) = model {
+                vec![QuotaTarget::Model(model)]
+            } else if !account.models.is_empty() {
+                account.models.iter().map(|m| QuotaTarget::Model(m)).collect()
+            } else {
+                scopes = account
+                    .windows
+                    .iter()
+                    .filter(|w| w.kind != QuotaWindowKind::Spend && w.unit != QuotaUnit::Credits)
+                    .filter_map(|w| w.scope_model.as_deref())
+                    .chain(account.scoped_cooldowns.iter().filter(|(_, c)| c.until > now).map(|(scope, _)| scope.as_str()))
+                    .chain(
+                        account
+                            .pending_quota
+                            .iter()
+                            .filter(|p| p.provisional.is_some_and(|c| c.until > now))
+                            .filter_map(|p| p.scope.as_deref()),
+                    )
+                    .map(|scope| if lane == Lane::Google { google_bucket(scope) } else { scope.to_owned() })
+                    .collect();
+                if scopes.is_empty() {
+                    vec![QuotaTarget::Model("")]
+                } else {
+                    scopes.iter().map(|scope| QuotaTarget::Bucket(lane, scope)).collect()
+                }
+            };
+            let mut best_capacity = None;
+            for target in targets {
+                let (blockers, proof) = account.eligibility_blockers(now, target);
+                if blockers.is_empty() {
+                    let mut active = account.percent_windows(target).filter(|w| quota_window_active(lane, w, now)).peekable();
+                    // No quota telemetry is nominal capacity; an observed but unmeasured bucket is not.
+                    let nominal = if active.peek().is_some() { 0.0 } else { 100.0 };
+                    let remaining = active.filter_map(|w| account.effective_percent(w, now)).reduce(f64::min).unwrap_or(nominal);
+                    // Any supported model can use this account; do not sum shared capacity across buckets.
+                    best_capacity = Some(best_capacity.map_or(remaining, |old: f64| old.max(remaining)));
+                } else {
+                    reasons.extend(blockers.into_iter().map(|reason| match reason {
+                        "global_cooldown" | "scoped_cooldown" => "cooldown",
+                        "quota_window" => "quota_exhausted",
+                        "auth_cooldown" => "auth_expired",
+                        "quarantined" if account.quota_backoff(now).is_some() => "quota_exhausted",
+                        other => other,
+                    }));
+                    verified = verified.into_iter().chain(proof).min();
+                    best_effort = best_effort.into_iter().chain(account.bounded_recovery(now, target)).min();
+                }
+            }
+            if let Some(remaining) = best_capacity {
+                eligible += 1;
+                available = (available + capacity * (remaining / 100.0)).min(f64::MAX);
+            }
+        }
+        if supported == 0 {
+            reasons.insert("no_supported_accounts");
+        }
+        if eligible != 0 {
+            reasons.clear();
+            best_effort = None;
+            verified = None;
+        }
+        json!({
+            "lane": match lane { Lane::Google => "google", Lane::Go => "go", _ => lane.name() },
+            "model": model,
+            "eligible_accounts": eligible,
+            "supported_accounts": supported,
+            "available_capacity_units": available,
+            "total_capacity_units": total,
+            "verified_next_reset_at": verified,
+            "best_effort_next_reset_at": best_effort,
+            "blocking_reasons": reasons,
+        })
     }
 
     #[cfg(test)]
@@ -1364,13 +2134,45 @@ impl Pool {
         self.evaluate_model_eligibility_for(filter, now)?.verified_next_reset_at
     }
 
+    #[cfg(test)]
     pub fn next_reset(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.supported(filter).filter(|a| !a.quarantined(now)).filter_map(|a| a.quota_limited_until(now, filter.model)).min()
     }
 
+    #[cfg(test)]
     pub fn all_quota_limited(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> bool {
         let mut accounts = self.supported(filter).peekable();
         accounts.peek().is_some() && accounts.all(|a| !a.quarantined(now) && a.quota_limited_until(now, filter.model).is_some())
+    }
+
+    pub(crate) fn transient_recovery(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.supported(filter)
+            .filter(|a| a.quota_limited_until(now, filter.model).is_none())
+            .filter_map(|a| a.transient_recovery(now))
+            .filter(|at| *at - now <= chrono::TimeDelta::seconds(MAX_COOLDOWN_SECS))
+            .min()
+    }
+
+    pub(crate) fn quota_recovery(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.supported(filter)
+            .filter(|a| a.active_quarantine(now).is_none_or(|e| e.kind.is_transient() || e.kind == AccountErrorKind::QuotaExhausted))
+            .filter_map(|a| Some(a.quota_limited_until(now, filter.model)?.max(a.transient_recovery(now).unwrap_or(now))))
+            .min()
+    }
+
+    pub(crate) fn bounded_quota_recovery(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>, witness: bool) -> Option<DateTime<Utc>> {
+        let target = QuotaTarget::Model(filter.model);
+        self.supported(filter)
+            .filter(|a| a.quota_limited_until_for(now, target).is_some())
+            .filter(|a| {
+                !witness || {
+                    a.quota_backoff(now).is_none()
+                        && a.active_quota_windows(now, target)
+                            .all(|w| w.resets_at.is_some() && !w.stale && w.observation_state == QuotaObservationState::Measured)
+                }
+            })
+            .filter_map(|a| a.bounded_recovery(now, target))
+            .min()
     }
 
     pub(crate) fn has_eligible_account(&self, filter: &AccountFilter<'_>, now: DateTime<Utc>) -> bool {
@@ -1442,6 +2244,47 @@ impl Pool {
         // later-resetting account moves back once that account's 5-hour window frees up.
         let drain_soonest = lane == Lane::Google && self.policy.strategy == RouteStrategy::SoonestReset;
         let sticky = session.and_then(bound).or_else(|| parent.and_then(bound));
+        if self.policy.strategy == RouteStrategy::CapacityBalanced {
+            let counts = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            let scored: Vec<_> =
+                options.into_iter().map(|a| (a, a.capacity_score(now, target, counts.get(&a.id).copied().unwrap_or_default()))).collect();
+            if let Some((a, _)) = [session, parent]
+                .into_iter()
+                .flatten()
+                .filter_map(bound)
+                .find_map(|id| scored.iter().find(|(a, s)| a.id == id && (s.session_left.is_none() || s.ample())))
+            {
+                return Some((*a).clone());
+            }
+            let active_ample = scored.iter().filter(|(_, s)| s.active && s.ample());
+            let best_active_rate = active_ample.clone().filter_map(|(_, s)| s.rate).reduce(f64::max);
+            let best_active_tier = active_ample.map(|(_, s)| s.multiplier).reduce(f64::max);
+            return scored
+                .into_iter()
+                .filter(|(_, s)| {
+                    !(s.idle
+                        && s.ample()
+                        && s.rate.zip(best_active_rate).is_some_and(|(idle, active)| idle <= active)
+                        && best_active_tier.is_some_and(|tier| s.multiplier <= tier))
+                })
+                .max_by(|(a, left), (b, right)| {
+                    left.ample()
+                        .cmp(&right.ample())
+                        .then_with(|| match (left.rate, right.rate) {
+                            (Some(a), Some(b)) => a.total_cmp(&b),
+                            (None, None) => {
+                                let nominal = |s: &CapacityScore| s.multiplier / (1.0 + s.in_flight as f64);
+                                nominal(left).total_cmp(&nominal(right))
+                            }
+                            _ => left.rate.is_some().cmp(&right.rate.is_some()),
+                        })
+                        .then_with(|| left.session_capacity.total_cmp(&right.session_capacity))
+                        .then_with(|| a.priority.cmp(&b.priority))
+                        .then_with(|| right.in_flight.cmp(&left.in_flight))
+                        .then_with(|| b.id.cmp(&a.id))
+                })
+                .map(|(a, _)| a.clone());
+        }
         if let Some(a) = sticky.and_then(|id| options.iter().find(|a| a.id == id))
             && (!drain_soonest || options.iter().all(|b| soonest(b).0 >= soonest(a).0))
         {
@@ -1449,6 +2292,7 @@ impl Pool {
         }
         let first = *options.first()?;
         match self.policy.strategy {
+            RouteStrategy::CapacityBalanced => unreachable!(),
             RouteStrategy::SoonestReset => options.sort_by_key(|a| soonest(a)),
             RouteStrategy::FillFirst => options.sort_by(|a, b| {
                 b.priority
@@ -1458,7 +2302,11 @@ impl Pool {
             }),
             RouteStrategy::RoundRobin | RouteStrategy::WeightedRoundRobin => {
                 let weighted = self.policy.strategy == RouteStrategy::WeightedRoundRobin;
-                let weight = |a: &&Account| if weighted { u64::from(a.weight) } else { 1 };
+                let weight = |a: &&Account| match (weighted, a.weight) {
+                    (false, _) => 1,
+                    (true, 1) => u64::from(a.capacity_multiplier().round().clamp(1.0, f64::from(u32::MAX)) as u32),
+                    (true, weight) => u64::from(weight),
+                };
                 let total: u64 = options.iter().map(weight).sum();
                 let key = (lane, first.api_key, options.iter().map(|a| a.id.clone()).collect());
                 let mut slot = self.cursors.get(&key).copied().unwrap_or_default() % total;
@@ -1496,6 +2344,7 @@ impl Pool {
             policy: self.policy.clone(),
             overrides: self.overrides.clone(),
             cursors: self.cursors.clone(),
+            in_flight: self.in_flight.clone(),
             ..Self::default()
         };
         let now = Utc::now();
@@ -1826,6 +2675,7 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
         if existing.email.is_none() {
             existing.email = email;
         }
+        apply_account_settings(&pool.account_defaults, &pool.account_overrides, existing);
         existing.scrub_label(&[]);
         // Track the last discovered token separately from any access token the
         // proxy refreshed in memory; an unchanged disk snapshot is not a renewal.
@@ -1891,15 +2741,19 @@ pub(crate) fn add_provenance_google(pool: &mut Pool, label: &str, mut raw: Value
             }
         }
         pool.propagate_api_key_conflicts();
+        pool.restore_discovered_cooldowns(Utc::now());
         return;
     }
     let source = format!("provenance:{label}");
     add_with_api_key(pool, Lane::Google, &source, raw, candidate_api_key);
-    if let Some(account) = pool.accounts.get_mut(&local_credential_name(Lane::Google, &source)) {
+    let id = local_credential_name(Lane::Google, &source);
+    if let Some(account) = pool.accounts.get_mut(&id) {
         account.provenance_enrollment = Some(label.to_owned());
         if !account.access.is_empty() {
             account.provenance_token_fp = Some(Sha256::digest(&account.access).into());
         }
+        pool.refresh_account_settings(&id);
+        pool.restore_discovered_cooldowns(Utc::now());
     }
 }
 

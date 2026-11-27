@@ -68,6 +68,7 @@ pub(super) fn account(provider: &ProviderDescriptor, id: &str, label: &str) -> M
         note: None,
         plan: None,
         tier_multiplier: None,
+        observed_capacity_ratio: None,
         status: AccountStatus::Ready,
         enabled: true,
         priority: 0,
@@ -352,6 +353,7 @@ const ACCOUNTS: &[ProviderCapability] = &[
     ProviderCapability::SetEnabled,
     ProviderCapability::SetPriority,
     ProviderCapability::SetWeight,
+    ProviderCapability::SetCapacity,
     ProviderCapability::SetNote,
 ];
 const CREDENTIALS: &[ProviderCapability] = &[

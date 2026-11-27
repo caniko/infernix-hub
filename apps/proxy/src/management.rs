@@ -26,7 +26,7 @@ use crate::{
     clients::Client,
     config::{matches_secret, read_text, write_private},
     openai_account,
-    pool::{Account, Lane, Pool, enforces_quota, filename, parse_credentials, text},
+    pool::{Account, AccountOverride, Lane, Pool, enforces_quota, filename, parse_credentials, text},
     provider_json,
     router::bearer,
 };
@@ -101,15 +101,16 @@ pub(crate) fn routes(proxy: Arc<Proxy>, v8: bool) -> Router<Arc<Proxy>> {
             .route("/logs", get(logs))
             .route("/debug", get(config))
     };
-    routes.layer(middleware::from_fn_with_state(proxy.clone(), move |state, req, next| authenticate(state, req, next, v8))).fallback(
-        move |req: Request| async move {
+    routes
+        .route("/model-eligibility", get(model_eligibility))
+        .layer(middleware::from_fn_with_state(proxy.clone(), move |state, req, next| authenticate(state, req, next, v8)))
+        .fallback(move |req: Request| async move {
             if bearer(req.headers()).is_some_and(|key| matches_secret(key, &proxy.config.usage_key)) {
                 if v8 { invalid_credentials() } else { usage_read_only() }.into_response()
             } else {
                 StatusCode::NOT_FOUND.into_response()
             }
-        },
-    )
+        })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -128,10 +129,12 @@ fn usage_read_only() -> Failure {
 
 async fn authenticate(State(proxy): State<Arc<Proxy>>, mut req: Request, next: Next, v8: bool) -> Response {
     let Some(key) = bearer(req.headers()) else { return invalid_credentials().into_response() };
+    let target = (req.method().as_str(), req.uri().path());
+    let eligibility = target == ("GET", "/model-eligibility");
     let scope = if matches_secret(key, &proxy.config.management_key) {
         ManagementScope::Full
-    } else if !v8 && matches_secret(key, &proxy.config.usage_key) {
-        if !matches!((req.method().as_str(), req.uri().path()), ("GET", "/auth-files" | "/auth-files/models") | ("POST", "/api-call")) {
+    } else if (!v8 || eligibility) && matches_secret(key, &proxy.config.usage_key) {
+        if !eligibility && !matches!(target, ("GET", "/auth-files" | "/auth-files/models") | ("POST", "/api-call")) {
             return usage_read_only().into_response();
         }
         ManagementScope::UsageReadOnly
@@ -161,6 +164,7 @@ fn strategy_name(strategy: RouteStrategy) -> &'static str {
         RouteStrategy::FillFirst => "fill-first",
         RouteStrategy::RoundRobin => "round-robin",
         RouteStrategy::WeightedRoundRobin => "weighted-round-robin",
+        RouteStrategy::CapacityBalanced => "capacity-balanced",
     }
 }
 
@@ -171,6 +175,7 @@ fn parse_strategy(raw: &Value) -> Result<RouteStrategy, Failure> {
         "fill-first" => Ok(RouteStrategy::FillFirst),
         "round-robin" => Ok(RouteStrategy::RoundRobin),
         "weighted-round-robin" => Ok(RouteStrategy::WeightedRoundRobin),
+        "capacity-balanced" => Ok(RouteStrategy::CapacityBalanced),
         _ => Err(bad("unknown routing strategy")),
     }
 }
@@ -256,7 +261,11 @@ async fn policy(State(proxy): State<Arc<Proxy>>) -> Reply {
     ok(json!(proxy.state.read().await.pool.policy))
 }
 
-async fn set_policy(State(proxy): State<Arc<Proxy>>, Json(value): Json<RoutingPolicy>) -> Reply {
+async fn set_policy(State(proxy): State<Arc<Proxy>>, Json(mut raw): Json<Value>) -> Reply {
+    if let Some(value) = raw.get_mut("strategy") {
+        *value = json!(parse_strategy(value)?);
+    }
+    let value = serde_json::from_value(raw).map_err(|_| bad("invalid routing policy"))?;
     let mut state = proxy.state.write().await;
     update_policy(&mut state.pool, value)?;
     ok(json!(state.pool.policy))
@@ -365,6 +374,22 @@ struct WindowsQuery {
     model: Option<String>,
 }
 
+async fn model_eligibility(State(proxy): State<Arc<Proxy>>, query: Result<Query<WindowsQuery>, QueryRejection>) -> Reply {
+    let Query(query) = query.map_err(|_| bad("invalid model eligibility query"))?;
+    let lane = match query.lane.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("claudeagent") => Some(Lane::Claude),
+        Some("go") => Some(Lane::Go),
+        Some(alias) => Lane::parse(alias),
+        None => None,
+    }
+    .ok_or_else(|| bad("missing or unknown lane"))?;
+    let model = query.model.as_deref();
+    if model.is_some_and(|model| !crate::pool::bounded_identifier(model)) {
+        return Err(bad("invalid wire model"));
+    }
+    ok(proxy.state.read().await.pool.model_eligibility_summary(lane, model, Utc::now()))
+}
+
 async fn windows(State(proxy): State<Arc<Proxy>>, query: Result<Query<WindowsQuery>, QueryRejection>) -> Reply {
     let Query(query) = query.map_err(|_| bad("invalid usage windows query"))?;
     match (query.lane.as_deref(), query.model.as_deref()) {
@@ -441,17 +466,30 @@ async fn upload(State(proxy): State<Arc<Proxy>>, Query(query): Query<Name>, Json
     let name = query.name.as_deref().ok_or_else(|| bad("credential file name required"))?;
     let accounts = parse_credentials(name, &raw, false).map_err(|_| bad("unsupported credential document"))?;
     let hydrate_google = accounts.iter().any(Account::needs_google_metadata);
+    let credential_guard = proxy.oauth_refresh.lock().await;
     let mut state = proxy.state.write().await;
     if state.pool.accounts.values().any(|a| a.name == name && a.local) {
         return Err(Failure(StatusCode::CONFLICT, "discovered accounts cannot be overwritten"));
     }
     let path = proxy.config.auth_dir.join(name);
-    write_private(&path, &serde_json::to_vec_pretty(&raw).map_err(|_| disk())?, true).map_err(|_| disk())?;
+    let replaced = state
+        .pool
+        .accounts
+        .values()
+        .filter(|old| old.name == name && !accounts.iter().any(|a| a.id == old.id && a.source_fingerprint == old.source_fingerprint))
+        .map(|a| a.id.clone())
+        .collect::<Vec<_>>();
+    state
+        .pool
+        .remove_account_overrides(&proxy.config.state_dir, &replaced, || write_private(&path, &serde_json::to_vec_pretty(&raw)?, true))
+        .map_err(|_| disk())?;
     let ids: BTreeSet<_> = accounts.iter().map(|a| a.id.as_str()).collect();
     state.pool.accounts.retain(|id, a| a.name != name || ids.contains(id.as_str()));
     state.pool.insert(accounts);
     state.pool.revision += 1;
     drop(state);
+    drop(credential_guard);
+    proxy.persist_cooldown_state().await;
     proxy.notify_hub_sync();
     if hydrate_google {
         tokio::spawn(async move { proxy.hydrate_google_metadata().await });
@@ -465,6 +503,14 @@ pub(crate) struct Changes {
     pub priority: Option<i32>,
     pub weight: Option<u32>,
     pub note: Option<Value>,
+    pub plan: Option<Value>,
+    pub tier_multiplier: Option<Value>,
+}
+
+impl Changes {
+    fn edits_auth_fields(&self) -> bool {
+        self.disabled.is_some() || self.priority.is_some() || self.weight.is_some() || self.note.is_some()
+    }
 }
 
 fn scrub_saved_label(field: Option<&mut Value>, pool: &Pool, accounts: &[Account]) {
@@ -479,18 +525,43 @@ fn scrub_saved_label(field: Option<&mut Value>, pool: &Pool, accounts: &[Account
     *field = json!(crate::error_classify::scrub_label(label, &secrets));
 }
 
+// Callers editing credential fields hold oauth_refresh before taking the pool write lock.
 pub(crate) fn change(proxy: &Proxy, pool: &mut Pool, id: &str, changes: Changes) -> Result<(), Failure> {
     let found = pool.find(id).or_else(|| pool.accounts.values().find(|a| a.name == id)).cloned().ok_or_else(missing)?;
+    let edits_auth = changes.edits_auth_fields();
     let note = match changes.note.as_ref() {
         Some(Value::String(s)) if s.len() <= 4096 => Some(Some(s.clone())),
         Some(Value::Null) => Some(None),
         Some(_) => return Err(bad("invalid credential note")),
         None => None,
     };
-    if changes.disabled.is_none() && changes.priority.is_none() && changes.weight.is_none() && note.is_none() {
+    let plan = match changes.plan {
+        Some(Value::String(s)) if s.trim().chars().count() <= 128 => {
+            let s = s.trim();
+            Some((!s.is_empty()).then(|| s.to_owned()))
+        }
+        Some(Value::Null) => Some(None),
+        Some(_) => return Err(bad("invalid credential plan")),
+        None => None,
+    };
+    let tier_multiplier = match changes.tier_multiplier {
+        Some(Value::Null) => Some(None),
+        Some(Value::Number(n)) => {
+            Some(Some(n.as_f64().filter(|n| n.is_finite() && *n > 0.0).ok_or_else(|| bad("invalid credential tier multiplier"))?))
+        }
+        Some(_) => return Err(bad("invalid credential tier multiplier")),
+        None => None,
+    };
+    if changes.disabled.is_none()
+        && changes.priority.is_none()
+        && changes.weight.is_none()
+        && note.is_none()
+        && plan.is_none()
+        && tier_multiplier.is_none()
+    {
         return Err(bad("no credential changes supplied"));
     }
-    if !found.local {
+    let managed = if !found.local && edits_auth {
         if !filename(&found.name) {
             return Err(bad("invalid file name"));
         }
@@ -549,23 +620,35 @@ pub(crate) fn change(proxy: &Proxy, pool: &mut Pool, id: &str, changes: Changes)
                 scrub_saved_label(key.get_mut("label"), pool, std::slice::from_ref(account));
             }
         }
-        write_private(&path, &serde_json::to_vec_pretty(&saved).map_err(|_| disk())?, true).map_err(|_| disk())?;
+        Some((path, serde_json::to_vec_pretty(&saved).map_err(|_| disk())?, accounts))
+    } else {
+        None
+    };
+    // Publish auth metadata as soon as it is durable, even if the separate capacity write fails.
+    let clean_managed_metadata = managed.is_some();
+    if let Some((path, saved, accounts)) = managed {
+        write_private(&path, &saved, true).map_err(|_| disk())?;
         pool.insert(accounts);
-    } else if let Some(a) = pool.accounts.get_mut(&found.id) {
-        if let Some(v) = changes.disabled {
-            a.disabled = v;
-        }
-        if let Some(v) = changes.priority {
-            a.priority = v;
-        }
-        if let Some(v) = changes.weight {
-            a.weight = v;
-        }
-        if let Some(v) = note {
-            a.note = v;
-        }
+        pool.revision += 1;
     }
-    pool.revision += 1;
+    pool.save_account_override(
+        &proxy.config.state_dir,
+        &found.id,
+        AccountOverride {
+            disabled: changes.disabled,
+            priority: changes.priority,
+            weight: changes.weight,
+            note,
+            plan,
+            tier_multiplier,
+            ..Default::default()
+        },
+        clean_managed_metadata,
+    )
+    .map_err(|_| disk())?;
+    if !clean_managed_metadata {
+        pool.revision += 1;
+    }
     Ok(())
 }
 
@@ -574,6 +657,9 @@ async fn edit_credential(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Map<St
     let id = text(&raw, &["name", "auth_index", "account_id"]).ok_or_else(|| bad("credential name required"))?;
     let mut changes: Changes = serde_json::from_value(raw.clone()).map_err(|_| bad("invalid credential fields"))?;
     changes.note = raw.get("note").cloned();
+    changes.plan = raw.get("plan").cloned();
+    changes.tier_multiplier = raw.get("tier_multiplier").cloned();
+    let _credential_guard = if changes.edits_auth_fields() { Some(proxy.oauth_refresh.lock().await) } else { None };
     let mut state = proxy.state.write().await;
     change(&proxy, &mut state.pool, id, changes)?;
     ok(json!({"status":"ok"}))
@@ -581,17 +667,25 @@ async fn edit_credential(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Map<St
 
 async fn delete_credential(State(proxy): State<Arc<Proxy>>, Query(query): Query<Name>) -> Reply {
     let name = query.name.as_deref().filter(|name| filename(name)).ok_or_else(|| bad("valid file name required"))?;
-    let mut state = proxy.state.write().await;
-    let mut candidates = state.pool.accounts.values().filter(|a| a.name == name).peekable();
-    if candidates.peek().is_none() {
-        return Err(missing());
+    {
+        let _credential_guard = proxy.oauth_refresh.lock().await;
+        let mut state = proxy.state.write().await;
+        let mut candidates = state.pool.accounts.values().filter(|a| a.name == name).peekable();
+        if candidates.peek().is_none() {
+            return Err(missing());
+        }
+        if candidates.any(|a| a.local) {
+            return Err(Failure(StatusCode::CONFLICT, "discovered credentials are read-only"));
+        }
+        let ids = state.pool.accounts.values().filter(|a| a.name == name).map(|a| a.id.clone()).collect::<Vec<_>>();
+        state
+            .pool
+            .remove_account_overrides(&proxy.config.state_dir, &ids, || Ok(fs::remove_file(proxy.config.auth_dir.join(name))?))
+            .map_err(|_| disk())?;
+        state.pool.accounts.retain(|_, a| a.name != name);
+        state.pool.revision += 1;
     }
-    if candidates.any(|a| a.local) {
-        return Err(Failure(StatusCode::CONFLICT, "discovered credentials are read-only"));
-    }
-    fs::remove_file(proxy.config.auth_dir.join(name)).map_err(|_| disk())?;
-    state.pool.accounts.retain(|_, a| a.name != name);
-    state.pool.revision += 1;
+    proxy.persist_cooldown_state().await;
     ok(json!({"status":"ok"}))
 }
 
@@ -916,6 +1010,7 @@ fn clear_quota(pool: &mut Pool, account: &Account, manual: bool) -> usize {
 async fn reset_quota(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -> Reply {
     let account = select(&proxy, &raw).await?;
     let count = clear_quota(&mut proxy.state.write().await.pool, &account, true);
+    proxy.persist_cooldown_state().await;
     proxy.notify_hub_sync();
     ok(json!({"status":"ok","windows_reset":count}))
 }
@@ -985,7 +1080,9 @@ async fn reset_credit(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
             .ok_or_else(upstream)?
     };
     let count = if account.lane == Lane::Codex && matches!(code, "reset" | "already_redeemed") {
-        clear_quota(&mut proxy.state.write().await.pool, &account, false)
+        let count = clear_quota(&mut proxy.state.write().await.pool, &account, false);
+        proxy.persist_cooldown_state().await;
+        count
     } else {
         0
     };
@@ -1002,6 +1099,8 @@ async fn reset_credit(State(proxy): State<Arc<Proxy>>, Json(raw): Json<Value>) -
             && current.windows.iter().all(|w| !w.used_percent.is_some_and(|p| p >= 100.0 && w.resets_at.is_none_or(|t| t > now)))
         {
             current.cooldown = None;
+            drop(state);
+            proxy.persist_cooldown_state().await;
         }
     }
     ok(json!({"code":code,"windows_reset":count,"refresh_error":refresh_error,"usage":usage(&proxy.state.read().await.pool)}))

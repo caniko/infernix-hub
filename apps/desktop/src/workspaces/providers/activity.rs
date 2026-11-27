@@ -7,7 +7,19 @@ use super::{charts::*, dashboard::account_name, data_settings::Archive, routing:
 mod detail;
 mod evals;
 
-const TABS: [&str; 8] = ["Overview", "Comparisons", "Drift", "Totals", "Thinking", "Requests", "Traces", "Evals"];
+const TABS: [(&str, &str); 9] = [
+    ("overview", "Overview"),
+    ("breakdowns", "Breakdowns"),
+    ("comparisons", "Comparisons"),
+    ("drift", "Drift"),
+    ("totals", "Totals"),
+    ("thinking", "Thinking"),
+    ("requests", "Requests"),
+    ("traces", "Traces"),
+    ("evals", "Evals"),
+];
+const BREAKDOWNS_TAB: usize = 1;
+const EVALS_TAB: usize = TABS.len() - 1;
 const METRICS: &[(&str, &str)] =
     &[("requests", "Requests"), ("tokens", "Tokens"), ("cost", "API-equivalent cost"), ("cache_hit", "Cache hit rate")];
 const DEFAULT_RANGE_DAYS: u32 = 1;
@@ -33,7 +45,9 @@ struct EvalSeed {
 #[component]
 pub(super) fn Activity(providers: Vec<ProviderSummary>, mut selected: Signal<String>) -> Element {
     let panel = use_context::<PanelState>();
-    let mut tab = use_signal(|| 0usize);
+    let mut activity_subtab = panel.activity_subtab;
+    let initial_tab = activity_subtab.peek().as_deref().and_then(|target| TABS.iter().position(|(key, _)| *key == target)).unwrap_or(0);
+    let mut tab = use_signal(|| initial_tab);
     let board = use_signal(|| None::<Vec<BoardTile>>);
     let mut seed = use_signal(|| None::<EvalSeed>);
     let mut range = use_signal(|| DEFAULT_RANGE_DAYS);
@@ -42,6 +56,19 @@ pub(super) fn Activity(providers: Vec<ProviderSummary>, mut selected: Signal<Str
     let mut filters = use_signal(|| ActivityScope { provider_id: optional(&selected.peek()), ..default_filters() });
     let mut request = use_signal(|| activity_scope(filters.cloned(), DEFAULT_RANGE_DAYS));
     let mut filter_revision = use_signal(|| 0u64);
+    use_effect(move || {
+        if let Some(target) = activity_subtab() {
+            if let Some(index) = TABS.iter().position(|(key, _)| *key == target) {
+                if index == EVALS_TAB {
+                    seed.set(None);
+                }
+                if *tab.peek() != index {
+                    tab.set(index);
+                }
+            }
+            activity_subtab.set(None);
+        }
+    });
     use_effect(move || {
         let provider_id = optional(&selected());
         let mut applied = request.peek().clone();
@@ -58,7 +85,7 @@ pub(super) fn Activity(providers: Vec<ProviderSummary>, mut selected: Signal<Str
     let draft = filters();
     let scope = request();
     let selection = optional(&selected());
-    let evals = tab() == 7;
+    let evals = tab() == EVALS_TAB;
     let active = providers.iter().filter(|p| selection.as_ref().is_none_or(|id| id == &p.descriptor.id));
     let mask = panel.settings.read().mask_emails;
     let mut account_options = vec![(String::new(), "All accounts".into())];
@@ -84,9 +111,9 @@ pub(super) fn Activity(providers: Vec<ProviderSummary>, mut selected: Signal<Str
     rsx! {
         section { class: "glass-card stack",
             div { class: "segmented activity-subtabs", role: "group", aria_label: "Activity views",
-                for (i, label) in TABS.into_iter().enumerate() {
+                for (i, (_, label)) in TABS.into_iter().enumerate() {
                     button { key: "{label}", class: "seg-btn", aria_pressed: tab() == i,
-                        onclick: move |_| { if i == 7 { seed.set(None); } tab.set(i); }, "{label}" }
+                        onclick: move |_| { if i == EVALS_TAB { seed.set(None); } tab.set(i); }, "{label}" }
                 }
             }
             div { class: "row",
@@ -124,14 +151,15 @@ pub(super) fn Activity(providers: Vec<ProviderSummary>, mut selected: Signal<Str
         }
         {rsx! { div { key: "{filter_revision}", class: "stack",
             if scope.provider_id == selection {
-                match tab() {
-                    0 => rsx! { Overview { scope, board, on_reset, on_compare: move |_| tab.set(1) } },
-                    1 => rsx! { Compare { scope } },
-                    2 => rsx! { Drift { scope, providers } },
-                    3 => rsx! { Totals { scope } },
-                    4 => rsx! { Thinking { scope, providers } },
-                    5 => rsx! { detail::Requests { scope, providers, on_reset } },
-                    6 => rsx! { detail::Traces { scope, on_reset, pin: move |value| { seed.set(Some(value)); tab.set(7); } } },
+                match TABS[tab()].0 {
+                    "overview" => rsx! { Overview { scope, board, on_reset, on_breakdowns: move |_| tab.set(BREAKDOWNS_TAB) } },
+                    "breakdowns" => rsx! { Breakdowns { scope } },
+                    "comparisons" => rsx! { Compare { scope } },
+                    "drift" => rsx! { Drift { scope, providers } },
+                    "totals" => rsx! { Totals { scope } },
+                    "thinking" => rsx! { Thinking { scope, providers } },
+                    "requests" => rsx! { detail::Requests { scope, providers, on_reset } },
+                    "traces" => rsx! { detail::Traces { scope, on_reset, pin: move |value| { seed.set(Some(value)); tab.set(EVALS_TAB); } } },
                     _ => rsx! { evals::Evals { providers, scoped_provider: scope.provider_id, seed: seed() } },
                 }
             }
@@ -165,16 +193,10 @@ fn Overview(
     scope: ActivityScope,
     board: Signal<Option<Vec<BoardTile>>>,
     on_reset: EventHandler<()>,
-    on_compare: EventHandler<()>,
+    on_breakdowns: EventHandler<()>,
 ) -> Element {
-    let client = use_context::<HubClient>();
-    let history_client = client.clone();
-    let panel = use_context::<PanelState>();
-    let data = use_resource(move || {
-        let _ = (panel.epoch)();
-        let (client, scope) = (client.clone(), scope.clone());
-        async move { timed(client.activity_overview(&scope)).await }
-    });
+    let history_client = use_context::<HubClient>();
+    let data = use_activity_overview(scope);
     let history = use_resource(move || {
         let empty = data.read().as_ref().is_some_and(|result| result.as_ref().is_ok_and(|report| report.requests == 0));
         let client = history_client.clone();
@@ -188,7 +210,17 @@ fn Overview(
     });
     let has_history = history.cloned().flatten();
     let result = data.read();
-    read_view(result.as_ref(), |report| rsx! { OverviewBoard { report: report.clone(), board, has_history, on_reset, on_compare } })
+    read_view(result.as_ref(), |report| rsx! { OverviewBoard { report: report.clone(), board, has_history, on_reset, on_breakdowns } })
+}
+
+fn use_activity_overview(scope: ActivityScope) -> Resource<Result<ActivityOverview, UiError>> {
+    let client = use_context::<HubClient>();
+    let panel = use_context::<PanelState>();
+    use_resource(move || {
+        let _ = (panel.epoch)();
+        let (client, scope) = (client.clone(), scope.clone());
+        async move { timed(client.activity_overview(&scope)).await }
+    })
 }
 
 #[component]
@@ -197,7 +229,7 @@ fn OverviewBoard(
     board: Signal<Option<Vec<BoardTile>>>,
     has_history: Option<bool>,
     on_reset: EventHandler<()>,
-    on_compare: EventHandler<()>,
+    on_breakdowns: EventHandler<()>,
 ) -> Element {
     let mut configure = use_signal(|| false);
     if report.requests == 0 {
@@ -210,16 +242,13 @@ fn OverviewBoard(
     }
     let custom_tiles = board.cloned();
     let default_layout = custom_tiles.is_none();
-    let rows = custom_tiles.unwrap_or_else(|| {
-        let mut tiles = report.board_tiles.clone();
-        if !tiles.iter().any(|t| t.kind == "model_effort") {
-            tiles.push(BoardTile { id: "model_effort".into(), kind: "model_effort".into(), metric: "cost".into(), span: 1, visible: true });
-        }
-        tiles
-    });
+    let rows: Vec<_> = custom_tiles
+        .unwrap_or_else(|| report.board_tiles.clone())
+        .into_iter()
+        .filter(|tile| matches!(tile.kind.as_str(), "trend" | "cache" | "heatmap" | "rhythm"))
+        .collect();
     let unpriced = report.unpriced_models.join(", ");
-    let hit_rate = effective_cache_hit_rate(report.input_tokens, report.cache_read_tokens, report.cache_hit_rate);
-    let hit_pct = fmt_hit_pct(hit_rate);
+    let hit_pct = fmt_hit_pct(effective_cache_hit_rate(report.input_tokens, report.cache_read_tokens, report.cache_hit_rate));
     let visible = rows.iter().filter(|tile| tile.visible);
     let featured = default_layout && visible.clone().take(4).map(|tile| tile.kind.as_str()).eq(["trend", "cache", "heatmap", "rhythm"]);
     let mut tiles = visible.map(|tile| {
@@ -237,31 +266,8 @@ fn OverviewBoard(
                     "trend" => rsx! { ActivityTrendChart { points: report.trend.clone(), metric, bucket_seconds: report.bucket_seconds } },
                     "heatmap" => rsx! { ActivityHeatmap { cells: report.heatmap.clone(), metric, covered_weekdays: report.covered_weekdays.clone() } },
                     "rhythm" => rsx! { ActivityRhythmChart { points: report.rhythm.clone(), metric } },
-                    "cache" => rsx! {
-                        CacheHitRateChart { points: report.trend.clone(), bucket_seconds: report.bucket_seconds }
-                        div { class: "cache-summary stack",
-                            div { class: "row cache-summary-head",
-                                strong { class: "mono", "{hit_pct} cache hit rate" }
-                                span { class: "muted", "{usd(report.cache_savings_usd)} estimated savings" }
-                            }
-                            svg { class: "quota-meter cache-meter", view_box: "0 0 100 6", preserve_aspect_ratio: "none", "aria-hidden": "true",
-                                rect { width: "100", height: "6", rx: "3", class: "quota-track" }
-                                if let Some(rate) = hit_rate {
-                                    rect { width: "{rate * 100.0:.2}", height: "6", rx: "3", class: "cache-meter-fill" }
-                                }
-                            }
-                            p { class: "muted",
-                                "{fmt_count(report.cache_read_tokens)} read · {fmt_count(report.cache_write_tokens)} write · "
-                                span { class: "nowrap-unit", "{fmt_count(report.input_tokens.saturating_sub(report.cache_read_tokens))} uncached input" }
-                            }
-                        }
-                    },
-                    "models" => breakdown("Models", &report.by_model),
-                    "accounts" => breakdown("Accounts", &report.by_account),
-                    "clients" => breakdown("Clients", &report.by_client),
-                    "model_effort" => breakdown("Model / Effort", &report.by_model_effort),
-                    "compare" => rsx! { button { class: "btn btn-glass", onclick: move |_| on_compare.call(()), "Open model / effort comparison" } },
-                    _ => rsx! { p { class: "muted", "This tile is not supported by this desktop build." } },
+                    "cache" => rsx! { CacheHitRateChart { points: report.trend.clone(), bucket_seconds: report.bucket_seconds } },
+                    _ => rsx! {},
                 }}
             }
         }
@@ -298,24 +304,34 @@ fn OverviewBoard(
                 }
             }
         }
-        div { class: "compact-kpi-grid activity-kpis",
-            article { class: "glass-card stat-card", title: unpriced.clone(),
-                span { class: "label-tech", "API-equivalent cost" }
-                strong { class: "value", "{usd(report.api_equivalent_cost_usd)}" }
-                span { "List-price estimate, not billed spend" }
+        div { class: "compact-kpi-grid activity-kpis activity-kpi-grid",
+            article { class: "glass-card stat-card",
+                div { class: "row",
+                    span { class: "label-tech", "API-equivalent value" }
+                    strong { class: "value", "{usd(report.api_equivalent_cost_usd)}" }
+                }
                 span { "{fmt_count(report.unpriced_requests)} unpriced requests" }
-                if !unpriced.is_empty() { details { summary { "Unpriced models" } p { "{unpriced}" } } }
             }
-            article { class: "glass-card stat-card", span { class: "label-tech", "Tokens" }
-                strong { class: "value", "{fmt_count(report.total_tokens)}" } span { "{fmt_count(report.output_tokens)} output" }
+            article { class: "glass-card stat-card",
+                div { class: "row",
+                    span { class: "label-tech", "Total tokens" }
+                    strong { class: "value", "{fmt_count(report.total_tokens)}" }
+                }
+                span { "{fmt_count(report.output_tokens)} output" }
             }
-            article { class: "glass-card stat-card", span { class: "label-tech", "Requests" }
-                strong { class: "value", "{fmt_count(report.requests)}" } span { "{fmt_count(report.failures)} failed" }
+            article { class: "glass-card stat-card",
+                div { class: "row",
+                    span { class: "label-tech", "Requests" }
+                    strong { class: "value", "{fmt_count(report.requests)}" }
+                }
+                span { "{fmt_count(report.failures)} failed" }
             }
-            article { class: "glass-card stat-card", span { class: "label-tech", "Cache hit" }
-                strong { class: "value", "{hit_pct}" }
+            article { class: "glass-card stat-card",
+                div { class: "row",
+                    span { class: "label-tech", "Cache hit rate" }
+                    strong { class: "value", "{hit_pct}" }
+                }
                 span { "{fmt_count(report.cache_read_tokens)} / {fmt_count(report.input_tokens)} input" }
-                span { "{usd(report.cache_savings_usd)} estimated savings" }
             }
         }
         div { class: "activity-board", "data-default-layout": if default_layout { "true" } else { "false" },
@@ -324,9 +340,21 @@ fn OverviewBoard(
             }
             for tile in tiles { {tile} }
         }
-        details { summary { "Traffic coverage, pricing and retention" }
-            p { class: "form-help", "{fmt_count(report.matched_proxy_requests)} matched proxy · {fmt_count(report.bypassed_local_requests)} bypassed local" }
-            p { class: "form-help", "Price catalog as of {report.price_as_of} · {report.cache_write_assumption} · detail retention {report.detail_retention_days} days." }
+        div { class: "compact-kpi-grid activity-share-grid",
+            for (label, rows) in breakdown_groups(&report) {
+                {share_card(label, rows, on_breakdowns)}
+            }
+        }
+        footer { class: "activity-footnote form-help",
+            p { "API-equivalent USD is a list-price estimate, not billed spend. Reference prices as of {report.price_as_of}. {report.cache_write_assumption}" }
+            p { "{fmt_count(report.matched_proxy_requests)} matched proxy · {fmt_count(report.bypassed_local_requests)} bypassed local · detail retention {report.detail_retention_days} days." }
+            p {
+                "{usd(report.cache_savings_usd)} estimated cache savings · {fmt_count(report.cache_read_tokens)} read · "
+                "{fmt_count(report.cache_write_tokens)} write · {fmt_count(report.input_tokens.saturating_sub(report.cache_read_tokens))} uncached input."
+            }
+            if !unpriced.is_empty() {
+                details { summary { "Unpriced models" } p { "{unpriced}" } }
+            }
         }
     }
 }
@@ -340,16 +368,93 @@ fn edit_tile(mut board: Signal<Option<Vec<BoardTile>>>, defaults: &[BoardTile], 
 fn tile_name(kind: &str) -> &str {
     match kind {
         "trend" => "Trend",
-        "cache" => "Cache",
+        "cache" => "Cache hit rate",
         "heatmap" => "Heatmap",
         "rhythm" => "Rhythm",
-        "models" => "Models",
-        "accounts" => "Accounts",
-        "clients" => "Clients",
-        "model_effort" => "Model / Effort",
-        "compare" => "Compare",
         _ => kind,
     }
+}
+
+fn breakdown_groups(report: &ActivityOverview) -> [(&'static str, &[BreakdownRow]); 4] {
+    [
+        ("Models", &report.by_model),
+        ("Accounts", &report.by_account),
+        ("Clients", &report.by_client),
+        ("Model / Effort", &report.by_model_effort),
+    ]
+}
+
+pub(super) fn top_breakdown_rows(rows: &[BreakdownRow], limit: usize) -> Vec<BreakdownRow> {
+    let mut ranked: Vec<_> = rows.iter().collect();
+    ranked.sort_by(|a, b| b.api_equivalent_cost_usd.total_cmp(&a.api_equivalent_cost_usd).then_with(|| b.requests.cmp(&a.requests)));
+    ranked.into_iter().take(limit).cloned().collect()
+}
+
+fn share_card(label: &'static str, rows: &[BreakdownRow], on_breakdowns: EventHandler<()>) -> Element {
+    let mask = try_consume_context::<PanelState>().is_some_and(|p| p.settings.read().mask_emails);
+    let cost = rows.iter().map(|row| row.api_equivalent_cost_usd).sum();
+    let requests = rows.iter().map(|row| row.requests as f64).sum();
+    rsx! {
+        article { key: "{label}", class: "glass-card stack activity-share-card",
+            div { class: "row",
+                h3 { "Top {label}" }
+                button { class: "btn secondary", aria_label: "Full breakdown: {label}",
+                    onclick: move |_| on_breakdowns.call(()), "Full breakdown →" }
+            }
+            if rows.is_empty() {
+                p { class: "muted", "No activity in this group." }
+            }
+            for row in top_breakdown_rows(rows, 5) {
+                {
+                    let group = breakdown_group(label, &row, mask);
+                    let hit = breakdown_cache_hit(&row);
+                    let (metric, value, total, scale_label) = if row.api_equivalent_cost_usd > 0.0 {
+                        (usd(row.api_equivalent_cost_usd), row.api_equivalent_cost_usd, cost, "of total API-equivalent cost")
+                    } else {
+                        (format!("{} req", fmt_count(row.requests)), row.requests as f64, requests, "of total requests")
+                    };
+                    rsx! {
+                        div { key: "{row.key}", class: "activity-share-row",
+                            div { class: "row", style: "flex-wrap: nowrap;",
+                                span { class: "activity-share-label", title: "{group}", style: "flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", "{group}" }
+                                span { class: "chip muted", title: "Cache hit rate", aria_label: "Cache hit rate: {hit}", "{hit}" }
+                            }
+                            ShareBar { label: metric, value, total, scale_label }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn Breakdowns(scope: ActivityScope) -> Element {
+    let data = use_activity_overview(scope);
+    read_view(data.read().as_ref(), breakdown_tables)
+}
+
+fn breakdown_tables(report: &ActivityOverview) -> Element {
+    rsx! {
+        section { class: "glass-card stack",
+            h2 { "Activity breakdowns" }
+            for (label, rows) in breakdown_groups(report) {
+                section { key: "{label}", class: "stack",
+                    h3 { "{label}" }
+                    {breakdown(label, rows)}
+                }
+            }
+        }
+    }
+}
+
+fn breakdown_group(label: &str, row: &BreakdownRow, mask: bool) -> String {
+    if label == "Accounts" && mask && row.label.contains('@') { mask_email(&row.label) } else { row.label.clone() }
+}
+
+fn breakdown_cache_hit(row: &BreakdownRow) -> String {
+    let input = if row.input_tokens > 0 { row.input_tokens } else { row.total_tokens.saturating_sub(row.output_tokens) };
+    fmt_hit_pct(effective_cache_hit_rate(input, row.cache_read_tokens, row.cache_hit_rate))
 }
 
 fn breakdown(label: &'static str, list: &[BreakdownRow]) -> Element {
@@ -358,8 +463,7 @@ fn breakdown(label: &'static str, list: &[BreakdownRow]) -> Element {
     let tokens = list.iter().map(|r| r.total_tokens as f64).sum();
     let cost = list.iter().map(|r| r.api_equivalent_cost_usd).sum();
     let rows = list.iter().map(|r| {
-        let input = if r.input_tokens > 0 { r.input_tokens } else { r.total_tokens.saturating_sub(r.output_tokens) };
-        let group = if label == "Accounts" && mask && r.label.contains('@') { mask_email(&r.label) } else { r.label.clone() };
+        let group = breakdown_group(label, r, mask);
         rsx! {
             tr { key: "{r.key}",
                 th { scope: "row", "{group}" }
@@ -369,7 +473,7 @@ fn breakdown(label: &'static str, list: &[BreakdownRow]) -> Element {
                 td { "{fmt_count(r.failures)}" }
                 td { "{fmt_count(r.output_tokens)}" }
                 td { "{fmt_count(r.cache_read_tokens)}" }
-                td { "{fmt_hit_pct(effective_cache_hit_rate(input, r.cache_read_tokens, r.cache_hit_rate))}" }
+                td { "{breakdown_cache_hit(r)}" }
                 td { "{fmt_count(r.thinking_tokens)}" }
                 td { "{fmt_count(r.unpriced_requests)}" }
             }
@@ -432,13 +536,108 @@ mod tests {
                 ]
             }))
             .unwrap();
-            rsx! { OverviewBoard { report, board, has_history: Some(true), on_reset: |_| {}, on_compare: |_| {} } }
+            rsx! { OverviewBoard { report, board, has_history: Some(true), on_reset: |_| {}, on_breakdowns: |_| {} } }
         }
         let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
         assert!(rendered.contains("No requests matched the current filters"));
         assert!(rendered.contains("Reset filters"));
         assert!(!rendered.contains("compact-kpi-grid"));
         assert!(!rendered.contains("activity-board"));
+    }
+
+    fn overview_fixture(requests: u64, kinds: &[&str]) -> ActivityOverview {
+        let board_tiles: Vec<_> = kinds
+            .iter()
+            .map(|kind| BoardTile { id: (*kind).into(), kind: (*kind).into(), metric: "requests".into(), span: 1, visible: true })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "api_equivalent_cost_usd": 0.0, "unpriced_requests": 0, "unpriced_models": [],
+            "price_as_of": "", "cache_write_assumption": "", "total_tokens": 0,
+            "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+            "thinking_tokens": 0, "requests": requests, "failures": 0, "cache_hit_rate": 0.0,
+            "cache_savings_usd": 0.0, "matched_proxy_requests": 0, "bypassed_local_requests": 0,
+            "trend": [], "heatmap": [], "rhythm": [], "by_model": [], "by_account": [],
+            "by_client": [], "by_model_effort": [], "detail_retention_days": 7, "board_tiles": board_tiles
+        }))
+        .unwrap()
+    }
+
+    fn breakdown_fixture(label: &str, requests: u64, cost: f64) -> BreakdownRow {
+        serde_json::from_value(serde_json::json!({
+            "key": label, "label": label, "requests": requests, "failures": 0,
+            "total_tokens": 120, "output_tokens": 20, "cache_read_tokens": 80,
+            "thinking_tokens": 0, "api_equivalent_cost_usd": cost, "unpriced_requests": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn top_breakdown_rows_ranks_and_caps_at_five() {
+        let rows = [
+            breakdown_fixture("Small", 1, 0.0),
+            breakdown_fixture("Priced", 1, 3.0),
+            breakdown_fixture("Zero", 4, 0.0),
+            breakdown_fixture("Other priced", 2, 1.0),
+            breakdown_fixture("Unpriced", 6, 0.0),
+            breakdown_fixture("Rest", 2, 0.0),
+        ];
+        let top = top_breakdown_rows(&rows, 5);
+        assert_eq!(top.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["Priced", "Other priced", "Unpriced", "Zero", "Rest"]);
+
+        fn app() -> Element {
+            let rows = [
+                breakdown_fixture("Priced", 1, 3.0),
+                breakdown_fixture("Other", 1, 1.0),
+                breakdown_fixture("Unpriced", 6, 0.0),
+                breakdown_fixture("Extra A", 1, 0.0),
+                breakdown_fixture("Extra B", 1, 0.0),
+                breakdown_fixture("Excluded", 1, 0.0),
+            ];
+            share_card("Models", &rows, EventHandler::new(|_| {}))
+        }
+        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        assert!(rendered.contains("75.0% of total API-equivalent cost"));
+        assert!(rendered.contains("54.5% of total requests"));
+        assert!(!rendered.contains("Excluded"));
+    }
+
+    #[test]
+    fn overview_omits_text_cache_and_stub_compare_tiles() {
+        fn app() -> Element {
+            let board = use_signal(|| None);
+            let report =
+                overview_fixture(1, &["trend", "cache", "heatmap", "rhythm", "models", "accounts", "clients", "model_effort", "compare"]);
+            rsx! { OverviewBoard { report, board, has_history: Some(true), on_reset: |_| {}, on_breakdowns: |_| {} } }
+        }
+        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        for chart in ["Trend", "Cache hit rate", "Heatmap", "Rhythm"] {
+            assert!(rendered.contains(&format!("\"{chart}\"")), "{chart} is missing");
+        }
+        assert_eq!(rendered.matches(NO_RANGE_DATA).count(), 4);
+        assert!(!rendered.contains("cache-summary"));
+        assert!(!rendered.contains("Open model / effort comparison"));
+        assert!(!rendered.contains("No rows for"));
+    }
+
+    #[test]
+    fn breakdowns_subtab_preserves_all_ten_columns() {
+        fn app() -> Element {
+            let mut report = overview_fixture(1, &[]);
+            report.by_model = vec![breakdown_fixture("Example model", 1, 1.0)];
+            report.by_account = vec![breakdown_fixture("Example account", 1, 1.0)];
+            report.by_client = vec![breakdown_fixture("Example client", 1, 1.0)];
+            report.by_model_effort = vec![breakdown_fixture("Example effort", 1, 1.0)];
+            breakdown_tables(&report)
+        }
+        let rendered = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        for header in
+            ["Group", "Requests", "Tokens", "API-equivalent USD", "Failed", "Output", "Cache read", "Cache hit %", "Thinking", "Unpriced"]
+        {
+            assert_eq!(rendered.matches(&format!("\"{header}\"")).count(), 4, "{header}");
+        }
+        for row in ["Example model", "Example account", "Example client", "Example effort"] {
+            assert!(rendered.contains(row));
+        }
     }
 
     #[test]

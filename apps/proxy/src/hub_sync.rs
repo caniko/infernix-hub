@@ -130,6 +130,7 @@ pub(crate) async fn observations(proxy: &Proxy, host: &str, user: &str) -> Vec<O
                 SetEnabled,
                 SetPriority,
                 SetWeight,
+                SetCapacity,
                 SetNote,
                 ReadProxyStatus,
                 ReadProxyLogs,
@@ -173,6 +174,7 @@ pub(crate) async fn observations(proxy: &Proxy, host: &str, user: &str) -> Vec<O
                         note: a.note.clone(),
                         plan: a.plan.clone(),
                         tier_multiplier: a.multiplier,
+                        observed_capacity_ratio: None,
                         status: AccountStatus::resolve_with_error(
                             !a.disabled,
                             a.cooldown_until(),
@@ -316,6 +318,11 @@ pub(crate) async fn execute(proxy: Arc<Proxy>, op: &ProviderOperation) -> Result
         }
         ProviderCommand::Routing(RoutingCommand::UndoClientWiring { client_id }) => management::wire_client(proxy, client_id, true).await?,
         command => {
+            let _credential_guard = if matches!(command, ProviderCommand::Account(c) if !matches!(c, AccountCommand::SetCapacity { .. })) {
+                Some(proxy.oauth_refresh.lock().await)
+            } else {
+                None
+            };
             let pool = &mut proxy.state.write().await.pool;
             match command {
                 ProviderCommand::Routing(RoutingCommand::SetRoutePolicy { policy }) => {
@@ -354,6 +361,15 @@ pub(crate) async fn execute(proxy: Arc<Proxy>, op: &ProviderOperation) -> Result
                         }
                         AccountCommand::SetNote { account_id, note } => {
                             (account_id, Changes { note: Some(json!(note)), ..Default::default() })
+                        }
+                        AccountCommand::SetCapacity { account_id, plan, tier_multiplier } => {
+                            if tier_multiplier.is_some_and(|n| !n.is_finite() || n <= 0.0) {
+                                return Err(Failure(StatusCode::BAD_REQUEST, "invalid credential tier multiplier"));
+                            }
+                            (
+                                account_id,
+                                Changes { plan: Some(json!(plan)), tier_multiplier: Some(json!(tier_multiplier)), ..Default::default() },
+                            )
                         }
                         _ => return Err(Failure(StatusCode::NOT_IMPLEMENTED, "unsupported account operation")),
                     };

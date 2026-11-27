@@ -43,12 +43,13 @@ pub struct Proxy {
     hub_sync_configured: bool,
     pub(crate) source_host: String,
     pub(crate) source_user: String,
-    state: RwLock<ProxyState>,
+    state: Arc<RwLock<ProxyState>>,
     http: reqwest::Client,
     oauth_refresh: Mutex<()>,
     local_discovery: Mutex<Option<Instant>>,
     local_discovery_generation: AtomicU64,
     quota_actions: Mutex<()>,
+    cooldown_state_write: Arc<Mutex<()>>,
     codex_keys: Mutex<CodexKeys>,
     google_tokens: Mutex<HashMap<[u8; 32], VerifiedGoogleToken>>,
     hub_sync_notify: Arc<Notify>,
@@ -147,23 +148,51 @@ impl Proxy {
             source_host,
             source_user,
             http,
-            state: RwLock::new(ProxyState {
+            state: Arc::new(RwLock::new(ProxyState {
                 pool,
                 usage_refreshes: HashMap::new(),
                 probe_generation: 0,
                 activity: VecDeque::new(),
                 logs: VecDeque::new(),
                 captures: Captures::default(),
-            }),
+            })),
             oauth_refresh: Mutex::new(()),
             local_discovery: Mutex::new(None),
             local_discovery_generation: AtomicU64::new(0),
             quota_actions: Mutex::new(()),
+            cooldown_state_write: Arc::new(Mutex::new(())),
             codex_keys: Mutex::new(CodexKeys::default()),
             google_tokens: Mutex::new(HashMap::new()),
             hub_sync_notify: Arc::new(Notify::new()),
             shutdown: Notify::new(),
             management_mock: None,
+        })
+    }
+
+    async fn persist_cooldown_state(&self) {
+        if let Err(error) = self.schedule_cooldown_state_write().await {
+            tracing::warn!(%error, "proxy cooldown state writer failed");
+        }
+    }
+
+    fn schedule_cooldown_state_write(&self) -> tokio::task::JoinHandle<()> {
+        // Enqueue before awaiting the previous writer so disconnects don't lose committed changes.
+        let writer = self.cooldown_state_write.clone();
+        let state = self.state.clone();
+        let path = self.config.state_dir.join(pool::COOLDOWN_STATE_FILE);
+        tokio::spawn(async move {
+            let writer = writer.lock_owned().await;
+            let snapshot = state.read().await.pool.cooldown_state(Utc::now());
+            match tokio::task::spawn_blocking(move || {
+                let _writer = writer;
+                config::write_private(&path, &serde_json::to_vec(&snapshot)?, true)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "could not persist proxy cooldown state"),
+                Err(error) => tracing::warn!(%error, "proxy cooldown state writer failed"),
+            }
         })
     }
 
@@ -315,6 +344,7 @@ impl Proxy {
     pub async fn discover_local_commands(&self) {
         let _last = self.local_discovery.lock().await;
         self.discover_local_commands_locked().await;
+        self.state.write().await.pool.finish_startup_discovery(Utc::now());
         self.local_discovery_generation.fetch_add(1, Ordering::Release);
     }
 
@@ -468,15 +498,26 @@ impl Proxy {
         }))
         .await;
         let mut state = self.state.write().await;
+        let before = state.pool.revision;
         for (account, email, project) in resolved.into_iter().flatten() {
             if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|c| !c.disabled && c.same_credential(&account)) {
-                if current.email.is_none() {
+                let email_changed = current.email.is_none() && email.is_some();
+                if email_changed {
                     current.email = email;
                 }
-                if project.is_some() && current.set_google_project(project) {
+                let project_changed = project.is_some() && current.set_google_project(project);
+                if email_changed || project_changed {
+                    state.pool.refresh_account_settings(&account.id);
+                }
+                if project_changed {
+                    state.pool.restore_discovered_cooldowns(Utc::now());
                     state.pool.revision += 1;
                 }
             }
+        }
+        if state.pool.revision != before {
+            drop(state);
+            self.persist_cooldown_state().await;
         }
     }
 
@@ -602,7 +643,6 @@ impl Proxy {
             let usable = |next: &Account| {
                 next.lane == current.lane
                     && !next.api_key
-                    && !next.disabled
                     && valid(next)
                     && (current.lane != Lane::Codex || codex_reload_matches(&current, next))
                     && next.organization.as_ref().zip(current.organization.as_ref()).is_none_or(|(x, y)| x == y)
@@ -637,7 +677,13 @@ impl Proxy {
             }
             let mut state = self.state.write().await;
             state.pool.merge_api_key_conflict_fps(&discovered_conflicts);
-            let reloaded = updated.filter(|next| !state.pool.is_api_key_conflicted(next));
+            let reloaded = updated
+                .map(|mut next| {
+                    state.pool.apply_account_settings(&mut next);
+                    next
+                })
+                .filter(|next| !next.disabled && !state.pool.is_api_key_conflicted(next));
+            let unchanged = reloaded.as_ref().is_some_and(|next| next.access == current.access);
             if let Some(updated) = reloaded
                 && (!force || updated.access != current.access)
             {
@@ -659,16 +705,30 @@ impl Proxy {
                 entry.codex_oauth_explicit = updated.codex_oauth_explicit;
                 entry.expires = updated.expires;
                 entry.source_fingerprint = updated.source_fingerprint;
-                return Ok(entry.clone());
+                entry.email = updated.email.or_else(|| entry.email.take());
+                entry.priority = updated.priority;
+                entry.weight = updated.weight;
+                entry.note = updated.note;
+                entry.auth_plan = updated.auth_plan;
+                entry.auth_multiplier = updated.auth_multiplier;
+                entry.observed_plan = updated.observed_plan.or_else(|| entry.observed_plan.take());
+                return state.pool.refresh_account_settings(&a.id).cloned().ok_or_else(superseded);
             }
             let can_refresh_codex = !current.local
                 && current.lane == Lane::Codex
                 && !current.api_key
                 && current.refresh.as_deref().is_some_and(|token| !token.is_empty() && token != "spillway-pool")
                 && !state.pool.is_api_key_conflicted(&current);
+            let unchanged = unchanged
+                .then(|| state.pool.accounts.get(&a.id).filter(|entry| !entry.disabled && entry.same_secret(&current)).cloned())
+                .flatten();
             drop(state);
             if can_refresh_codex {
                 return self.refresh_codex_oauth(&current).await;
+            }
+            if let Some(unchanged) = unchanged {
+                // Let the caller classify the original 401, not a reload failure.
+                return Ok(unchanged);
             }
             return Err(auth_error("no usable credential found on reload"));
         }
@@ -845,10 +905,10 @@ impl Proxy {
             next.email = email;
         }
         if plan.is_some() {
-            next.plan = plan;
+            next.observed_plan = plan;
         }
         next.source_fingerprint = Some(next.compute_source_fingerprint(id_token.as_deref()));
-        Ok(next.clone())
+        state.pool.refresh_account_settings(&current.id).cloned().ok_or_else(superseded)
     }
 
     fn persist_codex_auth_file(
@@ -1219,12 +1279,16 @@ impl Proxy {
         let was_probe_failed = current.probe_failed;
         let had_policy_error = current.quota_probe_policy_error.take().is_some();
         let project_changed = probed_project.is_some() && current.set_google_project(probed_project);
+        if project_changed {
+            state.pool.restore_discovered_cooldowns(Utc::now());
+        }
+        let current = state.pool.accounts.get_mut(&account.id).ok_or_else(|| probe_error("quota refresh was superseded"))?;
         let changed;
         let mut unsupported_logged = None;
         let result = match result {
             Ok((plan, email, windows, grants, next)) => {
                 if plan.is_some() {
-                    current.plan = plan;
+                    current.observed_plan = plan;
                 }
                 if email.is_some() && current.email.is_none() {
                     current.email = email;
@@ -1289,8 +1353,10 @@ impl Proxy {
             }
         };
         let probe_state_changed = was_probe_failed != current.probe_failed;
+        state.pool.refresh_account_settings(&account.id);
         state.pool.revision += i64::from(project_changed);
         drop(state);
+        self.persist_cooldown_state().await;
         if project_changed || changed || probe_state_changed {
             self.notify_hub_sync();
         }

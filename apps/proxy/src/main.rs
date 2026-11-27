@@ -29,6 +29,8 @@ enum Command {
         bind: SocketAddr,
         #[arg(long, env = "PROXY_STATE_DIR")]
         state_dir: Option<PathBuf>,
+        #[arg(long, env = "PROXY_ACCOUNT_DEFAULTS_FILE", value_name = "PATH")]
+        account_defaults_file: Option<PathBuf>,
         #[arg(long, env = "PROXY_AUTH_DIR")]
         auth_dir: Option<PathBuf>,
         #[arg(long, env = "PROXY_CLIENT_KEY_FILE")]
@@ -103,6 +105,7 @@ async fn main() -> Result<()> {
         Command::Serve {
             bind,
             state_dir: state,
+            account_defaults_file,
             auth_dir,
             client_key_file,
             management_key_file,
@@ -118,6 +121,7 @@ async fn main() -> Result<()> {
         } => {
             let mut config =
                 Config::new(bind, &state_dir(state)?, auth_dir, discover_local, client_key_file, management_key_file, usage_key_file)?;
+            config.account_defaults_file = account_defaults_file;
             let worker = worker.validate(&config)?;
             let google_worker = google_worker.validate(&config, worker.as_ref())?;
             config.exclude_local_lanes = exclude_local_providers.into_iter().collect();
@@ -246,6 +250,13 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_accepts_account_defaults_file() {
+        let cli = Cli::try_parse_from(["proxy", "serve", "--account-defaults-file", "/etc/proxy/accounts.json"]).unwrap();
+        let Command::Serve { account_defaults_file, .. } = cli.command else { panic!("expected serve command") };
+        assert_eq!(account_defaults_file, Some(PathBuf::from("/etc/proxy/accounts.json")));
+    }
 
     #[test]
     fn serve_parses_worker_flags_and_rejects_conflicting_transports() {

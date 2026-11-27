@@ -46,7 +46,7 @@ impl SpillwayProxyProvider {
             SetRoutePolicy,
         ]);
         if v8 {
-            descriptor.capabilities.extend([SetWeight, RenewLogin, SetPoolOverride, MoveConversation]);
+            descriptor.capabilities.extend([SetWeight, SetCapacity, RenewLogin, SetPoolOverride, MoveConversation]);
             if matches!(family, "claude" | "codex") {
                 descriptor.evidence_kinds.insert(EvidenceKind::ResetGrants);
                 descriptor.capabilities.extend([RefreshQuota, RefreshGrants, ClaimResetGrant, StartRollingWindow]);
@@ -284,16 +284,18 @@ impl SpillwayProxyProvider {
     }
 
     async fn submit_account(&self, token: &str, command: AccountCommand) -> PortResult<ProviderDispatch> {
-        let (suffix, field, value, id) = match command {
-            AccountCommand::SetEnabled { account_id, enabled } => ("/status", "disabled", json!(!enabled), account_id),
-            AccountCommand::SetPriority { account_id, priority } => ("/fields", "priority", json!(priority), account_id),
-            AccountCommand::SetNote { account_id, note } => ("/fields", "note", json!(note), account_id),
-            AccountCommand::SetWeight { account_id, weight } => ("/fields", "weight", json!(weight), account_id),
+        let (suffix, mut body, id) = match command {
+            AccountCommand::SetEnabled { account_id, enabled } => ("/status", json!({"disabled": !enabled}), account_id),
+            AccountCommand::SetPriority { account_id, priority } => ("/fields", json!({"priority": priority}), account_id),
+            AccountCommand::SetNote { account_id, note } => ("/fields", json!({"note": note}), account_id),
+            AccountCommand::SetWeight { account_id, weight } => ("/fields", json!({"weight": weight}), account_id),
+            AccountCommand::SetCapacity { account_id, plan, tier_multiplier } => {
+                ("/fields", json!({"plan": plan, "tier_multiplier": tier_multiplier}), account_id)
+            }
             _ => return Err(PortError::Unsupported("proxy account operation unavailable".into())),
         };
         let name = self.auth_file_name(token, &id).await?;
-        let mut body = json!({"name": name});
-        body[field] = value;
+        body["name"] = json!(name);
         self.update(token, Method::PATCH, &format!("{}{suffix}", self.credential_path()), body).await?;
         completed(json!({"applied": true}))
     }
@@ -332,6 +334,7 @@ impl SpillwayProxyProvider {
             }
             RoutingCommand::SetRoutePolicy { policy } => {
                 let strategy = match policy.strategy {
+                    RouteStrategy::CapacityBalanced => "capacity-balanced",
                     RouteStrategy::SoonestReset => "soonest-reset",
                     RouteStrategy::FillFirst => "fill-first",
                     RouteStrategy::RoundRobin => "round-robin",
@@ -659,7 +662,9 @@ impl ModelProvider for SpillwayProxyProvider {
                 Some("round-robin") => RouteStrategy::RoundRobin,
                 Some("weighted-round-robin") => RouteStrategy::WeightedRoundRobin,
                 Some("fill-first") => RouteStrategy::FillFirst,
-                _ => RouteStrategy::SoonestReset,
+                Some("soonest-reset" | "soonest_reset") => RouteStrategy::SoonestReset,
+                Some("capacity-balanced" | "capacity_balanced") => RouteStrategy::CapacityBalanced,
+                _ => RouteStrategy::default(),
             };
         let policy = RoutingPolicy {
             strategy: route_strategy,
@@ -829,9 +834,16 @@ fn read_account(account: &mut ModelAccount, raw: &Value, quota_row: bool, now: D
     account.status_message =
         account.last_error.as_ref().map(AccountError::summary).or_else(|| legacy_error.then(|| "proxy reports a credential error".into()));
     account.enrollment_state = if legacy_error { EnrollmentState::Error } else { EnrollmentState::Deployed };
+    if let Some(multiplier) = [raw.pointer("/plan/multiplier"), raw.get("tier_multiplier")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_f64)
+        .find(|value| value.is_finite() && *value > 0.0)
+    {
+        account.tier_multiplier = Some(multiplier);
+    }
     if quota_row {
         account.plan = str_field(&raw["plan"]["label"]).or_else(|| str_field(&raw["plan"]["tier"])).map(str::to_owned);
-        account.tier_multiplier = raw["plan"]["multiplier"].as_f64().filter(|value| *value > 0.0);
         account.is_preferred = raw["preferred"].as_bool() == Some(true);
         account.is_next_pick = raw["next_pick"].as_bool() == Some(true);
         account.cooldown_until = iso(&raw["cooldown_until"]);
@@ -855,6 +867,7 @@ fn read_account(account: &mut ModelAccount, raw: &Value, quota_row: bool, now: D
                 ProviderCapability::SetNote,
                 ProviderCapability::SetPriority,
                 ProviderCapability::SetWeight,
+                ProviderCapability::SetCapacity,
             ] {
                 account.capabilities.remove(&cap);
             }

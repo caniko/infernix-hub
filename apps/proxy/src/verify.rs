@@ -1006,9 +1006,15 @@ async fn check_antigravity_cache_hit_preservation() -> Result<String> {
     let server = EphemeralServer::start(proxy.clone().app()).await?;
     let http = http_client()?;
 
-    // Verify sticky cache affinity across all 4 strategies using real agy shape:
+    // Verify sticky cache affinity across all strategies using real agy shape:
     // shared numeric request.session_id, NO x-session-id header, growing contents.
-    for strategy in [RouteStrategy::RoundRobin, RouteStrategy::WeightedRoundRobin, RouteStrategy::SoonestReset, RouteStrategy::FillFirst] {
+    for strategy in [
+        RouteStrategy::RoundRobin,
+        RouteStrategy::WeightedRoundRobin,
+        RouteStrategy::SoonestReset,
+        RouteStrategy::FillFirst,
+        RouteStrategy::CapacityBalanced,
+    ] {
         {
             let mut state = proxy.state.write().await;
             state.pool.policy.strategy = strategy;

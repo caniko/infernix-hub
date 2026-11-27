@@ -3,6 +3,7 @@
 //! past windows, capability-gated operations, and Spillway-parity analytics.
 
 pub mod activity;
+mod capacity;
 pub mod capture;
 pub mod pricing;
 
@@ -930,7 +931,7 @@ pub async fn quota_report(hub: &Hub, actor: &Actor, provider_id: &str, query: Qu
     // The forecast lookback can be wider than the history requested by the chart.
     samples.drain(..samples.partition_point(|sample| sample.observed_at < since));
     let past_windows = compute_past_windows(&samples);
-    let pools = compute_pools(provider_id, &accounts, &forecasts);
+    let pools = compute_pools(provider_id, &accounts, &forecasts, as_of);
 
     Ok(ProviderQuotaReport { provider: desc, accounts, pools, samples, history_truncated, past_windows, forecasts, as_of })
 }
@@ -978,7 +979,7 @@ async fn build_provider_summary(hub: &Hub, descriptor: ProviderDescriptor) -> DR
     let active_account_id = pool_accounts.clone().find(|a| a.is_active).map(|a| a.id.clone());
     let preferred_account_id = pool_accounts.clone().find(|a| a.is_preferred).map(|a| a.id.clone());
     let next_pick_account_id = pool_accounts.clone().find(|a| a.is_next_pick).map(|a| a.id.clone());
-    let pools = compute_pools(&descriptor.id, pool_accounts, &[]);
+    let pools = compute_pools(&descriptor.id, pool_accounts, &[], Utc::now());
     Ok(ProviderSummary {
         descriptor,
         account_count,
@@ -1121,6 +1122,12 @@ async fn load_accounts_with_latest_windows(
             AccountStatus::resolve_with_error(acct.enabled, acct.cooldown_until, now, acct.is_next_pick, has_err, acct.last_error.as_ref());
         out.push(acct);
     }
+    if !out.is_empty() {
+        let ratios = capacity::compute_observed_capacity_ratios(db, provider_id, now, exclude_fixture_host).await?;
+        for account in &mut out {
+            account.observed_capacity_ratio = ratios.get(&account.id).copied();
+        }
+    }
     Ok(out)
 }
 
@@ -1161,6 +1168,7 @@ pub fn compute_pools<'a>(
     provider_id: &str,
     accounts: impl IntoIterator<Item = &'a ModelAccount>,
     forecasts: &[QuotaForecast],
+    now: DateTime<Utc>,
 ) -> Vec<PoolWindowSummary> {
     // Deduplicate logical entitlements by credential_fingerprint when present.
     let mut seen_fp: BTreeSet<String> = BTreeSet::new();
@@ -1189,7 +1197,7 @@ pub fn compute_pools<'a>(
         let Some((_, first)) = entries.first() else {
             continue;
         };
-        let mut weighted_used = 0.0;
+        let mut remaining_capacity = 0.0;
         let mut total_capacity = 0.0;
         let mut included = 0usize;
         let mut any_tier_weight = false;
@@ -1197,24 +1205,19 @@ pub fn compute_pools<'a>(
         let mut window_seconds = None;
 
         for (acct, win) in &entries {
-            let Some(used) = win.used_percent else {
+            let Some(remaining) = effective_remaining_percent_at(win, &acct.windows, now) else {
                 continue;
             };
             if !matches!(win.observation_state, QuotaObservationState::Measured | QuotaObservationState::StaleLastGood) {
                 continue;
             }
             let cap = acct.tier_multiplier.filter(|m| m.is_finite() && *m > 0.0).unwrap_or(1.0);
-            if acct.tier_multiplier.is_some() {
+            if acct.tier_multiplier.is_some_and(|m| m.is_finite() && m > 0.0) {
                 any_tier_weight = true;
             }
-            weighted_used += used * cap;
+            remaining_capacity += cap * (remaining / 100.0);
             total_capacity += cap;
-            let seconds = win.window_duration_mins.filter(|&mins| mins > 0).map(|mins| u64::from(mins) * 60).or(match win.kind {
-                QuotaWindowKind::Daily => Some(86_400),
-                QuotaWindowKind::Weekly => Some(604_800),
-                _ if win.window_key == "5h" => Some(18_000),
-                _ => None,
-            });
+            let seconds = infer_window_duration_mins(win).map(|mins| u64::from(mins) * 60);
             if included == 0 {
                 window_seconds = seconds;
             } else if window_seconds != seconds {
@@ -1230,8 +1233,8 @@ pub fn compute_pools<'a>(
         }
 
         let (used_pct, rem_pct) = if total_capacity > 0.0 {
-            let u = (weighted_used / total_capacity).clamp(0.0, 100.0);
-            (Some(u), Some((100.0 - u).clamp(0.0, 100.0)))
+            let rem = (remaining_capacity / total_capacity * 100.0).clamp(0.0, 100.0);
+            (Some((100.0 - rem).clamp(0.0, 100.0)), Some(rem))
         } else {
             (None, None)
         };
@@ -1250,6 +1253,8 @@ pub fn compute_pools<'a>(
             included_accounts: included,
             weighted_used_percent: used_pct,
             weighted_remaining_percent: rem_pct,
+            remaining_capacity_units: (total_capacity > 0.0).then_some(remaining_capacity),
+            total_capacity_units: (total_capacity > 0.0).then_some(total_capacity),
             capacity_basis: if any_tier_weight { "plan_tier_multiplier".into() } else { "equal_entitlements".into() },
             next_reset_at: next_reset,
             window_seconds,
@@ -1468,6 +1473,11 @@ pub async fn submit_operation(hub: &Hub, actor: &Actor, provider_id: &str, input
     if input.idempotency_key.trim().is_empty() {
         return Err(invalid("missing_idempotency_key", "idempotency_key is required"));
     }
+    if let ProviderCommand::Account(AccountCommand::SetCapacity { tier_multiplier: Some(multiplier), .. }) = &input.command
+        && (!multiplier.is_finite() || *multiplier <= 0.0)
+    {
+        return Err(invalid("invalid_tier_multiplier", "tier_multiplier must be finite and greater than zero"));
+    }
     let desc = load_descriptor(hub, provider_id).await?;
     let required = input.command.required_capability();
     if !desc.capabilities.contains(&required) {
@@ -1674,6 +1684,15 @@ async fn apply_hub_side_effects(
                 .bind(provider_id)
                 .bind(account_id)
                 .bind(note)
+                .execute(&mut **tx)
+                .await?;
+        }
+        ProviderCommand::Account(AccountCommand::SetCapacity { account_id, plan, tier_multiplier }) => {
+            sqlx::query("update model_accounts set plan = $3, tier_multiplier = $4, updated_at = now() where provider_id = $1 and id = $2")
+                .bind(provider_id)
+                .bind(account_id)
+                .bind(plan)
+                .bind(tier_multiplier)
                 .execute(&mut **tx)
                 .await?;
         }
@@ -2450,6 +2469,7 @@ mod tests {
             note: None,
             plan: None,
             tier_multiplier: tier,
+            observed_capacity_ratio: None,
             status: AccountStatus::Ready,
             enabled,
             priority: 0,
@@ -2720,7 +2740,7 @@ mod tests {
         let dup = acct("a-dup", true, Some(5.0), Some("fp1"), sample_window("five_hour", Some(20.0), QuotaObservationState::Measured));
         let b = acct("b", true, Some(1.0), Some("fp2"), sample_window("five_hour", Some(80.0), QuotaObservationState::Measured));
         let missing = acct("c", true, Some(5.0), Some("fp3"), sample_window("five_hour", None, QuotaObservationState::NeverObserved));
-        let pools = compute_pools("test", &[a, dup, b, missing], &[]);
+        let pools = compute_pools("test", &[a, dup, b, missing], &[], Utc::now());
         assert_eq!(pools.len(), 1);
         let p = &pools[0];
         assert_eq!(p.eligible_accounts, 3, "duplicate fingerprint collapsed");
@@ -2729,6 +2749,50 @@ mod tests {
         // Weighted used = (20*5 + 80*1) / 6 = 180 / 6 = 30%
         assert!((p.weighted_used_percent.unwrap() - 30.0).abs() < 1e-6);
         assert!((p.weighted_remaining_percent.unwrap() - 70.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn binding_windows_limit_effective_pool_headroom() {
+        let make = |id, tier, weekly, session| {
+            let session = sample_window("3p-5h", Some(session), QuotaObservationState::Measured);
+            let mut weekly = sample_window("3p-weekly", Some(weekly), QuotaObservationState::Measured);
+            weekly.kind = QuotaWindowKind::Weekly;
+            weekly.window_duration_mins = None;
+            let mut account = acct(id, true, Some(tier), None, session);
+            account.windows.push(weekly);
+            account
+        };
+        let accounts = [make("large", 20.0, 100.0, 0.0), make("small", 1.0, 50.0, 50.0)];
+        let pools = compute_pools("test", &accounts, &[], Utc::now());
+        let session = pools.iter().find(|pool| pool.window_key == "3p-5h").unwrap();
+        let remaining = 0.5 / 21.0 * 100.0;
+        assert_eq!(session.remaining_capacity_units, Some(0.5));
+        assert_eq!(session.total_capacity_units, Some(21.0));
+        assert_eq!(session.weighted_remaining_percent, Some(remaining));
+        assert_eq!(session.weighted_used_percent, Some(100.0 - remaining));
+    }
+
+    #[test]
+    fn expired_weekly_window_does_not_limit_live_pool_headroom() {
+        let now = Utc::now();
+        let session = sample_window("3p-5h", Some(25.0), QuotaObservationState::Measured);
+        let weekly = QuotaWindow {
+            kind: QuotaWindowKind::Weekly,
+            window_duration_mins: None,
+            resets_at: Some(now),
+            ..sample_window("3p-weekly", Some(100.0), QuotaObservationState::Measured)
+        };
+        let mut account = acct("a", true, None, None, session);
+        account.windows.push(weekly);
+        let remaining = |at| {
+            compute_pools("test", [&account], &[], at)
+                .into_iter()
+                .find(|pool| pool.window_key == "3p-5h")
+                .unwrap()
+                .weighted_remaining_percent
+        };
+        assert_eq!(remaining(now - Duration::seconds(1)), Some(0.0));
+        assert_eq!(remaining(now), Some(75.0));
     }
 
     #[test]

@@ -28,7 +28,10 @@ use crate::{
     config::matches_secret,
     error_classify::{ERROR_BODY_LIMIT, account_secrets, classify_sse_error, classify_upstream_http_error, local_error, safe_label},
     openai_account,
-    pool::{Account, AccountFilter, Cooldown, Lane, MAX_COOLDOWN_SECS, Pool, QuotaReader, bounded_identifier, model_cooldown_scope, text},
+    pool::{
+        Account, AccountFilter, Cooldown, InFlightGuard, Lane, MAX_COOLDOWN_SECS, Pool, QuotaReader, bounded_identifier,
+        model_cooldown_scope, text,
+    },
 };
 
 pub(crate) const REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024;
@@ -413,13 +416,13 @@ struct RetainedQuota {
 
 struct PoolQuota {
     reset: DateTime<Utc>,
-    verified_reset: Option<DateTime<Utc>>,
+    retry_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 }
 
 impl PoolQuota {
     fn unverified(reset: DateTime<Utc>) -> Self {
-        Self { reset, verified_reset: None, now: Utc::now() }
+        Self { reset, retry_at: None, now: Utc::now() }
     }
 }
 
@@ -604,9 +607,14 @@ pub(crate) async fn forward_authorized(
     let mut retained_quota = Vec::new();
     let mut last_decoded_quota_reset = None;
     let quota_snapshot = |pool: &Pool, now, retained: &mut [RetainedQuota]| {
+        let exhausted = !pool.has_eligible_account(&accounts, now);
+        let transient = exhausted.then(|| pool.transient_recovery(&accounts, now)).flatten();
         if lane != Lane::Google {
-            let reset = pool.next_reset(&accounts, now).filter(|_| pool.all_quota_limited(&accounts, now))?;
-            return Some(QuotaSnapshot::Ready(PoolQuota { reset, verified_reset: None, now }));
+            pool.quota_recovery(&accounts, now).filter(|_| exhausted)?;
+            let earliest = |at| transient.map_or(at, |t: DateTime<Utc>| t.min(at));
+            let reset = pool.bounded_quota_recovery(&accounts, now, false).map(earliest).unwrap_or(DateTime::<Utc>::MAX_UTC);
+            let retry_at = pool.bounded_quota_recovery(&accounts, now, true).map(earliest);
+            return Some(QuotaSnapshot::Ready(PoolQuota { reset, retry_at, now }));
         }
         let live_deadline = |account: &Account| account.quota_limited_until(now, model);
         let supported = |account: &Account| accounts.supports(pool, account) && !account.quarantined(now);
@@ -622,6 +630,7 @@ pub(crate) async fn forward_authorized(
                         .and_then(|quota| quota.until)
                 })
             })
+            .chain(exhausted.then(|| pool.quota_recovery(&accounts, now)).flatten())
             .min()?;
         let verified_reset = pool.verified_google_reset_at_for(&accounts, now);
         let pending = retained.iter_mut().enumerate().find_map(|(index, quota)| {
@@ -631,7 +640,9 @@ pub(crate) async fn forward_authorized(
             }
             Some(QuotaSnapshot::ReadBody(index, quota.reader.take()?))
         });
-        pending.or(Some(QuotaSnapshot::Ready(PoolQuota { reset, verified_reset, now })))
+        let retry_at = verified_reset.map(|v| transient.map_or(v, |t| v.min(t)));
+        let reset = reset.min(transient.unwrap_or(reset));
+        pending.or(Some(QuotaSnapshot::Ready(PoolQuota { reset, retry_at, now })))
     };
     let pick = |pool: &mut Pool, exchange: &Exchange, tried: &[String], now| {
         pool.pick_for(&accounts, (exchange.affinity_key.as_deref(), exchange.parent.as_deref()), tried, now)
@@ -642,7 +653,8 @@ pub(crate) async fn forward_authorized(
                 let mut state = proxy.state.write().await;
                 let now = Utc::now();
                 if let Some(account) = pick(&mut state.pool, exchange, tried, now) {
-                    return (Some(account), None, None);
+                    let in_flight = state.pool.acquire_in_flight(&account.id);
+                    return (Some((account, in_flight)), None, None);
                 }
                 match quota_snapshot(&state.pool, now, retained) {
                     Some(snapshot) => snapshot,
@@ -666,7 +678,7 @@ pub(crate) async fn forward_authorized(
             Some(account) => (Some(account), None, None),
             None => pick_or_quota(&exchange, &tried, &mut retained_quota).await,
         };
-        let Some(mut account) = account else {
+        let Some((mut account, in_flight)) = account else {
             if let Some(quota) = quota.or_else(|| last_decoded_quota_reset.map(PoolQuota::unverified)) {
                 return exchange.rate_limited(quota, Usage::default(), None).await;
             }
@@ -1212,6 +1224,7 @@ pub(crate) async fn forward_authorized(
         let state = Wire {
             proxy: proxy.clone(),
             guard,
+            _in_flight: in_flight,
             account,
             status,
             started: began,
@@ -1353,7 +1366,7 @@ pub(crate) fn normalize_google_quota(raw: &mut Value, model: &str, now: DateTime
     }
 }
 
-fn pool_limit(lane: Lane, model: &str, PoolQuota { reset, verified_reset, now }: PoolQuota) -> Response {
+fn pool_limit(lane: Lane, model: &str, PoolQuota { reset, retry_at, now }: PoolQuota) -> Response {
     let payload = if lane == Lane::Google {
         google_quota_error_body(model)
     } else {
@@ -1365,9 +1378,8 @@ fn pool_limit(lane: Lane, model: &str, PoolQuota { reset, verified_reset, now }:
     response.extensions_mut().insert(LocalPoolResponse);
     let headers = response.headers_mut();
     headers.insert("x-should-retry", header::HeaderValue::from_static("false"));
-    if lane == Lane::Google
-        && bounded_identifier(model)
-        && let Some(at) = verified_reset
+    if bounded_identifier(model)
+        && let Some(at) = retry_at
         && let Some(at) = DateTime::from_timestamp(at.timestamp() + i64::from(at.timestamp_subsec_nanos() > 0), 0)
         && at > now
         && at - now <= TimeDelta::seconds(MAX_COOLDOWN_SECS)
@@ -1401,14 +1413,14 @@ fn pool_witness_rounds_up_without_exceeding_the_horizon() {
     let now = "2026-11-23T12:00:00.900Z".parse::<DateTime<Utc>>().unwrap();
     let blocker = now + TimeDelta::seconds(10);
     let model = "gemini-neon";
-    let response = pool_limit(Lane::Google, model, PoolQuota { reset: blocker, verified_reset: Some(blocker), now });
+    let response = pool_limit(Lane::Google, model, PoolQuota { reset: blocker, retry_at: Some(blocker), now });
     let expected = "2026-11-23T12:00:11Z";
     assert_eq!(response.headers()[POOL_QUOTA_HEADER].to_str().unwrap(), format!("v1;retry_at={expected};wire_model={model}"));
     assert!(expected.parse::<DateTime<Utc>>().unwrap() >= blocker);
     assert_eq!(response.headers()["retry-after"], "10");
 
     let horizon = now + TimeDelta::days(7);
-    let response = pool_limit(Lane::Google, model, PoolQuota { reset: horizon, verified_reset: Some(horizon), now });
+    let response = pool_limit(Lane::Google, model, PoolQuota { reset: horizon, retry_at: Some(horizon), now });
     assert!(!response.headers().contains_key(POOL_QUOTA_HEADER));
 }
 
@@ -1416,7 +1428,7 @@ fn pool_witness_rounds_up_without_exceeding_the_horizon() {
 fn google_near_expiry_reset_keeps_transport_backoff_without_a_body_delay() {
     let now = DateTime::from_timestamp_millis(1_800_000_000_999).unwrap();
     let reset = now + TimeDelta::milliseconds(2);
-    let response = pool_limit(Lane::Google, "gemini", PoolQuota { reset, verified_reset: None, now });
+    let response = pool_limit(Lane::Google, "gemini", PoolQuota { reset, retry_at: None, now });
     assert_eq!(response.headers()["retry-after"], "5");
     assert!(!response.headers().contains_key(POOL_QUOTA_HEADER));
 }
@@ -2206,6 +2218,8 @@ async fn result(
         && body_read.is_none_or(|(reader, verified)| current.finish_google_quota_read(reader, (!verified).then_some(until.until)))
     {
         apply_quota(current, model, until, now);
+        drop(state);
+        proxy.persist_cooldown_state().await;
     }
 }
 
@@ -2217,7 +2231,7 @@ async fn begin_google_quota_read(
     unverified_until: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Option<QuotaReader> {
-    proxy
+    let reader = proxy
         .state
         .write()
         .await
@@ -2225,20 +2239,29 @@ async fn begin_google_quota_read(
         .accounts
         .get_mut(&account.id)
         .filter(|a| a.same_credential(account))
-        .map(|current| current.begin_google_quota_read(model, provisional, unverified_until, now))
+        .map(|current| current.begin_google_quota_read(model, provisional, unverified_until, now));
+    if reader.is_some() {
+        drop(proxy.schedule_cooldown_state_write());
+    }
+    reader
 }
 
 async fn extend_quota(proxy: &Proxy, account: &Account, model: &str, until: Cooldown) {
     let mut state = proxy.state.write().await;
     if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account)) {
         apply_quota(current, model, until, Utc::now());
+        drop(state);
+        proxy.persist_cooldown_state().await;
     }
 }
 
 async fn discard_google_quota_read(proxy: &Proxy, account: &Account, reader: &QuotaReader) {
     let mut state = proxy.state.write().await;
-    if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account)) {
-        current.finish_google_quota_read(reader, None);
+    if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|a| a.same_credential(account))
+        && current.finish_google_quota_read(reader, None)
+    {
+        drop(state);
+        drop(proxy.schedule_cooldown_state_write());
     }
 }
 
@@ -2893,6 +2916,7 @@ async fn google_first(response: &mut reqwest::Response, first: Bytes, sse: bool,
 struct Wire {
     proxy: Arc<Proxy>,
     guard: RecordOnDrop,
+    _in_flight: InFlightGuard,
     account: Account,
     status: StatusCode,
     started: Instant,

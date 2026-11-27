@@ -48,6 +48,7 @@ pub enum ProviderCapability {
     SetEnabled,
     SetPriority,
     SetWeight,
+    SetCapacity,
     SetNote,
     // Credentials facet
     BeginOAuth,
@@ -564,6 +565,103 @@ pub struct QuotaWindow {
     pub error_reason: Option<String>,
 }
 
+fn window_horizon(key: &str) -> Option<(&str, u32)> {
+    // Match whole keys or delimiter-separated suffixes, including multi-token horizons.
+    for (token, minutes) in [
+        ("five_hour", 300),
+        ("five-hour", 300),
+        ("seven_day", 10080),
+        ("seven-day", 10080),
+        ("session", 300),
+        ("rolling", 300),
+        ("quota", 300),
+        ("5h", 300),
+        ("daily", 1440),
+        ("day", 1440),
+        ("24h", 1440),
+        ("1d", 1440),
+        ("weekly", 10080),
+        ("week", 10080),
+        ("7d", 10080),
+        ("monthly", 43200),
+        ("month", 43200),
+        ("30d", 43200),
+    ] {
+        if let Some(prefix) = key.strip_suffix(token) {
+            if prefix.is_empty() {
+                return Some(("", minutes));
+            }
+            if let Some(family) = prefix.strip_suffix(['-', '_']) {
+                return Some((family, minutes));
+            }
+        }
+    }
+    None
+}
+
+/// Infer the horizon from explicit duration, calendar window kind, a key suffix, or session kind.
+pub fn infer_window_duration_mins(window: &QuotaWindow) -> Option<u32> {
+    window.window_duration_mins.filter(|&mins| mins > 0).or_else(|| match window.kind {
+        QuotaWindowKind::Daily => Some(1440),
+        QuotaWindowKind::Weekly => Some(10080),
+        QuotaWindowKind::Monthly => Some(43200),
+        _ => window_horizon(&window.window_key.to_ascii_lowercase())
+            .map(|(_, mins)| mins)
+            .or((window.kind == QuotaWindowKind::Session).then_some(300)),
+    })
+}
+
+/// Return the scope prefix of a recognized horizon key, if it has one.
+pub fn window_scope_family(window_key: &str) -> Option<String> {
+    let key = window_key.to_ascii_lowercase();
+    window_horizon(&key).filter(|(family, _)| !family.is_empty()).map(|(family, _)| family.to_owned())
+}
+
+fn raw_remaining_pct(window: &QuotaWindow) -> Option<f64> {
+    window
+        .remaining_percent
+        .filter(|pct| pct.is_finite())
+        .or_else(|| window.used_percent.filter(|pct| pct.is_finite()).map(|used| 100.0 - used))
+        .map(|pct| pct.clamp(0.0, 100.0))
+}
+
+/// Whether a measured longer quota also constrains the shorter quota.
+pub fn window_binds(longer: &QuotaWindow, shorter: &QuotaWindow) -> bool {
+    longer.unit == QuotaUnit::Percent
+        && shorter.unit == QuotaUnit::Percent
+        && matches!(longer.observation_state, QuotaObservationState::Measured | QuotaObservationState::StaleLastGood)
+        && raw_remaining_pct(longer).is_some()
+        && matches!((infer_window_duration_mins(longer), infer_window_duration_mins(shorter)), (Some(l), Some(s)) if l > s)
+        && window_scope_family(&longer.window_key) == window_scope_family(&shorter.window_key)
+        && longer
+            .scope_model
+            .as_deref()
+            .is_none_or(|model| shorter.scope_model.as_deref().is_some_and(|other| model.eq_ignore_ascii_case(other)))
+}
+
+/// Whether a compatible longer quota still constrains the shorter quota at `now`.
+pub fn window_binds_at(longer: &QuotaWindow, shorter: &QuotaWindow, now: DateTime<Utc>) -> bool {
+    longer.resets_at.is_none_or(|reset| reset > now) && window_binds(longer, shorter)
+}
+
+/// Percent remaining after applying all compatible, longer quota limits.
+pub fn effective_remaining_percent(window: &QuotaWindow, all_windows: &[QuotaWindow]) -> Option<f64> {
+    effective_remaining_percent_with(window, all_windows, |longer| window_binds(longer, window))
+}
+
+/// Percent remaining after applying compatible longer limits that have not reset.
+pub fn effective_remaining_percent_at(window: &QuotaWindow, all_windows: &[QuotaWindow], now: DateTime<Utc>) -> Option<f64> {
+    effective_remaining_percent_with(window, all_windows, |longer| window_binds_at(longer, window, now))
+}
+
+fn effective_remaining_percent_with(
+    window: &QuotaWindow,
+    all_windows: &[QuotaWindow],
+    binds: impl Fn(&QuotaWindow) -> bool,
+) -> Option<f64> {
+    Some(all_windows.iter().filter(|longer| binds(longer)).filter_map(raw_remaining_pct).fold(raw_remaining_pct(window)?, f64::min))
+}
+
 /// Provider reset credit / grant status (e.g. Codex/Claude reset credits).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResetGrant {
@@ -632,6 +730,9 @@ pub struct ModelAccount {
     /// Relative plan capacity multiplier (e.g. 1.0, 5.0, 20.0); never confused with routing weight.
     #[serde(default)]
     pub tier_multiplier: Option<f64>,
+    /// Advisory token-burn estimate; does not change the declared entitlement.
+    #[serde(default)]
+    pub observed_capacity_ratio: Option<f64>,
     #[serde(default)]
     pub status: AccountStatus,
     #[serde(default = "default_true")]
@@ -794,6 +895,10 @@ pub struct PoolWindowSummary {
     /// Weighted average across compatible eligible windows; `None` when none observed.
     pub weighted_used_percent: Option<f64>,
     pub weighted_remaining_percent: Option<f64>,
+    #[serde(default)]
+    pub remaining_capacity_units: Option<f64>,
+    #[serde(default)]
+    pub total_capacity_units: Option<f64>,
     /// Explains what weights were used (e.g. "plan_multiplier", "equal_entitlements").
     pub capacity_basis: String,
     pub next_reset_at: Option<DateTime<Utc>>,
@@ -935,6 +1040,7 @@ pub enum AccountCommand {
     SetEnabled { account_id: String, enabled: bool },
     SetPriority { account_id: String, priority: i32 },
     SetWeight { account_id: String, weight: u32 },
+    SetCapacity { account_id: String, plan: Option<String>, tier_multiplier: Option<f64> },
     SetNote { account_id: String, note: Option<String> },
 }
 
@@ -1074,6 +1180,7 @@ impl ProviderCommand {
             Self::Account(AccountCommand::SetEnabled { .. }) => ProviderCapability::SetEnabled,
             Self::Account(AccountCommand::SetPriority { .. }) => ProviderCapability::SetPriority,
             Self::Account(AccountCommand::SetWeight { .. }) => ProviderCapability::SetWeight,
+            Self::Account(AccountCommand::SetCapacity { .. }) => ProviderCapability::SetCapacity,
             Self::Account(AccountCommand::SetNote { .. }) => ProviderCapability::SetNote,
             Self::Credential(CredentialCommand::BeginOAuth { .. }) => ProviderCapability::BeginOAuth,
             Self::Credential(CredentialCommand::RenewLogin { .. }) => ProviderCapability::RenewLogin,
@@ -1120,6 +1227,7 @@ impl ProviderCommand {
             Self::Account(AccountCommand::SetEnabled { .. }) => "account.set_enabled",
             Self::Account(AccountCommand::SetPriority { .. }) => "account.set_priority",
             Self::Account(AccountCommand::SetWeight { .. }) => "account.set_weight",
+            Self::Account(AccountCommand::SetCapacity { .. }) => "account.set_capacity",
             Self::Account(AccountCommand::SetNote { .. }) => "account.set_note",
             Self::Credential(CredentialCommand::BeginOAuth { .. }) => "credential.begin_oauth",
             Self::Credential(CredentialCommand::RenewLogin { .. }) => "credential.renew",
@@ -1281,10 +1389,82 @@ pub struct ObservationAck {
 #[serde(rename_all = "snake_case")]
 pub enum RouteStrategy {
     #[default]
+    CapacityBalanced,
     SoonestReset,
     FillFirst,
     RoundRobin,
     WeightedRoundRobin,
+}
+
+#[cfg(test)]
+#[test]
+fn capacity_balanced_is_the_default_route_strategy() {
+    assert_eq!(serde_json::to_value(RoutingPolicy::default()).unwrap()["strategy"], "capacity_balanced");
+    assert_eq!(serde_json::from_str::<RouteStrategy>("\"capacity_balanced\"").unwrap(), RouteStrategy::CapacityBalanced);
+    assert_eq!(serde_json::from_str::<RoutingPolicy>("{}").unwrap(), RoutingPolicy::default());
+    let explicit: RoutingPolicy = serde_json::from_value(serde_json::json!({"strategy": "soonest_reset"})).unwrap();
+    assert_eq!(explicit.strategy, RouteStrategy::SoonestReset);
+}
+
+#[cfg(test)]
+#[test]
+fn reported_quota_binds_to_its_weekly_window() {
+    let window = |key| {
+        serde_json::from_value::<QuotaWindow>(serde_json::json!({
+            "window_key": key, "label": key, "remaining_percent": 25.0, "observation_state": "measured"
+        }))
+        .unwrap()
+    };
+    assert_eq!(window_scope_family("3p-quota").as_deref(), Some("3p"));
+    assert!(window_binds(&window("3p-weekly"), &window("3p-quota")));
+}
+
+#[test]
+fn session_kind_supplies_duration_when_key_has_no_horizon() {
+    let window: QuotaWindow = serde_json::from_value(serde_json::json!({
+        "window_key": "primary_window", "label": "Primary", "kind": "session"
+    }))
+    .unwrap();
+    assert_eq!(infer_window_duration_mins(&window), Some(300));
+    assert_eq!(infer_window_duration_mins(&QuotaWindow { window_key: "weekly".into(), ..window }), Some(10080));
+}
+
+#[test]
+fn binding_windows_respect_family_scope_and_measurement() {
+    let window = |key| {
+        serde_json::from_value::<QuotaWindow>(serde_json::json!({
+            "window_key": key, "label": key, "remaining_percent": 25.0, "observation_state": "measured"
+        }))
+        .unwrap()
+    };
+    for (session, weekly) in
+        [("3p-5h", "3p-weekly"), ("gemini-5h", "gemini-weekly"), ("claude_five_hour", "claude_seven_day"), ("five_hour", "seven_day")]
+    {
+        assert!(window_binds(&window(weekly), &window(session)));
+        assert!(!window_binds(&window(session), &window(weekly)));
+    }
+    assert!(!window_binds(&window("gemini-weekly"), &window("3p-5h")));
+    assert_eq!(window_scope_family("claude_seven_day").as_deref(), Some("claude"));
+    assert_eq!(window_scope_family("seven_day"), None);
+    let rolling = window("go_rolling");
+    assert_eq!(window_scope_family(&rolling.window_key).as_deref(), Some("go"));
+    assert_eq!(infer_window_duration_mins(&rolling), Some(300));
+    assert!(window_binds(&window("go_weekly"), &rolling));
+    assert_eq!(infer_window_duration_mins(&QuotaWindow { window_duration_mins: Some(180), ..rolling }), Some(180));
+
+    let mut weekly = window("seven_day");
+    let mut session = window("five_hour");
+    session.remaining_percent = None;
+    session.used_percent = Some(-1.0);
+    weekly.scope_model = Some("Opus".into());
+    assert!(!window_binds(&weekly, &session));
+    session.scope_model = Some("opus".into());
+    assert!(window_binds(&weekly, &session));
+    weekly.scope_model = None;
+    weekly.observation_state = QuotaObservationState::StaleLastGood;
+    assert_eq!(effective_remaining_percent(&session, &[weekly.clone()]), Some(25.0));
+    weekly.observation_state = QuotaObservationState::ProbeFailed;
+    assert_eq!(effective_remaining_percent(&session, &[weekly]), Some(100.0));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1329,7 +1509,7 @@ fn default_first_byte_secs() -> u64 {
 impl Default for RoutingPolicy {
     fn default() -> Self {
         Self {
-            strategy: RouteStrategy::SoonestReset,
+            strategy: RouteStrategy::default(),
             api_key_order: ApiKeyOrder::KeysLast,
             session_affinity_secs: default_affinity_secs(),
             preferred_account_id: None,

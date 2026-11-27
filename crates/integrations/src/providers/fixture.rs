@@ -646,6 +646,11 @@ fn apply_account(snapshot: &mut ObservationBatch, command: AccountCommand, at: D
         }
         AccountCommand::SetPriority { account_id, priority } => find_account(snapshot, &account_id)?.priority = priority,
         AccountCommand::SetWeight { account_id, weight } => find_account(snapshot, &account_id)?.weight = weight,
+        AccountCommand::SetCapacity { account_id, plan, tier_multiplier } => {
+            let account = find_account(snapshot, &account_id)?;
+            account.plan = plan;
+            account.tier_multiplier = tier_multiplier;
+        }
         AccountCommand::SetNote { account_id, note } => find_account(snapshot, &account_id)?.note = note,
     }
     complete(json!({"fixture": true, "applied": true}))

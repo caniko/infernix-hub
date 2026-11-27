@@ -996,11 +996,199 @@ async fn fixture_providers_and_activity_over_http() {
     assert_eq!(quota.accounts.len(), before.account_count);
     assert!(!quota.samples.is_empty());
 
+    assert_capacity_over_http(&db, &get, &post).await;
+
     server.abort();
     let _ = server.await;
     db.close().await;
     domain::sqlx::query(&format!("drop database {name} with (force)")).execute(&admin).await.unwrap();
     let _ = std::fs::remove_dir_all(assets);
+}
+
+async fn assert_capacity_over_http(
+    db: &domain::sqlx::PgPool,
+    get: impl Fn(&str) -> reqwest::RequestBuilder,
+    post: impl Fn(&str) -> reqwest::RequestBuilder,
+) {
+    use chrono::{Duration, Utc};
+    use contracts::providers::{ModelAccount, ProviderQuotaReport};
+    use domain::sqlx;
+
+    let first = "claude:subscription-1";
+    let second = "claude:subscription-2";
+    let operations = "providers/claude/operations";
+    let capacity = |key, account, plan, multiplier| {
+        post(operations).json(&json!({
+            "idempotency_key": key,
+            "command": {"facet":"account", "payload":{
+                "op":"set_capacity", "account_id":account, "plan":plan, "tier_multiplier":multiplier
+            }}
+        }))
+    };
+    for multiplier in [0.0, -1.0] {
+        let response = capacity("set-capacity", second, "Max", multiplier).send().await.unwrap();
+        assert_eq!(response.status(), 422);
+        assert_eq!(response.json::<Value>().await.unwrap()["code"], "invalid_tier_multiplier");
+    }
+    for (key, account, plan, multiplier) in [("set-base", first, "Base", 1.0), ("set-capacity", second, "Max", 20.0)] {
+        let response: Value =
+            capacity(key, account, plan, multiplier).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(response["status"], "succeeded");
+        let stored: (Option<String>, Option<f64>) =
+            sqlx::query_as("select plan, tier_multiplier from model_accounts where provider_id = 'claude' and id = $1")
+                .bind(account)
+                .fetch_one(db)
+                .await
+                .unwrap();
+        assert_eq!(stored, (Some(plan.into()), Some(multiplier)));
+    }
+    for strategy in ["soonest_reset", "capacity_balanced"] {
+        let response: Value = post(operations)
+            .json(&json!({
+                "idempotency_key":strategy, "command":{"facet":"routing","payload":{"op":"set_route_policy","policy":{"strategy":strategy}}}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "succeeded");
+        let routing: Value = get("providers/claude/routing").send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(routing["policy"]["strategy"], strategy);
+    }
+
+    // Measure against only the synthetic samples in this test, not seeded quota history.
+    sqlx::query("delete from model_quota_samples where provider_id = 'claude'").execute(db).await.unwrap();
+    let start = Utc::now() - Duration::minutes(5);
+    let step = Duration::seconds(10);
+    let reset = start + Duration::days(7);
+    let samples = |account, end_reset| {
+        sqlx::query(
+            "insert into model_quota_samples
+            (provider_id, account_id, window_key, label, kind, unit, used_percent, resets_at, observation_state, observed_at)
+            values ('claude', $1, 'capacity-weekly', 'Weekly', 'weekly', 'percent', 10, $2, 'measured', $3),
+                   ('claude', $1, 'capacity-weekly', 'Weekly', 'weekly', 'percent', 11, $2, 'measured', $4),
+                   ('claude', $1, 'capacity-weekly', 'Weekly', 'weekly',  'percent', 12, $5, 'measured', $6)",
+        )
+        .bind(account)
+        .bind(reset)
+        .bind(start)
+        .bind(start + step)
+        .bind(end_reset)
+        .bind(start + step * 2)
+    };
+    for (account, tokens) in [(first, 100_i64), (second, 2000)] {
+        sqlx::query(
+            "insert into activity_exchanges
+            (id, source_host, source_user, source_exchange_id, client, provider_id, account_id, requested_model, effective_model,
+             outcome, input_tokens, cache_read_tokens, occurred_at)
+             values ($1, 'capacity-test', 'test', $2, 'test', 'claude', $2, 'test', 'test', 'ok', $3, $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(account)
+        .bind(tokens)
+        .bind(start + step)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+    samples(first, reset).execute(db).await.unwrap();
+    samples(second, reset + Duration::days(7)).execute(db).await.unwrap();
+    let accounts = || async {
+        get("providers/claude/accounts").send().await.unwrap().error_for_status().unwrap().json::<Vec<ModelAccount>>().await.unwrap()
+    };
+    assert!(accounts().await.iter().all(|account| account.observed_capacity_ratio.is_none()));
+    sqlx::query("update model_quota_samples set resets_at = $1 where provider_id = 'claude' and account_id = $2")
+        .bind(reset)
+        .bind(second)
+        .execute(db)
+        .await
+        .unwrap();
+    let listed = accounts().await;
+    let base = listed.iter().find(|account| account.id == first).unwrap();
+    let max = listed.iter().find(|account| account.id == second).unwrap();
+    assert_eq!(base.observed_capacity_ratio, Some(1.0));
+    assert_eq!(max.observed_capacity_ratio, Some(20.0));
+    assert_eq!(max.plan.as_deref(), Some("Max"));
+    assert_eq!(max.tier_multiplier, Some(20.0));
+
+    // Equal inclusive totals and equal burn imply equal capacity, regardless of token subsets.
+    sqlx::query(
+        "update activity_exchanges set input_tokens = 100, output_tokens = 100,
+                cache_read_tokens = 100, thinking_tokens = 100
+         where source_host = 'capacity-test' and account_id = $1",
+    )
+    .bind(second)
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "update activity_exchanges set output_tokens = 100, cache_read_tokens = 0 where source_host = 'capacity-test' and account_id = $1",
+    )
+    .bind(first)
+    .execute(db)
+    .await
+    .unwrap();
+    let second_ratio = || async { accounts().await.into_iter().find(|a| a.id == second).unwrap().observed_capacity_ratio };
+    assert!((second_ratio().await.unwrap() - 1.0).abs() < 1e-9);
+
+    sqlx::query(
+        "update model_quota_samples set window_key = 'capacity-5h', kind = 'session'
+         where provider_id = 'claude' and account_id = $1",
+    )
+    .bind(second)
+    .execute(db)
+    .await
+    .unwrap();
+    assert!(accounts().await.iter().all(|a| a.observed_capacity_ratio.is_none()));
+
+    sqlx::query(
+        "update model_quota_samples set window_key = 'capacity-weekly', kind = 'weekly',
+            scope_model = case when account_id = $1 then 'TeSt' else 'test' end
+         where provider_id = 'claude'",
+    )
+    .bind(first)
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into activity_exchanges
+         (id, source_host, source_user, source_exchange_id, client, provider_id, account_id, requested_model, effective_model,
+          outcome, input_tokens, occurred_at)
+         values ($1, 'capacity-test', 'test', 'other-model', 'test', 'claude', $2, 'TeSt', 'other', 'ok', 10000, $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(second)
+    .bind(start + step)
+    .execute(db)
+    .await
+    .unwrap();
+    assert!((second_ratio().await.unwrap() - 1.0).abs() < 1e-9);
+
+    sqlx::query(
+        "insert into model_quota_samples
+            (provider_id, account_id, window_key, label, used_percent, observation_state, observed_at)
+         values ('claude', $1, '3p-weekly', 'Weekly', 50, 'measured', $3),
+                ('claude', $1, '3p-5h', 'Session', 50, 'measured', $3),
+                ('claude', $2, '3p-weekly', 'Weekly', 100, 'measured', $3),
+                ('claude', $2, '3p-5h', 'Session', 0, 'measured', $3)",
+    )
+    .bind(first)
+    .bind(second)
+    .bind(start)
+    .execute(db)
+    .await
+    .unwrap();
+    let report: ProviderQuotaReport = get("providers/claude/quota").send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let session = report.pools.iter().find(|pool| pool.window_key == "3p-5h").unwrap();
+    let remaining = 0.5 / 21.0 * 100.0;
+    assert_eq!(session.remaining_capacity_units, Some(0.5));
+    assert_eq!(session.total_capacity_units, Some(21.0));
+    assert_eq!(session.weighted_remaining_percent, Some(remaining));
+    assert_eq!(session.weighted_used_percent, Some(100.0 - remaining));
 }
 
 async fn assert_quota_plot_history(db: &domain::sqlx::PgPool, request: reqwest::RequestBuilder) {
@@ -1163,6 +1351,7 @@ async fn quota_latest_reconciliation_fixture_purge_and_retention() {
             note: None,
             plan: None,
             tier_multiplier: None,
+            observed_capacity_ratio: None,
             status: contracts::providers::AccountStatus::Ready,
             enabled: true,
             priority: 0,

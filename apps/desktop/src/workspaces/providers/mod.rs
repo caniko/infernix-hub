@@ -5,12 +5,13 @@ mod activity;
 mod charts;
 mod dashboard;
 mod data_settings;
+mod provider_detail;
 mod routing;
 
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use contracts::{Role, SystemStatus, client::HubClient, providers::*};
+use contracts::{AdapterMode, Role, SystemStatus, Verification, client::HubClient, providers::*};
 use dioxus::core::{Runtime, current_scope_id};
 use dioxus::prelude::*;
 use uuid::Uuid;
@@ -24,6 +25,11 @@ use crate::{
 
 #[derive(Clone, Copy)]
 struct PanelState {
+    tab: Signal<usize>,
+    selected_provider: Signal<String>,
+    detail_provider: Signal<Option<String>>,
+    activity_subtab: Signal<Option<String>>,
+    settings_ready: Signal<bool>,
     settings: Signal<ProviderPanelSettings>,
     saved_settings: Signal<Option<ProviderPanelSettings>>,
     toolbar_save_pending: Signal<bool>,
@@ -47,6 +53,38 @@ struct OperationProgress {
 }
 
 impl PanelState {
+    pub(super) fn open_provider_detail(mut self, provider_id: impl Into<String>) {
+        self.tab.set(0);
+        self.detail_provider.set(Some(provider_id.into()));
+    }
+
+    pub(super) fn back_to_overview(mut self) {
+        self.detail_provider.set(None);
+        self.selected_provider.set(String::new());
+    }
+
+    pub(super) fn open_accounts_for(mut self, provider_id: impl Into<String>) {
+        self.detail_provider.set(None);
+        self.selected_provider.set(provider_id.into());
+        self.tab.set(1);
+    }
+
+    pub(super) fn open_activity(mut self, subtab: Option<&str>) {
+        self.detail_provider.set(None);
+        self.activity_subtab.set(subtab.map(str::to_string));
+        self.tab.set(2);
+    }
+
+    pub(super) fn open_routing(mut self) {
+        self.detail_provider.set(None);
+        self.tab.set(3);
+    }
+
+    pub(super) fn open_settings(mut self) {
+        self.detail_provider.set(None);
+        self.tab.set(5);
+    }
+
     fn changed(mut self) {
         self.epoch += 1;
     }
@@ -170,11 +208,44 @@ fn client_wiring_label(state: ClientWiringState) -> &'static str {
 
 fn route_strategy_label(strategy: RouteStrategy) -> &'static str {
     match strategy {
+        RouteStrategy::CapacityBalanced => "Capacity Balanced",
         RouteStrategy::SoonestReset => "Soonest Reset",
         RouteStrategy::FillFirst => "Fill First",
         RouteStrategy::RoundRobin => "Round Robin",
         RouteStrategy::WeightedRoundRobin => "Weighted Round Robin",
     }
+}
+
+pub(super) fn route_strategy_description(strategy: RouteStrategy) -> &'static str {
+    match strategy {
+        RouteStrategy::CapacityBalanced => {
+            "Weights routing by subscription tier capacity and weekly expiry urgency so high-capacity pools stay balanced without stranding expiring quota."
+        }
+        RouteStrategy::SoonestReset => "Prefers the eligible account whose active window resets soonest to use expiring quota first.",
+        RouteStrategy::FillFirst => "Concentrates traffic on one eligible account before spilling over to the next.",
+        RouteStrategy::RoundRobin => "Distributes requests evenly across eligible accounts in rotation.",
+        RouteStrategy::WeightedRoundRobin => "Distributes requests across eligible accounts proportionally to their configured weights.",
+    }
+}
+
+pub(super) fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::AccountInventory => "Account inventory",
+        EvidenceKind::QuotaWindows => "Quota windows",
+        EvidenceKind::ResetGrants => "Reset grants",
+        EvidenceKind::RequestMetadata => "Request metadata",
+        EvidenceKind::TraceEdges => "Trace edges",
+        EvidenceKind::TransformedBodies => "Transformed bodies",
+        EvidenceKind::RawWire => "Raw wire",
+    }
+}
+
+pub(super) fn adapter_mode_label(mode: AdapterMode) -> &'static str {
+    crate::labels::adapter_mode(mode).0
+}
+
+pub(super) fn verification_label(v: Verification) -> &'static str {
+    crate::labels::verification(v).0
 }
 
 fn api_key_order_label(order: ApiKeyOrder) -> &'static str {
@@ -246,6 +317,11 @@ pub fn ProvidersView() -> Element {
     let store = use_context::<Store>();
     let scope = current_scope_id();
     let mut panel = use_context_provider(|| PanelState {
+        tab: Signal::new(0),
+        selected_provider: Signal::new(String::new()),
+        detail_provider: Signal::new(None),
+        activity_subtab: Signal::new(None),
+        settings_ready: Signal::new(false),
         settings: Signal::new(ProviderPanelSettings::default()),
         saved_settings: Signal::new(None),
         toolbar_save_pending: Signal::new(false),
@@ -258,10 +334,7 @@ pub fn ProvidersView() -> Element {
         status: store.status,
         scope,
     });
-    let mut selected = use_signal(String::new);
-    let mut tab = use_signal(|| 0usize);
     let mut providers = use_signal(Loaded::<Vec<ProviderSummary>>::default);
-    let mut settings_ready = use_signal(|| false);
     let mut settings_error = use_signal(|| None::<UiError>);
     let preferences_client = client.clone();
     let mut preferences = use_resource(move || {
@@ -271,7 +344,7 @@ pub fn ProvidersView() -> Element {
                 Ok(settings) => {
                     panel.settings.set(settings.clone());
                     panel.saved_settings.set(Some(settings));
-                    settings_ready.set(true);
+                    panel.settings_ready.set(true);
                     settings_error.set(None);
                 }
                 Err(error) => settings_error.set(Some(error)),
@@ -296,32 +369,48 @@ pub fn ProvidersView() -> Element {
     let loaded = providers.cloned();
     let inventory_stale = loaded.error.is_some();
     let all = loaded.data.unwrap_or_default();
-    let selection = selected.cloned();
+    let selection = panel.selected_provider.cloned();
     let scoped: Vec<_> = all.iter().filter(|row| selection.is_empty() || row.descriptor.id == selection).cloned().collect();
-    let section = tab();
-    let show_provider_filters = section < 4;
-    let view_key = if section == 2 { "" } else { &selection };
+    let section = (panel.tab)();
+    let settings_ready = (panel.settings_ready)();
+    let show_provider_status = section < 4;
+    let show_global_provider_bar = matches!(section, 0 | 2 | 3);
+    let view_key = if matches!(section, 1 | 2) { "" } else { &selection };
+    let detail_selection = (panel.detail_provider)();
+    let active_chip = if section == 0 { detail_selection.as_deref().unwrap_or(selection.as_str()) } else { selection.as_str() };
     let settings = panel.settings.cloned();
     let mask_client = client.clone();
-    let sort_client = client.clone();
     rsx! {
         main { class: "work providers-work stack",
             header { class: "glass-card providers-toolbar stack", style: "padding: 8px 12px; gap: 6px;",
                 nav { class: "tab-bar", style: "padding-top: 0; border-top: 0;", aria_label: "AI Usage sections",
                     for (i, label) in TABS.into_iter().enumerate() {
                         button { key: "{label}", class: if section == i { "tab-btn active" } else { "tab-btn" },
-                            aria_current: if section == i { "page" } else { "false" }, onclick: move |_| tab.set(i), "{label}" }
+                            aria_current: if section == i { "page" } else { "false" }, onclick: move |_| {
+                                panel.detail_provider.set(None);
+                                panel.activity_subtab.set(None);
+                                panel.tab.set(i);
+                            }, "{label}" }
                     }
                 }
-                if show_provider_filters {
+                if show_global_provider_bar {
                     div { class: "provider-bar", role: "group", aria_label: "Provider filter",
-                        button { class: "filter-chip", aria_pressed: selection.is_empty(), onclick: move |_| selected.set(String::new()), "All" }
+                        button { class: "filter-chip", aria_pressed: active_chip.is_empty(), onclick: move |_| panel.back_to_overview(), "All" }
                         for provider in &all {
                             {
                                 let id = provider.descriptor.id.clone();
                                 rsx! { button {
-                                    key: "{id}", class: "filter-chip", aria_pressed: id == selection,
-                                    onclick: move |_| selected.set(id.clone()), "{provider.descriptor.label}"
+                                    key: "{id}", class: "filter-chip", aria_pressed: id == active_chip,
+                                    onclick: move |_| {
+                                        if section == 0 && panel.detail_provider.peek().is_some() {
+                                            if !panel.selected_provider.peek().is_empty() {
+                                                panel.selected_provider.set(id.clone());
+                                            }
+                                            panel.open_provider_detail(id.clone());
+                                        } else {
+                                            panel.selected_provider.set(id.clone());
+                                        }
+                                    }, "{provider.descriptor.label}"
                                 } }
                             }
                         }
@@ -329,20 +418,11 @@ pub fn ProvidersView() -> Element {
                 }
                 if section < 5 {
                     div { class: "row",
-                        if section < 2 {
-                            Choice { label: "Account sort", value: sort_key(settings.account_sort), options: pairs(SORTS),
-                                change: move |value: String| {
-                                    panel.settings.write().account_sort = sort_order(&value);
-                                    if panel.operator() && settings_ready() {
-                                        schedule_toolbar_settings_save(panel, sort_client.clone());
-                                    }
-                                } }
-                        }
-                        if show_provider_filters {
-                            Check { label: "Mask emails", value: settings.mask_emails, disabled: !settings_ready(),
+                        if (2..=3).contains(&section) {
+                            Check { label: "Mask emails", value: settings.mask_emails, disabled: !settings_ready,
                                 change: move |value| {
                                     panel.settings.write().mask_emails = value;
-                                    if panel.operator() && settings_ready() {
+                                    if panel.operator() && settings_ready {
                                         schedule_toolbar_settings_save(panel, mask_client.clone());
                                     }
                                 } }
@@ -406,7 +486,7 @@ pub fn ProvidersView() -> Element {
                     }
                 }
             }
-            if show_provider_filters {
+            if show_provider_status {
                 for provider in scoped.iter().filter(|row| row.descriptor.health == ProviderHealth::Offline) {
                     p { key: "{provider.descriptor.id}", class: "monitoring-error", role: "status",
                         {format!("{} offline — {}", provider.descriptor.label, provider.descriptor.status_message.as_deref().unwrap_or("last observation only"))}
@@ -414,18 +494,18 @@ pub fn ProvidersView() -> Element {
                 }
                 if loaded.loading { Loading { text: "Loading model providers…".to_string() } }
             }
-            if !loaded.loading && scoped.is_empty() && !inventory_stale && matches!(section, 0 | 1 | 3) {
+            if !loaded.loading && (if section == 1 { all.is_empty() } else { scoped.is_empty() }) && !inventory_stale && matches!(section, 0 | 1 | 3) {
                 EmptyState { title: "No providers in this view.".to_string(), hint: Some("Select All or register a provider with the hub.".into()) }
             }
-            // Activity keys its results separately so provider changes retain the other filters.
+            // Accounts and Activity manage provider filtering internally so switching does not reset local state.
             {rsx! { div { key: "{view_key}", class: "stack",
                 match section {
                     0 => rsx! { dashboard::Dashboard { providers: scoped, stale: inventory_stale, all_providers: selection.is_empty() } },
-                    1 => rsx! { accounts::Accounts { providers: scoped } },
-                    2 => rsx! { activity::Activity { providers: all, selected } },
-                    3 => rsx! { routing::Routing { providers: scoped } },
+                    1 => rsx! { accounts::Accounts { providers: all } },
+                     2 => rsx! { activity::Activity { providers: all, selected: panel.selected_provider } },
+                     3 => rsx! { routing::Routing { providers: scoped, stale: inventory_stale } },
                     4 => rsx! { data_settings::DataExport {} },
-                    _ => rsx! { data_settings::SettingsHelp { providers: all, ready: settings_ready() } },
+                     _ => rsx! { data_settings::SettingsHelp { providers: all, ready: settings_ready } },
                 }
             } }}
         }
@@ -631,6 +711,71 @@ fn date(value: Option<DateTime<Utc>>) -> String {
     value.map(fmt_dt).unwrap_or_else(|| "—".into())
 }
 
+pub(super) fn format_multiplier(value: f64) -> String {
+    if !value.is_finite() {
+        return "—".into();
+    }
+    let rounded = if value.fract() == 0.0 { value } else { (value * 10.0).round() / 10.0 };
+    if rounded.fract() == 0.0 { format!("{rounded:.0}×") } else { format!("{rounded:.1}×") }
+}
+
+pub(super) fn format_capacity_units(remaining: Option<f64>, total: Option<f64>) -> Option<String> {
+    let (remaining, total) = (remaining?, total?);
+    (remaining.is_finite() && total.is_finite() && total > 0.0).then(|| format!("{remaining:.1} / {total:.1}×"))
+}
+
+pub(super) fn provider_total_capacity(provider: &ProviderSummary) -> Option<f64> {
+    provider
+        .pools
+        .iter()
+        .filter_map(|pool| pool.total_capacity_units)
+        .filter(|total| total.is_finite() && *total > 0.0)
+        .reduce(f64::max)
+        .or_else(|| {
+            let total: f64 = provider.accounts.iter().filter(|account| account.enabled).filter_map(|account| account.tier_multiplier).sum();
+            (total.is_finite() && total > 0.0).then_some(total)
+        })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CapacityRatioAdvisory {
+    pub observed_label: String,
+    pub mismatch: bool,
+    pub detail: String,
+}
+
+pub(super) fn capacity_ratio_mismatch(configured: Option<f64>, observed: Option<f64>) -> Option<CapacityRatioAdvisory> {
+    let observed = observed.filter(|value| value.is_finite() && *value > 0.0)?;
+    let ratio = format_multiplier(observed);
+    let (mismatch, detail) = match configured.filter(|value| value.is_finite() && *value > 0.0) {
+        Some(configured) => (
+            (observed - configured).abs() / configured >= 0.25,
+            format!("Observed capacity ratio {ratio} vs. configured tier multiplier {}", format_multiplier(configured)),
+        ),
+        None => (false, format!("Observed capacity ratio {ratio} (no configured tier multiplier)")),
+    };
+    Some(CapacityRatioAdvisory { observed_label: format!("Observed {ratio}"), mismatch, detail })
+}
+
+pub(super) fn format_relative_age(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    match (now - dt).num_seconds() {
+        seconds if seconds < 60 => "just now".into(),
+        seconds if seconds < 3600 => format!("{}m ago", seconds / 60),
+        seconds if seconds < 86400 => format!("{}h ago", seconds / 3600),
+        seconds => format!("{}d ago", seconds / 86400),
+    }
+}
+
+#[component]
+pub(super) fn QuotaMeterKey() -> Element {
+    rsx! {
+        div { class: "quota-meter-key form-help",
+            span { class: "quota-pace-key", span { aria_hidden: "true", "│ " } "Window pace" }
+            span { class: "quota-projected-key", span { aria_hidden: "true", "▒ " } "Projected end" }
+        }
+    }
+}
+
 fn number(value: Option<f64>) -> String {
     value.filter(|v| v.is_finite()).map_or_else(|| "—".into(), |v| format!("{v:.2}"))
 }
@@ -730,6 +875,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn routing_strategies_have_labels_and_policy_descriptions() {
+        for (strategy, label, description) in [
+            (RouteStrategy::CapacityBalanced, "Capacity Balanced", "weekly expiry urgency"),
+            (RouteStrategy::SoonestReset, "Soonest Reset", "resets soonest"),
+            (RouteStrategy::FillFirst, "Fill First", "spilling over"),
+            (RouteStrategy::RoundRobin, "Round Robin", "in rotation"),
+            (RouteStrategy::WeightedRoundRobin, "Weighted Round Robin", "configured weights"),
+        ] {
+            assert_eq!(route_strategy_label(strategy), label);
+            assert!(route_strategy_description(strategy).contains(description));
+        }
+    }
+
+    #[test]
+    fn capacity_labels_distinguish_zero_from_missing_values() {
+        for (value, expected) in [(20.0, "20×"), (27.5, "27.5×"), (1.25, "1.3×"), (f64::NAN, "—"), (f64::INFINITY, "—")] {
+            assert_eq!(format_multiplier(value), expected);
+        }
+        assert_eq!(format_capacity_units(Some(14.4), Some(27.0)).as_deref(), Some("14.4 / 27.0×"));
+        assert_eq!(format_capacity_units(Some(0.0), Some(1.0)).as_deref(), Some("0.0 / 1.0×"));
+        for (remaining, total) in
+            [(None, Some(1.0)), (Some(0.0), None), (Some(0.0), Some(0.0)), (Some(f64::NAN), Some(1.0)), (Some(0.0), Some(f64::INFINITY))]
+        {
+            assert_eq!(format_capacity_units(remaining, total), None);
+        }
+    }
+
+    #[test]
+    fn total_capacity_prefers_largest_pool_then_sums_enabled_tiers() {
+        let mut provider: ProviderSummary = serde_json::from_value(serde_json::json!({
+            "descriptor": {"id": "test", "label": "Test", "family": "test", "mode": "fixture", "verification": "built"},
+            "account_count": 4, "enabled_accounts": 3, "pools": [],
+            "accounts": [
+                {"id": "a", "provider_id": "test", "source_account_id": "a", "display_name": "A", "tier_multiplier": 5.0},
+                {"id": "b", "provider_id": "test", "source_account_id": "b", "display_name": "B", "tier_multiplier": 2.0},
+                {"id": "c", "provider_id": "test", "source_account_id": "c", "display_name": "C"},
+                {"id": "d", "provider_id": "test", "source_account_id": "d", "display_name": "D", "tier_multiplier": 20.0, "enabled": false}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(provider_total_capacity(&provider), Some(7.0));
+        for total in [0.0, 10.0, 27.0, 20.0] {
+            provider.pools.push(
+                serde_json::from_value(serde_json::json!({
+                    "provider_id": "test", "window_key": "weekly", "label": "Weekly", "kind": "weekly",
+                    "eligible_accounts": 3, "included_accounts": 3, "total_capacity_units": total,
+                    "capacity_basis": "plan_multiplier", "is_estimate": true,
+                }))
+                .unwrap(),
+            );
+        }
+        assert_eq!(provider_total_capacity(&provider), Some(27.0));
+        provider.pools.truncate(1);
+        assert_eq!(provider_total_capacity(&provider), Some(7.0));
+        provider.accounts.retain(|account| account.tier_multiplier.is_none() || !account.enabled);
+        assert_eq!(provider_total_capacity(&provider), None);
+    }
+
+    #[test]
+    fn observed_capacity_advises_on_drift_of_at_least_a_quarter() {
+        for (observed, mismatch) in [(20.0, false), (24.9, false), (25.0, true), (15.0, true), (14.0, true)] {
+            let advisory = capacity_ratio_mismatch(Some(20.0), Some(observed)).unwrap();
+            assert_eq!(advisory.mismatch, mismatch);
+            assert_eq!(advisory.observed_label, format!("Observed {}", format_multiplier(observed)));
+            assert!(advisory.detail.contains("configured"));
+        }
+        for configured in [None, Some(0.0), Some(f64::NAN)] {
+            let advisory = capacity_ratio_mismatch(configured, Some(25.0)).unwrap();
+            assert!(!advisory.mismatch);
+            assert_eq!(advisory.detail, "Observed capacity ratio 25× (no configured tier multiplier)");
+        }
+        for observed in [None, Some(0.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            assert_eq!(capacity_ratio_mismatch(Some(20.0), observed), None);
+        }
+    }
+
+    #[test]
+    fn relative_age_uses_whole_units_and_handles_future_times() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        for (seconds, expected) in [
+            (-60, "just now"),
+            (59, "just now"),
+            (60, "1m ago"),
+            (3599, "59m ago"),
+            (3600, "1h ago"),
+            (86399, "23h ago"),
+            (86400, "1d ago"),
+        ] {
+            assert_eq!(format_relative_age(now - chrono::TimeDelta::seconds(seconds), now), expected);
+        }
+    }
+
+    #[test]
     fn account_sort_keeps_the_active_login_first() {
         let provider: ProviderSummary = serde_json::from_value(serde_json::json!({
             "descriptor": {
@@ -765,6 +1003,11 @@ mod tests {
                     principal: contracts::Principal { id: Uuid::nil(), name: "test".into(), role: Role::Operator },
                 };
                 PanelState {
+                    tab: Signal::new(0),
+                    selected_provider: Signal::new(String::new()),
+                    detail_provider: Signal::new(None),
+                    activity_subtab: Signal::new(None),
+                    settings_ready: Signal::new(false),
                     settings: Signal::new(ProviderPanelSettings::default()),
                     saved_settings: Signal::new(None),
                     toolbar_save_pending: Signal::new(false),
@@ -812,18 +1055,87 @@ mod tests {
                 .unwrap(),
             );
             rsx! {
-                dashboard::Dashboard { providers: vec![provider.clone(), routed], stale: false, all_providers: true }
-                OperationButton { provider, label: "Must not render",
+                dashboard::Dashboard { providers: vec![provider.clone(), routed.clone()], stale: false, all_providers: true }
+                OperationButton { provider: provider.clone(), label: "Must not render",
                     command: ProviderCommand::Quota(QuotaCommand::RefreshQuota { account_id: None }) }
             }
         }
-        let output = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
-        assert!(output.contains("Future provider"));
-        assert!(output.contains("Not observed"));
-        assert!(output.contains("Future provider · No quota reading · Not observed"));
-        assert!(!output.contains("Must not render"));
-        assert!(output.contains("Other account quota history"));
-        assert!(output.contains("Retained login"));
+        fn accounts_app() -> Element {
+            use_context_provider(|| HubClient::new("http://127.0.0.1:1", ""));
+            use_context_provider(|| {
+                let status = SystemStatus {
+                    api_version: "v1".into(),
+                    fixture_mode: true,
+                    production_paused: false,
+                    integrations: vec![],
+                    feeds: vec![],
+                    capabilities: None,
+                    sync_failures: vec![],
+                    switch_train_gates: None,
+                    principal: contracts::Principal { id: Uuid::nil(), name: "test".into(), role: Role::Operator },
+                };
+                PanelState {
+                    tab: Signal::new(1),
+                    selected_provider: Signal::new(String::new()),
+                    detail_provider: Signal::new(None),
+                    activity_subtab: Signal::new(None),
+                    settings_ready: Signal::new(false),
+                    settings: Signal::new(ProviderPanelSettings::default()),
+                    saved_settings: Signal::new(None),
+                    toolbar_save_pending: Signal::new(false),
+                    toolbar_saving: Signal::new(false),
+                    epoch: Signal::new(0),
+                    busy: Signal::new(false),
+                    notice: Signal::new(None),
+                    oauth: Signal::new(None),
+                    operation: Signal::new(None),
+                    status: Signal::new(Loaded::ready(status)),
+                    scope: current_scope_id(),
+                }
+            });
+            let mut routed = ProviderSummary {
+                descriptor: ProviderDescriptor {
+                    id: "routed-provider".into(),
+                    label: "Future provider".into(),
+                    family: "unrecognized".into(),
+                    mode: contracts::AdapterMode::Fixture,
+                    verification: contracts::Verification::Built,
+                    evidence_kinds: Default::default(),
+                    capabilities: Default::default(),
+                    router_id: None,
+                    health: ProviderHealth::Unobserved,
+                    status_message: None,
+                    last_observed_at: None,
+                },
+                accounts: vec![],
+                routed_account_ids: Some(Default::default()),
+                account_count: 1,
+                enabled_accounts: 1,
+                pools: vec![],
+                active_account_id: None,
+                preferred_account_id: None,
+                next_pick_account_id: None,
+            };
+            routed.accounts.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "old-account", "provider_id": "routed-provider",
+                    "source_account_id": "old-account", "display_name": "Retained login",
+                }))
+                .unwrap(),
+            );
+            rsx! {
+                accounts::Accounts { providers: vec![routed] }
+            }
+        }
+        let dashboard_output = format!("{:?}", VirtualDom::new(app).rebuild_to_vec());
+        assert!(dashboard_output.contains("Future provider"));
+        assert!(dashboard_output.contains("Not observed"));
+        assert!(!dashboard_output.contains("Must not render"));
+        assert!(!dashboard_output.contains("Other account quota history"));
+        let accounts_output = format!("{:?}", VirtualDom::new(accounts_app).rebuild_to_vec());
+        assert!(accounts_output.contains("Retained login"));
+        assert!(accounts_output.contains("Other account quota history"));
+        assert!(!accounts_output.contains("Must not render"));
     }
 
     #[test]

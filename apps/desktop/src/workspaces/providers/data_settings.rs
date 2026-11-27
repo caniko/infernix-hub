@@ -313,13 +313,14 @@ fn ClickHouseEditor(status: ClickHouseStatus) -> Element {
 pub(super) fn SettingsHelp(providers: Vec<ProviderSummary>, ready: bool) -> Element {
     rsx! {
         if ready { Settings { providers } }
+        QuotaReferenceSection {}
         section { class: "glass-card stack",
             h2 { "Help" }
             for (title, hint, body) in [
                 ("Steer new conversations", "Choose how newly started sessions are assigned.", "In Accounts, set account priorities or weights, then choose the matching strategy in Routing & Proxy. Existing sessions may stay pinned by session affinity."),
                 ("Steer all traffic", "Temporarily prefer one account across the pool.", "In Routing & Proxy, set a preferred pool account to override ordinary scheduling. Choose Automatic to return to policy."),
                 ("Move one conversation", "Reassign an existing session without changing pool policy.", "Open Activity → Requests, inspect a request with a session ID, and select Move Conversation. Choose whether to include subagents; this can lose warm cache."),
-                ("Stop using an account", "Disable routing without removing its credentials.", "In Accounts, open Manage and choose Disable to stop routing new requests to that account. Remove login is a separate credential operation."),
+                ("Stop using an account", "Disable routing without removing its credentials.", "Open Accounts, select the account, and choose Edit or Disable in Automation & Auth to stop routing new requests to that account. Remove login is a separate credential operation."),
                 ("Unlock an outside tool", "Clear a lockout for an external client.", "Check Outside-tool lockouts in Routing & Proxy and unlock the matching entry. Correct the outside tool’s management configuration before retrying."),
             ] {
                 details { key: "{title}", class: "content-bounded",
@@ -331,6 +332,23 @@ pub(super) fn SettingsHelp(providers: Vec<ProviderSummary>, ready: bool) -> Elem
                 }
             }
             p { class: "muted", "Actions depend on the provider’s advertised capabilities and hub authorization. An accepted operation is not proof it was executed." }
+        }
+    }
+}
+
+#[component]
+fn QuotaReferenceSection() -> Element {
+    rsx! {
+        section { class: "glass-card quota-ref-card stack",
+            h2 { "Quota reference" }
+            super::QuotaMeterKey {}
+            h3 { "Capacity Weighting & Estimation Methodology" }
+            ul {
+                li { "Pool percentages use effective readings clamped to 0–100%. When subscription tiers differ, configured tier multipliers weight the readings and capacity is shown as remaining / total×. Otherwise, accounts are weighted equally." }
+                li { "The Accounts inspector compares a capacity ratio estimated from observed drain with the configured tier multiplier and flags differences of 25% or more. This advisory does not change the configured capacity." }
+                li { "A measured 0% is shown separately from unobserved or stale readings. Unavailable readings are never counted as 0%." }
+                li { "Activity API-equivalent USD estimates use the hub’s reference price catalog and cache-write assumptions." }
+            }
         }
     }
 }

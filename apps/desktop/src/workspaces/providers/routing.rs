@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use super::{dashboard::account_name, *};
 
 #[component]
-pub(super) fn Routing(providers: Vec<ProviderSummary>) -> Element {
+pub(super) fn Routing(providers: Vec<ProviderSummary>, stale: bool) -> Element {
     let running = use_signal(BTreeMap::<String, bool>::new);
+    let descriptors = providers.iter().map(|provider| provider.descriptor.clone()).collect::<Vec<_>>();
     let (mut capable, unsupported): (Vec<_>, Vec<_>) = providers.into_iter().partition(has_routing);
     capable.sort_by_key(|p| !running.read().get(&p.descriptor.id).copied().unwrap_or_default());
     let unsupported = unsupported.into_iter().map(|p| p.descriptor.label).collect::<Vec<_>>().join(", ");
@@ -18,7 +19,80 @@ pub(super) fn Routing(providers: Vec<ProviderSummary>) -> Element {
                 "{unsupported}"
             }
         }
+        if !descriptors.is_empty() {
+            ProviderAdapterInspector { providers: descriptors, stale }
+        }
     }
+}
+
+#[component]
+fn ProviderAdapterInspector(providers: Vec<ProviderDescriptor>, stale: bool) -> Element {
+    let now = Utc::now();
+    rsx! {
+        section { class: "glass-card stack",
+            h2 { "Provider adapter inspector" }
+            div { class: "adapter-inspector-grid",
+                for provider in providers {
+                    {
+                        let (health, tone) = match provider.health {
+                            ProviderHealth::Healthy if stale => ("Healthy (last known)", "muted"),
+                            ProviderHealth::Healthy => ("Healthy", "ok"),
+                            ProviderHealth::Degraded => ("Degraded", "warn"),
+                            ProviderHealth::Offline => ("Offline", "bad"),
+                            ProviderHealth::Unobserved => ("Not observed", "muted"),
+                        };
+                        let capability_count = provider.capabilities.len();
+                        rsx! {
+                            article { key: "{provider.id}", class: "adapter-inspector-card provider-inset stack",
+                                div { class: "row",
+                                    h3 { "{provider.label}" }
+                                    Chip { label: health.to_string(), tone: Some(tone.to_string()) }
+                                }
+                                p { class: "form-help", "ID: {provider.id} · Family: {provider.family}" }
+                                if let Some(router) = &provider.router_id { p { class: "form-help", "Router ID: {router}" } }
+                                if let Some(message) = &provider.status_message { p { "{message}" } }
+                                p { "Mode: {adapter_mode_label(provider.mode)} · Verification: {verification_label(provider.verification)}" }
+                                p { "Last observed: "
+                                    if let Some(observed) = provider.last_observed_at {
+                                        time { datetime: observed.to_rfc3339(), title: observed.to_rfc3339(), "{date(Some(observed))}" }
+                                        " · {format_relative_age(observed, now)}"
+                                    } else {
+                                        "Not observed"
+                                    }
+                                }
+                                div { class: "row",
+                                    strong { "Evidence" }
+                                    if provider.evidence_kinds.is_empty() {
+                                        span { class: "muted", "None" }
+                                    }
+                                    for &kind in &provider.evidence_kinds {
+                                        span { key: "{kind:?}", class: "chip muted", "{evidence_kind_label(kind)}" }
+                                    }
+                                }
+                                details {
+                                    summary { "Supported capabilities ({capability_count})" }
+                                    if provider.capabilities.is_empty() {
+                                        p { class: "muted", "None" }
+                                    } else {
+                                        ul {
+                                            for cap in &provider.capabilities {
+                                                li { key: "{cap:?}", "{capability_label(*cap)}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn capability_label(capability: ProviderCapability) -> String {
+    let wire_name = serde_json::to_value(capability).unwrap_or_default();
+    wire_name.as_str().unwrap_or("Unknown").replace('_', " ").replace("oauth", "OAuth")
 }
 
 fn has_routing(provider: &ProviderSummary) -> bool {
@@ -204,11 +278,12 @@ fn ProxyConfig(provider: ProviderSummary, runtime: ProxyRuntimeStatus, revision:
     } }
 }
 
-const STRATEGIES: &[(RouteStrategy, &str)] = &[
-    (RouteStrategy::SoonestReset, "Soonest Reset"),
-    (RouteStrategy::FillFirst, "Fill First"),
-    (RouteStrategy::RoundRobin, "Round Robin"),
-    (RouteStrategy::WeightedRoundRobin, "Weighted Round Robin"),
+const STRATEGIES: &[RouteStrategy] = &[
+    RouteStrategy::CapacityBalanced,
+    RouteStrategy::SoonestReset,
+    RouteStrategy::FillFirst,
+    RouteStrategy::RoundRobin,
+    RouteStrategy::WeightedRoundRobin,
 ];
 const ORDERS: &[(ApiKeyOrder, &str)] =
     &[(ApiKeyOrder::KeysLast, "Keys last"), (ApiKeyOrder::KeysFirst, "Keys first"), (ApiKeyOrder::SubscriptionsOnly, "Subscriptions only")];
@@ -222,6 +297,7 @@ fn RoutingPolicyView(provider: ProviderSummary, policy: RoutingPolicy, revision:
     let mut first_byte = use_signal(|| policy.first_byte_timeout_secs.to_string());
     let mut preferred = use_signal(|| policy.preferred_account_id.clone().unwrap_or_default());
     let help_id = use_hook(Uuid::new_v4);
+    let strategy_help = format!("routing-strategy-help-{help_id}");
     let key_order_help = format!("routing-key-order-help-{help_id}");
     let near_reset_help = format!("routing-near-reset-help-{help_id}");
     let saved_strategy = route_strategy_label(policy.strategy);
@@ -252,9 +328,12 @@ fn RoutingPolicyView(provider: ProviderSummary, policy: RoutingPolicy, revision:
             p { class: "form-help", "Revision {revision} · current strategy: {saved_strategy} · key order: {saved_key_order}" }
             if supports(&provider, None, ProviderCapability::SetRoutePolicy) {
                 div { class: "form-grid-2 content-bounded", style: "align-items: start;",
-                    Choice { label: "Strategy", value: format!("{:?}", current.strategy),
-                        options: STRATEGIES.iter().map(|(v, label)| (format!("{v:?}"), label.to_string())).collect(),
-                        change: move |key: String| if let Some((v, _)) = STRATEGIES.iter().find(|(v, _)| format!("{v:?}") == key) { draft.write().strategy = *v; } }
+                    div { class: "form-field",
+                        Choice { label: "Strategy", value: format!("{:?}", current.strategy), description_id: strategy_help.clone(),
+                            options: STRATEGIES.iter().map(|&v| (format!("{v:?}"), route_strategy_label(v).to_string())).collect(),
+                            change: move |key: String| if let Some(&v) = STRATEGIES.iter().find(|v| format!("{v:?}") == key) { draft.write().strategy = v; } }
+                        p { class: "form-help", id: strategy_help, "{super::route_strategy_description(current.strategy)}" }
+                    }
                     div { class: "form-field",
                         Choice { label: "Key order", value: format!("{:?}", current.api_key_order), description_id: key_order_help.clone(),
                             options: ORDERS.iter().map(|(v, label)| (format!("{v:?}"), label.to_string())).collect(),
