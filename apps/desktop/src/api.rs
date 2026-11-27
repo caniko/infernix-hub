@@ -123,6 +123,7 @@ pub fn test_status(role: Role, capabilities: Option<contracts::Capabilities>) ->
         feeds: vec![],
         capabilities,
         sync_failures: vec![],
+        switch_train_gates: None,
     }
 }
 

@@ -5075,6 +5075,42 @@ async fn fleet_create_skips_recovered_episode_and_worker_reports_progress() {
 }
 
 #[tokio::test]
+async fn fleet_and_system_status_preserve_switch_train_gates() {
+    let Some(h) = fleet_harness().await else { return };
+    let status = || h.op.get::<serde_json::Value>("/status");
+    assert!(status().await.unwrap().get("switchTrainGates").is_none(), "missing snapshot");
+    tokio::fs::write(h.assets.join("fleet.json"), "{ broken").await.unwrap();
+    assert!(status().await.unwrap().get("switchTrainGates").is_none(), "invalid snapshot");
+
+    let mut snapshot = fleet_snapshot();
+    h.write_fleet(&snapshot).await;
+    assert!(status().await.unwrap().get("switchTrainGates").is_none(), "legacy snapshot");
+    let gates = json!({
+        "activeTrains": [{"id": "train-1", "hosts": ["atlas"], "phase": "waiting", "startedAt": null,
+                          "waitedSeconds": 12, "detail": null}],
+        "memoryGate": {"memAvailableGib": 12.5, "memFloorGib": 16.0, "scopeBudgetGib": 8.0, "admissible": false,
+                       "topCgroupHolders": [{"path": "/build.slice", "currentGib": 3.25}]},
+        "intents": [{"id": "intent-1", "hosts": ["atlas"], "action": "switch", "owner": "operator",
+                     "deadline": "2026-11-25T13:00:00Z", "remainingSeconds": 1200}]
+    });
+    snapshot["switchTrainGates"] = gates.clone();
+    h.write_fleet(&snapshot).await;
+
+    for route in ["/fleet/status", "/status"] {
+        let body: serde_json::Value = h.op.get(route).await.unwrap();
+        assert_eq!(body["switchTrainGates"], gates, "{route}");
+    }
+    // Both MCP tools reserialize these same typed HTTP client results.
+    assert_eq!(serde_json::to_value(h.op.fleet_status().await.unwrap()).unwrap()["switchTrainGates"], gates);
+    assert_eq!(serde_json::to_value(h.op.status().await.unwrap()).unwrap()["switchTrainGates"], gates);
+
+    domain::system::issue_token(&h.hub.db, "dejana", Role::Member, Some("member-gates".into())).await.unwrap();
+    let member = HubClient::new(&h.url, "member-gates");
+    assert!(member.get::<serde_json::Value>("/status").await.unwrap().get("switchTrainGates").is_none(), "member status omits gates");
+    assert!(member.status().await.unwrap().switch_train_gates.is_none());
+}
+
+#[tokio::test]
 async fn fleet_status_headers_report_snapshot_age_and_staleness() {
     let Some(h) = fleet_harness().await else { return };
     let http = reqwest::Client::new();

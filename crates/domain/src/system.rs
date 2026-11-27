@@ -133,6 +133,7 @@ pub async fn status(hub: &Hub, actor: &Actor) -> DResult<SystemStatus> {
             calendar: owner,
         }),
         sync_failures: if member { Vec::new() } else { hub.sync_failures() },
+        switch_train_gates: None,
     })
 }
 

@@ -761,6 +761,7 @@ mod tests {
                     feeds: vec![],
                     capabilities: None,
                     sync_failures: vec![],
+                    switch_train_gates: None,
                     principal: contracts::Principal { id: Uuid::nil(), name: "test".into(), role: Role::Operator },
                 };
                 PanelState {
