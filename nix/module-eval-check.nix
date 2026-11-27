@@ -4,6 +4,7 @@
 {
   pkgs,
   module,
+  agentProxyForwardModule,
   infernixModule,
 }: let
   inherit (pkgs) lib;
@@ -133,6 +134,55 @@
   liveMigration = live.config.systemd.services."harbor-db-fleetix-hub";
   liveCheck = live.config.systemd.services."harbor-db-fleetix-hub-check";
   liveSeed = liveHub.environment.HUB_SEED_FILE;
+
+  forwardGuarded = mkSystem [
+    agentProxyForwardModule
+    ({config, ...}: {
+      system.stateVersion = config.system.nixos.release;
+      services.fleetixAgentProxyForward = {
+        enable = true;
+        targetHost = "10.100.0.1";
+        guardInterface = "wg-home";
+      };
+    })
+  ];
+
+  forwardUnguarded = mkSystem [
+    agentProxyForwardModule
+    ({config, ...}: {
+      system.stateVersion = config.system.nixos.release;
+      services.fleetixAgentProxyForward = {
+        enable = true;
+        listenAddress = "127.0.0.2";
+        port = 9317;
+        targetHost = "proxy.example.internal";
+        targetPort = 8443;
+      };
+    })
+  ];
+
+  forwardBadGuard = mkSystem [
+    agentProxyForwardModule
+    ({config, ...}: {
+      system.stateVersion = config.system.nixos.release;
+      services.fleetixAgentProxyForward = {
+        enable = true;
+        targetHost = "proxy.example.internal";
+        guardInterface = "wg-home";
+      };
+    })
+  ];
+
+  forwardDisabled = mkSystem [
+    agentProxyForwardModule
+    ({config, ...}: {
+      system.stateVersion = config.system.nixos.release;
+      services.fleetixAgentProxyForward = {
+        enable = false;
+        targetHost = "10.100.0.1";
+      };
+    })
+  ];
 in {
   # Hub alone, every integration fixture: fixture company, no seed, and the
   # harbor-db migration gate enabled with local PostgreSQL.
@@ -269,4 +319,32 @@ in {
       grep -F '"migrate","--check"' "$manifest"
       touch $out
     '';
+
+  module-eval-agent-proxy-forward = let
+    guardedSock = forwardGuarded.config.systemd.sockets.fleetix-agent-proxy-forward;
+    guardedSvc = forwardGuarded.config.systemd.services.fleetix-agent-proxy-forward;
+    unguardedSock = forwardUnguarded.config.systemd.sockets.fleetix-agent-proxy-forward;
+    unguardedSvc = forwardUnguarded.config.systemd.services.fleetix-agent-proxy-forward;
+  in
+    assert guardedSock.listenStreams == ["127.0.0.1:8317"];
+    assert lib.elem "nftables.service" guardedSock.requires;
+    assert lib.elem "nftables.service" guardedSock.after;
+    assert guardedSvc.serviceConfig.DynamicUser;
+    assert guardedSvc.serviceConfig.NoNewPrivileges;
+    assert guardedSvc.serviceConfig.PrivateDevices;
+    assert guardedSvc.serviceConfig.ProtectHome;
+    assert guardedSvc.serviceConfig.ProtectSystem == "strict";
+    assert lib.hasInfix "systemd-socket-proxyd" guardedSvc.serviceConfig.ExecStart;
+    assert lib.hasInfix "10.100.0.1:8317" guardedSvc.serviceConfig.ExecStart;
+    assert lib.hasInfix ''oifname != "wg-home" ip daddr 10.100.0.1 tcp dport 8317 drop'' forwardGuarded.config.networking.nftables.tables.fleetix-agent-proxy.content;
+    assert unguardedSock.listenStreams == ["127.0.0.2:9317"];
+    assert !(lib.elem "nftables.service" unguardedSock.requires);
+    assert !(forwardUnguarded.config.networking.nftables.tables ? fleetix-agent-proxy);
+    assert lib.hasInfix "proxy.example.internal:8443" unguardedSvc.serviceConfig.ExecStart;
+    assert lib.any (a: !a.assertion) forwardBadGuard.config.assertions;
+    assert !(forwardDisabled.config.systemd.sockets ? fleetix-agent-proxy-forward);
+    assert !(forwardDisabled.config.networking.nftables.tables ? fleetix-agent-proxy);
+      pkgs.runCommand "fleetix-hub-module-eval-agent-proxy-forward" {} ''
+        touch $out
+      '';
 }
