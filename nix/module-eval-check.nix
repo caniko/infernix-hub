@@ -328,6 +328,7 @@ in {
   in
     assert guardedSock.listenStreams == ["127.0.0.1:8317"];
     assert lib.elem "nftables.service" guardedSock.requires;
+    assert forwardGuarded.config.systemd.services ? nftables;
     assert lib.elem "nftables.service" guardedSock.after;
     assert guardedSvc.serviceConfig.DynamicUser;
     assert guardedSvc.serviceConfig.NoNewPrivileges;

@@ -79,8 +79,9 @@ in {
     };
 
     # Refuse cleartext fallback if the route ever leaves the guarded interface.
-    networking.nftables.tables = lib.mkIf (cfg.guardInterface != null) {
-      fleetix-agent-proxy = {
+    networking.nftables = lib.mkIf (cfg.guardInterface != null) {
+      enable = true;
+      tables.fleetix-agent-proxy = {
         family = "inet";
         content = ''
           chain output {
