@@ -95,3 +95,91 @@ async fn imports_are_idempotent_and_mail_isolated_by_principal() {
     sqlx::query(&format!("drop database {name} with (force)")).execute(&admin).await.unwrap();
     tokio::fs::remove_dir_all(&settings.asset_dir).await.unwrap();
 }
+
+#[tokio::test]
+async fn imap_missing_or_empty_password_file_transitions_to_awaiting_credentials() {
+    let Ok(base) = std::env::var("HUB_TEST_DATABASE_URL") else {
+        eprintln!("HUB_TEST_DATABASE_URL unset; skipping DB-backed test");
+        return;
+    };
+    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let name = format!("t_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("create database {name}")).execute(&admin).await.unwrap();
+    let mut url = reqwest::Url::parse(&base).unwrap();
+    url.set_path(&format!("/{name}"));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut settings = Settings::fixture(url.as_str(), &listener.local_addr().unwrap().to_string());
+    settings.asset_dir = std::env::temp_dir().join(&name);
+    settings.registry_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../registry").into();
+    settings.seed_file = Some(settings.registry_dir.join("hub.fixture.json"));
+    tokio::fs::create_dir_all(&settings.asset_dir).await.unwrap();
+    let owners = settings.asset_dir.join("owners.json");
+    tokio::fs::write(&owners, r#"{"can":"can-mail"}"#).await.unwrap();
+    settings.principal_owners_config = Some(owners);
+
+    let missing_password = settings.asset_dir.join("missing-gmail-password");
+    let empty_password = settings.asset_dir.join("empty-gmail-password");
+    tokio::fs::write(&empty_password, "   \n").await.unwrap();
+
+    let mail_config = settings.asset_dir.join("mail.json");
+    tokio::fs::write(
+        &mail_config,
+        json!({"accounts": [
+            {
+                "owner": "can-mail",
+                "label": "gmail-missing",
+                "provider": "gmail",
+                "transport": "imap",
+                "address": "can@example.org",
+                "host": "imap.gmail.com",
+                "port": 993,
+                "tls_mode": "tls",
+                "password_file": missing_password
+            },
+            {
+                "owner": "can-mail",
+                "label": "gmail-empty",
+                "provider": "gmail",
+                "transport": "imap",
+                "address": "can@example.org",
+                "host": "imap.gmail.com",
+                "port": 993,
+                "tls_mode": "tls",
+                "password_file": empty_password
+            },
+            {
+                "owner": "can-mail",
+                "label": "gmail-unconfigured",
+                "provider": "gmail",
+                "transport": "imap",
+                "address": "can@example.org",
+                "host": "imap.gmail.com",
+                "port": 993,
+                "tls_mode": "tls"
+            }
+        ]})
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    settings.mail_config = Some(mail_config);
+
+    let (state, _) = bootstrap::build(&settings).await.unwrap();
+    let token = Uuid::new_v4().to_string();
+    domain::system::issue_token(&state.hub.db, "can", Role::Member, Some(token.clone())).await.unwrap();
+    let can = HubClient::new(&settings.public_url, token);
+    let server = tokio::spawn(async move { axum::serve(listener, fleetix_hubd::router(state)).await.unwrap() });
+
+    let synced: Vec<contracts::MailAccount> = can.post("/mail/sync", &json!({})).await.unwrap();
+    assert_eq!(synced.len(), 3);
+    for account in &synced {
+        assert_eq!(account.status, "awaiting_credentials", "account {} had unexpected status", account.label);
+        assert_eq!(account.last_error, None, "account {} had unexpected last_error", account.label);
+    }
+
+    server.abort();
+    let _ = server.await;
+    sqlx::query(&format!("drop database {name} with (force)")).execute(&admin).await.unwrap();
+    tokio::fs::remove_dir_all(&settings.asset_dir).await.unwrap();
+}

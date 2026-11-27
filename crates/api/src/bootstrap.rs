@@ -548,6 +548,8 @@ async fn build_with_mail_policy(s: &Settings, mail_config_managed: bool) -> anyh
                 domain::providers::activity::ingest_activity(&hub, &actor, provider.seed_activity()).await?;
             }
         }
+    } else {
+        domain::providers::purge_fixture_data(&hub).await?;
     }
     mail_calendar.register(&hub, mail_config_managed).await.context("registering mail accounts and calendar sources")?;
     Ok((

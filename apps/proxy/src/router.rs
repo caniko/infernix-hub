@@ -3642,6 +3642,16 @@ impl Exchange {
             occurred_at: self.occurred,
             attempts: self.attempts,
         };
+        if row.requested_model.trim().is_empty()
+            && row.effective_model.trim().is_empty()
+            && row.input_tokens == 0
+            && row.output_tokens == 0
+            && row.cache_read_tokens == 0
+            && row.cache_write_tokens == 0
+            && row.thinking_tokens == 0
+        {
+            return;
+        }
         if state.activity.len() == ACTIVITY_CAP {
             state.activity.pop_front();
         }
@@ -3674,6 +3684,25 @@ async fn google_finish_without_an_alternate_keeps_completed_attempt_usage() {
     let attempt = &state.activity.back().unwrap().attempts[0];
     assert_eq!((attempt.input_tokens, attempt.cache_read_tokens, attempt.latency_ms), (100, 20, Some(42)));
     assert_eq!(attempt.finished_at, Some(finished_at));
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn finish_skips_empty_model_zero_token_metadata_exchanges() {
+    use crate::tests::{Scratch, fixture, serve};
+
+    let dir = Scratch::new();
+    let mock = serve(Router::new()).await;
+    let proxy = fixture(&dir, &mock);
+
+    let metadata = Exchange::new(proxy.clone(), Lane::Google, "", None, None, None, ActivityPurpose::Ordinary);
+    metadata.finish(Some(StatusCode::OK), "success", Usage::default(), Some(5), None).await;
+    assert!(proxy.state.read().await.activity.is_empty());
+
+    let inference = Exchange::new(proxy.clone(), Lane::Google, "gemini-2.5-pro", None, None, None, ActivityPurpose::Ordinary);
+    inference.finish(Some(StatusCode::OK), "success", Usage::default(), Some(12), None).await;
+    assert_eq!(proxy.state.read().await.activity.len(), 1);
+    assert_eq!(proxy.state.read().await.activity[0].effective_model, "gemini-2.5-pro");
 }
 
 /// Capture structure and usage, never arbitrary text, object keys, or numbers outside

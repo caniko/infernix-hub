@@ -1073,3 +1073,197 @@ async fn assert_quota_plot_history(db: &domain::sqlx::PgPool, request: reqwest::
         }
     }
 }
+
+#[tokio::test]
+async fn quota_latest_reconciliation_fixture_purge_and_retention() {
+    let Ok(base) = std::env::var("HUB_TEST_DATABASE_URL") else {
+        eprintln!("HUB_TEST_DATABASE_URL unset; skipping DB-backed test");
+        return;
+    };
+    let admin = domain::sqlx::PgPool::connect(&base).await.unwrap();
+    let name = format!("t_{}", Uuid::new_v4().simple());
+    domain::sqlx::query(&format!("create database {name}")).execute(&admin).await.unwrap();
+    let mut url = reqwest::Url::parse(&base).unwrap();
+    url.set_path(&format!("/{name}"));
+    let assets = std::env::temp_dir().join(&name);
+    let mut settings = Settings::fixture(url.as_str(), "127.0.0.1:0");
+    settings.asset_dir = assets.clone();
+    settings.registry_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../registry").into();
+    settings.seed_file = Some(settings.registry_dir.join("hub.fixture.json"));
+    let (state, _) = bootstrap::build(&settings).await.unwrap();
+    let hub = &state.hub;
+    let operator = domain::providers::internal_operator("test-operator");
+
+    // 1. Seeded fixture data populated `model_quota_latest`.
+    let latest_count: i64 = domain::sqlx::query_scalar("select count(*) from model_quota_latest").fetch_one(&hub.db).await.unwrap();
+    assert!(latest_count > 0, "fixture seed should populate model_quota_latest");
+
+    // 2. Live provider ingestion purges `fixture-host` accounts, reconciles `model_quota_latest`,
+    //    prunes legacy pre-0017 proxy/local rows, and dedupes superseded unscoped windows.
+    let now = chrono::Utc::now();
+    domain::sqlx::query(
+        "insert into model_provider_instances (id, label, family, mode, verification)
+         values ('live-ag', 'Live AG', 'antigravity', 'live', 'live_verified')",
+    )
+    .execute(&hub.db)
+    .await
+    .unwrap();
+    // Seed a leaked fixture-host account and a legacy pre-0017 proxy account under the live provider.
+    domain::sqlx::query(
+        "insert into model_accounts (id, provider_id, source_account_id, display_name, host, unix_user, last_observed_at)
+         values
+           ('live-ag:fixture-leak', 'live-ag', 'fixture-leak', 'Fixture Leak', 'fixture-host', 'can', $1),
+           ('live-ag:legacy-proxy', 'live-ag', 'proxy:old', 'Legacy Proxy', 'atlas', 'can', $1)",
+    )
+    .bind(now - chrono::Duration::hours(2))
+    .execute(&hub.db)
+    .await
+    .unwrap();
+    domain::sqlx::query(
+        "insert into model_quota_latest (sample_id, provider_id, account_id, window_key, scope_model_key, label, observed_at)
+         values
+           (1, 'live-ag', 'live-ag:fixture-leak', '5h', '', '5h', $1),
+           (2, 'live-ag', 'live-ag:legacy-proxy', '5h', '', '5h', $1),
+           (3, 'live-ag', 'live-ag:real', 'legacy-quota', '', 'Legacy', $1),
+           (4, 'live-ag', 'live-ag:real', '3p-5h', '', '3P Unscoped', $1)",
+    )
+    .bind(now - chrono::Duration::minutes(10))
+    .execute(&hub.db)
+    .await
+    .unwrap();
+
+    // Defensive read-path filter hides fixture-host on live providers even before ingestion.
+    let pre_accounts = domain::providers::list_accounts(hub, &operator, "live-ag").await.unwrap();
+    assert!(
+        !pre_accounts.iter().any(|a| a.id == "live-ag:fixture-leak"),
+        "live provider read must filter out fixture-host accounts defensively"
+    );
+
+    let batch = contracts::providers::ObservationBatch {
+        provider_id: "live-ag".into(),
+        provider_label: "Live AG".into(),
+        provider_family: "antigravity".into(),
+        router_id: Some("fleetix-proxy".into()),
+        source_host: "atlas".into(),
+        source_user: "can".into(),
+        source_publisher: Some("fleetix-agent-proxy".into()),
+        account_inventory_complete: true,
+        collected_at: now,
+        health: contracts::providers::ProviderHealth::Healthy,
+        status_message: None,
+        capabilities: Default::default(),
+        evidence_kinds: Default::default(),
+        accounts: vec![contracts::providers::ModelAccount {
+            id: "live-ag:real".into(),
+            provider_id: "live-ag".into(),
+            source_account_id: "real".into(),
+            display_name: "Real".into(),
+            email: None,
+            masked_email: None,
+            note: None,
+            plan: None,
+            tier_multiplier: None,
+            status: contracts::providers::AccountStatus::Ready,
+            enabled: true,
+            priority: 0,
+            weight: 1,
+            cooldown_until: None,
+            status_message: None,
+            last_error: None,
+            last_error_observed: false,
+            is_active: true,
+            is_preferred: false,
+            is_next_pick: false,
+            enrollment_state: contracts::providers::EnrollmentState::Verified,
+            host: Some("atlas".into()),
+            unix_user: Some("can".into()),
+            credential_fingerprint: None,
+            last_used_at: None,
+            last_observed_at: Some(now),
+            capabilities: Default::default(),
+            success_count: 0,
+            failure_count: 0,
+            windows: vec![contracts::providers::QuotaWindow {
+                window_key: "3p-5h".into(),
+                label: "3P 5h".into(),
+                kind: contracts::providers::QuotaWindowKind::Session,
+                unit: contracts::providers::QuotaUnit::Percent,
+                used_percent: Some(25.0),
+                remaining_percent: Some(75.0),
+                used_amount: None,
+                limit_amount: None,
+                currency: None,
+                resets_at: Some(now + chrono::Duration::hours(4)),
+                window_duration_mins: Some(300),
+                cadence: contracts::providers::ResetCadence::RollingOnUse,
+                scope_model: Some("claude".into()),
+                status: contracts::providers::QuotaStatus::Allowed,
+                observation_state: contracts::providers::QuotaObservationState::Measured,
+                observed_at: Some(now),
+                stale: false,
+                error_reason: None,
+            }],
+            reset_grant: None,
+            rolling_starter: None,
+        }],
+        quota_samples: vec![],
+        reset_grants: Default::default(),
+        key_groups: vec![],
+        models: vec![],
+        routing_status: None,
+        proxy_logs: vec![],
+    };
+    domain::providers::ingest_pushed_observations(hub, &operator, "live-ag", batch).await.unwrap();
+
+    let post_accounts = domain::providers::list_accounts(hub, &operator, "live-ag").await.unwrap();
+    assert_eq!(post_accounts.len(), 1, "fixture-host and legacy pre-0017 proxy accounts must be pruned");
+    assert_eq!(post_accounts[0].id, "live-ag:real");
+    assert_eq!(post_accounts[0].windows.len(), 1, "stale legacy-quota and superseded unscoped 3p-5h must be pruned");
+    assert_eq!(post_accounts[0].windows[0].window_key, "3p-5h");
+    assert_eq!(post_accounts[0].windows[0].scope_model.as_deref(), Some("claude"));
+
+    // 3. `purge_fixture_data` deletes fixture providers and fixture-host accounts.
+    domain::providers::purge_fixture_data(hub).await.unwrap();
+    let fixture_providers_left: i64 = domain::sqlx::query_scalar("select count(*) from model_provider_instances where mode = 'fixture'")
+        .fetch_one(&hub.db)
+        .await
+        .unwrap();
+    assert_eq!(fixture_providers_left, 0);
+    let live_providers_left: i64 =
+        domain::sqlx::query_scalar("select count(*) from model_provider_instances where id = 'live-ag'").fetch_one(&hub.db).await.unwrap();
+    assert_eq!(live_providers_left, 1);
+
+    // 4. `enforce_retention` prunes old `model_quota_samples` beyond `detail_retention_days`.
+    domain::sqlx::query(
+        "insert into model_quota_samples (provider_id, account_id, window_key, label, observed_at)
+         values ('live-ag', 'live-ag:real', '3p-5h', 'Old', $1)",
+    )
+    .bind(now - chrono::Duration::days(60))
+    .execute(&hub.db)
+    .await
+    .unwrap();
+    let evicted = domain::providers::capture::enforce_retention(hub).await.unwrap();
+    assert!(evicted >= 1, "enforce_retention should prune expired model_quota_samples");
+    let old_samples_left: i64 =
+        domain::sqlx::query_scalar("select count(*) from model_quota_samples where provider_id = 'live-ag' and observed_at < $1")
+            .bind(now - chrono::Duration::days(40))
+            .fetch_one(&hub.db)
+            .await
+            .unwrap();
+    assert_eq!(old_samples_left, 0);
+
+    // 5. `ClearTarget::QuotaHistory` clears both `model_quota_samples` and `model_quota_latest`.
+    domain::providers::capture::clear_data(
+        hub,
+        &operator,
+        contracts::providers::ClearDataIn { target: contracts::providers::ClearTarget::QuotaHistory },
+    )
+    .await
+    .unwrap();
+    let latest_after_clear: i64 = domain::sqlx::query_scalar("select count(*) from model_quota_latest").fetch_one(&hub.db).await.unwrap();
+    assert_eq!(latest_after_clear, 0);
+
+    hub.db.close().await;
+    domain::sqlx::query(&format!("drop database {name} with (force)")).execute(&admin).await.unwrap();
+    let _ = std::fs::remove_dir_all(assets);
+}

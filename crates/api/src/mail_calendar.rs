@@ -338,7 +338,10 @@ impl Runtime {
                 .await
                 .map_err(|_| "IMAP user credential unreadable")?
         } else {
-            config.username.clone().or_else(|| (!account.address.is_empty()).then(|| account.address.clone()))
+            config.username.as_deref().map(str::trim).filter(|u| !u.is_empty()).map(str::to_owned).or_else(|| {
+                let address = account.address.trim();
+                (!address.is_empty()).then(|| address.to_owned())
+            })
         };
         let password = self
             .credential(config.password_credential.as_deref(), config.password_file.as_deref())
@@ -346,6 +349,11 @@ impl Runtime {
             .map_err(|_| "IMAP password credential unreadable")?;
         let (Some(username), Some(password)) = (username, password) else {
             return Ok(None);
+        };
+        let password = if account.provider == "gmail" {
+            imap_sync::normalize_gmail_app_password(&password)
+        } else {
+            std::borrow::Cow::Borrowed(password.as_str())
         };
         let host = transport.host.as_deref().ok_or("missing IMAP host")?;
         let tls: TlsMode = transport.tls_mode.as_deref().unwrap_or("tls").parse().map_err(|_| "invalid IMAP TLS mode")?;
@@ -358,7 +366,17 @@ impl Runtime {
             move |msg, raw| archive_raw(archive.as_deref(), msg, raw),
         )
         .await
-        .map_err(|_| "IMAP sync failed (connection, authentication, message parsing or archive)")?;
+        .map_err(|error| {
+            tracing::warn!(
+                owner = %account.owner,
+                label = %account.label,
+                host,
+                error_category = error.category(),
+                error = error.message(),
+                "mail IMAP sync failed"
+            );
+            error.message()
+        })?;
         let mut messages = messages.into_iter().peekable();
         while messages.peek().is_some() {
             save(messages.by_ref().take(50).collect()).await?;
@@ -659,4 +677,30 @@ async fn agenda(State(state): State<AppState>, Caller(actor): Caller, Query(quer
         ApiErr::coded(StatusCode::UNPROCESSABLE_ENTITY, "calendar_range", "days must be between 1 and 366", actor.correlation_id.clone())
     })?;
     call!(actor, state.hub.calendar_agenda(&actor, from, to))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_credential_returns_none_for_missing_empty_or_unconfigured_files() {
+        let dir = std::env::temp_dir().join(format!("fleetix-hub-cred-{}", Uuid::new_v4().simple()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        assert_eq!(read_runtime_credential(None, None, None).await.unwrap(), None);
+
+        let missing = dir.join("missing-password");
+        assert_eq!(read_runtime_credential(None, None, Some(&missing)).await.unwrap(), None);
+
+        let empty = dir.join("empty-password");
+        tokio::fs::write(&empty, "  \n\t\r\n").await.unwrap();
+        assert_eq!(read_runtime_credential(None, None, Some(&empty)).await.unwrap(), None);
+
+        let populated = dir.join("gmail-password");
+        tokio::fs::write(&populated, "abcd efgh ijkl mnop\n").await.unwrap();
+        assert_eq!(read_runtime_credential(None, None, Some(&populated)).await.unwrap().as_deref(), Some("abcd efgh ijkl mnop"));
+
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
 }

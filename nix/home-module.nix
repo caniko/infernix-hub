@@ -150,6 +150,11 @@
     };
     Install.WantedBy = ["timers.target"];
   };
+  jobPath = entry: {
+    Unit.Description = "Watch Fleetix Hub mail export directory";
+    Path.PathChanged = lib.replaceStrings ["%"] ["%%"] entry.path;
+    Install.WantedBy = ["default.target"];
+  };
 in {
   options.programs.fleetixHub = {
     enable = lib.mkEnableOption "Fleetix Hub desktop integration";
@@ -599,9 +604,8 @@ in {
             (lib.concatStringsSep "," entry.folders)
           ])
         localSyncs);
-      systemd.user.timers =
-        clientJobs "import" (lib.mapAttrs (_: jobTimer) exports)
-        // clientJobs "bridge-sync" (lib.mapAttrs (_: jobTimer) localSyncs);
+      systemd.user.paths = clientJobs "import" (lib.mapAttrs (_: jobPath) exports);
+      systemd.user.timers = clientJobs "bridge-sync" (lib.mapAttrs (_: jobTimer) localSyncs);
       systemd.user.tmpfiles.rules =
         lib.mapAttrsToList (_: entry: ''d ${builtins.toJSON (lib.replaceStrings ["%"] ["%%"] entry.path)} 0700 - - -'')
         exports;

@@ -412,7 +412,9 @@ pub(crate) async fn refresh_selected(proxy: &Proxy, id: Option<&str>, family: Op
     .buffer_unordered(4);
     let mut errors = Map::new();
     while let Some((id, result)) = pending.next().await {
-        if let Err(e) = result {
+        if let Err(e) = result
+            && e.kind != contracts::providers::AccountErrorKind::QuotaProbeUnsupported
+        {
             errors.insert(id, json!(e.summary()));
         }
     }

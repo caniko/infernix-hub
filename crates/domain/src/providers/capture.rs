@@ -188,6 +188,20 @@ pub async fn enforce_retention(hub: &Hub) -> DResult<u64> {
     .await?;
     evicted += detail_res.rows_affected();
 
+    let quota_cutoff = Utc::now() - chrono::Duration::days(i64::from(policy.detail_retention_days));
+    let quota_res = sqlx::query(
+        "delete from model_quota_samples
+         where id in (
+             select id from model_quota_samples
+             where observed_at < $1
+             limit 50000
+         )",
+    )
+    .bind(quota_cutoff)
+    .execute(&hub.db)
+    .await?;
+    evicted += quota_res.rows_affected();
+
     let budget_bytes = (policy.body_budget_mib as i64) * 1024 * 1024;
     let total_bytes: i64 =
         sqlx::query_scalar("select coalesce(sum(size_bytes), 0)::bigint from activity_captures").fetch_one(&hub.db).await?;
@@ -214,7 +228,11 @@ pub async fn clear_data(hub: &Hub, actor: &Actor, input: ClearDataIn) -> DResult
     actor.require(OPERATOR)?;
     let mut tx = hub.db.begin().await?;
     let rows_deleted = match input.target {
-        ClearTarget::QuotaHistory => sqlx::query("delete from model_quota_samples").execute(&mut *tx).await?.rows_affected(),
+        ClearTarget::QuotaHistory => {
+            let n = sqlx::query("delete from model_quota_samples").execute(&mut *tx).await?.rows_affected();
+            sqlx::query("delete from model_quota_latest").execute(&mut *tx).await?;
+            n
+        }
         ClearTarget::CapturedBodies => {
             let n = sqlx::query("delete from activity_captures").execute(&mut *tx).await?.rows_affected();
             sqlx::query("update activity_exchanges set capture_state = 'evicted' where capture_state in ('transformed', 'raw_wire')")
