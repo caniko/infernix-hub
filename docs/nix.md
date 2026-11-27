@@ -1,12 +1,11 @@
 # Nix packaging and NixOS module
 
-`fleetix-hub` is packaged with [harbor-rs](https://github.com/caniko/harbor-rs)
-toolchain, build-cache, dev-shell, and formatter helpers, and its systemd unit
-is paired with [harbor-db](https://github.com/caniko/harbor-db) for database
-migrations. The NixOS module also reads the
-[infernix](https://github.com/caniko/infernix) option tree when a host imports
-it, so ComfyUI, llama-swap, and the load balancer are wired without copying
-addresses or unit names into this repository.
+`fleetix-hub` uses [harbor-rs](https://github.com/caniko/harbor-rs) for the
+toolchain, build cache, dev shell, and formatter, and pairs its systemd unit
+with [harbor-db](https://github.com/caniko/harbor-db) migrations. When a host
+imports [infernix](https://github.com/caniko/infernix), the NixOS module reads
+its option tree to wire ComfyUI, llama-swap, and the load balancer without
+copying addresses or unit names here.
 
 ## Flake inputs
 
@@ -19,9 +18,9 @@ addresses or unit names into this repository.
 | `rust-overlay`, `crane` | follow `harbor-rs` | The toolchain and cache wrapper must match the pinned harbor-rs revision. |
 | `treefmt-nix` | direct, follows `nixpkgs` | harbor-rs keeps it in its dev partition; harbor-db follows this one. |
 
-`harbor-rs`, `harbor-db`, and `infernix` all follow this flake's `nixpkgs`;
-infernix also follows this flake's `harbor-rs` so the sccache namespace and the
-Rust toolchain are shared.
+`harbor-rs`, `harbor-db`, and `infernix` follow this flake's `nixpkgs`.
+`infernix` also follows this flake's `harbor-rs` to share the sccache namespace
+and Rust toolchain.
 
 ## Packages
 
@@ -31,10 +30,9 @@ Rust toolchain are shared.
 | `hubctl` | `hubctl` | Operator CLI over the typed API client. |
 | `fleetix-hub-desktop` | `fleetix-hub-desktop` | Dioxus 0.8 desktop shell. Built separately from the server so WebKitGTK, GTK3, and libsoup-3 never enter the service closure. |
 
-Builds go through `harbor-rs.lib.mkBuildCachePolicy` with
-`withRustCache`; the wrapper and namespace come from the shared fleet policy
-(`canix-rust-v5-sccache-*`), so hub builds share compiler-cache hits with the
-other Rust projects on the host.
+Builds use `harbor-rs.lib.mkBuildCachePolicy` with `withRustCache`. The fleet
+policy supplies the wrapper and namespace (`canix-rust-v5-sccache-*`), so hub
+builds share compiler-cache hits with other Rust projects on the host.
 
 ## Development shell
 
@@ -54,14 +52,14 @@ nix develop -c cargo nextest run          # DB tests self-skip without HUB_TEST_
 nix develop -c hubctl today               # needs HUB_URL/HUB_TOKEN
 ```
 
-Formatting is treefmt only (`rustfmt` with edition 2024 and the repo's
-`rustfmt.toml` max width, `alejandra` for Nix). Enter a shell and run
-`treefmt <paths>`; the flake's `formatter` output is the same wrapper.
+Use only treefmt: `rustfmt` uses edition 2024 and the `rustfmt.toml` max
+width; `alejandra` formats Nix. Run `treefmt <paths>` in the dev shell.
+The flake's `formatter` output uses the same wrapper.
 
 ## Scoped Codex workers
 
-The worker listener is off by default. To enable the private Unix socket for
-the local Home Manager proxy:
+The worker listener defaults to off. Enable the local Home Manager proxy's
+private Unix socket with:
 
 ```nix
 programs.fleetixHub.agentProxy.workerListener = {
@@ -71,9 +69,9 @@ programs.fleetixHub.agentProxy.workerListener = {
 ```
 
 The default socket is `$XDG_RUNTIME_DIR/fleetix-agent-proxy/worker.sock`.
-The proxy creates the socket with mode `0600` and requires a service-owned
-`0700` parent directory. Clients on the Unix socket do not need a bearer
-unless the service is started with a separate worker key.
+The proxy creates a `0600` socket in a required service-owned `0700` parent
+directory. Unix socket clients need a bearer only if the service starts with
+a separate worker key.
 
 For CLI use, pass `--worker-unix-socket PATH` or
 `--worker-listen 127.0.0.1:PORT` to `fleetix-agent-proxy serve`, together
@@ -82,10 +80,10 @@ with `--worker-allowed-models MODEL[,MODEL...]`. TCP requires
 world permissions. Generate a random bearer of at least 32 characters,
 distinct from every client, management, and provider credential.
 
-Only `POST /backend-api/codex/responses` with an exactly allowlisted model is
-accepted. Worker requests always go to the ChatGPT Codex backend with a
-subscription credential; they never fall back to a metered OpenAI API key.
-The worker listener does not expose proxy management or model discovery.
+The listener accepts only `POST /backend-api/codex/responses` with an exact
+model allowlist match. Workers always use a subscription credential for the
+ChatGPT Codex backend, never a metered OpenAI API key. The listener exposes
+neither proxy management nor model discovery.
 
 ## Checks
 
@@ -139,14 +137,13 @@ The module imports `harbor-db.nixosModules.default` and registers
   when the schema is stale instead of racing migrations.
 
 Local PostgreSQL (`database.createLocally = true`, the default) creates the
-database and a role owner. When `database.migrationsUser` names a different
-system user, that role owns the schema, and `postgresql-setup.service` grants
-the runtime role table, sequence, and default privileges (the same shape as
-pink-raven).
+database and its owner role. If `database.migrationsUser` names a different
+system user, that role owns the schema and `postgresql-setup.service` grants the
+runtime role table, sequence, and default privileges.
 
-`database.urlFile` points at a file containing an external `DATABASE_URL`
-(typically an agenix secret). A private launcher reads it at exec time, so the
-URL never enters the Nix store; it implies `database.createLocally = false`.
+`database.urlFile` points to an external `DATABASE_URL` file (typically an
+agenix secret) and implies `database.createLocally = false`. A private
+launcher reads it at exec time so the URL stays out of the Nix store.
 
 ### ComfyUI, GPU admission, and engines
 
@@ -215,9 +212,8 @@ unit after/wants `llama-swap.service` or `infernix-lb.service` respectively.
 
 ### Publishing channels and approvals
 
-A release action dispatches only through the channel named by its frozen
-`transport`; a transport with no channel fails the intent for an operator
-instead of falling back to a different provider.
+A release action uses only its frozen `transport` channel. A missing channel
+fails the intent for an operator; there is no provider fallback.
 
 Only `integrations.publisher = "fixture"` aliases the seeded account transports
 to the in-process fixture adapter. A live publisher (`postiz`), every
@@ -243,12 +239,12 @@ When `seedFile` is null the module renders `HUB_SEED_FILE` from `engines`,
 }
 ```
 
-`renewals` rows are upserted by `(company_id, key)`: a new row starts from the
-seed's `due_at`, while a re-seed refreshes only `title`, `procedure`, `urls`,
-`account`, `cadence_days`, `warn_days`, and `expiry_kind`. The due date and the
-last renewal belong to the operator's renewals, so restarting or rebuilding
-never moves them. `urls` are opened in a browser, so the hub refuses a seed
-whose URLs do not start with `https://`.
+The hub upserts `renewals` by `(company_id, key)`. New rows start with the
+seed's `due_at`; re-seeding refreshes only `title`, `procedure`, `urls`,
+`account`, `cadence_days`, `warn_days`, and `expiry_kind`. Restarts and
+rebuilds leave the operator's due date and last renewal unchanged.
+The hub rejects the seed if any `urls` entry does not start with `https://`
+because they open in a browser.
 
 `expiryKind` (`cadence`, `never` or `provider`, default `cadence`) says where a
 renewal's expiry comes from. `never` is listed but never a to-do. `provider`
@@ -281,11 +277,10 @@ them at agenix paths; plaintext never goes into the store.
 
 ### Executable override and packs
 
-`executable` (default `${package}/bin/fleetix-hubd`) is the binary behind
-`serve`. A downstream product such as `canix-hub` points it at its own entry
-point, which must accept `serve [--packs-config FILE]`. Token registration and
-the harbor-db `migrate`/`migrate --check` runner are core and always use
-`${package}/bin/fleetix-hubd`.
+`executable` (default `${package}/bin/fleetix-hubd`) runs `serve`. Downstream
+binaries such as `canix-hub` must accept `serve [--packs-config FILE]`.
+Core token registration and the harbor-db `migrate`/`migrate --check` runner
+always use `${package}/bin/fleetix-hubd`.
 
 `packs.<id>` composes a downstream pack without editing the hub:
 
@@ -307,30 +302,27 @@ as
 and startup fails when that file names an id the binary does not register.
 Disabled packs contribute neither config nor credentials.
 
-Each pack credential becomes the systemd credential `<id>-<name>`: only the
-path enters the store, and the pack reads the file from
-`$CREDENTIALS_DIRECTORY`. Pack ids must match `[a-z0-9-]+` (the Rust
-registry's rule) and credential names `[A-Za-z0-9_.-]+`, so `<id>-<name>` is a
-valid systemd credential id. The module asserts that the complete generated
-`LoadCredential` id list is unique — built-in credentials, `token-<name>`
-entries and pack credentials together — because `<id>-<name>` is ambiguous
-(`foo` + `bar-baz` and `foo-bar` + `baz` both render `foo-bar-baz`) and
-systemd silently keeps one entry per repeated id.
+Each pack credential becomes a systemd credential `<id>-<name>`. Only its
+path enters the store; the pack reads the file from `$CREDENTIALS_DIRECTORY`.
+Pack IDs follow the Rust registry's `[a-z0-9-]+` rule and credential names
+must match `[A-Za-z0-9_.-]+` to produce valid systemd credential IDs. The
+module rejects duplicate `LoadCredential` IDs across built-ins, `token-<name>`
+entries, and pack credentials. Systemd silently keeps one entry per repeated ID,
+and `foo` + `bar-baz` and `foo-bar` + `baz` both render `foo-bar-baz`.
 
 ### Fleet status snapshot
 
-`fleetStatusFile` (null by default) points at the `fleetix::status::FleetStatus`
-JSON that `canix fleet status --write` rewrites atomically every few minutes.
-The module exports it as `HUB_FLEET_STATUS_FILE` and `GET /v1/fleet/status`
-re-reads the file per request; the hub never collects fleet data itself. Unset
-means the route answers `404 fleet_status_unconfigured`.
+`fleetStatusFile` (default null) points to the `fleetix::status::FleetStatus`
+JSON that `canix fleet status --write` replaces atomically every few minutes.
+The module exports the path as `HUB_FLEET_STATUS_FILE`. The hub collects no
+fleet data itself: `GET /v1/fleet/status` rereads the file per request or
+returns `404 fleet_status_unconfigured` when unset.
 
-The unit runs with `ProtectHome` and `ProtectSystem=strict`, so the module
-bind-mounts the snapshot's **parent directory** read-only (`BindReadOnlyPaths`).
-Binding the file inode would keep serving the pre-replacement file, because an
-atomic write renames a new inode into place; binding the directory keeps
-replacements visible. Put the file where the writer can atomically rename
-within that directory (for example `/var/lib/fleet-status/fleet.json`).
+With `ProtectHome` and `ProtectSystem=strict`, the unit bind-mounts the
+snapshot's **parent directory** read-only (`BindReadOnlyPaths`). Atomic writes
+rename a new inode into place; mounting the file itself would hide replacements.
+Put the file where the writer can rename it atomically within its directory
+(for example `/var/lib/fleet-status/fleet.json`).
 
 ### Notifications and the producer loop
 
@@ -351,9 +343,9 @@ the worker, not under `--no-worker`. Every 60 s it:
 - clears lapsed snoozes, which announces the row again, and deletes rows that
   were acknowledged and resolved more than 30 days ago.
 
-An unchanged condition touches nothing, so an acknowledgement survives every
-later pass. A failing step is logged and the next pass retries it; nothing in
-the loop is fatal.
+An unchanged condition leaves the row and `seq` untouched, so its
+acknowledgement survives. The loop logs step failures and retries them on the
+next pass; none is fatal.
 
 `HUB_SUMMARY_STALE_HOURS` (unset by default) turns on `hub:summary-stale`: when
 no `source = summary` notification has been written for that many hours, the hub
@@ -400,8 +392,8 @@ services.fleetix-hub.feeds.syndb = {
 
 ## Atlas example — not activated
 
-This is an example configuration only. It is not wired into any host; it shows
-how the options line up with the current atlas services and fleet secrets.
+This example maps hub options to current Atlas services and fleet secrets.
+No host imports it.
 
 ```nix
 { config, inputs, ... }: {
@@ -491,11 +483,11 @@ Notes for the example:
   secret names; wire them through `age.secrets` on the host before enabling.
 - No Postiz deployment exists, so the publisher is `disabled` (a `fixture`
   publisher would silently simulate publishing).
-# Secret inventory
 
-Set `services.fleetix-hub.secretInventoryFile` to the absolute inventory JSON
-path, outside `/home`, `/root`, and `/run/user`. Its directory is mounted
-read-only so atomic replacements remain visible. The service user must be able
-to read the file. An unreadable inventory preserves previous secret alerts and
-raises `secrets:inventory-stale`; readable snapshots older than 25 hours retain
-their secret alerts and also raise staleness.
+## Secret inventory
+
+Set `services.fleetix-hub.secretInventoryFile` to an absolute inventory JSON
+path outside `/home`, `/root`, and `/run/user` that the service user can read.
+The read-only directory mount keeps atomic replacements visible. An unreadable
+inventory preserves previous secret alerts and raises `secrets:inventory-stale`.
+Readable snapshots older than 25 hours retain their alerts and also raise staleness.

@@ -1,10 +1,8 @@
 # Source provenance
 
-fleetix-hub is an independent product with its own history, licensed under
-the EUPL-1.2 (`LICENSE`). It reuses
-selected code from one pinned historical snapshot of Aivyx PA. Reuse does
-not change its nature: the reused parts are MIT-licensed code from that
-snapshot, adapted as recorded here and in the two detail files.
+fleetix-hub is an independent EUPL-1.2 product (`LICENSE`) with its own
+history. It adapts selected MIT-licensed code from one pinned historical
+Aivyx PA snapshot. This page and the two detail files record the adaptations.
 
 ## Donor record
 
@@ -19,15 +17,15 @@ snapshot, adapted as recorded here and in the two detail files.
 | License | MIT, `Copyright (c) 2026 Julian (Aivyx)` — notice kept in `LICENSE-THIRD-PARTY.md` |
 | Trademark | Donor `TRADEMARK.md` read: the Aivyx name, logos and branding are not used |
 
-Rechecked after retrieval: the snapshot contains `crates/aivyx-web`, a Dioxus
-`0.6` web client (`dioxus = { version = "0.6", features = ["web"] }`) that
-talks to the daemon over a WebSocket through `aivyx-ipc`. It contains no
-ComfyUI gallery; the hub's production studio is built from the ComfyUI API
-contracts (`docs/capabilities.md`).
+The retrieval recheck confirmed that `crates/aivyx-web`, a Dioxus `0.6` web
+client (`dioxus = { version = "0.6", features = ["web"] }`), talks to the
+daemon over a WebSocket through `aivyx-ipc`. The snapshot has no ComfyUI
+gallery; the hub's production studio is built from the ComfyUI API contracts
+(`docs/capabilities.md`).
 
-Donor project policies, scripts (`scripts/dev-run.sh`, `install-hooks.sh`,
-`pre-commit.sh`), installers, Docker deploy, `dist` release config and
-publishing workflows were read as context only. None was run or adopted.
+Context only, neither run nor adopted: donor policies, scripts
+(`scripts/dev-run.sh`, `install-hooks.sh`, `pre-commit.sh`), installers,
+Docker deploy, `dist` release config, and publishing workflows.
 
 ## Dependency graph inspected
 
@@ -60,10 +58,9 @@ publishing workflows were read as context only. None was run or adopted.
 | `crates/contracts` | `aivyx-ipc` (crate shape) | Single wire-truth crate with no async/storage deps, shared by server and every client |
 | `crates/integrations/src/live/n8n.rs` | `aivyx-n8n/src/n8n_client.rs` (sha256 `2f012e59…f97`) | Base-URL trimming, `/api/v1` joins, `X-N8N-API-KEY`, response decoding, error enum, tests — with secrets redacted from `Debug` and a production-webhook trigger added |
 
-Canon proposals in the hub follow the donor's persona-governance idea
-(`aivyx-ipc/src/persona.rs`, proposals gated by the operator, append-only
-deltas). No code from that file was copied; the hub stores canon as
-append-only revisions in PostgreSQL.
+Canon proposals follow the donor's operator-gated, append-only delta model
+(`aivyx-ipc/src/persona.rs`) without copying its code. The hub stores canon
+as append-only revisions in PostgreSQL.
 
 ## Detail files
 
@@ -74,5 +71,5 @@ append-only revisions in PostgreSQL.
 
 ## Changing the donor
 
-Later upstream changes are imported only after a deliberate review and a new
-row here naming the commit, archive hash and the files taken.
+Import later upstream changes only after review and a new row here recording
+the commit, archive hash, and imported files.

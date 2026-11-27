@@ -3,12 +3,12 @@
 The desktop app (`apps/desktop`) is an adaptation of the pinned donor snapshot
 of **aivyx-pa** (MIT), commit `8097870bdad7c1a726448eeeeb82331027f1e6cf`, at
 `/data/nvme0/can/ProjectState/donors/aivyx-pa/src/aivyx-pa-8097870bdad7c1a726448eeeeb82331027f1e6cf`.
-Only the donor's `crates/aivyx-web` shell, component kit and stylesheet were
-used. The donor tree was read-only and is not part of the build graph.
+The desktop uses only the donor's `crates/aivyx-web` shell, component kit,
+and stylesheet. The donor tree was read-only and stays outside the build graph.
 
-The donor's `TRADEMARK.md` was read. No Aivyx name, logo, wordmark, favicon or
-"Stitch" branding is copied or displayed: the app is branded "fleetix hub".
-Fonts (OFL) and the generic line icons are copied, as permitted.
+The donor's `TRADEMARK.md` was checked. The "fleetix hub" app neither copies
+nor displays the Aivyx name, logo, wordmark, favicon, or "Stitch" branding.
+It copies permitted assets: OFL fonts and generic line icons.
 
 ## Donor files
 
@@ -54,15 +54,15 @@ All donor `assets/logos/*` files were omitted.
   a CSS honey mark and the "fleetix hub" wordmark.
 - **WebSocket transport** (`ws_task`, `FrontendMessage`, `DaemonEnvelope`,
   `gloo_net::websocket`, `gloo_timers`): the hub exposes a typed HTTP contract
-  (`hub_contracts::client::HubClient`), so the desktop talks to it directly and
-  polls on the donor's `POLL_INTERVAL_MS` cadence.
+  (`hub_contracts::client::HubClient`). The desktop polls it directly on the
+  donor's `POLL_INTERVAL_MS` cadence.
 - **Donor views outside the shell kit**: Missions, Teams, Memory, Documents,
   Voice, Settings, Onboarding, Classic UI. The hub's own workspaces (Today,
   News, Studio, Calendar, Relationships, Library) replace them; no donor domain
   types (`TeamMissionView`, `PersonaProposalSummary`, `SettingsSnapshot`, …) are
   carried over.
-- **Theme toggle / light theme**: the hub palette is a single dark operator
-  theme; the donor's `[data-theme="light"]` token block is omitted.
+- **Theme toggle / light theme**: the hub uses one dark operator theme without
+  the donor's `[data-theme="light"]` token block.
 - **`asset!()` bundling and `font_faces()`**: desktop has no `dx` bundler; CSS
   is embedded with `include_str!` and fonts with `include_bytes!` + base64 data
   URIs (`theme.rs`).
@@ -84,10 +84,10 @@ All donor `assets/logos/*` files were omitted.
 
 ### Theme palette file
 
-The console reads a palette at startup (once per process) from
+The console reads the palette once per process at startup:
 `HUB_THEME_FILE`, else `$XDG_CONFIG_HOME/fleetix-hub/theme.json`, else
-`~/.config/fleetix-hub/theme.json`. Every key is optional; each value must be
-a `#rrggbb` string, and anything else is dropped:
+`~/.config/fleetix-hub/theme.json`. All keys are optional; the console drops
+values that aren't `#rrggbb` strings:
 
 | Key | CSS variable |
 |---|---|
@@ -106,11 +106,10 @@ a `#rrggbb` string, and anything else is dropped:
 {"bg": "#f7f4ec", "panel": "#efe9dc", "card": "#ffffff", "text": "#1d1b16", "accent": "#a86f00"}
 ```
 
-The overrides become a second `:root{…}` block appended to the built-in
-stylesheet, so only provided keys change. A missing or malformed file keeps
-the built-in dark palette and logs one line; it never fails startup. Values are
-validated as `#` plus six hex digits before interpolation because they are
-operator-supplied CSS.
+The console validates operator-supplied CSS values as `#` plus six hex digits
+before appending a second `:root{…}` block to the built-in stylesheet. Only
+provided keys change. A missing or malformed file logs one line and keeps the
+built-in dark palette without failing startup.
 
 Text drawn on an accent (selection, primary/sage buttons, the fixture banner)
 uses `var(--bg)`, so a light palette with a dark accent stays readable. Left
@@ -118,12 +117,11 @@ as-is: the built-in `:root` palette, the `rgba(...)` tints/shadows (pale
 translucent accents over any panel), and `color-scheme: dark` on native
 `<select>` widgets — a light palette still gets dark native select popups.
 
-The console polls `/v1/status` plus the base lists and the selected detail on the
-donor's 1.5s cadence. The fleet snapshot has its own 30s cadence (plus the
-palette's "Refresh fleet status"); a failed refresh keeps the last good data and
-shows the `ApiError` code/message. Every list has loading, error and empty
-states, and `fleet_status_unconfigured` renders one shared empty state in all
-four fleet views.
+The console polls `/v1/status`, base lists, and selected detail at the donor's
+1.5s cadence. It refreshes the fleet snapshot every 30s or via the palette's
+"Refresh fleet status". On refresh failure it keeps the last good data and
+shows the `ApiError` code/message. All lists have loading, error, and empty
+states. All four fleet views share the `fleet_status_unconfigured` empty state.
 
 ## Workspace → endpoint coverage
 
@@ -146,47 +144,46 @@ four fleet views.
 ## Contract requests
 
 1. **Intent approval state.** `PublicationIntent` exposes delivery state,
-   attempts and `release_revision_id`, but not the release's approval state or
-   `content_item_id`. Calendar therefore builds a bounded release index from
-   `GET /v1/content/{id}` (20 content details per poll, plus a "Refresh index"
-   button). Please add `release_state` (and preferably `content_item_id`) to
-   the intent payload, or a release-by-id read.
-2. **Release / generation by id.** `TodayItem` and palette hits can carry a
-   `release` or `generation` subject id, but there is no `GET /v1/releases/{id}`
-   or `GET /v1/generations/{id}`. The UI opens Studio with a pointer notice
-   instead of the exact item. A by-id read (or `content_item_id` on the subject)
-   would remove the workaround.
-3. **Follow-up helper.** `hub_contracts::client::HubClient` has no
-   `follow_up` method. The UI uses the public generic `post` to
-   `/relationships/{id}/follow-up` with `FollowUpIn`. Please add a typed helper
-   (and confirm the route spelling) so the CLI and desktop share one call.
-4. **Release list.** Calendar's index would be unnecessary with a release list
-   or a `GET /v1/releases?content_item_id=…` read.
-5. **Incremental reads.** The console fetches every base list on the donor's
-   1.5s cadence. Local-first hubs are small, but `ETag`/`updated_since` support
-   would keep polling cheap as content grows.
+   attempts, and `release_revision_id`, but not release approval or
+   `content_item_id`. Calendar indexes releases via `GET /v1/content/{id}`
+   (20 content details per poll, plus a "Refresh index" button). Add
+   `release_state` (preferably also `content_item_id`) to the intent payload
+   or provide a release-by-id read.
+2. **Release / generation by id.** `TodayItem` and palette hits can carry
+   `release` or `generation` subject IDs. Without `GET /v1/releases/{id}` or
+   `GET /v1/generations/{id}`, the UI opens Studio with a pointer notice,
+   not the item. Add a by-ID read or `content_item_id` on the subject.
+3. **Follow-up helper.** Without a `follow_up` method on
+   `hub_contracts::client::HubClient`, the UI uses the public generic `post`
+   to `/relationships/{id}/follow-up` with `FollowUpIn`. Confirm the route
+   spelling and add a typed helper shared by CLI and desktop.
+4. **Release list.** A release list or `GET /v1/releases?content_item_id=…`
+   would replace Calendar's index.
+5. **Incremental reads.** The console polls every base list at the donor's
+   1.5s cadence. Local-first hubs are small, but `ETag`/`updated_since` would
+   keep polling cheap as content grows.
 
 ## Known gaps
 
-- The desktop binary was smoke-run headlessly (Weston headless, mock hub) and
-  builds/tests pass, but no screenshot was captured: the headless compositor
-  did not expose a screen-capture protocol. A manual visual pass on a real
-  desktop session is still recommended.
-- `Cargo.lock` is workspace-owned and is not included in the desktop milestone
-  commits. The new dependencies (`contracts/client`, `chrono`, `serde`,
-  `serde_json`, `tokio`, `uuid`) require a lock update by the workspace owner
-  before `cargo build --locked` or the Nix desktop package can succeed.
-- Times entered in `datetime-local` fields are interpreted as UTC and labelled
-  `(UTC)`; the hub stores UTC instants.
+- The desktop builds/tests and smoke run passed (Weston headless,
+  mock hub). The compositor had no screen-capture protocol, so no screenshot
+  was captured. A manual visual check in a real desktop session is still
+  recommended.
+- Desktop milestone commits omit the workspace-owned `Cargo.lock`. The owner
+  must lock the new dependencies (`contracts/client`, `chrono`, `serde`,
+  `serde_json`, `tokio`, `uuid`) before `cargo build --locked` or the Nix
+  desktop package can succeed.
+- `datetime-local` fields use UTC and carry a `(UTC)` label; the hub stores
+  UTC instants.
 - `HUB_TOKEN` is read from the environment; there is no login UI.
-- `window.open` for handoff/posts may be blocked by the webview; the returned
-  URL is always shown and can be opened again from the button.
+- The webview may block `window.open` for handoff/posts. The UI always shows
+  the returned URL; reopen it from the button.
 
 ## Toolchain
 
-The app is pinned to **Dioxus `=0.8.0-alpha.3`** (the newest published 0.8
-alpha on crates.io at 2026-11-09), with the `desktop` feature. No `dx` CLI is
-required: `cargo build -p fleetix-hub-desktop` builds the binary directly.
+The app pins **Dioxus `=0.8.0-alpha.3`** (the newest 0.8 alpha on crates.io on
+2026-11-09) with the `desktop` feature. `cargo build -p fleetix-hub-desktop`
+builds the binary without `dx`.
 
 The 0.6 → 0.8-alpha migration touched one API: keyboard matching now uses
 `Key::Named(NamedKey::Enter)` (the 0.6 `Key::Enter` variant is gone).
@@ -195,7 +192,7 @@ The 0.6 → 0.8-alpha migration touched one API: keyboard matching now uses
 
 ## Verification
 
-Final verification ran from the repository root with the checked-in devshell:
+Final checks ran from the repo root in the checked-in devshell:
 
 - `nix develop -c cargo build -p fleetix-hub-desktop` — passes (Dioxus 0.6 for
   milestone A, 0.8.0-alpha.3 for milestones B/C).
@@ -208,7 +205,6 @@ Final verification ran from the repository root with the checked-in devshell:
   warnings. No screenshot was captured because the headless compositor did not
   expose the screen-capture protocol.
 
-During development the shared checkout briefly had an untracked
-`nix/treefmt.nix` from another workstream, which made `nix develop` fail flake
-evaluation; the equivalent devshell was evaluated from a scratch snapshot of the
-same flake until that file was tracked.
+During development, another workstream's untracked `nix/treefmt.nix` in the
+shared checkout made `nix develop` fail flake evaluation. A scratch snapshot
+of the same flake supplied the equivalent devshell until Git tracked the file.
