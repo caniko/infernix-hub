@@ -91,6 +91,7 @@ const LOG_CAP: usize = 256;
 const CAPTURE_CAP: usize = 96;
 const CAPTURE_BYTES: usize = 64 * 1024;
 const CLAUDE_AGENT: &str = "claude-code/2.1.273";
+const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 #[derive(Default)]
 struct CodexKeys {
@@ -636,24 +637,40 @@ impl Proxy {
             }
             let mut state = self.state.write().await;
             state.pool.merge_api_key_conflict_fps(&discovered_conflicts);
-            let updated = updated
-                .filter(|next| !state.pool.is_api_key_conflicted(next))
-                .ok_or_else(|| auth_error("no usable credential found on reload"))?;
-            let entry =
-                state.pool.accounts.get_mut(&a.id).filter(|entry| entry.same_secret(&current) && !entry.disabled).ok_or_else(superseded)?;
-            if !entry.same_secret(&updated) && entry.error_generation == current.error_generation {
-                let cleared = entry.clear_account_error() || entry.probe_failed;
-                entry.probe_failed = false;
-                if cleared {
-                    self.notify_hub_sync();
+            let reloaded = updated.filter(|next| !state.pool.is_api_key_conflicted(next));
+            if let Some(updated) = reloaded
+                && (!force || updated.access != current.access)
+            {
+                let entry = state
+                    .pool
+                    .accounts
+                    .get_mut(&a.id)
+                    .filter(|entry| entry.same_secret(&current) && !entry.disabled)
+                    .ok_or_else(superseded)?;
+                if !entry.same_secret(&updated) && entry.error_generation == current.error_generation {
+                    let cleared = entry.clear_account_error() || entry.probe_failed;
+                    entry.probe_failed = false;
+                    if cleared {
+                        self.notify_hub_sync();
+                    }
                 }
+                entry.replace_access(updated.access);
+                entry.replace_refresh(updated.refresh);
+                entry.codex_oauth_explicit = updated.codex_oauth_explicit;
+                entry.expires = updated.expires;
+                entry.source_fingerprint = updated.source_fingerprint;
+                return Ok(entry.clone());
             }
-            entry.replace_access(updated.access);
-            entry.replace_refresh(updated.refresh);
-            entry.codex_oauth_explicit = updated.codex_oauth_explicit;
-            entry.expires = updated.expires;
-            entry.source_fingerprint = updated.source_fingerprint;
-            return Ok(entry.clone());
+            let can_refresh_codex = !current.local
+                && current.lane == Lane::Codex
+                && !current.api_key
+                && current.refresh.as_deref().is_some_and(|token| !token.is_empty() && token != "spillway-pool")
+                && !state.pool.is_api_key_conflicted(&current);
+            drop(state);
+            if can_refresh_codex {
+                return self.refresh_codex_oauth(&current).await;
+            }
+            return Err(auth_error("no usable credential found on reload"));
         }
         let (Some(refresh), Some(id), Some(secret)) = (&current.refresh, &current.google_client, &current.google_secret) else {
             return Err(auth_error("Google OAuth refresh fields unavailable"));
@@ -714,6 +731,174 @@ impl Proxy {
         next.replace_access(access);
         next.expires = Some(Utc::now() + TimeDelta::seconds(expires_in));
         Ok(next.clone())
+    }
+
+    async fn refresh_codex_oauth(&self, current: &Account) -> Result<Account, Box<AccountError>> {
+        let superseded =
+            || Box::new(local_error(AccountErrorKind::Other, AccountErrorSource::OAuthRefresh, "credential changed or was disabled"));
+        let Some(refresh) = current.refresh.as_deref().filter(|token| !token.is_empty() && *token != "spillway-pool") else {
+            return Err(Box::new(local_error(
+                AccountErrorKind::AuthExpired,
+                AccountErrorSource::OAuthRefresh,
+                "OpenAI OAuth refresh token unavailable",
+            )));
+        };
+        let client_id = current.codex_client_id.as_deref().unwrap_or(CODEX_OAUTH_CLIENT_ID);
+        let token_url = self
+            .management_mock
+            .as_ref()
+            .and_then(|base| base.join("/test/codex-token").ok())
+            .map_or_else(|| "https://auth.openai.com/oauth/token".to_owned(), |url| url.to_string());
+        let refreshed = async {
+            let response = self
+                .http
+                .post(token_url)
+                .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh), ("client_id", client_id)])
+                .timeout(Duration::from_secs(12))
+                .send()
+                .await
+                .map_err(|_| {
+                    local_error(AccountErrorKind::UpstreamUnavailable, AccountErrorSource::OAuthRefresh, "OpenAI OAuth request failed.")
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                let bytes = error_body(response).await;
+                return Err(classify_oauth_error(Lane::Codex, status, &bytes, &account_secrets(current)));
+            }
+            let body = provider_response_json(response)
+                .await
+                .map_err(|message| local_error(AccountErrorKind::UpstreamUnavailable, AccountErrorSource::OAuthRefresh, message))?;
+            let valid_token = |raw: Option<&str>| {
+                raw.filter(|s| !s.is_empty() && s.len() <= 32_768 && s.bytes().all(|b| b.is_ascii_graphic())).map(str::to_owned)
+            };
+            let access = valid_token(body["access_token"].as_str()).ok_or_else(|| {
+                local_error(AccountErrorKind::Other, AccountErrorSource::OAuthRefresh, "OpenAI OAuth did not return a usable token.")
+            })?;
+            let next_refresh = valid_token(body["refresh_token"].as_str()).unwrap_or_else(|| refresh.to_owned());
+            let id_token = valid_token(body["id_token"].as_str());
+            let access_claims = pool::jwt_claims(&access);
+            let claims = id_token.as_deref().map(pool::jwt_claims).unwrap_or_else(|| access_claims.clone());
+            let access_chat = &access_claims["https://api.openai.com/auth"];
+            let chat = &claims["https://api.openai.com/auth"];
+            let chatgpt_id = pool::text(access_chat, &["chatgpt_account_id"])
+                .or_else(|| pool::text(chat, &["chatgpt_account_id"]))
+                .map(str::to_owned)
+                .or_else(|| current.chatgpt_id.clone());
+            let chatgpt_user = pool::text(access_chat, &["chatgpt_user_id"])
+                .or_else(|| pool::text(chat, &["chatgpt_user_id"]))
+                .map(str::to_owned)
+                .or_else(|| current.chatgpt_user.clone());
+            let email = pool::text(&claims, &["email"]).map(str::to_owned);
+            let plan = pool::text(chat, &["chatgpt_plan_type"]).map(str::to_owned);
+            let jwt_exp = access_claims["exp"].as_i64().and_then(|ts| DateTime::from_timestamp(ts, 0));
+            let expires_in = body["expires_in"].as_i64().map(|secs| Utc::now() + TimeDelta::seconds(secs.clamp(60, 30 * 86400)));
+            let expires = jwt_exp.or(expires_in).or_else(|| Some(Utc::now() + TimeDelta::hours(1)));
+            let mut candidate = current.clone();
+            candidate.access.clone_from(&access);
+            candidate.refresh = Some(next_refresh.clone());
+            candidate.chatgpt_id.clone_from(&chatgpt_id);
+            candidate.chatgpt_user.clone_from(&chatgpt_user);
+            if !codex_reload_matches(current, &candidate) {
+                return Err(local_error(
+                    AccountErrorKind::AuthExpired,
+                    AccountErrorSource::OAuthRefresh,
+                    "OpenAI OAuth refresh returned a credential for a different account.",
+                ));
+            }
+            Ok((access, next_refresh, id_token, expires, chatgpt_id, chatgpt_user, email, plan))
+        }
+        .await;
+        let (access, next_refresh, id_token, expires, chatgpt_id, chatgpt_user, email, plan) = match refreshed {
+            Ok(result) => result,
+            Err(error) => {
+                self.report_account_error(current, &error).await;
+                return Err(Box::new(error));
+            }
+        };
+        if let Err(err) = self.persist_codex_auth_file(current, &access, &next_refresh, id_token.as_deref(), expires, chatgpt_id.as_deref())
+        {
+            tracing::error!(account = %safe_label(current), error = %err, "failed to persist rotated OpenAI OAuth token to auth_dir");
+        }
+        let mut state = self.state.write().await;
+        let next = state.pool.accounts.get_mut(&current.id).filter(|n| n.same_secret(current) && !n.disabled).ok_or_else(superseded)?;
+        if next.access != access
+            && next.error_generation == current.error_generation
+            && next.last_error.as_ref().is_none_or(|err| !err.kind.is_blocking() || err.kind == AccountErrorKind::AuthExpired)
+        {
+            let cleared = next.clear_account_error() || next.probe_failed;
+            next.probe_failed = false;
+            if cleared {
+                self.notify_hub_sync();
+            }
+        }
+        next.replace_access(access);
+        next.replace_refresh(Some(next_refresh));
+        next.codex_oauth_explicit = true;
+        next.expires = expires;
+        if next.chatgpt_id.is_none() {
+            next.chatgpt_id = chatgpt_id;
+        }
+        if next.chatgpt_user.is_none() {
+            next.chatgpt_user = chatgpt_user;
+        }
+        if next.email.is_none() {
+            next.email = email;
+        }
+        if plan.is_some() {
+            next.plan = plan;
+        }
+        next.source_fingerprint = Some(next.compute_source_fingerprint(id_token.as_deref()));
+        Ok(next.clone())
+    }
+
+    fn persist_codex_auth_file(
+        &self,
+        current: &Account,
+        access: &str,
+        refresh: &str,
+        id_token: Option<&str>,
+        expires: Option<DateTime<Utc>>,
+        chatgpt_id: Option<&str>,
+    ) -> Result<()> {
+        ensure!(!current.local && pool::filename(&current.name), "cannot persist non-file credential");
+        let path = self.config.auth_dir.join(&current.name);
+        let original = config::read_text(&path)?.unwrap_or_default();
+        let mut saved = config::json_object(&original)?;
+        saved.entry("type").or_insert_with(|| serde_json::json!("codex"));
+        saved.entry("auth_mode").or_insert_with(|| serde_json::json!("chatgpt"));
+        if let Some(tokens) = saved.get_mut("tokens").and_then(Value::as_object_mut) {
+            tokens.insert("access_token".into(), serde_json::json!(access));
+            tokens.insert("refresh_token".into(), serde_json::json!(refresh));
+            if let Some(id_token) = id_token {
+                tokens.insert("id_token".into(), serde_json::json!(id_token));
+            }
+            if let Some(account_id) = chatgpt_id {
+                tokens.insert("account_id".into(), serde_json::json!(account_id));
+            }
+            for stale in ["access", "accessToken", "access_token", "refresh", "refreshToken", "refresh_token"] {
+                saved.remove(stale);
+            }
+        } else {
+            for stale in ["access", "accessToken", "token", "refresh", "refreshToken", "accountId"] {
+                saved.remove(stale);
+            }
+            saved.insert("access_token".into(), serde_json::json!(access));
+            saved.insert("refresh_token".into(), serde_json::json!(refresh));
+            if let Some(id_token) = id_token {
+                saved.insert("id_token".into(), serde_json::json!(id_token));
+            }
+            if let Some(account_id) = chatgpt_id {
+                saved.insert("account_id".into(), serde_json::json!(account_id));
+            }
+        }
+        for stale in ["expiresAt", "expiry", "expired", "expires"] {
+            saved.remove(stale);
+        }
+        if let Some(expires) = expires {
+            saved.insert("expires_at".into(), serde_json::json!(expires.to_rfc3339()));
+        }
+        saved.insert("last_refresh".into(), serde_json::json!(Utc::now().to_rfc3339()));
+        config::write_private(&path, &serde_json::to_vec_pretty(&Value::Object(saved))?, true)
     }
 
     async fn schedule_usage_refresh(self: &Arc<Self>, id: String) {
@@ -1202,7 +1387,7 @@ fn merge_probe_windows(account: &mut Account, windows: Vec<QuotaWindow>, google_
 async fn read_local_opencode_auth() -> Option<Value> {
     use std::process::Stdio;
     let read = tokio::process::Command::new("opencode")
-        .args(["auth", "list", "--format", "json"])
+        .args(["auth", "export", "--standalone"])
         .env_clear()
         .envs(
             ["PATH", "HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "OPENCODE_DB"]

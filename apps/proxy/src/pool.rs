@@ -198,6 +198,7 @@ pub struct Account {
     pub chatgpt_id: Option<String>,
     pub chatgpt_user: Option<String>,
     pub organization: Option<String>,
+    pub codex_client_id: Option<String>,
     pub google_client: Option<String>,
     pub google_secret: Option<String>,
     provenance_enrollment: Option<String>,
@@ -373,6 +374,23 @@ impl Account {
             self.clear_account_error();
         }
         self.error_generation = self.error_generation.saturating_add(1);
+    }
+
+    pub(crate) fn compute_source_fingerprint(&self, id_token: Option<&str>) -> String {
+        let material = json!([
+            self.access,
+            self.refresh,
+            self.codex_oauth_explicit,
+            self.expires,
+            id_token,
+            self.google_client,
+            self.google_secret,
+            self.chatgpt_id,
+            self.chatgpt_user,
+            self.organization,
+            self.project,
+        ]);
+        hex::encode(Sha256::digest(material.to_string()))
     }
 
     pub(crate) fn same_secret(&self, other: &Self) -> bool {
@@ -817,13 +835,30 @@ fn parse_credentials_with_options(
         let claims = id_token.map(jwt_claims).unwrap_or_else(|| access_claims.clone());
         let chat = &claims["https://api.openai.com/auth"];
         let access_chat = &access_claims["https://api.openai.com/auth"];
-        let chatgpt_id =
-            text(entry, &["account_id", "accountId", "chatgpt_account_id", "/tokens/account_id", "/id_token/chatgpt_account_id"])
-                .or_else(|| text(access_chat, &["chatgpt_account_id"]))
-                .or_else(|| text(chat, &["chatgpt_account_id"]))
-                .map(str::to_owned);
+        let chatgpt_id = text(
+            entry,
+            &[
+                "account_id",
+                "accountId",
+                "chatgpt_account_id",
+                "/tokens/account_id",
+                "/id_token/chatgpt_account_id",
+                "/metadata/accountID",
+                "/metadata/account_id",
+            ],
+        )
+        .or_else(|| text(access_chat, &["chatgpt_account_id"]))
+        .or_else(|| text(chat, &["chatgpt_account_id"]))
+        .map(str::to_owned);
         let chatgpt_user = text(access_chat, &["chatgpt_user_id"]).or_else(|| text(chat, &["chatgpt_user_id"])).map(str::to_owned);
         let organization = text(entry, &["organization_uuid", "organizationUuid", "/claudeAiOauth/organizationUuid"]).map(str::to_owned);
+        let codex_client_id = (lane == Lane::Codex)
+            .then(|| {
+                text(entry, &["client_id", "clientID", "/metadata/clientID", "/metadata/client_id"])
+                    .or_else(|| text(raw, &["client_id", "clientID", "/metadata/clientID", "/metadata/client_id"]))
+                    .map(str::to_owned)
+            })
+            .flatten();
         let plan =
             text(entry, &["plan", "plan_type", "/id_token/plan_type", "/id_token/chatgpt_plan_type", "/claudeAiOauth/subscriptionType"])
                 .or_else(|| text(chat, &["chatgpt_plan_type"]))
@@ -880,6 +915,7 @@ fn parse_credentials_with_options(
             chatgpt_id,
             chatgpt_user,
             organization,
+            codex_client_id,
             google_client,
             google_secret,
             provenance_enrollment: None,
@@ -910,20 +946,7 @@ fn parse_credentials_with_options(
             failure: 0,
         };
         // Hash parsed credential material, not the editable credential document.
-        let material = json!([
-            account.access,
-            account.refresh,
-            account.codex_oauth_explicit,
-            account.expires,
-            id_token,
-            account.google_client,
-            account.google_secret,
-            account.chatgpt_id,
-            account.chatgpt_user,
-            account.organization,
-            account.project,
-        ]);
-        account.source_fingerprint = Some(hex::encode(Sha256::digest(material.to_string())));
+        account.source_fingerprint = Some(account.compute_source_fingerprint(id_token));
         Ok(account)
     };
     if let Some(keys) = group["keys"].as_array() {
@@ -1593,6 +1616,20 @@ fn add_with_api_key(pool: &mut Pool, lane: Lane, label: &str, raw: Value, force_
                     }
                     api_key_conflicts.push(a.clone());
                 }
+                if a.lane == Lane::Codex
+                    && !a.api_key
+                    && a.chatgpt_id.is_some()
+                    && pool.accounts.values().any(|old| {
+                        old.id != a.id
+                            && !old.local
+                            && !old.api_key
+                            && old.lane == Lane::Codex
+                            && old.chatgpt_id == a.chatgpt_id
+                            && old.chatgpt_user == a.chatgpt_user
+                    })
+                {
+                    return None;
+                }
                 let mut duplicates = pool.accounts.values_mut().filter(|old| old.id != a.id && old.shares_discovery_token(&a)).peekable();
                 if duplicates.peek().is_none() {
                     return Some(a);
@@ -1958,10 +1995,34 @@ fn extract_api_key_token_fps(record: &Value, lane: Lane, force_api_key: bool) ->
 pub(crate) fn add_opencode(pool: &mut Pool, raw: &Value, excluded: &BTreeSet<Lane>) {
     let rows = raw.get("credentials").unwrap_or(raw);
     let object = rows.as_object().into_iter().flatten().map(|(name, row)| (name.as_str(), row));
-    let list = rows.as_array().into_iter().flatten().filter_map(|row| Some((text(row, &["provider", "providerID", "id"])?, row)));
+    let list =
+        rows.as_array().into_iter().flatten().filter_map(|row| Some((text(row, &["integrationID", "provider", "providerID", "id"])?, row)));
     for (name, entry) in object.chain(list) {
         if let Some(lane) = Lane::parse(name).filter(|lane| !excluded.contains(lane)) {
-            if let Some(auth) = entry.get("auth") {
+            if let Some(value) = entry.get("value").filter(|v| v.is_object()) {
+                // OpenCode V2 `auth export` entry: {id, integrationID, label, active, value: {type, access, refresh, expires, methodID, metadata}}
+                let (outer_api, outer_oauth) = record_api_key_evidence(entry, lane);
+                let (inner_api, inner_oauth) = record_api_key_evidence(value, lane);
+                let force_api_key = outer_api || inner_api;
+                let mut explicit_fps = extract_api_key_token_fps(entry, lane, force_api_key);
+                explicit_fps.extend(extract_api_key_token_fps(value, lane, force_api_key));
+                pool.merge_api_key_conflict_fps(&explicit_fps);
+                if force_api_key && (outer_oauth || inner_oauth) {
+                    continue;
+                }
+                let mut normalized = value.as_object().cloned().unwrap_or_default();
+                if let Some(label) = text(entry, &["label"]) {
+                    normalized.entry("label").or_insert_with(|| json!(label));
+                }
+                if let Some(account_id) = text(value, &["/metadata/accountID", "/metadata/account_id"]) {
+                    normalized.entry("account_id").or_insert_with(|| json!(account_id));
+                }
+                if let Some(client_id) = text(value, &["/metadata/clientID", "/metadata/client_id"]) {
+                    normalized.entry("client_id").or_insert_with(|| json!(client_id));
+                }
+                let key = text(entry, &["id", "label"]).map(|id| format!("{name}:{id}")).unwrap_or_else(|| name.to_owned());
+                add_with_api_key(pool, lane, &key, Value::Object(normalized), force_api_key);
+            } else if let Some(auth) = entry.get("auth") {
                 // Classify outer and inner records independently before unwrapping so
                 // neither layer can mask API-key markers or contradictory OAuth fields.
                 let (outer_api, outer_oauth) = record_api_key_evidence(entry, lane);

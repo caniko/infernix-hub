@@ -9214,3 +9214,215 @@ fUzIU8/LOvSpg1rgVwKzTzwyTGAuI0Ch8RiMsNoOOoO/6dXeoA==
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn codex_jwt(account_id: &str, user_id: &str, exp: i64) -> String {
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(
+        json!({
+            "exp": exp,
+            "email": "operator@example.test",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_user_id": user_id,
+                "chatgpt_plan_type": "pro"
+            }
+        })
+        .to_string(),
+    );
+    format!("{header}.{payload}.sig")
+}
+
+#[tokio::test]
+async fn codex_oauth_refresh_rotates_and_persists_auth_file() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let future_exp = (Utc::now() + TimeDelta::days(5)).timestamp();
+    let old_jwt = codex_jwt("acct-same", "user-same", (Utc::now() - TimeDelta::minutes(5)).timestamp());
+    let new_jwt = codex_jwt("acct-same", "user-same", future_exp);
+    let new_jwt_reply = new_jwt.clone();
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = serve(Router::new().route(
+        "/test/codex-token",
+        post({
+            let refresh_calls = refresh_calls.clone();
+            move |body: String| {
+                let refresh_calls = refresh_calls.clone();
+                let new_jwt_reply = new_jwt_reply.clone();
+                async move {
+                    refresh_calls.fetch_add(1, Ordering::SeqCst);
+                    assert!(body.contains("grant_type=refresh_token"), "{body}");
+                    assert!(body.contains("refresh_token=refresh-old-fixture"), "{body}");
+                    assert!(body.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"), "{body}");
+                    axum::Json(json!({
+                        "access_token": new_jwt_reply,
+                        "refresh_token": "refresh-rotated-fixture",
+                        "expires_in": 432000
+                    }))
+                }
+            }
+        }),
+    ))
+    .await;
+
+    let dir = Scratch::new();
+    let auth_path = dir.join("auth/openai-primary.json");
+    config::write_private(
+        &auth_path,
+        serde_json::to_vec_pretty(&json!({
+            "type": "codex",
+            "auth_mode": "chatgpt",
+            "label": "OpenAI Primary",
+            "priority": 7,
+            "weight": 3,
+            "note": "keep-me",
+            "access_token": old_jwt,
+            "refresh_token": "refresh-old-fixture",
+            "account_id": "acct-same"
+        }))
+        .unwrap()
+        .as_slice(),
+        true,
+    )
+    .unwrap();
+    let mut cfg = fixture_config(&dir, &mock);
+    cfg.discover_local = false;
+    let mut proxy = Proxy::new(cfg).unwrap();
+    proxy.set_mock_endpoints(mock.0.clone());
+    let proxy = Arc::new(proxy);
+    let account = proxy.state.read().await.pool.accounts["openai-primary.json"].clone();
+
+    let renewed = proxy.token_account(&account, false).await.unwrap();
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(renewed.access, new_jwt);
+    assert_eq!(renewed.refresh.as_deref(), Some("refresh-rotated-fixture"));
+    assert_eq!(renewed.chatgpt_id.as_deref(), Some("acct-same"));
+
+    // Verify atomic persistence preserved user metadata and updated rotated tokens.
+    let saved: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+    assert_eq!(saved["label"], "OpenAI Primary");
+    assert_eq!(saved["priority"], 7);
+    assert_eq!(saved["weight"], 3);
+    assert_eq!(saved["note"], "keep-me");
+    assert_eq!(saved["access_token"], new_jwt);
+    assert_eq!(saved["refresh_token"], "refresh-rotated-fixture");
+    assert_eq!(saved["account_id"], "acct-same");
+
+    // Reloading the proxy from disk must load the rotated grant cleanly.
+    let reloaded = Pool::reload_file(&proxy.config, &renewed).unwrap();
+    assert_eq!(reloaded.access, new_jwt);
+    assert_eq!(reloaded.refresh.as_deref(), Some("refresh-rotated-fixture"));
+}
+
+#[tokio::test]
+async fn codex_oauth_refresh_rejects_mismatched_account_identity() {
+    let future_exp = (Utc::now() + TimeDelta::days(5)).timestamp();
+    let old_jwt = codex_jwt("acct-expected", "user-expected", (Utc::now() - TimeDelta::minutes(5)).timestamp());
+    let wrong_jwt = codex_jwt("acct-other", "user-other", future_exp);
+    let mock = serve(Router::new().route(
+        "/test/codex-token",
+        post({
+            let wrong_jwt = wrong_jwt.clone();
+            move || {
+                let wrong_jwt = wrong_jwt.clone();
+                async move {
+                    axum::Json(json!({
+                        "access_token": wrong_jwt,
+                        "refresh_token": "refresh-other-fixture",
+                        "expires_in": 3600
+                    }))
+                }
+            }
+        }),
+    ))
+    .await;
+
+    let dir = Scratch::new();
+    let auth_path = dir.join("auth/openai-primary.json");
+    config::write_private(
+        &auth_path,
+        serde_json::to_vec_pretty(&json!({
+            "type": "codex",
+            "auth_mode": "chatgpt",
+            "access_token": old_jwt,
+            "refresh_token": "refresh-expected-fixture",
+            "account_id": "acct-expected"
+        }))
+        .unwrap()
+        .as_slice(),
+        true,
+    )
+    .unwrap();
+    let mut cfg = fixture_config(&dir, &mock);
+    cfg.discover_local = false;
+    let mut proxy = Proxy::new(cfg).unwrap();
+    proxy.set_mock_endpoints(mock.0.clone());
+    let account = proxy.state.read().await.pool.accounts["openai-primary.json"].clone();
+
+    let err = proxy.token_account(&account, false).await.err().unwrap();
+    assert_eq!(err.kind, AccountErrorKind::AuthExpired);
+    assert!(err.message.contains("different account"), "{}", err.message);
+    let saved: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+    assert_eq!(saved["refresh_token"], "refresh-expected-fixture");
+}
+
+#[test]
+fn opencode_v2_auth_export_parses_and_deduplicates_against_managed_codex_account() {
+    let future_ms = (Utc::now() + TimeDelta::days(2)).timestamp_millis();
+    let managed_jwt = codex_jwt("acct-shared", "user-shared", (Utc::now() + TimeDelta::days(2)).timestamp());
+    let other_jwt = codex_jwt("acct-second", "user-second", (Utc::now() + TimeDelta::days(2)).timestamp());
+
+    let mut pool = Pool::default();
+    pool.insert(
+        pool::parse_credentials(
+            "openai-primary.json",
+            &json!({
+                "type": "codex",
+                "auth_mode": "chatgpt",
+                "label": "OpenAI Managed",
+                "access_token": managed_jwt,
+                "refresh_token": "refresh-rotated-in-proxy",
+                "account_id": "acct-shared"
+            }),
+            false,
+        )
+        .unwrap(),
+    );
+
+    let export = json!([
+        {
+            "id": "cred_shared",
+            "integrationID": "openai",
+            "label": "OpenAI",
+            "active": true,
+            "value": {
+                "type": "oauth",
+                "access": codex_jwt("acct-shared", "user-shared", (Utc::now() + TimeDelta::days(1)).timestamp()),
+                "refresh": "refresh-older-in-opencode",
+                "expires": future_ms,
+                "methodID": "chatgpt-browser",
+                "metadata": { "accountID": "acct-shared" }
+            }
+        },
+        {
+            "id": "cred_second",
+            "integrationID": "openai",
+            "label": "Secondary",
+            "active": false,
+            "value": {
+                "type": "oauth",
+                "access": other_jwt,
+                "refresh": "refresh-second",
+                "expires": future_ms,
+                "methodID": "chatgpt-browser",
+                "metadata": { "accountID": "acct-second" }
+            }
+        }
+    ]);
+    pool::add_opencode(&mut pool, &export, &BTreeSet::new());
+
+    // Managed acct-shared must not be duplicated by the local OpenCode export, while acct-second is added.
+    let codex_accounts: Vec<_> = pool.accounts.values().filter(|a| a.lane == Lane::Codex).collect();
+    assert_eq!(codex_accounts.len(), 2);
+    assert!(codex_accounts.iter().any(|a| !a.local && a.chatgpt_id.as_deref() == Some("acct-shared")));
+    assert!(codex_accounts.iter().any(|a| a.local && a.label == "Secondary" && a.chatgpt_id.as_deref() == Some("acct-second")));
+}

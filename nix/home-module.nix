@@ -55,13 +55,36 @@
     else if inputs ? nix-provenance
     then inputs.nix-provenance.packages.${pkgs.stdenv.hostPlatform.system}.provenance-oauth or null
     else null;
+  opencodePkg =
+    if cfg.opencodePackage != null
+    then cfg.opencodePackage
+    else config.programs.opencode.package or null;
+  proxyPathPackages =
+    lib.optional (provenanceOauthPkg != null) provenanceOauthPkg
+    ++ lib.optional (opencodePkg != null) opencodePkg;
   proxy = lib.optionalAttrs hasProxy {
     wrapped = wrap "fleetix-agent-proxy" proxyPkg (
-      lib.optionalString (provenanceOauthPkg != null)
-      "--prefix PATH : ${lib.escapeShellArg (lib.makeBinPath [provenanceOauthPkg])}"
+      lib.optionalString (proxyPathPackages != [])
+      "--prefix PATH : ${lib.escapeShellArg (lib.makeBinPath proxyPathPackages)}"
     );
   };
+  opencodeOpenaiPluginPackage = ../apps/proxy/opencode-openai-plugin;
   proxyCfg = cfg.agentProxy;
+  effectiveAccountDefaultsFile =
+    if proxyCfg.accountDefaultsFile != null
+    then proxyCfg.accountDefaultsFile
+    else if proxyCfg.accountDefaults != {}
+    then
+      pkgs.writeText "fleetix-agent-proxy-account-defaults.json" (builtins.toJSON {
+        version = 1;
+        accounts = lib.mapAttrs (_: entry:
+          lib.filterAttrs (_: value: value != null) {
+            inherit (entry) plan;
+            tier_multiplier = entry.tierMultiplier;
+          })
+        proxyCfg.accountDefaults;
+      })
+    else null;
   workerCfg = proxyCfg.workerListener;
   googleWorkerCfg = proxyCfg.googleWorkerListener;
   # The socket's leading %t is the only intentional systemd specifier.
@@ -171,6 +194,11 @@ in {
       default = null;
       description = "Optional OAuth helper for the local agent proxy; defaults to the nix-provenance input when available.";
     };
+    opencodePackage = mkOption {
+      type = types.nullOr types.package;
+      default = null;
+      description = "Optional OpenCode CLI package added to fleetix-agent-proxy's PATH for local discovery; defaults to programs.opencode.package when set.";
+    };
     calendar.enable = mkEnableOption "the personal schedule in Fleetix Hub Desktop (the wrapped hubctl also provides calendar commands)";
     mail = {
       enable = mkEnableOption "Fleetix Hub desktop mail integrations";
@@ -267,6 +295,37 @@ in {
         default = null;
         description = "File containing the read-only usage key for the local proxy daemon and T3 Code usage-limit registration.";
       };
+      clientKeyFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Optional runtime file containing the inference client key shared with local or forwarded proxy clients (for example OpenCode).";
+      };
+      effectiveClientKeyFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        readOnly = true;
+        internal = true;
+        default =
+          if proxyCfg.clientKeyFile != null
+          then proxyCfg.clientKeyFile
+          else if localProxy
+          then "${proxyCfg.stateDir}/client-key"
+          else null;
+      };
+      opencodeOpenaiPlugin = lib.mkOption {
+        type = lib.types.nullOr lib.types.attrs;
+        readOnly = true;
+        internal = true;
+        default =
+          if proxyCfg.effectiveUrl != null && proxyCfg.effectiveClientKeyFile != null
+          then {
+            package = "${opencodeOpenaiPluginPackage}";
+            options = {
+              baseURL = "${proxyCfg.effectiveUrl}/backend-api/codex";
+              clientKeyFile = proxyCfg.effectiveClientKeyFile;
+            };
+          }
+          else null;
+      };
       effectiveUrl = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         readOnly = true;
@@ -343,6 +402,29 @@ in {
         default = null;
         description = "Optional directory of CLIProxyAPI/Spillway credential JSON files.";
       };
+      accountDefaults = lib.mkOption {
+        type = types.attrsOf (types.submodule {
+          options = {
+            plan = lib.mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              description = "Default plan for this account.";
+            };
+            tierMultiplier = lib.mkOption {
+              type = types.nullOr types.number;
+              default = null;
+              description = "Positive default tier multiplier for this account.";
+            };
+          };
+        });
+        default = {};
+        description = "Default plan and tier multiplier metadata, keyed by account.";
+      };
+      accountDefaultsFile = lib.mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        description = "Optional external JSON account defaults file, instead of inline account defaults.";
+      };
     };
     collector = {
       enable = lib.mkEnableOption "User-session AI provider usage collector timer";
@@ -375,6 +457,14 @@ in {
         {
           assertion = !(proxyCfg.enable && proxyCfg.externalUrl != null);
           message = "Fleetix Agent Proxy local and external modes are mutually exclusive.";
+        }
+        {
+          assertion = proxyCfg.accountDefaults == {} || proxyCfg.accountDefaultsFile == null;
+          message = "Fleetix Agent Proxy accountDefaults and accountDefaultsFile are mutually exclusive.";
+        }
+        {
+          assertion = lib.all (entry: entry.tierMultiplier == null || entry.tierMultiplier > 0) (lib.attrValues proxyCfg.accountDefaults);
+          message = "Fleetix Agent Proxy accountDefaults tierMultiplier values must be positive.";
         }
         {
           assertion = isCanonicalSocketPath workerCfg.unixSocket;
@@ -447,7 +537,9 @@ in {
                     )
                   ]
                   ++ lib.optionals (proxyCfg.authDir != null) ["--auth-dir" proxyCfg.authDir]
+                  ++ lib.optionals (proxyCfg.clientKeyFile != null) ["--client-key-file" proxyCfg.clientKeyFile]
                   ++ lib.optionals (proxyCfg.usageKeyFile != null) ["--usage-key-file" proxyCfg.usageKeyFile]
+                  ++ lib.optionals (effectiveAccountDefaultsFile != null) ["--account-defaults-file" effectiveAccountDefaultsFile]
                   ++ lib.optional proxyCfg.discoverLocal "--discover-local"
                   ++ lib.optionals (proxyCfg.registerT3Code && !useDeclarativeT3Registration) [
                     "--register-t3code"

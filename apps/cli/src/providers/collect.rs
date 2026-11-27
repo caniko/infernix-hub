@@ -395,15 +395,15 @@ impl Collector {
     }
 
     async fn batch(&self, provider: &str, label: &str, service: &str, proxy: &ProxyInventory) -> Option<ObservationBatch> {
-        if provider == "antigravity" && (proxy.hub_sync_configured || proxy.unavailable) {
+        if matches!(provider, "antigravity" | "opencode") && (proxy.hub_sync_configured || proxy.unavailable) {
             return None;
         }
         let now = Utc::now();
         let selected = self.catalog.selected(service, &self.host, &self.user);
         let proxy_accounts = self.proxy_accounts(provider, &proxy.credentials, now);
-        // A reachable proxy inventory already represents the Google accounts;
-        // the catalogue and T3 token can describe the same accounts under other IDs.
-        let proxy_owns_accounts = provider == "antigravity" && !proxy_accounts.is_empty();
+        // A reachable proxy inventory already represents the pooled accounts;
+        // the catalogue and local files can describe the same accounts under other IDs.
+        let proxy_owns_accounts = matches!(provider, "antigravity" | "opencode") && !proxy_accounts.is_empty();
         let mut accounts = BTreeMap::new();
         if !proxy_owns_accounts && let Some(entry) = self.catalog.services.get(service) {
             for (id, entry) in &entry.accounts {
@@ -594,8 +594,8 @@ impl Collector {
             return Err(failed("Operation targets a different session"));
         }
         let proxy = self.proxy_inventory().await.map_err(|_| failed("Could not read local proxy inventory"))?;
-        if provider == "antigravity" && proxy.hub_sync_configured {
-            return Err(failed("Antigravity operations are owned by the native proxy"));
+        if matches!(provider, "antigravity" | "opencode") && proxy.hub_sync_configured {
+            return Err(failed("Provider operations are owned by the native proxy"));
         }
         match &op.command {
             ProviderCommand::Quota(QuotaCommand::RefreshQuota { account_id }) => {
@@ -704,8 +704,10 @@ mod tests {
         });
         let native = ProxyInventory::from_response(json!({"credentials":credentials,"hub_sync_configured":true})).unwrap();
         assert!(collector.batch("antigravity", "Antigravity", "google", &native).await.is_none());
+        assert!(collector.batch("opencode", "OpenCode", "openai", &native).await.is_none());
         let unavailable = ProxyInventory { unavailable: true, ..ProxyInventory::default() };
         assert!(collector.batch("antigravity", "Antigravity", "google", &unavailable).await.is_none());
+        assert!(collector.batch("opencode", "OpenCode", "openai", &unavailable).await.is_none());
         let external = ProxyInventory::from_response(json!({"credentials":credentials})).unwrap();
         let accounts = collector.batch("antigravity", "Antigravity", "google", &external).await.unwrap().accounts;
         assert_eq!(accounts.len(), 6);

@@ -542,7 +542,7 @@ pub(crate) async fn forward_authorized(
     let session = if lane == Lane::Google {
         extract_google_session(&parts.headers, &raw)
     } else {
-        header_id(&parts.headers, &["x-session-id", "x-claude-session-id", "session_id"])
+        header_id(&parts.headers, &["x-session-id", "session-id", "x-claude-session-id", "session_id"])
             .or_else(|| {
                 text(
                     &raw,
@@ -1519,7 +1519,7 @@ fn extract_google_session(headers: &HeaderMap, raw: &Value) -> Option<String> {
         bounded_identifier(s) && (digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()))
     };
     // ACP's numeric request.session_id is a shared user hash, not a conversation ID.
-    ["x-session-id", "session_id", "conversation_id"]
+    ["x-session-id", "session-id", "session_id", "conversation_id"]
         .into_iter()
         .filter_map(|name| headers.get(name)?.to_str().ok())
         .chain(
@@ -1720,6 +1720,7 @@ fn request_header(name: &str) -> bool {
             | "anthropic-version"
             | "openai-beta"
             | "originator"
+            | "x-codex-beta-features"
             | "client-metadata"
             | "x-goog-api-client"
             | "x-goog-request-params"
@@ -1727,6 +1728,7 @@ fn request_header(name: &str) -> bool {
             | "x-client-version"
             | "x-client-request-id"
             | "x-session-id"
+            | "session-id"
             | "x-stainless-lang"
             | "x-stainless-package-version"
             | "x-stainless-os"
