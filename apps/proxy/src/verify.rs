@@ -1013,6 +1013,7 @@ async fn check_antigravity_cache_hit_preservation() -> Result<String> {
         RouteStrategy::WeightedRoundRobin,
         RouteStrategy::SoonestReset,
         RouteStrategy::FillFirst,
+        RouteStrategy::TierAscending,
         RouteStrategy::CapacityBalanced,
     ] {
         {

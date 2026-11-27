@@ -1042,10 +1042,15 @@ async fn assert_capacity_over_http(
                 .unwrap();
         assert_eq!(stored, (Some(plan.into()), Some(multiplier)));
     }
-    for strategy in ["soonest_reset", "capacity_balanced"] {
+    for (key, policy, strategy) in [
+        ("default-strategy", json!({}), "tier_ascending"),
+        ("soonest-reset", json!({"strategy": "soonest_reset"}), "soonest_reset"),
+        ("capacity-balanced", json!({"strategy": "capacity_balanced"}), "capacity_balanced"),
+        ("tier-ascending", json!({"strategy": "tier_ascending"}), "tier_ascending"),
+    ] {
         let response: Value = post(operations)
             .json(&json!({
-                "idempotency_key":strategy, "command":{"facet":"routing","payload":{"op":"set_route_policy","policy":{"strategy":strategy}}}
+                "idempotency_key":key, "command":{"facet":"routing","payload":{"op":"set_route_policy","policy":policy}}
             }))
             .send()
             .await

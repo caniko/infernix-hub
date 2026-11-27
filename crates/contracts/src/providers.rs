@@ -1389,6 +1389,7 @@ pub struct ObservationAck {
 #[serde(rename_all = "snake_case")]
 pub enum RouteStrategy {
     #[default]
+    TierAscending,
     CapacityBalanced,
     SoonestReset,
     FillFirst,
@@ -1398,12 +1399,20 @@ pub enum RouteStrategy {
 
 #[cfg(test)]
 #[test]
-fn capacity_balanced_is_the_default_route_strategy() {
-    assert_eq!(serde_json::to_value(RoutingPolicy::default()).unwrap()["strategy"], "capacity_balanced");
-    assert_eq!(serde_json::from_str::<RouteStrategy>("\"capacity_balanced\"").unwrap(), RouteStrategy::CapacityBalanced);
+fn tier_ascending_is_the_default_route_strategy() {
+    assert_eq!(RouteStrategy::default(), RouteStrategy::TierAscending);
+    assert_eq!(serde_json::to_value(RouteStrategy::default()).unwrap(), "tier_ascending");
+    assert_eq!(serde_json::to_value(RoutingPolicy::default()).unwrap()["strategy"], "tier_ascending");
+    assert_eq!(serde_json::from_str::<RoutingPolicy>("{}").unwrap().strategy, RouteStrategy::TierAscending);
     assert_eq!(serde_json::from_str::<RoutingPolicy>("{}").unwrap(), RoutingPolicy::default());
-    let explicit: RoutingPolicy = serde_json::from_value(serde_json::json!({"strategy": "soonest_reset"})).unwrap();
-    assert_eq!(explicit.strategy, RouteStrategy::SoonestReset);
+    for (explicit, expected) in [
+        ("tier_ascending", RouteStrategy::TierAscending),
+        ("capacity_balanced", RouteStrategy::CapacityBalanced),
+        ("soonest_reset", RouteStrategy::SoonestReset),
+    ] {
+        let policy: RoutingPolicy = serde_json::from_value(serde_json::json!({"strategy": explicit})).unwrap();
+        assert_eq!(policy.strategy, expected);
+    }
 }
 
 #[cfg(test)]

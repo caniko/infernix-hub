@@ -542,6 +542,7 @@ async fn proxy_inventory_only_preserves_tier_multipliers() {
                 ]
             }),
         ),
+        "GET /v8/management/config/routing/strategy HTTP/1.1" => (200, String::new(), json!("tier_ascending")),
         _ => (404, String::new(), Value::Null),
     })
     .await;
@@ -556,6 +557,7 @@ async fn proxy_inventory_only_preserves_tier_multipliers() {
     tokio::fs::remove_file(path).await.unwrap();
     for batch in batches {
         let batch = batch.unwrap().unwrap();
+        assert_eq!(batch.routing_status.as_ref().unwrap().policy.strategy, RouteStrategy::TierAscending);
         assert_eq!(batch.accounts.len(), 2);
         for (id, multiplier) in [("my-proxy:nested.json", 20.0), ("my-proxy:flat.json", 5.0)] {
             let account = batch.accounts.iter().find(|account| account.id == id).unwrap();
@@ -566,12 +568,38 @@ async fn proxy_inventory_only_preserves_tier_multipliers() {
 }
 
 #[tokio::test]
+async fn proxy_uses_first_recognized_route_strategy() {
+    let path = std::env::temp_dir().join(format!("hub-provider-test-{}", Uuid::new_v4()));
+    tokio::fs::write(&path, "fake-management-token-for-loopback").await.unwrap();
+    for (strategy, expected) in [
+        (None, RouteStrategy::CapacityBalanced),
+        (Some("unknown-future-strategy"), RouteStrategy::CapacityBalanced),
+        (Some("weighted_round_robin"), RouteStrategy::WeightedRoundRobin),
+    ] {
+        let (base, task) = serve(move |request, _| match request.lines().next().unwrap() {
+            "GET /v8/management/credentials HTTP/1.1" => (200, String::new(), json!({"files": []})),
+            "GET /v8/management/usage/windows HTTP/1.1" => (200, String::new(), json!({"credentials": []})),
+            "GET /v8/management/config/routing/strategy HTTP/1.1" if strategy.is_some() => (200, String::new(), json!(strategy)),
+            "GET /v8/management/config HTTP/1.1" => (200, String::new(), json!({"routing": {"strategy": "capacity-balanced"}})),
+            _ => (404, String::new(), Value::Null),
+        })
+        .await;
+        let provider = SpillwayProxyProvider::new("my-proxy", "Spillway", "claude", "router-1", &base, &path).unwrap();
+        let batch = provider.collect().await;
+        task.abort();
+        assert_eq!(batch.unwrap().unwrap().routing_status.unwrap().policy.strategy, expected, "{strategy:?}");
+    }
+    tokio::fs::remove_file(path).await.unwrap();
+}
+
+#[tokio::test]
 async fn proxy_collects_typed_observations_and_dispatches_against_auth_index() {
     const MANAGEMENT_TOKEN: &str = "fake-management-token-for-loopback";
     const API_KEY: &str = "fake-private-upstream-api-key-1234";
     let path = std::env::temp_dir().join(format!("hub-provider-test-{}", Uuid::new_v4()));
     tokio::fs::write(&path, MANAGEMENT_TOKEN).await.unwrap();
-    let (base, task) = serve(|request, payload| {
+    let routing = std::sync::Mutex::new((1, "capacity_balanced"));
+    let (base, task) = serve(move |request, payload| {
         assert!(request.contains(&format!("authorization: Bearer {MANAGEMENT_TOKEN}")));
         let first = request.lines().next().unwrap();
         let route = first.strip_suffix(" HTTP/1.1").unwrap();
@@ -590,11 +618,18 @@ async fn proxy_collects_typed_observations_and_dispatches_against_auth_index() {
                  "reset_credits": {"available": 1, "grants": [{"id": "grant-one", "available": 1, "applicable": 1, "clears": ["five_hour"]}]}},
                 {"id": "c.json", "provider": "claude", "tier_multiplier": 5.0},
             ]}),
-            "GET /v8/management/config/routing/strategy" => return (200, "X-CPA-Version: v8.2.3\r\n".into(), json!("capacity_balanced")),
-            "GET /v8/management/config" => return (200, "ETag: \"revision-1\"\r\n".into(), json!({
-                "routing": {"session-affinity": false, "prefer-auth-kind": "api-key"},
-                "api-keys": {"claude": [{"name": "Work keys", "keys": [{"api-key": API_KEY}], "models": [{"name": "claude-sonnet", "alias": "sonnet"}]}]}
-            })),
+            "GET /v8/management/config/routing/strategy" => {
+                let (revision, strategy) = *routing.lock().unwrap();
+                let body = if revision == 1 { json!(strategy) } else { Value::Null };
+                return (200, "X-CPA-Version: v8.2.3\r\n".into(), body);
+            }
+            "GET /v8/management/config" => {
+                let (revision, strategy) = *routing.lock().unwrap();
+                return (200, format!("ETag: \"revision-{revision}\"\r\n"), json!({
+                    "routing": {"strategy": strategy, "session-affinity": false, "prefer-auth-kind": "api-key"},
+                    "api-keys": {"claude": [{"name": "Work keys", "keys": [{"api-key": API_KEY}], "models": [{"name": "claude-sonnet", "alias": "sonnet"}]}]}
+                }));
+            }
             "GET /v8/management/observability/logs?limit=100" => json!({"lines": [format!("[2026-11-21 12:00:00] [request] [warn] Authorization: Bearer {API_KEY}")]}),
             "PUT /v8/management/routing/preferred-auth" => {
                 assert_eq!(payload, json!({"provider": "claude", "auth_index": "proxy-index"}));
@@ -617,12 +652,19 @@ async fn proxy_collects_typed_observations_and_dispatches_against_auth_index() {
                 json!({"status": "ok"})
             }
             "PATCH /v8/management/config/routing" => {
-                assert!(request.contains("if-match: \"revision-1\""));
-                assert_eq!(payload["strategy"], "capacity-balanced");
+                let mut routing = routing.lock().unwrap();
+                assert!(request.contains(&format!("if-match: \"revision-{}\"", routing.0)));
+                let expected = match routing.0 {
+                    1 => "tier-ascending",
+                    2 => "capacity-balanced",
+                    revision => panic!("unexpected routing patch at revision {revision}"),
+                };
+                assert_eq!(payload["strategy"], expected);
+                *routing = (routing.0 + 1, expected);
                 json!({"status": "ok"})
             }
             "PUT /v8/management/config/api-keys/claude" => {
-                assert!(request.contains("if-match: \"revision-1\""));
+                assert!(request.contains("if-match: \"revision-3\""));
                 assert_eq!(payload[0]["keys"][0]["api-key"], API_KEY);
                 assert_eq!(payload[0]["keys"][0]["disabled"], true);
                 json!({"status": "ok"})
@@ -653,7 +695,12 @@ async fn proxy_collects_typed_observations_and_dispatches_against_auth_index() {
         let facets = provider.facets();
         let routing = facets.routing.unwrap();
         let op = intent("my-proxy");
-        routing.submit(&op, &RoutingCommand::SetRoutePolicy { policy: RoutingPolicy::default() }).await.unwrap();
+        for strategy in [RouteStrategy::TierAscending, RouteStrategy::CapacityBalanced] {
+            let policy = RoutingPolicy { strategy, ..RoutingPolicy::default() };
+            routing.submit(&op, &RoutingCommand::SetRoutePolicy { policy }).await.unwrap();
+            let batch = provider.collect().await.unwrap().unwrap();
+            assert_eq!(batch.routing_status.unwrap().policy.strategy, strategy);
+        }
         assert!(account.capabilities.contains(&ProviderCapability::SetCapacity));
         facets
             .accounts

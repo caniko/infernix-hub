@@ -279,6 +279,7 @@ fn ProxyConfig(provider: ProviderSummary, runtime: ProxyRuntimeStatus, revision:
 }
 
 const STRATEGIES: &[RouteStrategy] = &[
+    RouteStrategy::TierAscending,
     RouteStrategy::CapacityBalanced,
     RouteStrategy::SoonestReset,
     RouteStrategy::FillFirst,

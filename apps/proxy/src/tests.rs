@@ -9,7 +9,7 @@ use crate::{
 };
 use axum::{
     body::{Body, Bytes},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -299,6 +299,324 @@ fn google_preview_ranks_allowlisted_credentials_by_gemini_quota() {
 }
 
 #[test]
+fn google_preview_ranks_model_scoped_capacity_like_live_pick() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+
+    let mut pool = Pool::default();
+    let now = Utc::now();
+    let model = "gemini-4-neon-high";
+    for (id, remaining) in [("a.json", 0.02), ("z.json", 0.8)] {
+        let mut accounts =
+            pool::parse_credentials(id, &json!({"type":"google","access_token":id,"models":[model],"tier_multiplier":1.0}), false).unwrap();
+        accounts[0].windows = parse_antigravity_summary(
+            &json!({"groups":[{"displayName":model,"buckets":[
+                {"bucketId":"custom-neon","window":"weekly","remainingFraction":remaining,"resetTime":now + TimeDelta::hours(10)}
+            ]}]}),
+            now,
+        );
+        pool.insert(accounts);
+    }
+    for strategy in [TierAscending, CapacityBalanced] {
+        pool.policy.strategy = strategy;
+        let live = pool.pick(Lane::Google, (None, None), model, None, &[], now).unwrap();
+        assert_eq!(live.id, "z.json", "{strategy:?}");
+        assert_eq!(pool.preview(Lane::Google).as_deref(), Some(live.id.as_str()), "{strategy:?}");
+    }
+}
+
+#[test]
+fn google_preview_filters_idle_capacity_per_model_like_live_pick() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+
+    let mut pool = Pool::default();
+    let now = Utc::now();
+    let models = ["gemini-4-neon-high", "gemini-3.8-flash"];
+    for (id, supported, priority) in [("a.json", &models[..], 0), ("b.json", &models[..1], 1)] {
+        let mut accounts =
+            pool::parse_credentials(id, &json!({"type":"google","access_token":id,"models":supported,"tier_multiplier":1.0}), false)
+                .unwrap();
+        accounts[0].priority = priority;
+        accounts[0].windows = supported
+            .iter()
+            .flat_map(|model| {
+                let active = id == "a.json" && *model == models[0];
+                parse_antigravity_summary(
+                    &json!({"groups":[{"displayName":model,"buckets":[
+                        {"bucketId":format!("custom-{model}-weekly"),"window":"weekly","remainingFraction":0.5,"resetTime":now + TimeDelta::hours(10)},
+                        {"bucketId":format!("custom-{model}-session"),"window":"5h","remainingFraction":if active { 0.8 } else { 1.0 },
+                         "resetTime":active.then_some(now + TimeDelta::hours(2))}
+                    ]}]}),
+                    now,
+                )
+            })
+            .collect();
+        pool.insert(accounts);
+    }
+    for strategy in [TierAscending, CapacityBalanced] {
+        pool.policy.strategy = strategy;
+        for model in models {
+            let live = pool.pick(Lane::Google, (None, None), model, None, &[], now).unwrap();
+            assert_eq!(live.id, "a.json", "{strategy:?}: {model}");
+        }
+        assert_eq!(pool.preview(Lane::Google).as_deref(), Some("a.json"), "{strategy:?}");
+    }
+}
+
+#[test]
+fn google_preview_isolates_idle_gate_per_model_across_tiers() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+
+    let mut pool = Pool::default();
+    let now = Utc::now();
+    let neon = "gemini-4-neon-high";
+    let flash = "gemini-3.8-flash";
+
+    // Account A (20x): idle Neon (4/h, 20.0 session capacity) + active Flash (2.5/h).
+    let mut ultra = pool::parse_credentials(
+        "a.json",
+        &json!({"type":"google","access_token":"a","models":[neon, flash],"tier_multiplier":20.0}),
+        false,
+    )
+    .unwrap();
+    ultra[0].windows = parse_antigravity_summary(
+        &json!({"groups":[
+            {"displayName":neon,"buckets":[
+                {"bucketId":"custom-neon-5h","window":"5h","remainingFraction":1.0,"resetTime":null}
+            ]},
+            {"displayName":flash,"buckets":[
+                {"bucketId":"custom-flash-5h","window":"5h","remainingFraction":0.5,"resetTime":now + TimeDelta::hours(4)}
+            ]}
+        ]}),
+        now,
+    );
+    pool.insert(ultra);
+
+    // Account B (5x): active Neon only (0.8 remaining, <1h reset -> 4/h, 4.0 session capacity).
+    let mut mid =
+        pool::parse_credentials("b.json", &json!({"type":"google","access_token":"b","models":[neon],"tier_multiplier":5.0}), false)
+            .unwrap();
+    mid[0].windows = parse_antigravity_summary(
+        &json!({"groups":[
+            {"displayName":neon,"buckets":[
+                {"bucketId":"custom-neon-5h","window":"5h","remainingFraction":0.8,"resetTime":now + TimeDelta::minutes(30)}
+            ]}
+        ]}),
+        now,
+    );
+    pool.insert(mid);
+
+    pool.policy.strategy = CapacityBalanced;
+    assert_eq!(pool.pick(Lane::Google, (None, None), neon, None, &[], now).unwrap().id, "a.json");
+    assert_eq!(pool.pick(Lane::Google, (None, None), flash, None, &[], now).unwrap().id, "a.json");
+    assert_eq!(pool.preview(Lane::Google).as_deref(), Some("a.json"));
+
+    pool.policy.strategy = TierAscending;
+    assert_eq!(pool.pick(Lane::Google, (None, None), neon, None, &[], now).unwrap().id, "b.json");
+    assert_eq!(pool.pick(Lane::Google, (None, None), flash, None, &[], now).unwrap().id, "a.json");
+    assert_eq!(pool.preview(Lane::Google).as_deref(), Some("b.json"));
+}
+
+#[test]
+fn google_preview_includes_unrestricted_accounts_in_concrete_model_idle_gate() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+
+    let mut pool = Pool::default();
+    let now = Utc::now();
+    let neon = "gemini-4-neon-high";
+
+    // Unrestricted active 1x account: 20% left resetting in 30m -> 0.20/h.
+    let mut unrestricted =
+        pool::parse_credentials("a.json", &json!({"type":"google","access_token":"a","tier_multiplier":1.0}), false).unwrap();
+    unrestricted[0].windows = parse_antigravity_summary(
+        &json!({"groups":[{"displayName":"Gemini","buckets":[
+            {"bucketId":"gemini-pro","window":"5h","remainingFraction":0.2,"resetTime":now + TimeDelta::minutes(30)}
+        ]}]}),
+        now,
+    );
+    pool.insert(unrestricted);
+
+    // Neon-only idle 1x account: 100% left in a 5h window -> 0.20/h.
+    let mut neon_only =
+        pool::parse_credentials("b.json", &json!({"type":"google","access_token":"b","models":[neon],"tier_multiplier":1.0}), false)
+            .unwrap();
+    neon_only[0].windows = parse_antigravity_summary(
+        &json!({"groups":[{"displayName":neon,"buckets":[
+            {"bucketId":"custom-neon-5h","window":"5h","remainingFraction":1.0,"resetTime":null}
+        ]}]}),
+        now,
+    );
+    pool.insert(neon_only);
+
+    for strategy in [TierAscending, CapacityBalanced] {
+        pool.policy.strategy = strategy;
+        assert_eq!(pool.pick(Lane::Google, (None, None), neon, None, &[], now).unwrap().id, "a.json", "{strategy:?}");
+        assert_eq!(pool.preview(Lane::Google).as_deref(), Some("a.json"), "{strategy:?}");
+    }
+
+    // Reversed: unrestricted idle account must not bypass the Neon active gate via a generic GoogleGemini score.
+    let mut reversed = Pool::default();
+    let mut unrestricted_idle =
+        pool::parse_credentials("a.json", &json!({"type":"google","access_token":"a","tier_multiplier":1.0}), false).unwrap();
+    unrestricted_idle[0].windows = parse_antigravity_summary(
+        &json!({"groups":[{"displayName":"Gemini","buckets":[
+            {"bucketId":"gemini-pro","window":"5h","remainingFraction":1.0,"resetTime":null}
+        ]}]}),
+        now,
+    );
+    reversed.insert(unrestricted_idle);
+
+    let mut neon_active =
+        pool::parse_credentials("b.json", &json!({"type":"google","access_token":"b","models":[neon],"tier_multiplier":1.0}), false)
+            .unwrap();
+    neon_active[0].windows = parse_antigravity_summary(
+        &json!({"groups":[{"displayName":neon,"buckets":[
+            {"bucketId":"custom-neon-5h","window":"5h","remainingFraction":0.2,"resetTime":now + TimeDelta::minutes(30)}
+        ]}]}),
+        now,
+    );
+    reversed.insert(neon_active);
+
+    for strategy in [TierAscending, CapacityBalanced] {
+        reversed.policy.strategy = strategy;
+        assert_eq!(reversed.pick(Lane::Google, (None, None), neon, None, &[], now).unwrap().id, "b.json", "{strategy:?}");
+        assert_eq!(reversed.preview(Lane::Google).as_deref(), Some("b.json"), "{strategy:?}");
+    }
+}
+
+#[test]
+fn google_preview_discovers_peer_models_before_filtering_unrestricted_accounts() {
+    use integrations::providers::antigravity::parse_antigravity_summary;
+
+    let mut pool = Pool::default();
+    let now = Utc::now();
+    let neon = "gemini-4-neon-high";
+    let flash = "gemini-3.8-flash";
+
+    // Unrestricted 1x account with exhausted Neon still serves Flash live.
+    let mut unrestricted =
+        pool::parse_credentials("a.json", &json!({"type":"google","access_token":"a","tier_multiplier":1.0}), false).unwrap();
+    unrestricted[0].priority = 1;
+    unrestricted[0].windows = parse_antigravity_summary(
+        &json!({"groups":[{"displayName":neon,"buckets":[
+            {"bucketId":"custom-neon","window":"weekly","remainingFraction":0.0,"resetTime":now + TimeDelta::hours(10)}
+        ]}]}),
+        now,
+    );
+    pool.insert(unrestricted);
+
+    // Quota-blocked Flash-only peer must still contribute Flash during model discovery.
+    let mut flash_only =
+        pool::parse_credentials("b.json", &json!({"type":"google","access_token":"b","models":[flash],"tier_multiplier":1.0}), false)
+            .unwrap();
+    flash_only[0].windows = parse_antigravity_summary(
+        &json!({"groups":[{"displayName":flash,"buckets":[
+            {"bucketId":"custom-flash","window":"weekly","remainingFraction":0.0,"resetTime":now + TimeDelta::hours(10)}
+        ]}]}),
+        now,
+    );
+    pool.insert(flash_only);
+
+    // Healthy higher-tier Neon-only peer would win if quota-blocked `b.json` were excluded before discovery.
+    let mut neon_ultra =
+        pool::parse_credentials("c.json", &json!({"type":"google","access_token":"c","models":[neon],"tier_multiplier":20.0}), false)
+            .unwrap();
+    neon_ultra[0].windows = parse_antigravity_summary(
+        &json!({"groups":[{"displayName":neon,"buckets":[
+            {"bucketId":"custom-neon","window":"weekly","remainingFraction":0.8,"resetTime":now + TimeDelta::hours(10)}
+        ]}]}),
+        now,
+    );
+    pool.insert(neon_ultra);
+
+    pool.policy.strategy = TierAscending;
+    assert_eq!(pool.pick(Lane::Google, (None, None), flash, None, &[], now).unwrap().id, "a.json");
+    assert_eq!(pool.preview(Lane::Google).as_deref(), Some("a.json"));
+
+    // QuotaExhausted probe backoff on the Flash-only peer must keep Flash discoverable while excluding `b.json` even if preferred.
+    let flash_peer = pool.accounts.get_mut("b.json").unwrap();
+    flash_peer.windows.clear();
+    let mut backoff =
+        crate::error_classify::local_error(AccountErrorKind::QuotaExhausted, AccountErrorSource::QuotaProbe, "Quota probe backoff active.");
+    backoff.occurred_at = now;
+    backoff.backoff_until = Some(now + TimeDelta::hours(1));
+    flash_peer.last_error = Some(backoff);
+    pool.overrides.insert(Lane::Google, "b.json".into());
+    assert_eq!(pool.pick(Lane::Google, (None, None), flash, None, &[], now).unwrap().id, "a.json");
+    assert_eq!(pool.preview(Lane::Google).as_deref(), Some("a.json"));
+
+    // An unrestricted account with exhausted Neon plus a healthy general Gemini window still previews for other Gemini models.
+    let mut mixed = Pool::default();
+    let mut general = pool::parse_credentials("a.json", &json!({"type":"google","access_token":"a","tier_multiplier":1.0}), false).unwrap();
+    general[0].windows = parse_antigravity_summary(
+        &json!({"groups":[
+            {"displayName":neon,"buckets":[
+                {"bucketId":"custom-neon","window":"weekly","remainingFraction":0.0,"resetTime":now + TimeDelta::hours(10)}
+            ]},
+            {"displayName":"Gemini","buckets":[
+                {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.8,"resetTime":now + TimeDelta::hours(20)}
+            ]}
+        ]}),
+        now,
+    );
+    mixed.insert(general);
+    for strategy in [TierAscending, CapacityBalanced] {
+        mixed.policy.strategy = strategy;
+        assert_eq!(mixed.pick(Lane::Google, (None, None), flash, None, &[], now).unwrap().id, "a.json", "{strategy:?}");
+        assert_eq!(mixed.preview(Lane::Google).as_deref(), Some("a.json"), "{strategy:?}");
+    }
+
+    // Without measured positive headroom on the general Gemini window, exhausted Neon leaves preview empty.
+    let mut unavailable_general = Pool::default();
+    let mut unmeasured =
+        pool::parse_credentials("a.json", &json!({"type":"google","access_token":"a","tier_multiplier":1.0}), false).unwrap();
+    unmeasured[0].windows = parse_antigravity_summary(
+        &json!({"groups":[
+            {"displayName":neon,"buckets":[
+                {"bucketId":"custom-neon","window":"weekly","remainingFraction":0.0,"resetTime":now + TimeDelta::hours(10)}
+            ]},
+            {"displayName":"Gemini","buckets":[
+                {"bucketId":"gemini-weekly","window":"weekly","resetTime":now + TimeDelta::hours(20)}
+            ]}
+        ]}),
+        now,
+    );
+    unavailable_general.insert(unmeasured);
+    for strategy in [TierAscending, CapacityBalanced] {
+        unavailable_general.policy.strategy = strategy;
+        assert_eq!(unavailable_general.preview(Lane::Google), None, "{strategy:?}");
+    }
+
+    // SoonestReset and FillFirst also rank unrestricted custom-scoped windows against peer-advertised models.
+    let mut legacy = Pool::default();
+    let mut scoped_neon =
+        pool::parse_credentials("a.json", &json!({"type":"google","access_token":"a","tier_multiplier":1.0}), false).unwrap();
+    scoped_neon[0].windows = parse_antigravity_summary(
+        &json!({"groups":[{"displayName":"neon","buckets":[
+            {"bucketId":"custom-neon","window":"weekly","remainingFraction":0.2,"resetTime":now + TimeDelta::hours(5)}
+        ]}]}),
+        now,
+    );
+    legacy.insert(scoped_neon);
+
+    let mut peer =
+        pool::parse_credentials("b.json", &json!({"type":"google","access_token":"b","models":[neon],"tier_multiplier":1.0}), false)
+            .unwrap();
+    peer[0].windows = parse_antigravity_summary(
+        &json!({"groups":[{"displayName":neon,"buckets":[
+            {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.8,"resetTime":now + TimeDelta::hours(20)}
+        ]}]}),
+        now,
+    );
+    legacy.insert(peer);
+
+    for strategy in [SoonestReset, FillFirst] {
+        legacy.policy.strategy = strategy;
+        assert_eq!(legacy.pick(Lane::Google, (None, None), neon, None, &[], now).unwrap().id, "a.json", "{strategy:?}");
+        assert_eq!(legacy.preview(Lane::Google).as_deref(), Some("a.json"), "{strategy:?}");
+    }
+}
+
+#[test]
 fn preview_keeps_non_google_lanes_model_agnostic() {
     use integrations::providers::{
         claude::parse_claude_oauth_usage,
@@ -401,9 +719,8 @@ fn round_robin_cursors_follow_eligible_accounts() {
 
 #[test]
 fn capacity_balanced_uses_effective_tier_for_unmeasured_accounts() {
-    use contracts::providers::RouteStrategy;
     let mut pool = Pool::default();
-    assert_eq!(pool.policy.strategy, RouteStrategy::CapacityBalanced);
+    pool.policy.strategy = CapacityBalanced;
     for (id, tier) in [("a.json", 1.0), ("z.json", 20.0)] {
         pool.insert(pool::parse_credentials(id, &json!({"type": "claude", "access_token": id, "tier_multiplier": tier}), false).unwrap());
     }
@@ -839,6 +1156,7 @@ fn audit_google_lane_summary_shares_bucket_and_reports_resetless_expiry() {
 fn audit_capacity_balancing_handles_idle_unknown_and_implicit_codex_session_windows() {
     use contracts::providers::QuotaWindowKind;
     let mut pool = Pool::default();
+    pool.policy.strategy = CapacityBalanced;
     let now = Utc::now();
     for id in ["a.json", "b.json"] {
         pool.insert(pool::parse_credentials(id, &json!({"type":"codex","access_token":id}), false).unwrap());
@@ -868,6 +1186,7 @@ fn audit_capacity_balancing_handles_idle_unknown_and_implicit_codex_session_wind
 #[test]
 fn capacity_balanced_prefers_burn_rate_but_preserves_ample_affinity() {
     let mut pool = Pool::default();
+    pool.policy.strategy = CapacityBalanced;
     let now = Utc::now();
     for (id, tier) in [("large.json", 20.0), ("small.json", 1.0)] {
         let mut accounts =
@@ -895,6 +1214,7 @@ fn capacity_balanced_prefers_burn_rate_but_preserves_ample_affinity() {
 #[test]
 fn capacity_balanced_gates_idle_clocks_and_spreads_live_attempts() {
     let mut pool = Pool::default();
+    pool.policy.strategy = CapacityBalanced;
     let now = Utc::now();
     for (id, tier) in [("large.json", 20.0), ("small.json", 1.0)] {
         let mut accounts =
@@ -925,6 +1245,155 @@ fn capacity_balanced_gates_idle_clocks_and_spreads_live_attempts() {
     assert_eq!(pick(&mut pool), "small.json", "equal active tiers spread evenly");
     drop(guard);
     assert_eq!(pick(&mut pool), "large.json");
+}
+
+fn tier_test_pool(accounts: &[(&str, Option<f64>)]) -> Pool {
+    let mut pool = Pool::default();
+    for &(id, tier) in accounts {
+        pool.insert(pool::parse_credentials(id, &json!({"type": "codex", "access_token": id, "tier_multiplier": tier}), false).unwrap());
+    }
+    pool
+}
+
+#[test]
+fn tier_ascending_spills_up_and_immediately_downshifts() {
+    let mut pool = tier_test_pool(&[("pro.json", Some(1.0)), ("max.json", Some(5.0)), ("ultra.json", Some(20.0))]);
+    let now = Utc::now();
+    let reset = Some(now + TimeDelta::hours(5));
+    for (id, left) in [("pro.json", 2.0), ("max.json", 80.0), ("ultra.json", 90.0)] {
+        pool.accounts.get_mut(id).unwrap().windows = vec![capacity_window("5h", left, reset, now)];
+    }
+    pool.bind(Lane::Codex, "warm", "ultra.json");
+    let pick = |pool: &mut Pool, tried: &[String]| pool.pick(Lane::Codex, (Some("warm"), None), "", None, tried, now).unwrap().id;
+    let tried = ["pro.json".into(), "max.json".into()];
+    assert_eq!(pick(&mut pool, &[]), "pro.json");
+    assert_eq!(pick(&mut pool, &tried[..1]), "max.json");
+    assert_eq!(pick(&mut pool, &tried), "ultra.json");
+    assert_eq!(pick(&mut pool, &[]), "pro.json");
+}
+
+#[test]
+fn tier_ascending_uses_all_eligible_pros_before_idle_ultra() {
+    let mut pool = tier_test_pool(&[("a.json", Some(1.0)), ("b.json", Some(1.0)), ("c.json", Some(1.0)), ("ultra.json", Some(20.0))]);
+    let now = Utc::now();
+    let reset = now + TimeDelta::hours(5);
+    for id in ["a.json", "b.json", "c.json"] {
+        pool.accounts.get_mut(id).unwrap().windows = vec![capacity_window("5h", 80.0, Some(reset), now)];
+    }
+    pool.accounts.get_mut("ultra.json").unwrap().windows = vec![capacity_window("5h", 100.0, None, now)];
+    let pick = |pool: &mut Pool| pool.pick(Lane::Codex, (None, None), "", None, &[], now).unwrap().id;
+    assert_eq!(pick(&mut pool), "a.json");
+    pool.accounts.get_mut("a.json").unwrap().windows[0] = capacity_window("5h", 0.0, Some(reset), now);
+    assert_eq!(pick(&mut pool), "b.json");
+    pool.accounts.get_mut("b.json").unwrap().windows.push(capacity_window("weekly", 0.0, Some(now + TimeDelta::days(7)), now));
+    assert_eq!(pick(&mut pool), "c.json");
+    pool.accounts.get_mut("c.json").unwrap().cooldown = Some(pool::Cooldown { until: reset, verified_reset: false });
+    assert_eq!(pick(&mut pool), "ultra.json");
+}
+
+#[test]
+fn tier_ascending_preserves_ample_affinity_only_within_the_selected_tier() {
+    let mut pool = tier_test_pool(&[("fast.json", Some(1.0)), ("warm.json", Some(1.0)), ("ultra.json", Some(20.0))]);
+    let now = Utc::now();
+    let reset = Some(now + TimeDelta::hours(5));
+    for (id, left) in [("fast.json", 90.0), ("warm.json", 70.0), ("ultra.json", 90.0)] {
+        pool.accounts.get_mut(id).unwrap().windows = vec![capacity_window("5h", left, reset, now)];
+    }
+    pool.bind(Lane::Codex, "parent", "warm.json");
+    pool.bind(Lane::Codex, "child", "ultra.json");
+    let pick = |pool: &mut Pool, affinity| pool.pick(Lane::Codex, affinity, "", None, &[], now).unwrap().id;
+    assert_eq!(pick(&mut pool, (None, None)), "fast.json");
+    assert_eq!(pick(&mut pool, (Some("parent"), None)), "warm.json");
+    assert_eq!(pick(&mut pool, (Some("child"), Some("parent"))), "warm.json");
+    pool.accounts.get_mut("warm.json").unwrap().windows[0] = capacity_window("5h", 4.0, reset, now);
+    assert_eq!(pick(&mut pool, (Some("parent"), None)), "fast.json");
+}
+
+#[test]
+fn tier_ascending_matches_capacity_balanced_with_uniform_tiers() {
+    let now = Utc::now();
+    let active = capacity_window("5h", 80.0, Some(now + TimeDelta::hours(5)), now);
+    let idle = capacity_window("5h", 100.0, None, now);
+    for strategy in [TierAscending, CapacityBalanced] {
+        let mut pool = tier_test_pool(&[("active.json", Some(1.0)), ("idle.json", Some(1.0))]);
+        pool.policy.strategy = strategy;
+        pool.accounts.get_mut("active.json").unwrap().windows = vec![active.clone()];
+        pool.accounts.get_mut("idle.json").unwrap().windows = vec![idle.clone()];
+        let pick = |pool: &mut Pool| pool.pick(Lane::Codex, (None, None), "", None, &[], now).unwrap().id;
+        assert_eq!(pick(&mut pool), "idle.json", "{strategy:?}: 0.20/h beats 0.16/h");
+        pool.accounts.get_mut("active.json").unwrap().windows.push(capacity_window("weekly", 90.0, Some(now + TimeDelta::hours(3)), now));
+        assert_eq!(pick(&mut pool), "active.json", "{strategy:?}: urgent weekly window");
+        let _guard = pool.acquire_in_flight("active.json");
+        assert_eq!(pick(&mut pool), "idle.json", "{strategy:?}: in-flight load lowers active rate");
+    }
+}
+
+#[test]
+fn tier_ascending_does_not_suppress_idle_smaller_tier() {
+    let mut pool = tier_test_pool(&[("pro.json", Some(1.0)), ("ultra.json", Some(20.0))]);
+    let now = Utc::now();
+    pool.accounts.get_mut("pro.json").unwrap().windows = vec![capacity_window("5h", 100.0, None, now)];
+    pool.accounts.get_mut("ultra.json").unwrap().windows = vec![capacity_window("5h", 80.0, Some(now + TimeDelta::hours(5)), now)];
+    assert_eq!(pool.pick(Lane::Codex, (None, None), "", None, &[], now).unwrap().id, "pro.json");
+    assert_eq!(pool.preview(Lane::Codex).as_deref(), Some("pro.json"));
+}
+
+#[test]
+fn tier_ascending_uses_default_tier_without_inventing_headroom_and_honors_override() {
+    let mut pool = tier_test_pool(&[("unknown.json", None), ("ultra.json", Some(20.0))]);
+    let now = Utc::now();
+    let reset = Some(now + TimeDelta::hours(5));
+    pool.accounts.get_mut("ultra.json").unwrap().windows = vec![capacity_window("5h", 90.0, reset, now)];
+    let pick = |pool: &mut Pool, session| pool.pick(Lane::Codex, (session, None), "", None, &[], now).unwrap().id;
+    assert_eq!(pick(&mut pool, None), "unknown.json");
+    let mut measured =
+        pool::parse_credentials("pro.json", &json!({"type": "codex", "access_token": "pro.json", "tier_multiplier": 1.0}), false).unwrap();
+    measured[0].windows = vec![capacity_window("5h", 2.0, reset, now)];
+    pool.insert(measured);
+    assert_eq!(pick(&mut pool, None), "pro.json", "even measured reserve outranks unknown headroom in the same tier");
+    pool.bind(Lane::Codex, "warm", "unknown.json");
+    assert_eq!(pick(&mut pool, Some("warm")), "unknown.json");
+    pool.overrides.insert(Lane::Codex, "ultra.json".into());
+    assert_eq!(pick(&mut pool, Some("warm")), "ultra.json");
+}
+
+#[test]
+fn tier_ascending_preview_honors_source_qualified_preferred_account() {
+    let mut pool = Pool::default();
+    pool.source_host = "atlas".into();
+    pool.source_user = "can".into();
+    pool.policy.strategy = TierAscending;
+    pool.policy.preferred_account_id = Some("antigravity:atlas:can:ultra.json".into());
+    for (id, tier) in [("pro.json", 1.0), ("ultra.json", 20.0)] {
+        pool.insert(pool::parse_credentials(id, &json!({"type":"google","access_token":id,"tier_multiplier":tier}), false).unwrap());
+    }
+    let live = pool.pick(Lane::Google, (None, None), "gemini-4-neon-high", None, &[], Utc::now()).unwrap();
+    assert_eq!(live.id, "ultra.json");
+    assert_eq!(pool.preview(Lane::Google).as_deref(), Some(live.id.as_str()));
+}
+
+#[test]
+fn tier_ascending_applies_api_key_order_before_tier_filtering() {
+    use contracts::providers::ApiKeyOrder;
+
+    let mut pool = Pool::default();
+    pool.policy.strategy = TierAscending;
+    pool.insert(
+        pool::parse_credentials(
+            "key.json",
+            &json!({"type":"api_key","family":"anthropic","api_key":"fixture","tier_multiplier":1.0}),
+            false,
+        )
+        .unwrap(),
+    );
+    pool.insert(
+        pool::parse_credentials("sub.json", &json!({"type":"claude","access_token":"fixture","tier_multiplier":20.0}), false).unwrap(),
+    );
+    for (order, expected) in [(ApiKeyOrder::KeysLast, "sub.json"), (ApiKeyOrder::KeysFirst, "key.json")] {
+        pool.policy.api_key_order = order;
+        let account = pool.pick(Lane::Claude, (None, None), "claude-fixture", None, &[], Utc::now()).unwrap();
+        assert_eq!(account.id, expected, "{order:?}");
+    }
 }
 
 #[test]
@@ -4416,18 +4885,44 @@ async fn management_wire_contracts_reject_cross_origin_and_manage_pool() {
     for name in ["x-cpa-version", "x-cpa-commit", "x-cpa-build-date"] {
         assert!(reply.headers().contains_key(name));
     }
+    assert_eq!(reply.json::<Value>().await.unwrap(), "tier-ascending");
+    let policy_path = "/v8/management/routing/policy";
+    let policy: Value = http.management("GET", policy_path, None).await.json().await.unwrap();
+    assert_eq!(policy["strategy"], "tier_ascending");
     assert_eq!(http.management("PUT", strategy, Some(json!("weighted-round-robin"))).await.status(), 200);
-    let policy: Value = http.management("GET", "/v8/management/routing/policy", None).await.json().await.unwrap();
+    let policy: Value = http.management("GET", policy_path, None).await.json().await.unwrap();
     assert_eq!(policy["strategy"], "weighted_round_robin");
-    for (path, full_policy) in [
-        ("/v0/management/routing/strategy", false),
-        ("/v8/management/config/routing/strategy", false),
-        ("/v8/management/routing/policy", true),
-    ] {
-        for alias in ["capacity-balanced", "capacity_balanced"] {
+    for (wire, policy_name) in [("tier-ascending", "tier_ascending"), ("capacity-balanced", "capacity_balanced")] {
+        let config = http.management("GET", "/v8/management/config", None).await;
+        assert_eq!(config.status(), StatusCode::OK);
+        let reply = http
+            .request("PATCH", "/v8/management/config/routing")
+            .bearer_auth("management-fixture")
+            .header(header::IF_MATCH, config.headers()[header::ETAG].clone())
+            .json(&json!({"strategy":wire}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), StatusCode::OK, "{wire}");
+        let policy: Value = http.management("GET", policy_path, None).await.json().await.unwrap();
+        assert_eq!(policy["strategy"], policy_name);
+    }
+    for (path, full_policy) in
+        [("/v0/management/routing/strategy", false), ("/v8/management/config/routing/strategy", false), (policy_path, true)]
+    {
+        for (alias, expected, canonical, policy_name) in [
+            ("tier-ascending", TierAscending, "tier-ascending", "tier_ascending"),
+            ("tier_ascending", TierAscending, "tier-ascending", "tier_ascending"),
+            ("capacity-balanced", CapacityBalanced, "capacity-balanced", "capacity_balanced"),
+            ("capacity_balanced", CapacityBalanced, "capacity-balanced", "capacity_balanced"),
+        ] {
             let body = if full_policy { json!({"strategy": alias}) } else { json!(alias) };
             assert_eq!(http.management("PUT", path, Some(body)).await.status(), 200, "{path}: {alias}");
-            assert_eq!(proxy.state.read().await.pool.policy.strategy, CapacityBalanced);
+            assert_eq!(proxy.state.read().await.pool.policy.strategy, expected);
+            let returned: Value = http.management("GET", strategy, None).await.json().await.unwrap();
+            assert_eq!(returned, canonical);
+            let policy: Value = http.management("GET", policy_path, None).await.json().await.unwrap();
+            assert_eq!(policy["strategy"], policy_name);
         }
     }
     assert_eq!(

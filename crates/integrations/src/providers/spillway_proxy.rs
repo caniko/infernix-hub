@@ -334,6 +334,7 @@ impl SpillwayProxyProvider {
             }
             RoutingCommand::SetRoutePolicy { policy } => {
                 let strategy = match policy.strategy {
+                    RouteStrategy::TierAscending => "tier-ascending",
                     RouteStrategy::CapacityBalanced => "capacity-balanced",
                     RouteStrategy::SoonestReset => "soonest-reset",
                     RouteStrategy::FillFirst => "fill-first",
@@ -657,15 +658,16 @@ impl ModelProvider for SpillwayProxyProvider {
         }
         let config = config.unwrap_or_default();
         let (strategy, build_version) = strategy.unwrap_or_default();
-        let route_strategy =
-            match str_field(&strategy).or_else(|| str_field(&strategy["strategy"])).or_else(|| str_field(&usage["strategy"])) {
-                Some("round-robin") => RouteStrategy::RoundRobin,
-                Some("weighted-round-robin") => RouteStrategy::WeightedRoundRobin,
-                Some("fill-first") => RouteStrategy::FillFirst,
-                Some("soonest-reset" | "soonest_reset") => RouteStrategy::SoonestReset,
-                Some("capacity-balanced" | "capacity_balanced") => RouteStrategy::CapacityBalanced,
-                _ => RouteStrategy::default(),
-            };
+        let route_strategy = [
+            str_field(&strategy),
+            str_field(&strategy["strategy"]),
+            str_field(&usage["strategy"]),
+            str_field(&config["routing"]["strategy"]),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(parse_route_strategy)
+        .unwrap_or_default();
         let policy = RoutingPolicy {
             strategy: route_strategy,
             session_affinity_secs: if config["routing"]["session-affinity"].as_bool() == Some(false) {
@@ -716,6 +718,18 @@ impl ModelProvider for SpillwayProxyProvider {
         }
         Ok(Some(batch))
     }
+}
+
+fn parse_route_strategy(raw: &str) -> Option<RouteStrategy> {
+    Some(match raw {
+        "round-robin" | "round_robin" => RouteStrategy::RoundRobin,
+        "weighted-round-robin" | "weighted_round_robin" => RouteStrategy::WeightedRoundRobin,
+        "fill-first" | "fill_first" => RouteStrategy::FillFirst,
+        "soonest-reset" | "soonest_reset" => RouteStrategy::SoonestReset,
+        "tier-ascending" | "tier_ascending" => RouteStrategy::TierAscending,
+        "capacity-balanced" | "capacity_balanced" => RouteStrategy::CapacityBalanced,
+        _ => return None,
+    })
 }
 
 fn auth_index(row: &Value) -> PortResult<&str> {

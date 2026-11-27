@@ -208,6 +208,7 @@ fn client_wiring_label(state: ClientWiringState) -> &'static str {
 
 fn route_strategy_label(strategy: RouteStrategy) -> &'static str {
     match strategy {
+        RouteStrategy::TierAscending => "Tier Ascending",
         RouteStrategy::CapacityBalanced => "Capacity Balanced",
         RouteStrategy::SoonestReset => "Soonest Reset",
         RouteStrategy::FillFirst => "Fill First",
@@ -218,6 +219,9 @@ fn route_strategy_label(strategy: RouteStrategy) -> &'static str {
 
 pub(super) fn route_strategy_description(strategy: RouteStrategy) -> &'static str {
     match strategy {
+        RouteStrategy::TierAscending => {
+            "Exhausts smaller subscription tiers before spilling over to larger tiers, balancing capacity within each tier."
+        }
         RouteStrategy::CapacityBalanced => {
             "Weights routing by subscription tier capacity and weekly expiry urgency so high-capacity pools stay balanced without stranding expiring quota."
         }
@@ -877,6 +881,7 @@ mod tests {
     #[test]
     fn routing_strategies_have_labels_and_policy_descriptions() {
         for (strategy, label, description) in [
+            (RouteStrategy::TierAscending, "Tier Ascending", "balancing capacity within each tier"),
             (RouteStrategy::CapacityBalanced, "Capacity Balanced", "weekly expiry urgency"),
             (RouteStrategy::SoonestReset, "Soonest Reset", "resets soonest"),
             (RouteStrategy::FillFirst, "Fill First", "spilling over"),

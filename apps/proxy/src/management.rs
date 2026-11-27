@@ -164,6 +164,7 @@ fn strategy_name(strategy: RouteStrategy) -> &'static str {
         RouteStrategy::FillFirst => "fill-first",
         RouteStrategy::RoundRobin => "round-robin",
         RouteStrategy::WeightedRoundRobin => "weighted-round-robin",
+        RouteStrategy::TierAscending => "tier-ascending",
         RouteStrategy::CapacityBalanced => "capacity-balanced",
     }
 }
@@ -175,6 +176,7 @@ fn parse_strategy(raw: &Value) -> Result<RouteStrategy, Failure> {
         "fill-first" => Ok(RouteStrategy::FillFirst),
         "round-robin" => Ok(RouteStrategy::RoundRobin),
         "weighted-round-robin" => Ok(RouteStrategy::WeightedRoundRobin),
+        "tier-ascending" => Ok(RouteStrategy::TierAscending),
         "capacity-balanced" => Ok(RouteStrategy::CapacityBalanced),
         _ => Err(bad("unknown routing strategy")),
     }

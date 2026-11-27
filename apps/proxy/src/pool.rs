@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
@@ -50,7 +50,7 @@ impl Lane {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum QuotaTarget<'a> {
     Model(&'a str),
     Bucket(Lane, &'a str),
@@ -652,7 +652,7 @@ impl Account {
         self.windows.iter().filter(move |w| w.unit == QuotaUnit::Percent && w.kind != QuotaWindowKind::Spend && window_applies(w, target))
     }
 
-    fn capacity_score(&self, now: DateTime<Utc>, target: QuotaTarget<'_>, in_flight: usize) -> CapacityScore {
+    fn capacity_score_for_target(&self, now: DateTime<Utc>, target: QuotaTarget<'_>, in_flight: usize) -> CapacityScore {
         let idle_clock = |w: &QuotaWindow| {
             w.resets_at.is_none()
                 && w.observation_state == QuotaObservationState::Measured
@@ -777,24 +777,52 @@ impl Account {
         targets
     }
 
-    fn eligible_quota_targets<'a>(&'a self, now: DateTime<Utc>, target: QuotaTarget<'a>) -> Vec<QuotaTarget<'a>> {
-        match target {
-            QuotaTarget::Model(_) | QuotaTarget::Bucket(..) => {
-                self.quota_limited_until_for(now, target).is_none().then_some(target).into_iter().collect()
-            }
-            QuotaTarget::GoogleGemini => {
-                self.google_preview_targets().into_iter().filter(|t| self.quota_limited_until_for(now, *t).is_none()).collect()
-            }
+    fn google_preview_eligible_targets<'a>(&'a self, now: DateTime<Utc>, preview_models: &[&'a str]) -> Vec<QuotaTarget<'a>> {
+        if self.quarantined(now) || !self.supports("") {
+            return Vec::new();
         }
+        if !self.models.is_empty() {
+            let mut seen = HashSet::new();
+            return self
+                .models
+                .iter()
+                .map(String::as_str)
+                .filter(|model| is_google_gemini_model(model) && seen.insert(*model))
+                .map(QuotaTarget::Model)
+                .filter(|t| self.quota_limited_until_for(now, *t).is_none())
+                .collect();
+        }
+        if !preview_models.is_empty() {
+            let concrete: Vec<_> = preview_models
+                .iter()
+                .copied()
+                .map(QuotaTarget::Model)
+                .filter(|t| self.quota_limited_until_for(now, *t).is_none())
+                .collect();
+            if !concrete.is_empty() {
+                return concrete;
+            }
+            let has_healthy_general = self.percent_windows(QuotaTarget::GoogleGemini).any(|w| {
+                w.observation_state == QuotaObservationState::Measured
+                    && !w.stale
+                    && quota_window_active(self.lane, w, now)
+                    && self.effective_percent(w, now).is_some_and(|pct| pct > 0.0)
+            });
+            return (has_healthy_general && self.quota_limited_until_for(now, QuotaTarget::GoogleGemini).is_none())
+                .then_some(QuotaTarget::GoogleGemini)
+                .into_iter()
+                .collect();
+        }
+        self.quota_limited_until_for(now, QuotaTarget::GoogleGemini).is_none().then_some(QuotaTarget::GoogleGemini).into_iter().collect()
     }
 
-    fn eligible_for_quota(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> bool {
+    fn eligible_for_quota(&self, now: DateTime<Utc>, target: QuotaTarget<'_>, preview_models: &[&str]) -> bool {
         if self.quarantined(now) {
             return false;
         }
         match target {
             QuotaTarget::Model(_) | QuotaTarget::Bucket(..) => self.quota_limited_until_for(now, target).is_none(),
-            QuotaTarget::GoogleGemini => !self.eligible_quota_targets(now, target).is_empty(),
+            QuotaTarget::GoogleGemini => !self.google_preview_eligible_targets(now, preview_models).is_empty(),
         }
     }
 
@@ -816,11 +844,16 @@ impl Account {
         (weekly, session)
     }
 
-    fn soonest_reset(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> (DateTime<Utc>, DateTime<Utc>, std::cmp::Reverse<i32>) {
+    fn soonest_reset(
+        &self,
+        now: DateTime<Utc>,
+        target: QuotaTarget<'_>,
+        preview_models: &[&str],
+    ) -> (DateTime<Utc>, DateTime<Utc>, std::cmp::Reverse<i32>) {
         let (weekly, session) = match target {
             QuotaTarget::Model(_) | QuotaTarget::Bucket(..) => self.reset_pair(now, target),
             QuotaTarget::GoogleGemini => self
-                .eligible_quota_targets(now, target)
+                .google_preview_eligible_targets(now, preview_models)
                 .into_iter()
                 .map(|t| self.reset_pair(now, t))
                 .min()
@@ -829,7 +862,7 @@ impl Account {
         (weekly, session, std::cmp::Reverse(self.priority))
     }
 
-    fn max_used_percent(&self, now: DateTime<Utc>, target: QuotaTarget<'_>) -> f64 {
+    fn max_used_percent(&self, now: DateTime<Utc>, target: QuotaTarget<'_>, preview_models: &[&str]) -> f64 {
         let score = |applies: &dyn Fn(&QuotaWindow) -> bool| {
             self.windows
                 .iter()
@@ -842,7 +875,7 @@ impl Account {
         match target {
             QuotaTarget::Model(_) | QuotaTarget::Bucket(..) => score(&|w| window_applies(w, target)),
             QuotaTarget::GoogleGemini => {
-                let targets = self.eligible_quota_targets(now, target);
+                let targets = self.google_preview_eligible_targets(now, preview_models);
                 score(&|w| targets.iter().any(|t| window_applies(w, *t)))
             }
         }
@@ -1377,6 +1410,20 @@ struct CapacityScore {
 impl CapacityScore {
     fn ample(&self) -> bool {
         self.session_left.is_some_and(|left| left >= AMPLE_SESSION_HEADROOM)
+    }
+
+    fn cmp_rank(&self, other: &Self) -> std::cmp::Ordering {
+        self.ample()
+            .cmp(&other.ample())
+            .then_with(|| match (self.rate, other.rate) {
+                (Some(a), Some(b)) => a.total_cmp(&b),
+                (None, None) => {
+                    let nominal = |s: &Self| s.multiplier / (1.0 + s.in_flight as f64);
+                    nominal(self).total_cmp(&nominal(other))
+                }
+                _ => self.rate.is_some().cmp(&other.rate.is_some()),
+            })
+            .then_with(|| self.session_capacity.total_cmp(&other.session_capacity))
     }
 }
 
@@ -2235,7 +2282,28 @@ impl Pool {
         now: DateTime<Utc>,
     ) -> Option<Account> {
         let lane = filter.lane;
-        let eligible = |a: &&Account| filter.supports_for(self, a, target) && a.eligible_for_quota(now, target) && !tried.contains(&a.id);
+        let preview_models: Vec<&str> = if matches!(target, QuotaTarget::GoogleGemini) {
+            self.accounts
+                .values()
+                .filter(|a| {
+                    filter.supports_for(self, a, target)
+                        && !tried.contains(&a.id)
+                        && a.active_quarantine(now).is_none_or(|err| err.kind == AccountErrorKind::QuotaExhausted)
+                })
+                .flat_map(|a| a.google_preview_targets())
+                .filter_map(|t| match t {
+                    QuotaTarget::Model(model) => Some(model),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let eligible = |a: &&Account| {
+            filter.supports_for(self, a, target) && a.eligible_for_quota(now, target, &preview_models) && !tried.contains(&a.id)
+        };
         if let Some(a) = self.preferred(lane).and_then(|id| self.accounts.get(id)).filter(eligible) {
             return Some(a.clone());
         }
@@ -2244,55 +2312,72 @@ impl Pool {
         if options.iter().any(|a| a.api_key == keys_first) {
             options.retain(|a| a.api_key == keys_first);
         }
+        let strategy = self.policy.strategy;
+        if strategy == RouteStrategy::TierAscending {
+            let tier = options.iter().map(|a| a.capacity_multiplier()).min_by(f64::total_cmp)?;
+            options.retain(|a| a.capacity_multiplier() == tier);
+        }
         let bound = |session| {
             self.bound(lane, session)
                 .filter(|id| !filter.subscriptions_only || self.accounts.get(*id).is_some_and(|a| filter.allows_in(self, a)))
         };
-        let soonest = |a: &Account| a.soonest_reset(now, target);
+        let soonest = |a: &Account| a.soonest_reset(now, target, &preview_models);
         // Antigravity subscriptions drain the soonest weekly reset first: a session bound to a
         // later-resetting account moves back once that account's 5-hour window frees up.
-        let drain_soonest = lane == Lane::Google && self.policy.strategy == RouteStrategy::SoonestReset;
+        let drain_soonest = lane == Lane::Google && strategy == RouteStrategy::SoonestReset;
         let sticky = session.and_then(bound).or_else(|| parent.and_then(bound));
-        if self.policy.strategy == RouteStrategy::CapacityBalanced {
-            let counts = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-            let scored: Vec<_> =
-                options.into_iter().map(|a| (a, a.capacity_score(now, target, counts.get(&a.id).copied().unwrap_or_default()))).collect();
-            if let Some((a, _)) = [session, parent]
+        if matches!(strategy, RouteStrategy::TierAscending | RouteStrategy::CapacityBalanced) {
+            let in_flight: Vec<usize> = {
+                let counts = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                options.iter().map(|a| counts.get(&a.id).copied().unwrap_or_default()).collect()
+            };
+            let mut scored = Vec::with_capacity(options.len());
+            for (a, active_in_flight) in options.into_iter().zip(in_flight) {
+                match target {
+                    QuotaTarget::GoogleGemini => {
+                        for score_target in a.google_preview_eligible_targets(now, &preview_models) {
+                            scored.push((a, score_target, a.capacity_score_for_target(now, score_target, active_in_flight)));
+                        }
+                    }
+                    QuotaTarget::Model(_) | QuotaTarget::Bucket(..) => {
+                        scored.push((a, target, a.capacity_score_for_target(now, target, active_in_flight)));
+                    }
+                }
+            }
+            if let Some((a, _, _)) = [session, parent]
                 .into_iter()
                 .flatten()
                 .filter_map(bound)
-                .find_map(|id| scored.iter().find(|(a, s)| a.id == id && (s.session_left.is_none() || s.ample())))
+                .find_map(|id| scored.iter().find(|(a, _, s)| a.id == id && (s.session_left.is_none() || s.ample())))
             {
                 return Some((*a).clone());
             }
-            let active_ample = scored.iter().filter(|(_, s)| s.active && s.ample());
-            let best_active_rate = active_ample.clone().filter_map(|(_, s)| s.rate).reduce(f64::max);
-            let best_active_tier = active_ample.map(|(_, s)| s.multiplier).reduce(f64::max);
+            let mut active_max: HashMap<QuotaTarget<'_>, (Option<f64>, f64)> = HashMap::new();
+            for (_, score_target, s) in &scored {
+                if s.active && s.ample() {
+                    let entry = active_max.entry(*score_target).or_insert((None, 0.0));
+                    if let Some(rate) = s.rate {
+                        entry.0 = Some(entry.0.map_or(rate, |best| best.max(rate)));
+                    }
+                    entry.1 = entry.1.max(s.multiplier);
+                }
+            }
             return scored
                 .into_iter()
-                .filter(|(_, s)| {
+                .filter(|(_, score_target, s)| {
                     !(s.idle
                         && s.ample()
-                        && s.rate.zip(best_active_rate).is_some_and(|(idle, active)| idle <= active)
-                        && best_active_tier.is_some_and(|tier| s.multiplier <= tier))
+                        && active_max.get(score_target).is_some_and(|(best_rate, best_tier)| {
+                            s.rate.zip(*best_rate).is_some_and(|(idle, active)| idle <= active) && s.multiplier <= *best_tier
+                        }))
                 })
-                .max_by(|(a, left), (b, right)| {
-                    left.ample()
-                        .cmp(&right.ample())
-                        .then_with(|| match (left.rate, right.rate) {
-                            (Some(a), Some(b)) => a.total_cmp(&b),
-                            (None, None) => {
-                                let nominal = |s: &CapacityScore| s.multiplier / (1.0 + s.in_flight as f64);
-                                nominal(left).total_cmp(&nominal(right))
-                            }
-                            _ => left.rate.is_some().cmp(&right.rate.is_some()),
-                        })
-                        .then_with(|| left.session_capacity.total_cmp(&right.session_capacity))
+                .max_by(|(a, _, left), (b, _, right)| {
+                    left.cmp_rank(right)
                         .then_with(|| a.priority.cmp(&b.priority))
                         .then_with(|| right.in_flight.cmp(&left.in_flight))
                         .then_with(|| b.id.cmp(&a.id))
                 })
-                .map(|(a, _)| a.clone());
+                .map(|(a, _, _)| a.clone());
         }
         if let Some(a) = sticky.and_then(|id| options.iter().find(|a| a.id == id))
             && (!drain_soonest || options.iter().all(|b| soonest(b).0 >= soonest(a).0))
@@ -2300,13 +2385,15 @@ impl Pool {
             return Some((*a).clone());
         }
         let first = *options.first()?;
-        match self.policy.strategy {
-            RouteStrategy::CapacityBalanced => unreachable!(),
+        match strategy {
+            RouteStrategy::TierAscending | RouteStrategy::CapacityBalanced => unreachable!(),
             RouteStrategy::SoonestReset => options.sort_by_key(|a| soonest(a)),
             RouteStrategy::FillFirst => options.sort_by(|a, b| {
                 b.priority
                     .cmp(&a.priority)
-                    .then_with(|| b.max_used_percent(now, target).total_cmp(&a.max_used_percent(now, target)))
+                    .then_with(|| {
+                        b.max_used_percent(now, target, &preview_models).total_cmp(&a.max_used_percent(now, target, &preview_models))
+                    })
                     .then_with(|| b.success.cmp(&a.success))
             }),
             RouteStrategy::RoundRobin | RouteStrategy::WeightedRoundRobin => {
@@ -2354,6 +2441,8 @@ impl Pool {
             overrides: self.overrides.clone(),
             cursors: self.cursors.clone(),
             in_flight: self.in_flight.clone(),
+            source_host: self.source_host.clone(),
+            source_user: self.source_user.clone(),
             ..Self::default()
         };
         let now = Utc::now();
