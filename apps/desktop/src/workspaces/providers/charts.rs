@@ -1407,20 +1407,21 @@ pub(super) fn build_tier_split_series(report: &ProviderQuotaReport, window_key: 
             }
         }
     }
-    let times: BTreeSet<_> = readings.values().flatten().map(|point| point.at).collect();
+    let observed_capacity_at_now: f64 = groups
+        .values()
+        .flatten()
+        .filter(|a| readings.get(a.id.as_str()).and_then(|pts| pool_latest(pts, report.as_of)).is_some())
+        .map(|a| tier_weight(a))
+        .sum();
+    let has_observed_now = observed_capacity_at_now.is_finite() && observed_capacity_at_now > 0.0;
+    let times: BTreeSet<_> = readings.values().flatten().map(|point| point.at).chain(has_observed_now.then_some(report.as_of)).collect();
     let mut total_points: Vec<_> = times.into_iter().map(|at| (at, 0.0)).collect();
-    let mut observed_capacity_at_now = 0.0;
     let mut bands = Vec::new();
     for (color_index, (key, accounts)) in groups.into_iter().rev().enumerate() {
         let multiplier = key as f64 / 100.0;
         let plan = accounts[0].plan.as_deref().map(str::trim).filter(|plan| {
             !plan.is_empty() && accounts.iter().all(|account| account.plan.as_deref().is_some_and(|p| p.trim().eq_ignore_ascii_case(plan)))
         });
-        observed_capacity_at_now += accounts
-            .iter()
-            .filter(|a| readings.get(a.id.as_str()).and_then(|pts| pool_latest(pts, report.as_of)).is_some())
-            .map(|a| tier_weight(a))
-            .sum::<f64>();
         let points = total_points
             .iter_mut()
             .map(|(at, total)| {
@@ -1448,11 +1449,21 @@ pub(super) fn build_tier_split_series(report: &ProviderQuotaReport, window_key: 
     if !total_capacity_units.is_finite() || total_capacity_units <= 0.0 {
         return None;
     }
-    let forecast_scale = if observed_capacity_at_now.is_finite() && observed_capacity_at_now > 0.0 {
+    let forecast_scale = if has_observed_now {
         observed_capacity_at_now
     } else {
         pool.and_then(|p| p.total_capacity_units).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(total_capacity_units)
     };
+    let mut forecast_units = projection_points(pool_forecast(report, pool, window_key, scope_model), report.as_of, forecast_scale);
+    if has_observed_now && forecast_units.last().is_some_and(|p| p.0 > report.as_of) {
+        // Join the weighted projection to the chart's measured tier total at NOW.
+        let observed_now = total_points[total_points.len() - 1];
+        if forecast_units[0].0 == report.as_of {
+            forecast_units[0] = observed_now;
+        } else {
+            forecast_units.insert(0, observed_now);
+        }
+    }
     let next_reset_at = pool
         .and_then(|p| p.next_reset_at)
         .or_else(|| readings.values().filter_map(|points| pool_latest(points, report.as_of)?.reset.filter(|&at| at > report.as_of)).min());
@@ -1468,7 +1479,7 @@ pub(super) fn build_tier_split_series(report: &ProviderQuotaReport, window_key: 
         total_capacity_units,
         bands,
         total_points,
-        forecast_units: projection_points(pool_forecast(report, pool, window_key, scope_model), report.as_of, forecast_scale),
+        forecast_units,
         next_reset_at,
     })
 }
@@ -1601,14 +1612,10 @@ pub(super) fn UnifiedPoolQuotaChart(report: ProviderQuotaReport, mut range_hours
                 div { class: "segmented", role: "group", aria_label: "Quota window",
                     button { class: "seg-btn", aria_pressed: focused.is_none(),
                         onclick: move |_| { selected.set(None); split_mode.set(false); scrub.reset(); }, "All" }
-                    for s in series.iter() {
-                        {
-                            let key = (s.window_key.clone(), s.scope_model.clone());
-                            let pressed = focused.is_some_and(|window| window.color_index == s.color_index);
-                            rsx! {
-                                button { key: "{s.color_index}", class: "seg-btn", aria_pressed: pressed, title: "{s.label}",
-                                    onclick: move |_| { selected.set(Some(key.clone())); scrub.reset(); }, "{s.pill_label}" }
-                            }
+                    for (s, window_key) in series.iter().map(|s| (s, (s.window_key.clone(), s.scope_model.clone()))) {
+                        button { key: "{s.window_key:?}:{s.scope_model:?}", class: "seg-btn",
+                            aria_pressed: focused.is_some_and(|window| window.color_index == s.color_index), title: "{s.label}",
+                            onclick: move |_| { selected.set(Some(window_key.clone())); scrub.reset(); }, "{s.pill_label}"
                         }
                     }
                 }
@@ -1645,25 +1652,22 @@ pub(super) fn UnifiedPoolQuotaChart(report: ProviderQuotaReport, mut range_hours
                         } else if let Some(i) = tier.total_points.partition_point(|p| p.0 <= at).checked_sub(1)
                             && at - tier.total_points[i].0 <= POOL_READING_MAX_AGE
                         {
-                            for band in &tier.bands {
-                                {
-                                    let point = band.points[i];
-                                    let value = if point.observed {
-                                        format!("{:.1} / {:.1}×", point.y1 - point.y0, band.total_capacity_units)
-                                    } else {
-                                        "—".to_string()
-                                    };
-                                    rsx! { span { key: "{band.color_index}", class: "mono", "{band.tier_label}: {value}" } }
-                                }
-                            }
+                            {tier.bands.iter().map(|band| {
+                                let point = band.points[i];
+                                let value = if point.observed {
+                                    format!("{:.1} / {:.1}×", point.y1 - point.y0, band.total_capacity_units)
+                                } else {
+                                    "—".to_string()
+                                };
+                                rsx! { span { key: "{band.tier_multiplier}", class: "mono", "{band.tier_label}: {value}" } }
+                            })}
                         } else {
                             span { class: "form-help", "No observed tier capacity" }
                         }
                     } else {
-                        for s in visible() {
-                            {
-                                let (value, remaining, total) = reading(s);
-                                rsx! { span { key: "{s.color_index}", class: "mono", "{s.pill_label}: {remaining_text(value, remaining, total)}" } }
+                        for (s, (value, remaining, total)) in visible().map(|s| (s, reading(s))) {
+                            span { key: "{s.window_key:?}:{s.scope_model:?}", class: "mono",
+                                "{s.pill_label}: {remaining_text(value, remaining, total)}"
                             }
                         }
                     }
@@ -1698,28 +1702,24 @@ pub(super) fn UnifiedPoolQuotaChart(report: ProviderQuotaReport, mut range_hours
                     }
                     g { clip_path: "url(#{clip_id})", pointer_events: "none",
                         if let Some(tier) = split.as_ref() {
-                            for (run_index, run) in tier.total_points.chunk_by(|a, b| b.0 - a.0 <= POOL_READING_MAX_AGE).enumerate() {
-                                {
-                                    let start = tier.total_points.partition_point(|p| p.0 < run[0].0);
-                                    rsx! {
-                                        g { key: "{run_index}",
-                                            for band in &tier.bands {
-                                                {
-                                                    let points = &band.points[start..start + run.len()];
-                                                    let upper = svg_points(points.iter().map(|p| (x(p.at), y(p.y1))));
-                                                    let lower = svg_points(points.iter().rev().map(|p| (x(p.at), y(p.y0))));
-                                                    let color = QuotaSeries::color(band.color_index, band.color_index == 0);
-                                                    rsx! { path { key: "{band.color_index}", d: "M{upper}{lower}Z", fill: color, fill_opacity: "0.48" } }
-                                                }
-                                            }
-                                            polyline { points: svg_points(run.iter().map(coordinates)), fill: "none", stroke: "var(--text)", stroke_width: "1.8" }
-                                            if run.len() == 1 {
-                                                circle { cx: "{x(run[0].0)}", cy: "{y(run[0].1)}", r: "3", fill: "var(--text)" }
-                                            }
+                            {tier.total_points.chunk_by(|a, b| b.0 - a.0 <= POOL_READING_MAX_AGE).map(|run| {
+                                let start = tier.total_points.partition_point(|p| p.0 < run[0].0);
+                                rsx! {
+                                    g { key: "{run[0].0}",
+                                        {tier.bands.iter().map(|band| {
+                                            let points = &band.points[start..start + run.len()];
+                                            let upper = svg_points(points.iter().map(|p| (x(p.at), y(p.y1))));
+                                            let lower = svg_points(points.iter().rev().map(|p| (x(p.at), y(p.y0))));
+                                            let color = QuotaSeries::color(band.color_index, band.color_index == 0);
+                                            rsx! { path { key: "{band.tier_multiplier}", d: "M{upper}{lower}Z", fill: color, fill_opacity: "0.48" } }
+                                        })}
+                                        polyline { points: svg_points(run.iter().map(coordinates)), fill: "none", stroke: "var(--text)", stroke_width: "1.8" }
+                                        if run.len() == 1 {
+                                            circle { cx: "{x(run[0].0)}", cy: "{y(run[0].1)}", r: "3", fill: "var(--text)" }
                                         }
                                     }
                                 }
-                            }
+                            })}
                             if forecast_visible && let [(at, amount)] = tier.forecast_units.as_slice() {
                                 circle { cx: "{x(*at)}", cy: "{y(*amount)}", r: "3", fill: "none", stroke: "var(--text)", stroke_dasharray: "3 2" }
                             } else if forecast_visible {
@@ -1727,44 +1727,40 @@ pub(super) fn UnifiedPoolQuotaChart(report: ProviderQuotaReport, mut range_hours
                                     stroke: "var(--text)", stroke_width: "1.8", stroke_dasharray: "4 3" }
                             }
                         } else {
-                            for s in visible() {
-                                {
-                                    let single = focused.is_some();
-                                    let color = QuotaSeries::color(s.color_index, s.color_index == 0);
-                                    let weight = if single { 2.5 } else if s.is_weekly { 2.4 } else { 1.7 };
-                                    let opacity = if single || s.is_weekly { 1.0 } else { 0.8 };
-                                    rsx! {
-                                        g { key: "{s.color_index}",
-                                            for (i, run) in s.points.chunk_by(|a, b| pool_reading_is_fresh(a.at, a.resets_at, b.at)).enumerate() {
-                                                {
-                                                    let points = svg_points(run.iter().map(|p| (x(p.at), y(p.remaining_percent))));
-                                                    let fill = format!("{points} {},{} {},{}", x(run[run.len() - 1].at), plot.bottom, x(run[0].at), plot.bottom);
-                                                    rsx! {
-                                                        g { key: "{i}",
-                                                            if single && run.len() > 1 { polygon { points: fill, fill: color, opacity: "0.14" } }
-                                                            polyline { points, fill: "none", stroke: color, stroke_width: "{weight}", opacity: "{opacity}" }
-                                                            if run.len() == 1 && (run[0].at != now || s.current_remaining_percent.is_none()) {
-                                                                circle { cx: "{x(run[0].at)}", cy: "{y(run[0].remaining_percent)}", r: "2.6", fill: color }
-                                                            }
-                                                        }
+                            {visible().map(|s| {
+                                let single = focused.is_some();
+                                let color = QuotaSeries::color(s.color_index, s.color_index == 0);
+                                let weight = if single { 2.5 } else if s.is_weekly { 2.4 } else { 1.7 };
+                                let opacity = if single || s.is_weekly { 1.0 } else { 0.8 };
+                                rsx! {
+                                    g { key: "{s.window_key:?}:{s.scope_model:?}",
+                                        {s.points.chunk_by(|a, b| pool_reading_is_fresh(a.at, a.resets_at, b.at)).map(|run| {
+                                            let points = svg_points(run.iter().map(|p| (x(p.at), y(p.remaining_percent))));
+                                            let fill = format!("{points} {},{} {},{}", x(run[run.len() - 1].at), plot.bottom, x(run[0].at), plot.bottom);
+                                            rsx! {
+                                                g { key: "{run[0].at}",
+                                                    if single && run.len() > 1 { polygon { points: fill, fill: color, opacity: "0.14" } }
+                                                    polyline { points, fill: "none", stroke: color, stroke_width: "{weight}", opacity: "{opacity}" }
+                                                    if run.len() == 1 && (run[0].at != now || s.current_remaining_percent.is_none()) {
+                                                        circle { cx: "{x(run[0].at)}", cy: "{y(run[0].remaining_percent)}", r: "2.6", fill: color }
                                                     }
                                                 }
                                             }
-                                            if forecast_visible && let Some(points) = forecasts.get(&s.color_index) {
-                                                if let [(at, amount)] = points.as_slice() {
-                                                    circle { cx: "{x(*at)}", cy: "{y(*amount)}", r: "3", fill: "none", stroke: color, stroke_dasharray: "3 2" }
-                                                } else {
-                                                    polyline { points: svg_points(points.iter().map(coordinates)), fill: "none",
-                                                        stroke: color, stroke_width: "{weight}", stroke_dasharray: "4 3", opacity: "{opacity}" }
-                                                }
+                                        })}
+                                        if forecast_visible && let Some(points) = forecasts.get(&s.color_index) {
+                                            if let [(at, amount)] = points.as_slice() {
+                                                circle { cx: "{x(*at)}", cy: "{y(*amount)}", r: "3", fill: "none", stroke: color, stroke_dasharray: "3 2" }
+                                            } else {
+                                                polyline { points: svg_points(points.iter().map(coordinates)), fill: "none",
+                                                    stroke: color, stroke_width: "{weight}", stroke_dasharray: "4 3", opacity: "{opacity}" }
                                             }
-                                            if view.contains(now) && let Some(pct) = s.current_remaining_percent {
-                                                circle { cx: "{x(now)}", cy: "{y(pct)}", r: if single { "4" } else { "3.2" }, fill: color }
-                                            }
+                                        }
+                                        if view.contains(now) && let Some(pct) = s.current_remaining_percent {
+                                            circle { cx: "{x(now)}", cy: "{y(pct)}", r: if single { "4" } else { "3.2" }, fill: color }
                                         }
                                     }
                                 }
-                            }
+                            })}
                         }
                         if let Some(reset) = reset_mark.filter(|at| view.contains(*at)) {
                             path { d: "M{x(reset)} {plot.bottom - 4.0}l4 4-4 4-4-4z", fill: "var(--warn)" }
@@ -1786,12 +1782,10 @@ pub(super) fn UnifiedPoolQuotaChart(report: ProviderQuotaReport, mut range_hours
                                 }
                             }
                         } else {
-                            for s in visible() {
-                                if let Some(value) = reading(s).0 {
-                                    circle { key: "{s.color_index}", cx: "{x(at)}", cy: "{y(value)}",
-                                        r: "4", fill: QuotaSeries::color(s.color_index, s.color_index == 0),
-                                        stroke: "var(--panel)", stroke_width: "1.5", pointer_events: "none" }
-                                }
+                            for (s, value) in visible().filter_map(|s| Some((s, reading(s).0?))) {
+                                circle { key: "{s.window_key:?}:{s.scope_model:?}", cx: "{x(at)}", cy: "{y(value)}",
+                                    r: "4", fill: QuotaSeries::color(s.color_index, s.color_index == 0),
+                                    stroke: "var(--panel)", stroke_width: "1.5", pointer_events: "none" }
                             }
                         }
                     }
@@ -1801,7 +1795,7 @@ pub(super) fn UnifiedPoolQuotaChart(report: ProviderQuotaReport, mut range_hours
             div { class: "chart-legend unified-legend-bar",
                 if let Some(tier) = split.as_ref() {
                     for band in &tier.bands {
-                        span { key: "{band.color_index}", class: "chart-legend-item", style: "--chart-accent: {QuotaSeries::color(band.color_index, band.color_index == 0)}",
+                        span { key: "{band.tier_multiplier}", class: "chart-legend-item", style: "--chart-accent: {QuotaSeries::color(band.color_index, band.color_index == 0)}",
                             span { class: "chart-swatch", aria_hidden: "true" }
                             "{band.tier_label} · {band.account_count} accounts"
                             if latest_tier.is_some() && let Some(last) = band.points.last() {
@@ -1816,7 +1810,7 @@ pub(super) fn UnifiedPoolQuotaChart(report: ProviderQuotaReport, mut range_hours
                     span { "Observed tier capacity only" }
                 } else {
                     for s in visible() {
-                        span { key: "{s.color_index}", class: "chart-legend-item", style: "--chart-accent: {QuotaSeries::color(s.color_index, s.color_index == 0)}",
+                        span { key: "{s.window_key:?}:{s.scope_model:?}", class: "chart-legend-item", style: "--chart-accent: {QuotaSeries::color(s.color_index, s.color_index == 0)}",
                             span { class: "chart-swatch", aria_hidden: "true" } "{s.label} · {remaining_text(s.current_remaining_percent, None, None)}"
                         }
                     }
@@ -2854,7 +2848,10 @@ mod tests {
             resets_before_exhaustion: false,
             lookback_hours: 6,
             horizon_hours: 12,
-            points: vec![ForecastPoint { at: projected, used_percent: 75.0, remaining_percent: 25.0 }],
+            points: vec![
+                ForecastPoint { at: report.as_of, used_percent: 62.5, remaining_percent: 37.5 },
+                ForecastPoint { at: projected, used_percent: 75.0, remaining_percent: 25.0 },
+            ],
             is_estimate: true,
         });
         let split = build_tier_split_series(&report, "gemini-weekly", None).unwrap();
@@ -2864,8 +2861,9 @@ mod tests {
         assert_eq!(split.bands[0].points[1], TierBandPoint { at: report.as_of, y0: 0.0, y1: 5.0, observed: true });
         assert_eq!(split.bands[1].points[1], TierBandPoint { at: report.as_of, y0: 5.0, y1: 5.5, observed: true });
         assert_eq!(split.total_points[1], (report.as_of, 5.5));
-        // Only 21x (20x Ultra + 1x Pro) is observed at NOW; forecast scales to observed capacity to avoid a jump.
-        assert_eq!(split.forecast_units, [(projected, 5.25)]);
+        // An unweighted forecast starts at 37.5%, but its NOW point must join the observed tier total.
+        // Future points still scale to the 21× of observed capacity, not the 22× of eligible capacity.
+        assert_eq!(split.forecast_units, [(report.as_of, 5.5), (projected, 5.25)]);
         report.samples.clear();
         report.accounts[0].windows = serde_json::from_value(serde_json::json!([{
             "window_key": "gemini-weekly", "label": "Gemini Weekly",
@@ -2876,6 +2874,36 @@ mod tests {
         assert_eq!(current_only.total_points, [(report.as_of, 6.0)]);
         report.accounts[0].tier_multiplier = None;
         assert!(build_tier_split_series(&report, "gemini-weekly", None).is_none());
+    }
+
+    #[test]
+    fn tier_split_forecast_keeps_mixed_tier_capacity_continuous_without_a_reset() {
+        let mut report = unified_report();
+        report.samples[0].remaining_percent = Some(90.0); // 1×
+        report.samples[2].remaining_percent = Some(10.0); // 20×
+        let projected = report.as_of + TimeDelta::hours(1);
+        let remaining = 290.0 / 21.0;
+        report.forecasts.push(QuotaForecast {
+            window_key: "gemini-weekly".into(),
+            account_id: None,
+            scope_model: None,
+            drain_pct_per_hour: 0.0,
+            projected_exhaustion_at: None,
+            resets_before_exhaustion: false,
+            lookback_hours: 6,
+            horizon_hours: 12,
+            points: [report.as_of, projected]
+                .map(|at| ForecastPoint { at, used_percent: 100.0 - remaining, remaining_percent: remaining })
+                .to_vec(),
+            is_estimate: true,
+        });
+
+        let split = build_tier_split_series(&report, "gemini-weekly", None).unwrap();
+        assert_eq!(split.forecast_units.len(), 2);
+        for ((at, units), expected_at) in split.forecast_units.iter().zip([report.as_of, projected]) {
+            assert_eq!(*at, expected_at);
+            assert!((units - 2.9).abs() < 1e-8, "{units}");
+        }
     }
 
     #[test]
@@ -2918,6 +2946,75 @@ mod tests {
         assert_eq!(interpolated_projection_at(&points, start + TimeDelta::hours(1)), Some(60.0));
         assert_eq!(interpolated_projection_at(&points, start + TimeDelta::hours(2)), Some(40.0));
         assert_eq!(interpolated_projection_at(&points, start + TimeDelta::hours(3)), None);
+    }
+
+    #[test]
+    fn unified_pool_quota_chart_interpolates_readout_at_another_windows_forecast_point() {
+        use dioxus::html::{
+            Code, Location, Modifiers, PlatformEventData, SerializedHtmlEventConverter, SerializedKeyboardData, set_event_converter,
+        };
+
+        fn app() -> Element {
+            let range_hours = use_signal(|| 24);
+            let show_forecast = use_signal(|| true);
+            let mut report = unified_report();
+            for (window, hours, remaining) in [("gemini-weekly", 2, 40.0), ("3p-5h", 1, 70.0)] {
+                report.forecasts.push(QuotaForecast {
+                    window_key: window.into(),
+                    account_id: None,
+                    scope_model: None,
+                    drain_pct_per_hour: 20.0,
+                    projected_exhaustion_at: None,
+                    resets_before_exhaustion: false,
+                    lookback_hours: 6,
+                    horizon_hours: hours as u32,
+                    points: vec![
+                        ForecastPoint { at: report.as_of, used_percent: 20.0, remaining_percent: 80.0 },
+                        ForecastPoint {
+                            at: report.as_of + TimeDelta::hours(hours),
+                            used_percent: 100.0 - remaining,
+                            remaining_percent: remaining,
+                        },
+                    ],
+                    is_estimate: true,
+                });
+            }
+            rsx! { UnifiedPoolQuotaChart { report, range_hours, show_forecast } }
+        }
+
+        set_event_converter(Box::new(SerializedHtmlEventConverter));
+        let mut dom = VirtualDom::new(app);
+        let mut id = None;
+        let plot = dom
+            .rebuild_to_vec()
+            .edits
+            .into_iter()
+            .find_map(|edit| match edit {
+                Mutation::PushId { id: current } | Mutation::SetId { id: current } => {
+                    id = Some(current);
+                    None
+                }
+                Mutation::NewEventListener { name } if name == "keydown" => id,
+                _ => None,
+            })
+            .expect("quota timeline keyboard listener");
+        // Move first to NOW+2h, then to the session forecast point at NOW+1h.
+        let mut rendered = String::new();
+        for _ in 0..2 {
+            let key = SerializedKeyboardData::new(
+                Key::Named(NamedKey::ArrowLeft),
+                Code::ArrowLeft,
+                Location::Standard,
+                false,
+                Modifiers::empty(),
+                false,
+            );
+            let data = PlatformEventData::new(Box::new(key));
+            dom.runtime().handle_event("keydown", Event::new(Rc::new(data), true).into_any(), plot);
+            rendered = format!("{:?}", dom.render_immediate_to_vec());
+        }
+        assert!(rendered.contains("Gem Wk: 60.0%"), "{rendered}");
+        assert!(rendered.contains("3P 5h: 70.0%"), "{rendered}");
     }
 
     #[test]

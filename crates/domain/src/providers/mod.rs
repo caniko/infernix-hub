@@ -1349,8 +1349,8 @@ pub fn compute_forecasts(
     }
 
     let mut forecasts = Vec::new();
-    type PoolRateSample = (f64, f64, Option<DateTime<Utc>>);
-    let mut pool_rates = BTreeMap::<_, Vec<PoolRateSample>>::new();
+    type PoolMember = (usize, f64, Option<DateTime<Utc>>);
+    let mut pool_members = BTreeMap::<_, Vec<PoolMember>>::new();
 
     for ((account_id, window_key, scope_model), series) in by_acct_win {
         let Some(last) = series.last().copied() else {
@@ -1373,14 +1373,14 @@ pub fn compute_forecasts(
             }
         }
         let drain_per_hour = if elapsed_hours > 0.01 { (positive_delta / elapsed_hours).max(0.0) } else { 0.0 };
-        let resets_at = accounts
-            .iter()
-            .find(|a| a.id == account_id)
+        let account = accounts.iter().find(|a| a.id == account_id);
+        let resets_at = account
             .and_then(|a| a.windows.iter().find(|w| w.window_key == window_key && w.scope_model.as_deref() == scope_model))
             .and_then(|w| w.resets_at)
             .or(last.resets_at);
 
-        pool_rates.entry((window_key, scope_model)).or_default().push((current_used, drain_per_hour, resets_at));
+        let capacity = account.and_then(|a| a.tier_multiplier).filter(|m| m.is_finite() && *m > 0.0).unwrap_or(1.0);
+        pool_members.entry((window_key, scope_model)).or_default().push((forecasts.len(), capacity, resets_at));
         forecasts.push(build_forecast(
             Some(account_id.to_owned()),
             window_key,
@@ -1394,16 +1394,21 @@ pub fn compute_forecasts(
         ));
     }
 
-    // Aggregate pool forecasts across accounts, never across model scopes.
-    for ((window_key, scope_model), entries) in pool_rates {
-        let n = entries.len() as f64;
-        if n <= 0.0 {
-            continue;
+    // Aggregate account curves pointwise so an account reset restores only its own capacity.
+    for ((window_key, scope_model), entries) in pool_members {
+        let total_capacity: f64 = entries.iter().map(|(_, capacity, _)| capacity).sum();
+        let weighted = |value: &dyn Fn(&QuotaForecast) -> f64| {
+            entries.iter().map(|&(index, capacity, _)| (capacity / total_capacity) * value(&forecasts[index])).sum::<f64>()
+        };
+        let avg_used = weighted(&|f| f.points[0].used_percent);
+        let avg_drain = weighted(&|f| f.drain_pct_per_hour);
+        let next_reset = entries.iter().filter_map(|(_, _, reset)| *reset).min();
+        let mut pool = build_forecast(None, window_key, scope_model, avg_used, avg_drain, next_reset, lookback_hours, horizon_hours, now);
+        for (step, point) in pool.points.iter_mut().enumerate() {
+            point.remaining_percent = weighted(&|f| f.points[step].remaining_percent).clamp(0.0, 100.0);
+            point.used_percent = 100.0 - point.remaining_percent;
         }
-        let avg_used = entries.iter().map(|(u, _, _)| *u).sum::<f64>() / n;
-        let avg_drain = entries.iter().map(|(_, r, _)| *r).sum::<f64>() / n;
-        let next_reset = entries.iter().filter_map(|(_, _, r)| *r).min();
-        forecasts.push(build_forecast(None, window_key, scope_model, avg_used, avg_drain, next_reset, lookback_hours, horizon_hours, now));
+        forecasts.push(pool);
     }
 
     forecasts
@@ -2434,6 +2439,43 @@ fn quota_raises(provider_id: &str, settings: &ProviderPanelSettings, accounts: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_forecast_weights_mixed_tiers_and_keeps_resets_per_account() {
+        let now = DateTime::UNIX_EPOCH;
+        let mut accounts = [
+            acct("ultra", true, Some(20.0), None, sample_window("weekly", Some(90.0), QuotaObservationState::Measured)),
+            acct("pro", true, None, None, sample_window("weekly", Some(10.0), QuotaObservationState::Measured)),
+        ];
+        for account in &mut accounts {
+            account.windows[0].resets_at = None;
+        }
+        let samples = accounts
+            .iter()
+            .enumerate()
+            .map(|(i, account)| {
+                serde_json::from_value(serde_json::json!({
+                    "id": i, "provider_id": "test", "account_id": account.id, "window_key": "weekly",
+                    "label": "Weekly", "kind": "weekly", "unit": "percent", "used_percent": account.windows[0].used_percent,
+                    "cadence": "unknown", "status": "allowed", "observation_state": "measured",
+                    "observed_at": now, "recorded_at": now, "stale": false
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<QuotaSample>>();
+        let pool_points = |accounts: &[ModelAccount]| {
+            compute_forecasts(&samples, accounts, 6, 2, now).into_iter().find(|f| f.account_id.is_none()).unwrap().points
+        };
+        let points = pool_points(&accounts);
+        assert_eq!(points[0].at, now);
+        assert_eq!(points[1].at, now + Duration::hours(1));
+        for point in &points[..2] {
+            assert!((point.remaining_percent - 290.0 / 21.0).abs() < 1e-8, "{point:?}");
+        }
+        accounts[0].windows[0].resets_at = Some(now + Duration::hours(1));
+        let points = pool_points(&accounts);
+        assert!((points[1].remaining_percent - 2090.0 / 21.0).abs() < 1e-8, "{:?}", points[1]);
+    }
 
     fn sample_window(key: &str, used: Option<f64>, state: QuotaObservationState) -> QuotaWindow {
         QuotaWindow {

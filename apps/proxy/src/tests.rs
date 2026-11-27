@@ -1240,6 +1240,26 @@ async fn account_defaults_match_aliases_and_leave_invalid_fields_unset() {
 }
 
 #[tokio::test]
+async fn account_defaults_match_enrollment_with_custom_label() {
+    let dir = Scratch::new();
+    let mock = serve(Router::new()).await;
+    let mut config = fixture_config(&dir, &mock);
+    let defaults = dir.join("defaults.json");
+    fs::write(&defaults, json!({"version":1,"accounts":{"google-agam":{"tier_multiplier":20.0}}}).to_string()).unwrap();
+    config.account_defaults_file = Some(defaults);
+
+    let mut pool = Pool::load(&config).unwrap();
+    pool::add_provenance_google(
+        &mut pool,
+        "google-agam",
+        json!({"access_token":"fixture-google","refresh_token":"fixture-refresh","project_id":"project","label":"Custom display name"}),
+    );
+    let account = pool.accounts.values().next().unwrap();
+    assert_eq!(account.label, "Custom display name");
+    assert_eq!(account.multiplier, Some(20.0));
+}
+
+#[tokio::test]
 async fn account_overrides_survive_managed_local_and_provenance_reload_with_explicit_clears() {
     let dir = Scratch::new();
     let mock = serve(Router::new()).await;

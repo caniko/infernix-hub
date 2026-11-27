@@ -16,17 +16,19 @@ pub(super) enum AccountListSort {
     #[default]
     Capacity,
     Usage,
+    MostLeft,
     NextReset,
     Name,
 }
 
 impl AccountListSort {
-    const OPTIONS: &[(&str, &str)] = &[("capacity", "Capacity"), ("usage", "Usage"), ("reset", "Next Reset"), ("name", "Name")];
+    const OPTIONS: &[(&str, &str)] =
+        &[("capacity", "Capacity"), ("usage", "Most Used"), ("most-left", "Most Left"), ("reset", "Next Reset"), ("name", "Name")];
 
     fn from_setting(order: AccountSortOrder) -> Self {
         match order {
             AccountSortOrder::SoonestReset => Self::NextReset,
-            AccountSortOrder::MostLeft => Self::Usage,
+            AccountSortOrder::MostLeft => Self::MostLeft,
             AccountSortOrder::Name => Self::Name,
         }
     }
@@ -35,6 +37,7 @@ impl AccountListSort {
         match self {
             Self::Capacity => "capacity",
             Self::Usage => "usage",
+            Self::MostLeft => "most-left",
             Self::NextReset => "reset",
             Self::Name => "name",
         }
@@ -73,7 +76,8 @@ fn sort_account_rows_at(rows: &mut Vec<(&ProviderSummary, &ModelAccount)>, sort:
                 .then_with(|| b.is_active.cmp(&a.is_active))
                 .then_with(|| reports_next_pick(bp, b).cmp(&reports_next_pick(ap, a)))
                 .then_with(|| b.priority.cmp(&a.priority)),
-            AccountListSort::Usage => match (tightest_remaining(a), tightest_remaining(b)) {
+            AccountListSort::Usage | AccountListSort::MostLeft => match (tightest_remaining(a), tightest_remaining(b)) {
+                (Some(a), Some(b)) if sort == AccountListSort::MostLeft => b.total_cmp(&a),
                 (Some(a), Some(b)) => a.total_cmp(&b),
                 (Some(_), None) => Ordering::Less,
                 (None, Some(_)) => Ordering::Greater,
@@ -137,10 +141,11 @@ pub(super) fn Accounts(providers: Vec<ProviderSummary>) -> Element {
     let client = use_context::<HubClient>();
     let mut key_groups = use_signal(|| false);
     let mut connecting = use_signal(|| false);
-    let mut sort = use_signal(|| AccountListSort::from_setting(panel.settings.peek().account_sort));
+    let mut sort_override = use_signal(|| None);
     let mut selected_key = use_signal(|| None::<(String, String)>);
     let show_history = use_signal(|| false);
     let settings = panel.settings.cloned();
+    let sort = sort_override().unwrap_or_else(|| AccountListSort::from_setting(settings.account_sort));
     let selection = panel.selected_provider.cloned();
     let ready = (panel.settings_ready)();
     let operator = panel.operator();
@@ -148,7 +153,7 @@ pub(super) fn Accounts(providers: Vec<ProviderSummary>) -> Element {
     let scoped_providers: Vec<&ProviderSummary> =
         providers.iter().filter(|p| selection.is_empty() || p.descriptor.id == selection).collect();
     let mut rows: Vec<_> = scoped_providers.iter().copied().flat_map(|p| p.accounts.iter().map(move |a| (p, a))).collect();
-    sort_account_rows_at(&mut rows, sort(), now);
+    sort_account_rows_at(&mut rows, sort, now);
     let current = selected_key.cloned();
     let selected = rows
         .iter()
@@ -171,34 +176,28 @@ pub(super) fn Accounts(providers: Vec<ProviderSummary>) -> Element {
             button { class: if key_groups() { "tab-btn active" } else { "tab-btn" },
                 aria_current: if key_groups() { "page" } else { "false" }, onclick: move |_| key_groups.set(true), "Key Groups & Models" }
         }
-        if key_groups() {
-            for provider in &scoped_providers {
-                section { key: "{provider.descriptor.id}", class: "glass-card stack",
-                    h2 { "{provider.descriptor.label} · Key Groups & Models" }
-                    KeyGroups { provider: (*provider).clone() }
-                }
-            }
-        } else {
-            div { class: "accounts-toolbar row",
-                div { class: "row", role: "group", aria_label: "Account provider scope",
-                    button { class: "filter-chip", aria_pressed: selection.is_empty(), onclick: move |_| panel.selected_provider.set(String::new()), "All" }
-                    for provider in &providers {
-                        {
-                            let id = provider.descriptor.id.clone();
-                            rsx! { button { key: "{id}", class: "filter-chip", aria_pressed: selection == id,
-                                onclick: move |_| panel.selected_provider.set(id.clone()),
-                                "{provider.descriptor.label} ({provider.accounts.len()})" } }
-                        }
+        div { class: "accounts-toolbar row",
+            div { class: "row", role: "group", aria_label: "Account provider scope",
+                button { class: "filter-chip", aria_pressed: selection.is_empty(), onclick: move |_| panel.selected_provider.set(String::new()), "All" }
+                for provider in &providers {
+                    {
+                        let id = provider.descriptor.id.clone();
+                        rsx! { button { key: "{id}", class: "filter-chip", aria_pressed: selection == id,
+                            onclick: move |_| panel.selected_provider.set(id.clone()),
+                            "{provider.descriptor.label} ({provider.accounts.len()})" } }
                     }
                 }
+            }
+            if !key_groups() {
                 div { class: "row accounts-tools",
-                    Choice { label: "Sort accounts", value: sort().key(), options: pairs(AccountListSort::OPTIONS), change: move |value: String| {
-                        sort.set(match value.as_str() {
+                    Choice { label: "Sort accounts", value: sort.key(), options: pairs(AccountListSort::OPTIONS), change: move |value: String| {
+                        sort_override.set(Some(match value.as_str() {
                             "usage" => AccountListSort::Usage,
+                            "most-left" => AccountListSort::MostLeft,
                             "reset" => AccountListSort::NextReset,
                             "name" => AccountListSort::Name,
                             _ => AccountListSort::Capacity,
-                        });
+                        }));
                     } }
                     Check { label: "Mask emails", value: settings.mask_emails, disabled: !ready, change: move |value| {
                         panel.settings.write().mask_emails = value;
@@ -210,6 +209,15 @@ pub(super) fn Accounts(providers: Vec<ProviderSummary>) -> Element {
                     }
                 }
             }
+        }
+        if key_groups() {
+            for provider in scoped_providers.iter().copied() {
+                section { key: "{provider.descriptor.id}", class: "glass-card stack",
+                    h2 { "{provider.descriptor.label} · Key Groups & Models" }
+                    KeyGroups { provider: provider.clone() }
+                }
+            }
+        } else {
             div { id: "accounts-connect", class: "stack", hidden: !connecting(),
                 if connecting() {
                     for provider in scoped_providers.iter().copied().filter(|p| can_add(p)) {
@@ -967,7 +975,36 @@ fn GroupEditor(provider: ProviderSummary, group: Option<KeyGroup>) -> Element {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use dioxus::dioxus_core::{AttributeValue, Mutation};
+
     use super::*;
+    use crate::workspaces::providers::dashboard::tests::test_panel;
+
+    #[test]
+    fn account_sort_updates_when_saved_settings_arrive_after_mount() {
+        #[derive(Clone, PartialEq, Props)]
+        struct TestProps {
+            settings: Rc<Cell<Option<Signal<ProviderPanelSettings>>>>,
+        }
+
+        fn app(TestProps { settings }: TestProps) -> Element {
+            settings.set(Some(test_panel().settings));
+            rsx! { Accounts { providers: vec![] } }
+        }
+
+        let settings = Rc::new(Cell::new(None));
+        let mut dom = VirtualDom::new_with_props(app, TestProps { settings: settings.clone() });
+        dom.rebuild_to_vec();
+        let mut settings = settings.get().unwrap();
+        dom.in_runtime(|| settings.write().account_sort = AccountSortOrder::MostLeft);
+        let edits = dom.render_immediate_to_vec().edits;
+        assert!(
+            edits.iter().any(|edit| matches!(edit, Mutation::SetAttribute { name, value: AttributeValue::Text(value), .. } if name == "value" && value == "most-left")),
+            "{edits:?}"
+        );
+    }
 
     #[test]
     fn sort_account_rows_orders_by_capacity_usage_reset_and_name() {
@@ -979,13 +1016,13 @@ mod tests {
                 {"id": "zulu", "provider_id": "test", "source_account_id": "zulu", "display_name": "Zulu",
                  "tier_multiplier": 20.0, "windows": [
                     {"window_key": "weekly", "label": "Weekly", "kind": "weekly", "observation_state": "measured",
-                     "remaining_percent": 40.0, "resets_at": "2030-01-02T00:00:00Z"},
+                     "remaining_percent": 80.0, "resets_at": "2030-01-02T00:00:00Z"},
                     {"window_key": "spend", "label": "Spend", "kind": "spend", "observation_state": "measured",
                      "remaining_percent": 0.0, "resets_at": "2030-01-01T00:00:00Z"}
                  ]},
                 {"id": "bravo", "provider_id": "test", "source_account_id": "bravo", "display_name": "Bravo", "is_active": true,
                  "windows": [{"window_key": "weekly", "label": "Weekly", "kind": "weekly", "observation_state": "measured",
-                              "remaining_percent": 10.0, "resets_at": "2030-01-03T00:00:00Z"}]},
+                              "remaining_percent": 20.0, "resets_at": "2030-01-03T00:00:00Z"}]},
                 {"id": "alpha", "provider_id": "test", "source_account_id": "alpha", "display_name": "alpha",
                  "windows": [{"window_key": "weekly", "label": "Weekly", "kind": "weekly", "observation_state": "measured",
                               "resets_at": "2020-01-01T00:00:00Z"}]},
@@ -999,6 +1036,7 @@ mod tests {
         for (sort, expected) in [
             (AccountListSort::Capacity, ["zulu", "bravo", "alpha", "delta", "charlie"]),
             (AccountListSort::Usage, ["bravo", "zulu", "alpha", "charlie", "delta"]),
+            (AccountListSort::from_setting(AccountSortOrder::MostLeft), ["zulu", "bravo", "alpha", "charlie", "delta"]),
             (AccountListSort::NextReset, ["zulu", "bravo", "alpha", "charlie", "delta"]),
             (AccountListSort::Name, ["alpha", "bravo", "charlie", "delta", "zulu"]),
         ] {

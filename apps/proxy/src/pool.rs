@@ -1469,7 +1469,16 @@ fn apply_account_settings(defaults: &BTreeMap<String, Value>, overrides: &BTreeM
     account.plan.clone_from(&account.auth_plan);
     account.multiplier = account.auth_multiplier;
     let stem = account.name.strip_suffix(".json").unwrap_or(&account.name);
-    for key in [Some(account.id.as_str()), Some(stem), Some(account.label.as_str()), account.email.as_deref()].into_iter().flatten() {
+    for key in [
+        Some(account.id.as_str()),
+        Some(stem),
+        account.provenance_enrollment.as_deref(),
+        Some(account.label.as_str()),
+        account.email.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if let Some(entry) = defaults.get(&key.to_lowercase()) {
             if account.plan.is_none() {
                 account.plan =
