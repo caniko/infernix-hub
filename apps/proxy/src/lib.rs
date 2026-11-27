@@ -1346,6 +1346,31 @@ async fn provider_response_json(response: reqwest::Response) -> Result<Value, &'
     serde_json::from_slice(&bounded_body(response, 2 * 1024 * 1024).await?).map_err(|_| "invalid upstream JSON")
 }
 
+const NIX_SANDBOX_NO_CERT_FILE: &str = "/no-cert-file.crt";
+
+fn with_env_root_certificates(builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
+    let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|value| !value.is_empty()) else {
+        return Ok(builder);
+    };
+    with_root_certificates_from_path(builder, Path::new(&path))
+}
+
+pub(crate) fn with_root_certificates_from_path(mut builder: reqwest::ClientBuilder, path: &Path) -> Result<reqwest::ClientBuilder> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound && path == Path::new(NIX_SANDBOX_NO_CERT_FILE) => {
+            return Ok(builder);
+        }
+        Err(error) => return Err(error).with_context(|| format!("read SSL_CERT_FILE {}", path.display())),
+    };
+    let certs = reqwest::Certificate::from_pem_bundle(&bytes).with_context(|| format!("parse SSL_CERT_FILE {}", path.display()))?;
+    ensure!(!certs.is_empty(), "SSL_CERT_FILE {} contains no certificates", path.display());
+    for cert in certs {
+        builder = builder.add_root_certificate(cert);
+    }
+    Ok(builder)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1417,29 +1442,4 @@ mod quota_probe_backoff_tests {
         assert!(errors.is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
-}
-
-const NIX_SANDBOX_NO_CERT_FILE: &str = "/no-cert-file.crt";
-
-fn with_env_root_certificates(builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
-    let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|value| !value.is_empty()) else {
-        return Ok(builder);
-    };
-    with_root_certificates_from_path(builder, Path::new(&path))
-}
-
-pub(crate) fn with_root_certificates_from_path(mut builder: reqwest::ClientBuilder, path: &Path) -> Result<reqwest::ClientBuilder> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound && path == Path::new(NIX_SANDBOX_NO_CERT_FILE) => {
-            return Ok(builder);
-        }
-        Err(error) => return Err(error).with_context(|| format!("read SSL_CERT_FILE {}", path.display())),
-    };
-    let certs = reqwest::Certificate::from_pem_bundle(&bytes).with_context(|| format!("parse SSL_CERT_FILE {}", path.display()))?;
-    ensure!(!certs.is_empty(), "SSL_CERT_FILE {} contains no certificates", path.display());
-    for cert in certs {
-        builder = builder.add_root_certificate(cert);
-    }
-    Ok(builder)
 }
