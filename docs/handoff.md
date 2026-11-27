@@ -1,46 +1,44 @@
 # Handoff
 
-The hub is deployed on Atlas as `fleetix-hub.service` using `canix-hub`, with
-most integrations in fixture mode. Read `VISION.md` for the product, `docs/capabilities.md`
-for per-integration evidence, and `docs/nix.md` for the flake and NixOS module.
+Atlas runs `canix-hub` as `fleetix-hub.service`, with most integrations in
+fixture mode. See `VISION.md` for the product, `docs/capabilities.md` for
+integration evidence, and `docs/nix.md` for the flake and NixOS module.
 
 ## What the product is today
 
 - **Hub.** One Axum API (`/v1`), one domain command layer, an outbox worker and
   an audit log over PostgreSQL. Content flows brief → generation → assets →
   release → approval → publication intent → channel.
-- **Generation backends.** ComfyUI through a Windmill procedure, and pipelines
-  behind the `Pipeline` port (submit/status/cancel/find) selected by
-  `workflows.pipeline_id`. Pipeline submission is at-most-once with a committed
-  claim, and a claim whose run handle was lost is adopted through
-  `Pipeline::find` instead of resubmitted.
-- **Packs.** Compile-time extensions that add channels, pipelines, outbox topics,
-  `/v1/p/<id>` routes, status rows, workflow versions and MCP tools. The
-  upstream binary installs none; a product binary such as `canix-hub` installs
-  its own and is configured by `packs.json` plus systemd credentials.
-- **Channels.** A release freezes its account's transport and dispatch uses only
-  that channel: `fixture`, `postiz`, `disabled`, `n8n:<platform>`, or a
-  pack-provided one such as `plinth`. No fallback; an unknown transport stops
-  the intent for an operator. Every real channel requires live Paperclip
-  approvals.
+- **Generation backends.** A Windmill procedure drives ComfyUI;
+  `workflows.pipeline_id` selects backends through the `Pipeline` port
+  (submit/status/cancel/find). A committed claim makes submission at-most-once.
+  If the handle was lost, the hub uses `Pipeline::find` to adopt the run.
+- **Packs.** Compile-time extensions add channels, pipelines, outbox topics,
+  `/v1/p/<id>` routes, status rows, workflow versions and MCP tools. Upstream
+  installs none; product binaries like `canix-hub` install their own, using
+  `packs.json` and systemd credentials.
+- **Channels.** Dispatch uses only the account transport frozen in the
+  release: `fixture`, `postiz`, `disabled`, `n8n:<platform>`, or a pack channel
+  such as `plinth`. An unknown transport stops the intent for an operator;
+  there is no fallback. Real channels require live Paperclip approvals.
 - **Notifications.** A PostgreSQL table stores deduplicated conditions and their
   acknowledgement, resolution and snooze state. `GET /v1/notifications` returns
   a snapshot without `after`, or a cursor feed with `after` and optional `wait`.
   Producers sync Today and fleet conditions and summary staleness. MCP
   `hub_post_summary` writes a daily notification keyed `summary:<YYYY-MM-DD>`.
-- **Status feeds.** The hub polls JSON status documents (S3, SigV4) that
-  projects publish; each failing check is a `monitor:<feed>:<check>`
-  notification that resolves on recovery, and a stale or unreadable feed is
+- **Status feeds.** The hub polls project JSON status documents (S3, SigV4).
+  Each failing check raises `monitor:<feed>:<check>`, which resolves on
+  recovery. A stale or unreadable feed raises
   `monitor:<feed>:feed`. Feed states are in `/v1/status`.
-- **Renewals.** Seeded renewal records include procedures and HTTPS provider URLs;
-  the operator can mark a renewal complete and set its next due date.
-- **Clients.** The Dioxus console has a Notifications workspace; `hubctl` and
-  the MCP server expose notification operations. `fleetix-hub-tray` is a desktop
-  daemon with a tray icon, long-poll feed and desktop notifications.
+- **Renewals.** Seeds include procedures and HTTPS provider URLs. Operators
+  mark renewals complete and set the next due date.
+- **Clients.** The Dioxus console has a Notifications workspace. `hubctl` and
+  MCP expose notification operations. The `fleetix-hub-tray` desktop daemon
+  provides a tray icon, long-poll feed, and desktop notifications.
 
 ## Run it
 
-Everything below runs on fixtures: no external service is called.
+These commands use fixtures and call no external services.
 
 ```sh
 nix develop                                    # harbor-rs devshell (treefmt, sqlx, psql)
@@ -51,11 +49,11 @@ HUB_URL=http://127.0.0.1:8470 HUB_TOKEN=dev-operator-token cargo run -p fleetix-
 HUB_URL=http://127.0.0.1:8470 HUB_TOKEN=dev-operator-token cargo run -p hubctl -- today
 ```
 
-Do not point `dev-db.sh` at `var/pg` from this dev shell: that directory was
-initialised by PostgreSQL 18 and the dev shell's PostgreSQL 16 cannot start it.
+Do not point `dev-db.sh` at `var/pg` from this dev shell. Its PostgreSQL 16
+cannot start the data directory initialized by PostgreSQL 18.
 
-`dev` prints its tokens (`dev-operator-token`, `dev-agent-token`,
-`dev-procedure-token`, `dev-ingest-token`). Fixture approvals are decided with
+`dev` prints `dev-operator-token`, `dev-agent-token`, `dev-procedure-token`,
+and `dev-ingest-token`. Decide fixture approvals with
 `POST /v1/fixtures/paperclip/approvals/{id}/decide` (fixture mode only).
 
 Production-style commands: `serve [--no-worker] [--packs-config FILE]`,
@@ -66,18 +64,18 @@ from `*_TOKEN_FILE`. Modes: `HUB_PAPERCLIP|HUB_WINDMILL|HUB_COMFY|HUB_ASSISTANT`
 `N8N_PUBLISH_PLATFORMS` + `N8N_WEBHOOK_TOKEN_FILE` add one `n8n:<platform>`
 channel each.
 
-`POST /v1/humanize` previews rewriting for operator and agent tokens without
-saving the draft. `HUB_HUMANIZER` defaults to `disabled`; it also accepts
-`fixture` or `live`. The live adapter uses `HUMANIZER_URL` (default
+`POST /v1/humanize` lets operator and agent tokens preview rewrites without
+saving the draft. `HUB_HUMANIZER` accepts `disabled` (default), `fixture`, or
+`live`. The live adapter uses `HUMANIZER_URL` (default
 `http://127.0.0.1:3000`), optional `HUMANIZER_TOKEN_FILE` (preferred) or
-`HUMANIZER_TOKEN`, and `HUMANIZER_TIMEOUT_SECS` (default 180). `HUB_HUMANIZER_AUTO_APPLY=true` enables
-verified rewriting of assistant replies before they enter review; preview
-does not require this setting. On failure the original text is used.
+`HUMANIZER_TOKEN`, and `HUMANIZER_TIMEOUT_SECS` (default 180).
+`HUB_HUMANIZER_AUTO_APPLY=true` enables verified rewriting of assistant
+replies before review; previews don't require it. Failures keep the original text.
 
 The `/v1/personas/{id}` Soul endpoints manage memories, written/spoken voice
-exemplars, and daily persona state. Thread drafts use persona-wide memories and
-the exact thread's memories, never sandbox entries. Recall and listing can
-explicitly include sandbox; novelty checks compare against aired memories only.
+exemplars, and daily persona state. Thread drafts use persona-wide and
+exact-thread memories, never sandbox entries. Recall and listing can opt into
+sandbox; novelty checks use only aired memories.
 
 ## Checks
 
@@ -87,19 +85,22 @@ HUB_TEST_DATABASE_URL="$DATABASE_URL" cargo test --workspace   # DB tests skip w
 treefmt <files>
 ```
 
-The journey tests cover: changed content cannot reuse an approval, stale and
-duplicate timers, early timer / pause / unverifiable approval fail closed,
-partial multi-account failure, lost publish response reconciled (never
-resubmitted), accepted tracked to published, lost generation receipt found by
-the hub-chosen prompt id, targeted cancel, human takeover beats a queued agent
-reply, assets survive engine history cleanup, chat suggestions stay proposals,
-GPU admission, cancel while awaiting admission, unreachable publisher retry,
-pipeline at-most-once submission, the crash-window adoption and its lookup
-outage, manifest/upload agreement and its deadline, pack routes, pack workflows
-and `generate`, and a procedure downloading asset bytes.
+Journey tests cover:
 
-Not run here: clippy, the flake's Nix checks (module eval, packaging), any live
-integration, and the CI workflow another stream added under `.github/workflows`.
+- Approval invalidation on content changes; stale and duplicate timers;
+  fail-closed early timers, pauses, and unverifiable approvals.
+- Partial multi-account failure, lost publish response reconciliation without
+  resubmission, tracking accepted posts to published, and unreachable publisher retry.
+- Finding lost generation receipts by hub-chosen prompt ID, targeted cancel,
+  GPU admission and cancel while waiting, and asset retention after engine
+  history cleanup.
+- Human takeover ahead of a queued agent reply, and chat suggestions staying proposals.
+- Pipeline at-most-once submission, crash-window adoption and lookup outage,
+  manifest/upload agreement and deadline, pack routes, pack workflows and
+  `generate`, and a procedure downloading asset bytes.
+
+This pass did not run clippy, the flake's Nix checks (module eval, packaging),
+live integrations, or the CI workflow another stream added under `.github/workflows`.
 
 ## Capability levels
 
@@ -125,38 +126,37 @@ integration, and the CI workflow another stream added under `.github/workflows`.
 1. **ComfyUI has no checkpoints.** The atlas instance is the TRELLIS workbench;
    `poster-txt2img` needs a checkpoint. `registry/comfyui/swatch.v1.json` is
    model-free and is the only workflow that could run today.
-2. **Paperclip:** no authenticated call made; the board key
-   (`paperclip-operations-operator-key`) was not read. Company id unknown — set
-   `HUB_COMPANY_ID`. Approval create has no idempotency key in 0.3.1: an
-   ambiguous create is dead-lettered and the operator links the approval with
-   `link-approval` (hash-checked).
+2. **Paperclip:** No authenticated calls or reads of the board key
+   (`paperclip-operations-operator-key`). Set `HUB_COMPANY_ID`; the company ID
+   was unknown. Approval create has no idempotency key in 0.3.1: ambiguous
+   creates go to the dead-letter queue; operators use hash-checked `link-approval`.
 3. **Windmill:** procedures not deployed (`wmill sync push` not run); secret
    variable `f/fleetix_hub/hub_token` not created; workspace token not read.
 4. **n8n:** no `X-N8N-API-KEY`; the `X-Studio-Token` webhook secret was not read;
    no workflow is imported and none points at `/v1/ingest/news` or the publish
    contract.
-5. **Postiz:** not deployed. When it is, the adapter refuses media that carries
-   alt text (the documented API has no alt field) — confirm an alt-text field
-   before enabling image posts. Lookup is unsupported, so accepted/ambiguous
-   posts are resolved by an operator (`POST /v1/intents/{id}/resolve`).
+5. **Postiz:** Not deployed. The adapter refuses media with alt text (no
+   documented alt field); confirm one before enabling image posts. Lookup is
+   unsupported; operators resolve accepted/ambiguous posts
+   (`POST /v1/intents/{id}/resolve`).
 
 ## Deployment qualification
 
-Atlas runs the hub; this does not establish live qualification of its external
-integrations. The integration observations above describe the earlier review.
+The Atlas deployment does not qualify external integrations. The findings
+above come from the earlier review.
 
 ## Review
 
-Four Sol review rounds (`openai/gpt-6.1-sol`, xhigh) on the earlier tree; round 4
-approved. Round 1 found 14 issues (3 blockers); all fixed or narrowed in
-`1ce7dcc`, `3b78006` and `5d6b3f1`. The later delta (license, approved state,
-procedure status, polish, harbor bump) had its own four rounds; round 4 approved
-after lock-order fixes in `e418f03`, `f51a350` and `a527cc6`.
+Sol (`openai/gpt-6.1-sol`, xhigh) approved the earlier tree in round 4. Round 1
+found 14 issues (3 blockers); `1ce7dcc`, `3b78006` and `5d6b3f1` fixed or
+narrowed all of them. The later changes (license, approved state, procedure
+status, polish, harbor bump) also passed in round 4 after lock-order fixes in
+`e418f03`, `f51a350` and `a527cc6`.
 
-Known ceiling: the worker holds the outbox row lock across a remote call; a
-crash between a non-idempotent call and its record can still replay it
-(approvals and generations check their recorded effect first, and a pipeline
-claim is adopted rather than resubmitted). A lease column is the upgrade path.
+The worker holds the outbox row lock across remote calls. A crash after a
+non-idempotent call but before recording its effect can replay it. Approvals and
+generations check their recorded effect first; the worker adopts pipeline claims
+instead of resubmitting. A lease column is the upgrade path.
 
 ## Desktop delivery log
 
@@ -176,15 +176,15 @@ claim is adopted rather than resubmitted). A lease column is the upgrade path.
 
 ## Designs
 
-`design/fleetix-hub.fig` (OpenPencil): D01 Studio, D02 Today, M01 narrow
-(390 px). Checked against screenshots of the running app at 1440 and 760 px;
-layout and tokens match. D01 was updated for P1–P3 (status bar wording,
-"Approved" chip, persona name); D02 already used readable labels; M01 shows the
-selecting stage, which is unchanged. 390 px was not captured from the app
-(desktop window minimum in practice is wider).
+`design/fleetix-hub.fig` (OpenPencil) contains D01 Studio, D02 Today, and M01
+narrow (390 px). Layout and tokens match screenshots of the running app at
+1440 and 760 px. D01 reflects P1–P3 (status bar wording, "Approved" chip,
+persona name); D02 already had readable labels. M01 shows the unchanged
+selecting stage. The practical desktop window minimum is wider than 390 px,
+so there is no app screenshot at that width.
 
 ## Open decisions for the owner
 
-- Postiz vs another transport for publishing; whether the n8n free-platform set
-  is worth importing at all.
+- Whether to publish through Postiz or another transport, and whether to import
+  the n8n free-platform set.
 - Which ComfyUI checkpoint/workflow to register first.

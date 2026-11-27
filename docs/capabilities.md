@@ -1,30 +1,25 @@
 # Integration and platform capabilities
 
-What the hub can do, what has actually been proven, and what does not exist.
-The hub runs on Atlas with most integrations in fixture mode. Deployment does
-not by itself establish live integration qualification.
+The hub runs on Atlas with most integrations in fixture mode. Deployment alone
+does not establish live integration qualification.
 
 ## Status terms
 
 - **built** — the code exists and compiles.
 - **fixture-tested** — a `Fixture*` adapter in `crates/integrations/src/fixture/`
-  or the in-process stand-in was exercised end to end. It is evidence for the
-  hub's own machinery, never for the live adapter.
+  or the in-process stand-in ran end to end. This verifies hub behavior; do not
+  mark the live adapter `fixture-tested` on that basis.
 - **contract-verified** — request/response shapes were checked against a
   downloaded OpenAPI document or the deployed server source.
 - **live-verified** — a request was actually made to the deployed service. No
   mutating request was recorded in the original integration assessment.
 
-A live adapter is never marked fixture-tested by association: the fixture
-adapters are separate code.
-
 ## Packs
 
-A pack is a compile-time extension. The trait is `Pack` in
-`crates/api/src/plugin.rs`; `fleetix_hubd::run(settings, packs)` installs the
-packs it is given once the `Hub` exists. The upstream `fleetix-hubd` binary
-passes an empty list, so everything below is inert unless a product binary
-(such as `canix-hub`) ships a pack.
+A pack is a compile-time extension implementing `Pack` in
+`crates/api/src/plugin.rs`. `fleetix_hubd::run(settings, packs)` installs packs
+after creating the `Hub`. The upstream `fleetix-hubd` passes an empty list;
+pack features require a product binary such as `canix-hub` to ship a pack.
 
 `Pack::install` gets a `ServerHost`, which registers:
 
@@ -37,26 +32,24 @@ passes an empty list, so everything below is inert unless a product binary
 | `integration(status)` | one status row for `GET /v1/status` |
 | `workflow(spec)` | name `<pack id>.…`; one definition per name+version; a `pipeline_id` must name a pipeline this same pack registered |
 
-`install_mcp` gets an `McpHost` and registers tools with an effect. The MCP
-server's authorizer allows `Read` and `Write` and denies `Destructive`; the
-token's role still decides what the API accepts.
+`install_mcp` registers tools and their effects on an `McpHost`. The hub's MCP
+authorizer allows `Read` and `Write` and denies `Destructive`; the token role
+still governs API access.
 
-Startup fails, rather than resolving a conflict by order, on: a duplicate pack
-id, an id outside `[a-z0-9-]+`, a pack id that collides with a core topic
-namespace, a duplicate or unprefixed pipeline/topic/workflow, a workflow naming
-an unregistered pipeline, a pack channel colliding with a live built-in or an
-earlier pack, and a pipeline or topic registered twice.
+Startup rejects duplicate pack IDs, IDs outside `[a-z0-9-]+`, and IDs that
+collide with a core topic namespace. It also rejects a duplicate or unprefixed
+pipeline/topic/workflow (including repeat registrations), workflows
+that name an unregistered pipeline, and channels that collide with a live
+built-in or an earlier pack. Registration order does not resolve conflicts.
 
-Pack workflows are written after the `Hub` exists (that is why they are
-declared through `ServerHost` and not through the registry directory). A
-workflow version is immutable: re-registering the same name and version with a
-different graph or pipeline is refused.
+Pack workflows are written after the `Hub` exists, so declare them through
+`ServerHost`, not the registry directory. Versions are immutable:
+re-registering the same name and version with a different graph or pipeline fails.
 
-`packs.json` (via `serve --packs-config FILE` or `HUB_PACKS_CONFIG`) is an
-object mapping pack id to that pack's config object. Startup fails when the file
-enables an id the binary does not register. The pack sees its own config as
-`ServerContext.config` (`{}` when absent) and its credential files in
-`$CREDENTIALS_DIRECTORY`.
+`packs.json` (via `serve --packs-config FILE` or `HUB_PACKS_CONFIG`) maps pack
+IDs to config objects. Startup rejects IDs the binary does not register.
+The pack sees its config as `ServerContext.config` (`{}` when absent) and its
+credential files in `$CREDENTIALS_DIRECTORY`.
 
 A pack channel posts for real, so it is subject to the live-approval guard in
 [Channels](#channels-and-publication-transports) even when the built-in
@@ -74,9 +67,9 @@ A pipeline is a generation backend behind the `Pipeline` port
 | `cancel` | stop the run; `Dequeued`, `Interrupted`, `AlreadyFinished`, `Unsupported` |
 | `find` | the run an earlier submission started, if the backend still knows it; default `Ok(None)` |
 
-A workflow row selects it: `workflows.pipeline_id` is set instead of an
-`api_graph`, and `engine_instance_id` is only the admission target (its base
-URL is never polled as a ComfyUI queue).
+A workflow selects `workflows.pipeline_id` instead of an `api_graph`.
+`engine_instance_id` sets only the admission target; the hub never polls its
+base URL as a ComfyUI queue.
 
 Submission is at-most-once and crash-safe:
 
@@ -85,11 +78,11 @@ Submission is at-most-once and crash-safe:
 2. `deliver_pipeline` commits a submission claim (`submit_started_at`) in its
    own transaction **before** calling `submit`.
 3. A redelivery that sees a recorded run does nothing.
-4. A redelivery that sees a claim without a run calls `Pipeline::find`: a run
-   comes back and is recorded through the same fenced path a fresh submission
-   uses (so a cancel that won the race stops the run instead of adopting it); no
-   run fails the attempt with `submission outcome unknown`; a lookup error
-   keeps the claim and retries. The work is never submitted twice.
+4. A redelivery with a claim but no run calls `Pipeline::find` instead of
+   resubmitting. A found run goes through the fresh submission's fenced path:
+   if cancellation won the race, it stops the run rather than adopting it.
+   If no run is found, the attempt fails with `submission outcome unknown`.
+   On a lookup error, the worker keeps the claim and retries.
 5. `Unreachable`, and `5xx`/`429`, release the claim and retry. `Ambiguous` and
    every other answer fail the attempt and leave the claim.
 
@@ -113,20 +106,19 @@ Follow-up, artifacts and completion:
   until a status read ends it); `Unsupported` or an error leaves it
   `cancelling` until a later status read or the operator ends it.
 
-What ships here: `fixture.svg`, the in-process fixture pipeline behind
+The hub ships `fixture.svg`, the in-process fixture pipeline behind
 `registry/pipeline/fixture-svg.v1.json`, and `WindmillPipeline`, a generic
 adapter that runs one Windmill script per `pipeline_id` and reads its terminal
-manifest from the job result. Packs add their own, e.g. the `animation` pack's
+manifest from the job result. Packs can add pipelines, such as `animation`'s
 four ledger-backed stage pipelines.
 
 ## Channels and publication transports
 
-A publishing channel is keyed by `accounts.transport` and implements
-`Publisher` (`submit`, `lookup`, `reply`, `lookup_reply`). A release action
-freezes the account's transport when the release is frozen; dispatch uses only
-that channel, and a transport with no channel fails the intent with
-`transport_unavailable` for an operator. There is no fallback to another
-provider, ever.
+A publishing channel implements `Publisher` (`submit`, `lookup`, `reply`,
+`lookup_reply`) and uses `accounts.transport` as its key. Each release action
+freezes that transport with the release. Dispatch uses only that channel:
+a missing channel fails the intent with `transport_unavailable` for the
+operator, with no provider fallback.
 
 Registered today:
 
@@ -145,8 +137,8 @@ authorize a real post, and startup fails naming the channel otherwise.
 
 ## The n8n contract (v1)
 
-One versioned webhook serves every platform. Contract source of truth is
-`studio-pipeline/n8n/README.md`; the only caller is `N8nPublisher`.
+One versioned webhook serves every platform. `studio-pipeline/n8n/README.md`
+defines the contract; only `N8nPublisher` calls it.
 
 - `POST {base}/webhook/fleetix-hub/v1/<platform>` as `multipart/form-data`:
   a JSON `request` part (idempotency key, frozen text and `platform_settings`,
@@ -168,17 +160,16 @@ One versioned webhook serves every platform. Contract source of truth is
   new standalone status.
 - No per-post metrics in v1.
 
-State: built; the publisher's request shapes and claim mapping are unit-tested
-against a recording server. **Not verified against a live n8n**: the workflow
-exports live in `studio-pipeline/n8n/` marked unverified, no `X-N8N-API-KEY`
-exists on this deployment, and no workflow points at the hub yet.
+Built and unit-tested against a recording server for request shapes and claim
+mapping. **Not verified against live n8n**: exports in `studio-pipeline/n8n/`
+are marked unverified, the deployment has no `X-N8N-API-KEY`, and no workflow
+points at the hub.
 
 ## Plinth through a pack
 
-The hub ships no Plinth code. Plinth is reached as a pack channel: a downstream
-binary (`canix-hub`) registers a `plinth` `Publisher` that creates the article
-through Plinth's admin API, and the NixOS module wires its configuration and
-credential:
+The hub ships no Plinth code. The downstream `canix-hub` binary registers a
+`plinth` `Publisher` that creates articles through Plinth's admin API. The
+NixOS module supplies its config and credential:
 
 ```nix
 services.fleetix-hub.packs.plinth = {
@@ -188,11 +179,11 @@ services.fleetix-hub.packs.plinth = {
 };
 ```
 
-That renders `packs.json` and a `<id>-<name>` systemd credential; the pack reads
-the token from `$CREDENTIALS_DIRECTORY`. Because it is a pack channel, it posts
-for real and therefore requires live Paperclip approvals. State: the pack
-contract and the module options are tested; the Plinth channel itself lives in
-the `canix-hub` crate in the canix repository; its live channel is not qualified here.
+The module renders `packs.json` and a `<id>-<name>` systemd credential. The
+pack reads the token from `$CREDENTIALS_DIRECTORY`. This real pack channel
+requires live Paperclip approvals. Tests cover the pack contract and module
+options, not live qualification of the Plinth channel in the canix
+repository's `canix-hub` crate.
 
 ## Live adapters: evidence
 
@@ -251,11 +242,12 @@ tool can mark a renewal.
 
 ### Notifications
 
-One row per condition, keyed by `dedupe_key`: the source sets it, and an
-unchanged condition touches nothing, so an acknowledgement survives a producer
-pass and only a changed or returning one reopens. `seq` is the long-poll cursor
-and moves on every change. `GET /v1/notifications` reads a snapshot (no `after`)
-or the feed past a cursor, optionally holding the request with `wait` seconds;
+Each source sets a `dedupe_key` for its condition's row. An unchanged condition
+leaves the row and `seq` untouched, so its acknowledgement survives; only
+changed or returning conditions reopen. Every change advances `seq`, the
+long-poll cursor. `GET /v1/notifications`
+reads a snapshot without `after`, or the feed after a cursor, optionally
+holding the request for `wait` seconds;
 `POST /v1/notifications` upserts, and `POST /v1/notifications/ack` and
 `POST /v1/notifications/{id}/snooze` are operator-only. `hubctl notifications
 list|ack|snooze` and `hubctl notify --key --severity --title` drive the same
@@ -345,8 +337,8 @@ without it.
 
 ## Fixture coverage
 
-Fixture mode is what `dev` and every test runs. It exercises the hub's own
-machinery end to end: briefs, Paperclip issues and approvals, the Windmill
+`dev` and every test run in fixture mode. That exercises the hub end to end:
+briefs, Paperclip issues and approvals, the Windmill
 procedure and publication clock, ComfyUI generation and asset import, the
 pipeline submission/status/cancel paths including the crash-window adoption,
 release freezing, channel dispatch, engagement replies, MCP, the desktop and
@@ -356,9 +348,8 @@ Projects: fixture-tested against PostgreSQL, including member and account
 rules and delegated brief dynamics. No live adapter is changed by this feature.
 Look image checks: operator attestation; no automated image check exists.
 Desktop individual Image step: built; upload, library selection and look generation are not yet fixture-tested through the desktop.
-Desktop Image, Refine and pin screens are built with unit-test coverage only, not verified in a running GUI.
-The desktop Projects workspace is built and covered by unit tests only; it
-has not been verified in a running GUI.
+The desktop Image, Refine, and pin screens and Projects workspace are built
+and unit-tested only, not verified in a running GUI.
 
 The desktop shows a `FIXTURE MODE` banner whenever any adapter is simulated,
 and `GET /v1/status` reports the mode and verification level per integration.
@@ -371,8 +362,11 @@ and `GET /v1/status` reports the mode and verification level per integration.
 - Paperclip approvals: never created against the live board.
 - Postiz: no module, package, secret, endpoint or DNS record.
 
-These observations date from the original assessment and are not a current
-inventory of all external activity.
-# Per-project models
+These observations describe the original assessment, not all current external
+activity.
 
-Per-project models: stored and validated; the hub acts on `checker` after slice 8 and on `image`; `assistant`, `three_d` and `voice` are served to agents and the pipeline only.
+## Per-project models
+
+The hub stores and validates per-project models. It acts on `checker` after
+slice 8 and on `image`; it serves `assistant`, `three_d`, and `voice` only to
+agents and the pipeline.
