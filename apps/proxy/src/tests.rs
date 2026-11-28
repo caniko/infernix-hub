@@ -1783,6 +1783,7 @@ async fn account_overrides_survive_managed_local_and_provenance_reload_with_expl
                 id,
                 management::Changes {
                     disabled: Some(true),
+                    quota_probe: None,
                     priority: Some(8),
                     weight: Some(5),
                     note: Some(json!("runtime")),
@@ -8826,6 +8827,207 @@ async fn google_usage_probe_renews_then_retains_rejected_buckets_only_on_the_sam
     assert_eq!(next.windows.len(), 1);
     assert_eq!(next.windows[0].window_key, "gemini-5h");
     assert!(next.windows.iter().all(|w| w.stale));
+}
+
+#[tokio::test]
+async fn observe_only_google_renews_and_exports_quota_without_routing() {
+    let mock = serve(
+        Router::new()
+            .route("/test/google-token", post(|| async { axum::Json(json!({"access_token":"observe-renewed","expires_in":3600})) }))
+            .route(
+                "/test/google-tokeninfo",
+                post(|| async { axum::Json(json!({"email_verified":true,"email":"test@example.test","aud":"client","expires_in":600})) }),
+            )
+            .route(
+                "/v1internal:retrieveUserQuotaSummary",
+                post(|headers: HeaderMap| async move {
+                    assert_eq!(router::bearer(&headers), Some("observe-renewed"));
+                    axum::Json(json!({"buckets":[{"bucketId":"gemini-5h","window":"5h","remainingFraction":0.75}]}))
+                }),
+            ),
+    )
+    .await;
+    let dir = Scratch::new();
+    let config = fixture_config(&dir, &mock);
+    let raw = json!({
+        "type":"google","access_token":"observe-expired","refresh_token":"observe-refresh","client_id":"client","client_secret":"secret",
+        "expires_at":Utc::now() - TimeDelta::hours(1),"project_id":"project","disabled":true,"quota_probe":true,
+    });
+    config::write_private(&config.auth_dir.join("observe.json"), &serde_json::to_vec(&raw).unwrap(), true).unwrap();
+    let mut proxy = Proxy::new(config).unwrap();
+    proxy.management_mock = Some(mock.0.clone());
+    {
+        let mut state = proxy.state.write().await;
+        state.pool.overrides.insert(Lane::Google, "observe.json".into());
+        state.pool.insert(
+            pool::parse_credentials(
+                "key.json",
+                &json!({"type":"google","api_key":"fixture-api-key","disabled":true,"quota_probe":true}),
+                false,
+            )
+            .unwrap(),
+        );
+        state.pool.insert(
+            pool::parse_credentials(
+                "go.json",
+                &json!({"type":"opencode-go","api_key":"fixture-go-key","disabled":true,"quota_probe":true}),
+                false,
+            )
+            .unwrap(),
+        );
+        assert_eq!(state.pool.preferred(Lane::Google), None);
+        assert_eq!(state.pool.preview(Lane::Google), None);
+    }
+    assert!(!proxy.authorize_google("observe-expired").await);
+    assert_eq!(proxy.state.read().await.pool.accounts["observe.json"].access, "observe-expired");
+    assert!(management::refresh_selected(&proxy, None, Some("antigravity")).await.unwrap().is_empty());
+    {
+        let mut state = proxy.state.write().await;
+        let account = &state.pool.accounts["observe.json"];
+        assert_eq!(account.access, "observe-renewed");
+        assert_eq!(account.email.as_deref(), Some("test@example.test"));
+        assert!(account.expires.unwrap() > Utc::now());
+        assert_eq!(account.inventory(&state.pool)["quota_probe"], true);
+        assert_eq!(account.windows[0].used_percent, Some(25.0));
+        state.pool.accounts.get_mut("observe.json").unwrap().windows.clear();
+    }
+    assert!(management::refresh_selected(&proxy, Some("observe.json"), None).await.unwrap().is_empty());
+    for ineligible in ["key.json", "go.json"] {
+        let errors = management::refresh_selected(&proxy, Some(ineligible), None).await.unwrap();
+        assert!(errors[ineligible].as_str().unwrap().ends_with("account does not support quota probes"), "{ineligible}: {errors:?}");
+    }
+    assert!(!proxy.authorize_google("observe-renewed").await);
+    let batch = hub_sync::observations(&proxy, "host", "user").await.into_iter().find(|b| b.provider_id == "antigravity").unwrap();
+    let account = batch.accounts.iter().find(|a| a.source_account_id == "observe.json").unwrap();
+    assert!(!account.enabled);
+    assert!(account.capabilities.contains(&contracts::providers::ProviderCapability::RefreshQuota));
+    assert_eq!(account.windows[0].observation_state, QuotaObservationState::Measured);
+    assert_eq!(account.windows[0].used_percent, Some(25.0));
+}
+
+#[tokio::test]
+async fn observe_only_fields_persist_for_managed_and_discovered_credentials() {
+    let mock = serve(Router::new()).await;
+    let dir = Scratch::new();
+    let config = fixture_config(&dir, &mock);
+    let raw = json!({"type":"google","access_token":"managed-access","disabled":true,"quota_probe":true});
+    config::write_private(&config.auth_dir.join("managed.json"), &serde_json::to_vec(&raw).unwrap(), true).unwrap();
+    let proxy = Arc::new(Proxy::new(config).unwrap());
+    let discovered = json!({"access_token":"local-access","refresh_token":"local-refresh"});
+    let id = {
+        let mut state = proxy.state.write().await;
+        pool::add_provenance_google(&mut state.pool, "local", discovered.clone());
+        state.pool.accounts.values().find(|a| a.local).unwrap().id.clone()
+    };
+    let server = serve(proxy.clone().app()).await;
+    let http = Http::new(&server);
+    let edit = "/v8/management/credentials/fields";
+    assert_eq!(http.management("PATCH", edit, Some(json!({"account_id":id,"disabled":true,"quota_probe":true}))).await.status(), 200);
+    let reload = || {
+        let mut pool = Pool::load(&proxy.config).unwrap();
+        pool::add_provenance_google(&mut pool, "local", discovered.clone());
+        pool
+    };
+    let restored = reload();
+    assert!(restored.accounts[&id].disabled && restored.accounts[&id].quota_probe);
+    for id in ["managed.json", id.as_str()] {
+        assert_eq!(http.management("PATCH", edit, Some(json!({"account_id":id,"quota_probe":false}))).await.status(), 200);
+        let errors = management::refresh_selected(&proxy, Some(id), None).await.unwrap();
+        assert!(errors[id].as_str().unwrap().ends_with("account does not support quota probes"));
+        let restored = reload();
+        assert!(restored.accounts[id].disabled && !restored.accounts[id].quota_probe);
+    }
+}
+
+#[tokio::test]
+async fn observe_only_upload_supersedes_matching_discovery_and_preserves_overrides() {
+    let mock = serve(Router::new()).await;
+    // S1: Supersede discovered Google credential by shared refresh_token or shared access_token (with compatible refresh).
+    for (discovered, uploaded) in [
+        (
+            json!({"access_token":"old-access","refresh_token":"old-refresh"}),
+            json!({
+                "type":"google","access_token":"managed-access","refresh_token":"old-refresh","label":"managed-label",
+                "project_id":"project","email":"test@example.test","disabled":true,"quota_probe":true,
+            }),
+        ),
+        (
+            json!({"access_token":"shared-access"}),
+            json!({
+                "type":"google","access_token":"shared-access","label":"managed-label",
+                "project_id":"project","email":"test@example.test","disabled":true,"quota_probe":true,
+            }),
+        ),
+    ] {
+        let dir = Scratch::new();
+        let proxy = Arc::new(Proxy::new(fixture_config(&dir, &mock)).unwrap());
+        let local_id = {
+            let mut state = proxy.state.write().await;
+            pool::add_provenance_google(&mut state.pool, "enrollment", discovered.clone());
+            assert!(state.pool.preview(Lane::Google).is_some());
+            state.pool.accounts.values().find(|a| a.local).unwrap().id.clone()
+        };
+        let server = serve(proxy.clone().app()).await;
+        let http = Http::new(&server);
+        // S3: Persisted override on the discovered account must survive temporary shadowing by a managed upload.
+        assert_eq!(
+            http.management(
+                "PATCH",
+                "/v8/management/credentials/fields",
+                Some(json!({"account_id":local_id,"disabled":true,"quota_probe":true})),
+            )
+            .await
+            .status(),
+            200
+        );
+        assert_eq!(http.management("POST", "/v8/management/credentials?name=observe.json", Some(uploaded)).await.status(), 200);
+        let assert_managed = |pool: &Pool| {
+            assert_eq!(pool.accounts.len(), 1);
+            let account = &pool.accounts["observe.json"];
+            assert!(!account.local && account.disabled && account.quota_probe);
+            assert_eq!(pool.preview(Lane::Google), None);
+        };
+        {
+            let mut state = proxy.state.write().await;
+            assert_managed(&state.pool);
+            pool::add_provenance_google(&mut state.pool, "enrollment", discovered.clone());
+            assert_managed(&state.pool);
+        }
+        let mut reloaded = Pool::load(&proxy.config).unwrap();
+        pool::add_provenance_google(&mut reloaded, "enrollment", discovered.clone());
+        assert_managed(&reloaded);
+
+        assert_eq!(http.management("DELETE", "/v8/management/credentials?name=observe.json", None).await.status(), 200);
+        let mut after_delete = Pool::load(&proxy.config).unwrap();
+        pool::add_provenance_google(&mut after_delete, "enrollment", discovered);
+        assert_eq!(after_delete.accounts.len(), 1);
+        assert!(after_delete.accounts[&local_id].disabled && after_delete.accounts[&local_id].quota_probe);
+    }
+
+    // S2: A matching display label alone must not evict an unrelated discovered Google enrollment (live or after restart).
+    let dir = Scratch::new();
+    let proxy = Arc::new(Proxy::new(fixture_config(&dir, &mock)).unwrap());
+    let discovered = json!({"access_token":"old-access","refresh_token":"old-refresh","project_id":"project-a","email":"a@example.test"});
+    {
+        let mut state = proxy.state.write().await;
+        pool::add_provenance_google(&mut state.pool, "enrollment", discovered.clone());
+    }
+    let server = serve(proxy.clone().app()).await;
+    let unrelated = json!({
+        "type":"google","access_token":"other-access","refresh_token":"other-refresh","label":"enrollment",
+        "project_id":"project-b","email":"b@example.test","disabled":true,"quota_probe":true,
+    });
+    assert_eq!(Http::new(&server).management("POST", "/v8/management/credentials?name=observe.json", Some(unrelated)).await.status(), 200);
+    {
+        let state = proxy.state.read().await;
+        assert_eq!(state.pool.accounts.len(), 2);
+        assert!(state.pool.accounts.values().any(|a| a.local && !a.disabled));
+    }
+    let mut reloaded = Pool::load(&proxy.config).unwrap();
+    pool::add_provenance_google(&mut reloaded, "enrollment", discovered);
+    assert_eq!(reloaded.accounts.len(), 2);
+    assert!(reloaded.accounts.values().any(|a| a.local && !a.disabled));
+    assert!(reloaded.accounts.values().any(|a| !a.local && a.disabled && a.quota_probe));
 }
 
 #[tokio::test]

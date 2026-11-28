@@ -419,17 +419,11 @@ pub(crate) async fn refresh_selected(proxy: &Proxy, id: Option<&str>, family: Op
         if let Some(id) = id {
             vec![state.pool.find(id).filter(|a| family.is_none_or(|f| a.lane.family() == f)).cloned().ok_or_else(missing)?]
         } else {
-            state
-                .pool
-                .accounts
-                .values()
-                .filter(|a| !a.disabled && !a.api_key && family.is_none_or(|f| a.lane.family() == f))
-                .cloned()
-                .collect()
+            state.pool.accounts.values().filter(|a| a.can_probe_quota() && family.is_none_or(|f| a.lane.family() == f)).cloned().collect()
         }
     };
     let mut pending = stream::iter(accounts.into_iter().map(|account| async move {
-        let result = if account.disabled || account.api_key {
+        let result = if !account.can_probe_quota() {
             Err(crate::error_classify::probe_error("account does not support quota probes"))
         } else {
             proxy.refresh_usage(&account).await
@@ -474,6 +468,20 @@ async fn upload(State(proxy): State<Arc<Proxy>>, Query(query): Query<Name>, Json
         return Err(Failure(StatusCode::CONFLICT, "discovered accounts cannot be overwritten"));
     }
     let path = proxy.config.auth_dir.join(name);
+    let superseded = state
+        .pool
+        .accounts
+        .values()
+        .filter(|old| {
+            old.local
+                && old.lane == Lane::Google
+                && !old.api_key
+                && accounts
+                    .iter()
+                    .any(|a| a.lane == Lane::Google && !a.api_key && old.shares_discovery_token(a) && old.compatible_refresh(a))
+        })
+        .map(|a| a.id.clone())
+        .collect::<BTreeSet<_>>();
     let replaced = state
         .pool
         .accounts
@@ -486,7 +494,7 @@ async fn upload(State(proxy): State<Arc<Proxy>>, Query(query): Query<Name>, Json
         .remove_account_overrides(&proxy.config.state_dir, &replaced, || write_private(&path, &serde_json::to_vec_pretty(&raw)?, true))
         .map_err(|_| disk())?;
     let ids: BTreeSet<_> = accounts.iter().map(|a| a.id.as_str()).collect();
-    state.pool.accounts.retain(|id, a| a.name != name || ids.contains(id.as_str()));
+    state.pool.accounts.retain(|id, a| !superseded.contains(id) && (a.name != name || ids.contains(id.as_str())));
     state.pool.insert(accounts);
     state.pool.revision += 1;
     drop(state);
@@ -502,6 +510,7 @@ async fn upload(State(proxy): State<Arc<Proxy>>, Query(query): Query<Name>, Json
 #[derive(Default, Deserialize)]
 pub(crate) struct Changes {
     pub disabled: Option<bool>,
+    pub quota_probe: Option<bool>,
     pub priority: Option<i32>,
     pub weight: Option<u32>,
     pub note: Option<Value>,
@@ -511,7 +520,7 @@ pub(crate) struct Changes {
 
 impl Changes {
     fn edits_auth_fields(&self) -> bool {
-        self.disabled.is_some() || self.priority.is_some() || self.weight.is_some() || self.note.is_some()
+        self.disabled.is_some() || self.quota_probe.is_some() || self.priority.is_some() || self.weight.is_some() || self.note.is_some()
     }
 }
 
@@ -555,6 +564,7 @@ pub(crate) fn change(proxy: &Proxy, pool: &mut Pool, id: &str, changes: Changes)
         None => None,
     };
     if changes.disabled.is_none()
+        && changes.quota_probe.is_none()
         && changes.priority.is_none()
         && changes.weight.is_none()
         && note.is_none()
@@ -580,6 +590,9 @@ pub(crate) fn change(proxy: &Proxy, pool: &mut Pool, id: &str, changes: Changes)
             if let Some(v) = changes.disabled {
                 target.insert("disabled".into(), json!(v));
                 target.remove("enabled");
+            }
+            if let Some(v) = changes.quota_probe {
+                target.insert("quota_probe".into(), json!(v));
             }
             if let Some(v) = changes.priority {
                 target.insert("priority".into(), json!(v));
@@ -638,6 +651,7 @@ pub(crate) fn change(proxy: &Proxy, pool: &mut Pool, id: &str, changes: Changes)
         &found.id,
         AccountOverride {
             disabled: changes.disabled,
+            quota_probe: changes.quota_probe,
             priority: changes.priority,
             weight: changes.weight,
             note,

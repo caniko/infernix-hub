@@ -203,6 +203,7 @@ pub struct Account {
     pub label: String,
     pub email: Option<String>,
     pub disabled: bool,
+    pub quota_probe: bool,
     pub priority: i32,
     pub weight: u32,
     pub note: Option<String>,
@@ -316,8 +317,12 @@ impl Account {
         self.scrub_label(&[old.as_deref().unwrap_or_default()]);
     }
 
+    pub(crate) fn can_probe_quota(&self) -> bool {
+        !self.api_key && (!self.disabled || (self.quota_probe && self.lane != Lane::Go))
+    }
+
     pub(crate) fn needs_google_metadata(&self) -> bool {
-        self.lane == Lane::Google && !self.disabled && !self.api_key && (self.email.is_none() || self.project.is_none())
+        self.lane == Lane::Google && self.can_probe_quota() && (self.email.is_none() || self.project.is_none())
     }
 
     pub(crate) fn same_credential(&self, other: &Self) -> bool {
@@ -329,11 +334,11 @@ impl Account {
             && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
     }
 
-    fn compatible_refresh(&self, other: &Self) -> bool {
+    pub(crate) fn compatible_refresh(&self, other: &Self) -> bool {
         self.refresh.is_none() || other.refresh.is_none() || self.refresh == other.refresh
     }
 
-    fn shares_discovery_token(&self, other: &Self) -> bool {
+    pub(crate) fn shares_discovery_token(&self, other: &Self) -> bool {
         self.lane == other.lane
             && ((!self.access.is_empty() && self.access == other.access) || (self.refresh.is_some() && self.refresh == other.refresh))
     }
@@ -894,6 +899,7 @@ impl Account {
             "id": self.id, "name": self.name, "auth_index": self.auth_index, "provider": self.provider,
             "type": self.provider, "label": crate::error_classify::safe_label(self), "disabled": self.disabled, "note": self.note, "priority": self.priority,
             "weight": self.weight, "status": if self.disabled { "disabled" } else if self.has_account_error() { "error" } else { "active" },
+            "quota_probe": self.quota_probe,
             "cooldown_until": self.cooldown_until(), "observed_at": self.observed, "last_used_at": self.last_used,
             "last_error": self.reported_error(),
             "preferred": pool.preferred(self.lane) == Some(self.id.as_str()),
@@ -1154,6 +1160,11 @@ fn parse_credentials_with_options(
             note,
             plan: auth_plan.clone().or_else(|| observed_plan.clone()),
             disabled,
+            quota_probe: entry_obj
+                .and_then(|o| o.get("quota_probe").and_then(Value::as_bool))
+                .or_else(|| group["quota_probe"].as_bool())
+                .or_else(|| raw["quota_probe"].as_bool())
+                .unwrap_or(false),
             priority,
             weight,
             multiplier: auth_multiplier,
@@ -1453,6 +1464,8 @@ pub(crate) struct AccountOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_probe: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
@@ -1474,11 +1487,12 @@ impl AccountOverride {
     }
 
     fn has_metadata(&self) -> bool {
-        self.disabled.is_some() || self.priority.is_some() || self.weight.is_some() || self.note.is_some()
+        self.disabled.is_some() || self.quota_probe.is_some() || self.priority.is_some() || self.weight.is_some() || self.note.is_some()
     }
 
     fn clear_metadata(&mut self) {
         self.disabled = None;
+        self.quota_probe = None;
         self.priority = None;
         self.weight = None;
         self.note = None;
@@ -1486,6 +1500,7 @@ impl AccountOverride {
 
     fn merge(&mut self, changes: Self) {
         self.disabled = changes.disabled.or(self.disabled);
+        self.quota_probe = changes.quota_probe.or(self.quota_probe);
         self.priority = changes.priority.or(self.priority);
         self.weight = changes.weight.or(self.weight);
         self.note = changes.note.or(self.note.take());
@@ -1497,6 +1512,7 @@ impl AccountOverride {
         // Managed auth JSON is authoritative even if an older override still has duplicates.
         if account.local {
             account.disabled = self.disabled.unwrap_or(account.disabled);
+            account.quota_probe = self.quota_probe.unwrap_or(account.quota_probe);
             account.priority = self.priority.unwrap_or(account.priority);
             account.weight = self.weight.unwrap_or(account.weight);
             if let Some(note) = &self.note {
@@ -1947,6 +1963,7 @@ impl Pool {
                 a.scrub_label(&old.current_secrets());
                 if a.local && old.local && old.lane == a.lane {
                     a.disabled = old.disabled;
+                    a.quota_probe = old.quota_probe;
                     a.priority = old.priority;
                     a.weight = old.weight;
                     a.note.clone_from(&old.note);

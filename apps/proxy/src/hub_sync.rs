@@ -160,7 +160,7 @@ pub(crate) async fn observations(proxy: &Proxy, host: &str, user: &str) -> Vec<O
                         errors += usize::from(error.map_or(a.probe_failed, AccountError::is_notification_worthy));
                     }
                     let mut account_caps = capabilities.clone();
-                    if a.api_key {
+                    if !a.can_probe_quota() {
                         account_caps.remove(&RefreshQuota);
                     }
                     let is_next = picks.contains(&a.id);

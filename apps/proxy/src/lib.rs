@@ -63,6 +63,21 @@ pub(crate) enum QuotaRefreshOutcome {
     Suppressed,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenPurpose {
+    Routing,
+    QuotaProbe,
+}
+
+impl TokenPurpose {
+    fn allows(self, account: &Account) -> bool {
+        match self {
+            Self::Routing => !account.disabled,
+            Self::QuotaProbe => account.can_probe_quota(),
+        }
+    }
+}
+
 struct VerifiedGoogleToken {
     expires: Instant,
     client_id: String,
@@ -274,13 +289,17 @@ impl Proxy {
     }
 
     async fn report_account_error(&self, account: &Account, error: &AccountError) {
+        self.report_account_error_for(account, error, TokenPurpose::Routing).await;
+    }
+
+    async fn report_account_error_for(&self, account: &Account, error: &AccountError, purpose: TokenPurpose) {
         let changed = {
             let mut state = self.state.write().await;
             state
                 .pool
                 .accounts
                 .get_mut(&account.id)
-                .filter(|a| !a.disabled && a.same_secret(account))
+                .filter(|a| purpose.allows(a) && a.same_secret(account))
                 .is_some_and(|a| a.record_error_once(error))
         };
         if changed {
@@ -454,17 +473,19 @@ impl Proxy {
     }
 
     async fn hydrate_google_metadata(&self) {
-        self.hydrate_missing_google_metadata(true).await;
+        self.hydrate_missing_google_metadata(true, TokenPurpose::QuotaProbe).await;
     }
 
-    async fn hydrate_missing_google_metadata(&self, include_project: bool) {
+    async fn hydrate_missing_google_metadata(&self, include_project: bool, purpose: TokenPurpose) {
         let missing: Vec<Account> = {
             let state = self.state.read().await;
             state
                 .pool
                 .accounts
                 .values()
-                .filter(|a| a.needs_google_metadata() && (include_project || (a.email.is_none() && a.google_client.is_some())))
+                .filter(|a| {
+                    purpose.allows(a) && a.needs_google_metadata() && (include_project || (a.email.is_none() && a.google_client.is_some()))
+                })
                 .cloned()
                 .collect()
         };
@@ -472,7 +493,7 @@ impl Proxy {
             return;
         }
         let resolved = futures_util::future::join_all(missing.into_iter().map(|account| async move {
-            let mut account = self.token_account(&account, false).await.ok()?;
+            let mut account = self.token_account_for(&account, false, purpose).await.ok()?;
             let base = account.base.clone();
             let lookup = async |access: &str, email, project| {
                 tokio::join!(async { if email { self.google_token_email(access).await } else { None } }, async {
@@ -486,7 +507,7 @@ impl Proxy {
             let retry_project = need_project && project.is_none();
             if (retry_email || retry_project)
                 && account.refresh.is_some()
-                && let Ok(fresh) = self.token_account(&account, true).await
+                && let Ok(fresh) = self.token_account_for(&account, true, purpose).await
                 && fresh.access != account.access
             {
                 account = fresh;
@@ -500,7 +521,9 @@ impl Proxy {
         let mut state = self.state.write().await;
         let before = state.pool.revision;
         for (account, email, project) in resolved.into_iter().flatten() {
-            if let Some(current) = state.pool.accounts.get_mut(&account.id).filter(|c| !c.disabled && c.same_credential(&account)) {
+            if let Some(current) =
+                state.pool.accounts.get_mut(&account.id).filter(|c| purpose.allows(c) && !c.api_key && c.same_credential(&account))
+            {
                 let email_changed = current.email.is_none() && email.is_some();
                 if email_changed {
                     current.email = email;
@@ -558,7 +581,7 @@ impl Proxy {
         // An overlapping reload can finish discovery before its metadata is hydrated.
         let discovery_seen = self.local_discovery_generation.load(Ordering::Acquire);
         let reload_interval = Duration::from_secs(15);
-        self.hydrate_missing_google_metadata(false).await;
+        self.hydrate_missing_google_metadata(false, TokenPurpose::Routing).await;
         let has_pool_candidates = |pool: &Pool| {
             pool.accounts
                 .values()
@@ -568,7 +591,7 @@ impl Proxy {
         let mut refreshed = false;
         if !has_candidates && self.refresh_local_commands_since(reload_interval, discovery_seen).await {
             refreshed = true;
-            self.hydrate_missing_google_metadata(false).await;
+            self.hydrate_missing_google_metadata(false, TokenPurpose::Routing).await;
             has_candidates = has_pool_candidates(&self.state.read().await.pool);
         }
         if !has_candidates {
@@ -592,7 +615,7 @@ impl Proxy {
             clients.iter().copied().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned)
         };
         if matched_client.is_none() && !refreshed && self.refresh_local_commands_since(reload_interval, discovery_seen).await {
-            self.hydrate_missing_google_metadata(false).await;
+            self.hydrate_missing_google_metadata(false, TokenPurpose::Routing).await;
             let state = self.state.read().await;
             matched_client = clients.iter().copied().find(|client_id| matches_pool(&state.pool, client_id, email)).map(str::to_owned);
         }
@@ -620,12 +643,19 @@ impl Proxy {
     }
 
     async fn token_account(&self, a: &Account, force: bool) -> Result<Account, Box<AccountError>> {
+        self.token_account_for(a, force, TokenPurpose::Routing).await
+    }
+
+    async fn token_account_for(&self, a: &Account, force: bool, purpose: TokenPurpose) -> Result<Account, Box<AccountError>> {
         let auth_error = |message| {
             let kind = if force { AccountErrorKind::Other } else { AccountErrorKind::AuthExpired };
             Box::new(local_error(kind, AccountErrorSource::OAuthRefresh, message))
         };
         let superseded =
             || Box::new(local_error(AccountErrorKind::Other, AccountErrorSource::OAuthRefresh, "credential changed or was disabled"));
+        if !purpose.allows(a) {
+            return Err(superseded());
+        }
         if a.api_key || a.lane == Lane::Go {
             return if force { Err(auth_error("credential renewal is unavailable for this provider")) } else { Ok(a.clone()) };
         }
@@ -634,8 +664,15 @@ impl Proxy {
             return Ok(a.clone());
         }
         let _guard = self.oauth_refresh.lock().await;
-        let current =
-            self.state.read().await.pool.find(&a.id).filter(|c| c.same_credential(a) && !c.disabled).cloned().ok_or_else(superseded)?;
+        let current = self
+            .state
+            .read()
+            .await
+            .pool
+            .find(&a.id)
+            .filter(|c| c.same_credential(a) && purpose.allows(c))
+            .cloned()
+            .ok_or_else(superseded)?;
         if (!force || current.access != a.access) && valid(&current) {
             return Ok(current);
         }
@@ -682,7 +719,7 @@ impl Proxy {
                     state.pool.apply_account_settings(&mut next);
                     next
                 })
-                .filter(|next| !next.disabled && !state.pool.is_api_key_conflicted(next));
+                .filter(|next| purpose.allows(next) && !state.pool.is_api_key_conflicted(next));
             let unchanged = reloaded.as_ref().is_some_and(|next| next.access == current.access);
             if let Some(updated) = reloaded
                 && (!force || updated.access != current.access)
@@ -691,7 +728,7 @@ impl Proxy {
                     .pool
                     .accounts
                     .get_mut(&a.id)
-                    .filter(|entry| entry.same_secret(&current) && !entry.disabled)
+                    .filter(|entry| entry.same_secret(&current) && purpose.allows(entry))
                     .ok_or_else(superseded)?;
                 if !entry.same_secret(&updated) && entry.error_generation == current.error_generation {
                     let cleared = entry.clear_account_error() || entry.probe_failed;
@@ -720,11 +757,11 @@ impl Proxy {
                 && current.refresh.as_deref().is_some_and(|token| !token.is_empty() && token != "spillway-pool")
                 && !state.pool.is_api_key_conflicted(&current);
             let unchanged = unchanged
-                .then(|| state.pool.accounts.get(&a.id).filter(|entry| !entry.disabled && entry.same_secret(&current)).cloned())
+                .then(|| state.pool.accounts.get(&a.id).filter(|entry| purpose.allows(entry) && entry.same_secret(&current)).cloned())
                 .flatten();
             drop(state);
             if can_refresh_codex {
-                return self.refresh_codex_oauth(&current).await;
+                return self.refresh_codex_oauth(&current, purpose).await;
             }
             if let Some(unchanged) = unchanged {
                 // Let the caller classify the original 401, not a reload failure.
@@ -772,12 +809,12 @@ impl Proxy {
         let (access, expires_in) = match refreshed {
             Ok(result) => result,
             Err(error) => {
-                self.report_account_error(&current, &error).await;
+                self.report_account_error_for(&current, &error, purpose).await;
                 return Err(Box::new(error));
             }
         };
         let mut state = self.state.write().await;
-        let next = state.pool.accounts.get_mut(&a.id).filter(|n| n.same_secret(&current) && !n.disabled).ok_or_else(superseded)?;
+        let next = state.pool.accounts.get_mut(&a.id).filter(|n| n.same_secret(&current) && purpose.allows(n)).ok_or_else(superseded)?;
         if next.access != access
             && next.error_generation == current.error_generation
             && next.last_error.as_ref().is_none_or(|err| !err.kind.is_blocking() || err.kind == AccountErrorKind::AuthExpired)
@@ -793,7 +830,7 @@ impl Proxy {
         Ok(next.clone())
     }
 
-    async fn refresh_codex_oauth(&self, current: &Account) -> Result<Account, Box<AccountError>> {
+    async fn refresh_codex_oauth(&self, current: &Account, purpose: TokenPurpose) -> Result<Account, Box<AccountError>> {
         let superseded =
             || Box::new(local_error(AccountErrorKind::Other, AccountErrorSource::OAuthRefresh, "credential changed or was disabled"));
         let Some(refresh) = current.refresh.as_deref().filter(|token| !token.is_empty() && *token != "spillway-pool") else {
@@ -871,7 +908,7 @@ impl Proxy {
         let (access, next_refresh, id_token, expires, chatgpt_id, chatgpt_user, email, plan) = match refreshed {
             Ok(result) => result,
             Err(error) => {
-                self.report_account_error(current, &error).await;
+                self.report_account_error_for(current, &error, purpose).await;
                 return Err(Box::new(error));
             }
         };
@@ -880,7 +917,8 @@ impl Proxy {
             tracing::error!(account = %safe_label(current), error = %err, "failed to persist rotated OpenAI OAuth token to auth_dir");
         }
         let mut state = self.state.write().await;
-        let next = state.pool.accounts.get_mut(&current.id).filter(|n| n.same_secret(current) && !n.disabled).ok_or_else(superseded)?;
+        let next =
+            state.pool.accounts.get_mut(&current.id).filter(|n| n.same_secret(current) && purpose.allows(n)).ok_or_else(superseded)?;
         if next.access != access
             && next.error_generation == current.error_generation
             && next.last_error.as_ref().is_none_or(|err| !err.kind.is_blocking() || err.kind == AccountErrorKind::AuthExpired)
@@ -989,7 +1027,7 @@ impl Proxy {
         let send = |account: &Account| request(account).timeout(Duration::from_secs(12)).send();
         let mut response = send(account).await.map_err(|_| probe_transport_error())?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED && !account.api_key {
-            match self.token_account(account, true).await {
+            match self.token_account_for(account, true, TokenPurpose::QuotaProbe).await {
                 Ok(fresh) if fresh.access != account.access => {
                     *account = fresh;
                     response = send(account).await.map_err(|_| probe_transport_error())?;
@@ -1117,7 +1155,7 @@ impl Proxy {
                     break;
                 }
                 renewed = true;
-                let fresh = match self.token_account(account, true).await {
+                let fresh = match self.token_account_for(account, true, TokenPurpose::QuotaProbe).await {
                     Ok(fresh) if fresh.access != account.access => fresh,
                     Err(error) if error.kind.is_blocking() => return Err(error),
                     Err(error) => {
@@ -1155,7 +1193,7 @@ impl Proxy {
                 .pool
                 .accounts
                 .get_mut(&account.id)
-                .filter(|c| !c.disabled && c.same_credential(account))
+                .filter(|c| c.can_probe_quota() && c.same_credential(account))
                 .ok_or_else(|| probe_error("credential changed before quota refresh"))?;
             let now = Utc::now();
             if let Some(error) = &current.quota_probe_policy_error
@@ -1184,7 +1222,7 @@ impl Proxy {
         let mut google_summary = false;
         let mut probed_project = None;
         let result = async {
-            account = self.token_account(&account, false).await?;
+            account = self.token_account_for(&account, false, TokenPurpose::QuotaProbe).await?;
             match account.lane {
                 Lane::Claude => {
                     let mut url = self.config.anthropic.clone();
@@ -1273,7 +1311,7 @@ impl Proxy {
             .pool
             .accounts
             .get_mut(&account.id)
-            .filter(|c| !c.disabled && c.probe_generation == generation && c.same_secret(&account))
+            .filter(|c| c.can_probe_quota() && c.probe_generation == generation && c.same_secret(&account))
             .ok_or_else(|| probe_error("quota refresh was superseded"))?;
         let error_is_current = current.error_generation == error_generation;
         let was_probe_failed = current.probe_failed;
